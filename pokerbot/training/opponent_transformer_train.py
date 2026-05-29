@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,10 +17,9 @@ from pokerbot.opponent.scapt_manager import SCAPTManager
 from pokerbot.opponent.sequence_encoder import (
     HandTrajectoryBuilder,
     TrajectoryRecord,
-    trajectory_to_batch,
 )
 from pokerbot.training.mixed_self_play import rollout_opponent_trajectories
-from pokerbot.training.trajectory_dataset import OpponentTrajectoryDataset
+from pokerbot.training.trajectory_dataset import OpponentTrajectoryDataset, compute_trajectory_build_fingerprint
 
 
 @dataclass
@@ -37,12 +37,27 @@ class OpponentTransformerTrainConfig:
     exploitative_limit: int = 0
     exploitative_weight: float = 0.1
     grad_clip: float = 1.0
-    use_scapt: bool = False
+    use_scapt: bool = True
+    hero_checkpoint: str = "checkpoints/policy_selfplay_mixed.pt"
+    mi_population_samples: int = 4
+    scapt_diversity_floor: float | None = None
+    require_scapt_diversity: bool = False
+    diversity_probe_states: int = 16
+
+
+def _hero_checkpoint_sha256(path: str) -> str | None:
+    p = Path(path)
+    if not p.exists():
+        return None
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _exploitative_trajectories(limit: int) -> list[TrajectoryRecord]:
     """Build policy-only trajectories from SoelMgd (belief mask zero)."""
-    from pokerbot.engine.actions import Action, ActionType
     from pokerbot.opponent.sequence_encoder import TokenType, _pad_feature, encode_action_token
 
     samples = load_exploitative_dataset("train", limit)
@@ -68,6 +83,49 @@ def _exploitative_trajectories(limit: int) -> list[TrajectoryRecord]:
     return trajectories
 
 
+def _population_policy_logits(
+    model: OpponentTransformer,
+    batch: dict[str, torch.Tensor],
+    scapt: SCAPTManager | None,
+    *,
+    samples: int,
+) -> torch.Tensor | None:
+    """Stack (P, B, 5, A) policy logits from primary + SCAPT-perturbed forwards for MI loss."""
+
+    if scapt is None or not scapt.population:
+        return None
+
+    base_sd = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    logits_list: list[torch.Tensor] = []
+
+    with torch.no_grad():
+        primary = model(
+            batch["token_types"],
+            batch["token_features"],
+            batch["attn_mask"],
+            batch["hero_seat"],
+        )["policy_logits"]
+        logits_list.append(primary.unsqueeze(0))
+
+        n_extra = min(samples - 1, max(len(scapt.population) - 1, 2))
+        for _ in range(n_extra):
+            perturbed = scapt._perturb_state_dict(base_sd, sigma=scapt.mutation_sigma)
+            model.load_state_dict(perturbed, strict=True)
+            out = model(
+                batch["token_types"],
+                batch["token_features"],
+                batch["attn_mask"],
+                batch["hero_seat"],
+            )
+            logits_list.append(out["policy_logits"].unsqueeze(0))
+
+    model.load_state_dict(base_sd, strict=True)
+
+    if len(logits_list) < 2:
+        return None
+    return torch.cat(logits_list, dim=0)
+
+
 def train_opponent_transformer(
     config: OpponentTransformerTrainConfig | None = None,
     hero_model=None,
@@ -78,6 +136,10 @@ def train_opponent_transformer(
     device = torch.device(config.device)
 
     traj_dir = Path("data/trajectories")
+    scapt_gen = scapt._generation if scapt is not None else 0
+    build_fp = compute_trajectory_build_fingerprint(config.hero_checkpoint, scapt_gen)
+
+    # SCAPT generates opponent-seat policies only; hero seat uses Step 2 checkpoint.
     if config.rollout_hands > 0 and hero_model is not None:
         rollout_opponent_trajectories(
             hero_model,
@@ -85,16 +147,34 @@ def train_opponent_transformer(
             config.rollout_hands,
             traj_dir,
             scapt=scapt if config.use_scapt else None,
+            shard_metadata={
+                "build_fingerprint": build_fp,
+                "hero_checkpoint": config.hero_checkpoint,
+                "hero_sha256": _hero_checkpoint_sha256(config.hero_checkpoint),
+                "scapt_generation": scapt_gen,
+                "use_scapt": config.use_scapt,
+            },
+            scapt_diversity_floor=config.scapt_diversity_floor,
+            require_scapt_diversity=config.require_scapt_diversity,
+            diversity_probe_states=config.diversity_probe_states,
         )
+        if scapt is not None:
+            scapt.advance_generation()
+            scapt.save()
 
-    ds = OpponentTrajectoryDataset(config.parquet_glob)
+    ds = OpponentTrajectoryDataset(config.parquet_glob, expected_build_fingerprint=build_fp)
     if len(ds) == 0 and config.exploitative_limit > 0:
         aux = _exploitative_trajectories(config.exploitative_limit)
         if aux:
             from pokerbot.training.trajectory_dataset import append_trajectories
 
-            append_trajectories(aux, traj_dir, shard_name="soelmgd_aux.parquet")
-            ds = OpponentTrajectoryDataset(config.parquet_glob)
+            append_trajectories(
+                aux,
+                traj_dir,
+                shard_name="soelmgd_aux.parquet",
+                metadata={"build_fingerprint": build_fp, "source": "soelmgd_aux"},
+            )
+            ds = OpponentTrajectoryDataset(config.parquet_glob, expected_build_fingerprint=build_fp)
 
     if len(ds) == 0:
         raise ValueError("No trajectory data available for opponent transformer training")
@@ -141,12 +221,21 @@ def train_opponent_transformer(
                     batch["attn_mask"],
                     batch["hero_seat"],
                 )
+                pop_logits = None
+                if config.use_scapt and scapt is not None:
+                    pop_logits = _population_policy_logits(
+                        model,
+                        batch,
+                        scapt,
+                        samples=config.mi_population_samples,
+                    )
                 breakdown = opponent_transformer_loss(
                     out,
                     targets,
                     lambda_policy=config.lambda_policy,
                     lambda_belief=config.lambda_belief,
                     lambda_mi=config.lambda_mi,
+                    population_policy_logits=pop_logits,
                 )
 
             scaler.scale(breakdown.total).backward()
@@ -180,6 +269,12 @@ def train_opponent_transformer(
         {
             "model": model.state_dict(),
             "config": OpponentTransformerConfig().__dict__,
+            "source": "madt_pretrain",
+            "hero_checkpoint": config.hero_checkpoint,
+            "hero_sha256": _hero_checkpoint_sha256(config.hero_checkpoint),
+            "scapt_generation": scapt_gen,
+            "use_scapt": config.use_scapt,
+            "build_fingerprint": build_fp,
         },
         ckpt_path,
     )

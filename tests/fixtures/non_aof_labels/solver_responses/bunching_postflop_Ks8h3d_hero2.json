@@ -1,0 +1,26 @@
+{
+  "spot_key": "bunching_postflop|Ks8h3d|hero=2",
+  "spot_id": "bunching_postflop",
+  "solver_response": {
+    "exploitability": 0.009,
+    "target_exploitability": 0.01,
+    "exploitability_pct_of_pot": 0.45,
+    "converged": true,
+    "iterations": 10000,
+    "iterations_used": 510,
+    "available_actions": ["check", "bet_0.50", "all_in"],
+    "action_distribution": {
+      "bet_0.50": 0.62,
+      "check": 0.28,
+      "all_in": 0.10
+    },
+    "solver_version": "postflop-solver@main",
+    "error": null
+  },
+  "oop_range": "TT+,AQs+",
+  "ip_range": "99-22,ATs+",
+  "bet_sizes": "50%,a",
+  "raise_sizes": "2.5x",
+  "target_exploitability_pct": 0.5,
+  "notes": "Synthetic bunching fixture with narrowed ranges."
+}

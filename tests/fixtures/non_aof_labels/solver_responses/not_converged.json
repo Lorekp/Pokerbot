@@ -1,0 +1,20 @@
+{
+  "spot_key": "sb_vs_bb_flop|Td9d6h|hero=4",
+  "solver_response": {
+    "exploitability": 0.05,
+    "target_exploitability": 0.01,
+    "exploitability_pct_of_pot": 2.5,
+    "converged": false,
+    "iterations": 10000,
+    "iterations_used": 10000,
+    "available_actions": ["check", "bet_0.50", "all_in"],
+    "action_distribution": {
+      "check": 0.7,
+      "bet_0.50": 0.2,
+      "all_in": 0.1
+    },
+    "solver_version": "postflop-solver@main",
+    "error": null
+  },
+  "notes": "Not-converged edge case — build_labels should skip unless include_unconverged."
+}

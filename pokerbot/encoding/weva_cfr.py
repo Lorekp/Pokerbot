@@ -35,6 +35,9 @@ DEFAULT_SCENARIOS: tuple[PreflopScenario, ...] = (
     PreflopScenario(1, pot_bb=2.5, hero_invested_bb=0.0, call_bb=1.0, raise_bb=4.0, fold_equity=0.45),
     PreflopScenario(2, pot_bb=4.5, hero_invested_bb=0.0, call_bb=3.0, raise_bb=9.0, fold_equity=0.35),
     PreflopScenario(3, pot_bb=12.0, hero_invested_bb=3.0, call_bb=6.0, raise_bb=15.0, fold_equity=0.25),
+    PreflopScenario(4, pot_bb=20.0, hero_invested_bb=6.0, call_bb=10.0, raise_bb=24.0, fold_equity=0.20),
+    PreflopScenario(5, pot_bb=6.0, hero_invested_bb=2.0, call_bb=4.0, raise_bb=12.0, fold_equity=0.30),
+    PreflopScenario(6, pot_bb=3.0, hero_invested_bb=1.0, call_bb=2.0, raise_bb=6.0, fold_equity=0.40),
 )
 
 

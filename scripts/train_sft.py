@@ -25,6 +25,11 @@ def main() -> None:
     p.add_argument("--num-weva-buckets", type=int, default=WEVA_DEFAULT_K)
     p.add_argument("--device", default="cuda")
     p.add_argument("--checkpoint-dir", default="checkpoints")
+    p.add_argument(
+        "--checkpoint-output",
+        default=None,
+        help="Override checkpoint path (default: checkpoints/policy_sft.pt)",
+    )
     p.add_argument("--amp", action="store_true")
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--num-workers", type=int, default=0)
@@ -47,6 +52,7 @@ def main() -> None:
         num_weva_buckets=args.num_weva_buckets,
         device=args.device,
         checkpoint_dir=Path(args.checkpoint_dir),
+        checkpoint_output=Path(args.checkpoint_output) if args.checkpoint_output else None,
         amp=args.amp,
         grad_accum=args.grad_accum,
         num_workers=args.num_workers,

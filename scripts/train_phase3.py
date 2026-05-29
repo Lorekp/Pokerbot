@@ -1,53 +1,70 @@
 #!/usr/bin/env python3
-"""Phase 3: mixed-opponent self-play + opponent transformer pretrain."""
+"""Phase 3: MADT opponent transformer pretrain + SCAPT league rollouts (no hero PPO)."""
+
+from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-import torch
-
-from pokerbot.agent import HybridAgent
-from pokerbot.models.policy import PseudoSiamesePolicy
-from pokerbot.training.mixed_self_play import train_self_play_mixed
-from pokerbot.training.phase3 import PretrainConfig, pretrain_opponent_transformer
-from pokerbot.training.self_play import SelfPlayConfig
+from pokerbot.training.phase3 import PretrainConfig, pretrain_opponent_transformer, resolve_hero_checkpoint
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Phase 3 hybrid training")
-    p.add_argument("--checkpoint", default="checkpoints/policy_distilled.pt")
-    p.add_argument("--updates", type=int, default=30)
-    p.add_argument("--hands", type=int, default=32)
-    p.add_argument("--device", default="cuda")
+    p = argparse.ArgumentParser(description="Phase 3 MADT + SCAPT opponent training")
     p.add_argument(
-        "--league-opponents",
-        default="cnn,human_like,nit,lag,donk,alpha_hu",
-        help="Comma-separated opponent types",
+        "--checkpoint",
+        default=None,
+        help="Hero policy for rollouts (default: selfplay → sft → sft_bc)",
     )
-    p.add_argument("--pretrain-transformer", action="store_true")
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--rollout-hands", type=int, default=256)
+    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--exploitative-limit", type=int, default=5000)
+    p.add_argument("--pretrain-transformer", action="store_true", help="Deprecated alias; pretrain is default")
+    p.add_argument("--skip-transformer-pretrain", action="store_true")
+    p.add_argument("--no-scapt", action="store_true", help="Static bot league instead of SCAPT population")
+    p.add_argument("--scapt-population", type=int, default=16)
+    p.add_argument("--scapt-mutation-sigma", type=float, default=None, help="Override SCAPT σ (default 0.08)")
+    p.add_argument(
+        "--scapt-diversity-floor",
+        type=float,
+        default=None,
+        help=f"Min mean pairwise action KL (default {0.02})",
+    )
+    p.add_argument(
+        "--require-scapt-diversity",
+        action="store_true",
+        help="Hard-fail rollouts when SCAPT league diversity is below floor",
+    )
+    p.add_argument("--diversity-probe-states", type=int, default=16)
     args = p.parse_args()
 
-    if args.pretrain_transformer:
-        pretrain_opponent_transformer(
-            PretrainConfig(limit=args.exploitative_limit, device=args.device)
-        )
+    hero_ckpt = args.checkpoint or str(resolve_hero_checkpoint())
+    print(f"Phase 3 hero checkpoint for opponent rollouts: {hero_ckpt}")
 
-    model = PseudoSiamesePolicy()
-    ckpt_path = Path(args.checkpoint)
-    if ckpt_path.exists():
-        ckpt = torch.load(ckpt_path, map_location=args.device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
+    if args.skip_transformer_pretrain:
+        out = Path("checkpoints/opponent_transformer_madt.pt")
+        if not out.exists():
+            raise SystemExit(f"--skip-transformer-pretrain but missing {out}")
+        print(f"Skipping transformer pretrain (using existing {out})")
+        return
 
-    opponents = [x.strip() for x in args.league_opponents.split(",") if x.strip()]
-    train_self_play_mixed(
-        model,
-        SelfPlayConfig(
-            hands_per_update=args.hands,
-            total_updates=args.updates,
+    pretrain_opponent_transformer(
+        PretrainConfig(
+            limit=args.exploitative_limit,
             device=args.device,
-        ),
-        league_opponents=opponents,
+            rollout_hands=args.rollout_hands,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            hero_checkpoint=hero_ckpt,
+            use_scapt=not args.no_scapt,
+            scapt_population_size=args.scapt_population,
+            scapt_mutation_sigma=args.scapt_mutation_sigma,
+            scapt_diversity_floor=args.scapt_diversity_floor,
+            require_scapt_diversity=args.require_scapt_diversity,
+            diversity_probe_states=args.diversity_probe_states,
+        )
     )
 
 

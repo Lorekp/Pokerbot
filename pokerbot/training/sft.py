@@ -112,6 +112,8 @@ class SFTConfig:
 
     checkpoint_dir: Path = Path("checkpoints")
 
+    checkpoint_output: Path | None = None
+
     amp: bool = False
 
     grad_accum: int = 1
@@ -247,7 +249,23 @@ def train_sft(config: SFTConfig | None = None) -> PseudoSiamesePolicy:
 
     train_loader, val_loader = _build_loaders(config)
 
+    if config.mode == "solver":
+        from pokerbot.data.sft_collision_check import require_no_sft_input_collisions
+        from pokerbot.data.sft_dataloader import SolverAnnotatedParquetDataset
 
+        collision = require_no_sft_input_collisions(config.parquet_glob)
+        print(
+            f"SFT input collision precondition passed: "
+            f"{collision['n_unique_inputs']}/{collision['n_rows']} unique inputs"
+        )
+
+        full_count = len(SolverAnnotatedParquetDataset(config.parquet_glob))
+        train_count = len(train_loader.dataset)
+        val_count = len(val_loader.dataset) if val_loader else 0
+        print(
+            f"Solver dataset: {full_count} rows loaded (train={train_count}, val={val_count}); "
+            f"no rows dropped except val split"
+        )
 
     model = PseudoSiamesePolicy(
 
@@ -284,15 +302,11 @@ def train_sft(config: SFTConfig | None = None) -> PseudoSiamesePolicy:
             with torch.amp.autocast("cuda", enabled=config.amp and device.type == "cuda"):
 
                 out = model(
-
                     batch["weva_ids"],
-
                     batch["actions"],
-
                     batch["position"],
-
                     batch["legal_mask"],
-
+                    cards=batch["cards"],
                 )
 
                 if config.mode == "solver":
@@ -384,15 +398,11 @@ def train_sft(config: SFTConfig | None = None) -> PseudoSiamesePolicy:
                     batch = {k: v.to(device) for k, v in batch.items()}
 
                     out = model(
-
                         batch["weva_ids"],
-
                         batch["actions"],
-
                         batch["position"],
-
                         batch["legal_mask"],
-
+                        cards=batch["cards"],
                     )
 
                     pred = out.logits.argmax(dim=-1)
@@ -431,7 +441,9 @@ def train_sft(config: SFTConfig | None = None) -> PseudoSiamesePolicy:
 
 
 
-    ckpt = config.checkpoint_dir / sft_checkpoint_basename(config.mode)
+    ckpt = config.checkpoint_output or (
+        config.checkpoint_dir / sft_checkpoint_basename(config.mode)
+    )
 
     torch.save(
 

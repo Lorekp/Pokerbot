@@ -1,0 +1,32 @@
+{
+  "samples": 12000,
+  "seed": 42,
+  "rho": 0.35,
+  "max_abs_delta_bb": 0.0466,
+  "spots": [
+    {
+      "spot": "AJo UTG 8bb",
+      "ev_independent_bb": 0.8953,
+      "ev_sequential_bb": 0.8838,
+      "delta_bb": 0.0116
+    },
+    {
+      "spot": "77 BTN 3 8bb",
+      "ev_independent_bb": 1.077,
+      "ev_sequential_bb": 1.0632,
+      "delta_bb": 0.0139
+    },
+    {
+      "spot": "KQs BTN 8bb",
+      "ev_independent_bb": 0.9612,
+      "ev_sequential_bb": 1.0077,
+      "delta_bb": -0.0466
+    },
+    {
+      "spot": "22 UTG 8bb",
+      "ev_independent_bb": 1.0757,
+      "ev_sequential_bb": 1.0765,
+      "delta_bb": -0.0008
+    }
+  ]
+}

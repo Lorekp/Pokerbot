@@ -1,0 +1,15 @@
+{
+  "oop_range": "QQ+,AK",
+  "ip_range": "TT-22,AQs+",
+  "board": ["Td", "9d", "6h"],
+  "turn": null,
+  "river": null,
+  "starting_pot_bb": 2.0,
+  "effective_stack_bb": 98.0,
+  "chip_unit_bb": 100,
+  "bet_sizes": "50%,a",
+  "raise_sizes": "2.5x",
+  "max_iterations": 10000,
+  "target_exploitability_pct": 0.5,
+  "action_path": []
+}

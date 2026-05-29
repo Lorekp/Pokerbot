@@ -54,6 +54,7 @@ class DistillDataset(Dataset):
         weva_id = weva_id_from_tensors(cards, position, mapper=self.mapper)
         return {
             "weva_ids": torch.tensor(weva_id, dtype=torch.long),
+            "cards": torch.tensor(cards, dtype=torch.float32),
             "actions": torch.tensor(r["actions"], dtype=torch.float32),
             "position": torch.tensor(r["position"], dtype=torch.float32),
             "legal_mask": torch.tensor(r["legal_mask"], dtype=torch.bool),
@@ -110,7 +111,13 @@ def train_distill(config: DistillConfig | None = None) -> PseudoSiamesePolicy:
         for batch in train_loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             with torch.amp.autocast("cuda", enabled=config.amp and device.type == "cuda"):
-                out = model(batch["weva_ids"], batch["actions"], batch["position"], batch["legal_mask"])
+                out = model(
+                    batch["weva_ids"],
+                    batch["actions"],
+                    batch["position"],
+                    batch["legal_mask"],
+                    cards=batch["cards"],
+                )
                 loss_gto = F.cross_entropy(out.logits, batch["gto_label"])
                 loss_llm = F.cross_entropy(out.logits, batch["llm_label"])
                 loss = alpha * loss_gto + (1 - alpha) * loss_llm
@@ -126,7 +133,13 @@ def train_distill(config: DistillConfig | None = None) -> PseudoSiamesePolicy:
         with torch.no_grad():
             for batch in val_loader:
                 batch = {k: v.to(device) for k, v in batch.items()}
-                out = model(batch["weva_ids"], batch["actions"], batch["position"], batch["legal_mask"])
+                out = model(
+                    batch["weva_ids"],
+                    batch["actions"],
+                    batch["position"],
+                    batch["legal_mask"],
+                    cards=batch["cards"],
+                )
                 pred = out.logits.argmax(dim=-1)
                 correct += (pred == batch["gto_label"]).sum().item()
                 total_n += batch["gto_label"].size(0)

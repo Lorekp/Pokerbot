@@ -54,6 +54,7 @@ def trinal_clip_ppo_loss(
         batch["actions"],
         batch["position"],
         batch.get("legal_mask"),
+        cards=batch["cards"],
     )
     log_probs = F.log_softmax(out.logits, dim=-1)
     selected = batch["action"].long()

@@ -1,0 +1,9 @@
+# Smoke RL profile — v1 obs + teacher (fast, manual/CI-slow)
+profile: smoke
+obs_version: 1
+teacher_version: 1
+updates: 8
+hands_per_update: 32
+seed: 42
+allow_cpu: false
+out: checkpoints/aof_smoke_v1.pt

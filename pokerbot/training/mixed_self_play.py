@@ -11,7 +11,7 @@ import torch
 
 from pokerbot.engine.actions import Action, ActionType
 from pokerbot.engine.game import GameState, NUM_PLAYERS, Street, play_hand
-from pokerbot.encoding.tensors import encode_state
+from pokerbot.encoding.eval_scope import encode_state_for_policy
 from pokerbot.eval.bots import build_bot
 from pokerbot.models.policy import PseudoSiamesePolicy
 from pokerbot.opponent.scapt_manager import SCAPTManager
@@ -99,20 +99,24 @@ def collect_trajectory_mixed(
 
     def make_cnn_policy(model: PseudoSiamesePolicy, seat: int):
         def policy(state: GameState) -> Action:
-            enc = encode_state(state, seat)
+            enc = encode_state_for_policy(state, seat, require_scope=False)
             weva_ids = torch.tensor([enc["weva_id"]], dtype=torch.long, device=device)
+            cards = torch.from_numpy(enc["cards"]).unsqueeze(0).to(device)
             actions = torch.from_numpy(enc["actions"]).unsqueeze(0).to(device)
-            position = torch.from_numpy(enc["position"]).unsqueeze(0).to(device)
+            position = torch.from_numpy(enc["policy_position"]).unsqueeze(0).to(device)
             mask = torch.from_numpy(_legal_mask(state, seat)).unsqueeze(0).to(device)
             with torch.no_grad():
-                idx, out = model.act(weva_ids, actions, position, mask, deterministic=False)
+                idx, out = model.act(
+                    weva_ids, actions, position, mask, cards=cards, deterministic=False
+                )
             if seat == hero_seat:
                 log_probs = torch.log_softmax(out.logits, dim=-1)
                 traj.append(
                     {
                         "weva_id": enc["weva_id"],
+                        "cards": enc["cards"],
                         "actions": enc["actions"],
-                        "position": enc["position"],
+                        "position": enc["policy_position"],
                         "legal_mask": _legal_mask(state, seat),
                         "action": int(idx.item()),
                         "log_prob": float(log_probs[0, idx].item()),
@@ -153,13 +157,16 @@ def collect_opponent_trajectory(
 
     def make_cnn_policy(model: PseudoSiamesePolicy, seat: int):
         def policy(state: GameState) -> Action:
-            enc = encode_state(state, seat)
+            enc = encode_state_for_policy(state, seat, require_scope=False)
             weva_ids = torch.tensor([enc["weva_id"]], dtype=torch.long, device=device)
+            cards = torch.from_numpy(enc["cards"]).unsqueeze(0).to(device)
             actions = torch.from_numpy(enc["actions"]).unsqueeze(0).to(device)
-            position = torch.from_numpy(enc["position"]).unsqueeze(0).to(device)
+            position = torch.from_numpy(enc["policy_position"]).unsqueeze(0).to(device)
             mask = torch.from_numpy(_legal_mask(state, seat)).unsqueeze(0).to(device)
             with torch.no_grad():
-                idx, _ = model.act(weva_ids, actions, position, mask, deterministic=False)
+                idx, _ = model.act(
+                    weva_ids, actions, position, mask, cards=cards, deterministic=False
+                )
             return _index_to_action(state, seat, int(idx.item()))
 
         return policy
@@ -185,11 +192,30 @@ def rollout_opponent_trajectories(
     rng: random.Random | None = None,
     league_opponents: list[str] | None = None,
     scapt: SCAPTManager | None = None,
+    shard_metadata: dict | None = None,
+    *,
+    scapt_diversity_floor: float | None = None,
+    require_scapt_diversity: bool = False,
+    diversity_probe_states: int = 16,
 ) -> Path:
     """Run self-play and write trajectory Parquet shards."""
+    from pokerbot.opponent.scapt_manager import SCAPT_MIN_LEAGUE_ACTION_KL, check_league_diversity
+
     rng = rng or random.Random()
     league_opponents = league_opponents or ["cnn", "nit", "lag", "donk"]
     trajectories: list[TrajectoryRecord] = []
+    floor = SCAPT_MIN_LEAGUE_ACTION_KL if scapt_diversity_floor is None else scapt_diversity_floor
+
+    if scapt and scapt.population:
+        diversity_report = scapt.measure_league_policy_diversity(
+            hero_model,
+            device,
+            num_probe_states=diversity_probe_states,
+            rng=rng,
+        )
+        check_league_diversity(diversity_report, floor=floor, require=require_scapt_diversity)
+        shard_metadata = dict(shard_metadata or {})
+        shard_metadata.update(diversity_report.as_metadata())
 
     for _ in range(num_hands):
         hero_seat = rng.randrange(NUM_PLAYERS)
@@ -213,7 +239,7 @@ def rollout_opponent_trajectories(
     if not trajectories:
         raise RuntimeError("No trajectories collected")
 
-    return append_trajectories(trajectories, output_dir)
+    return append_trajectories(trajectories, output_dir, metadata=shard_metadata)
 
 
 def sample_opponent_seats(
@@ -271,6 +297,7 @@ def train_self_play_mixed(
 
         batch = {
             "weva_ids": torch.tensor([t["weva_id"] for t in all_traj], dtype=torch.long, device=device),
+            "cards": torch.from_numpy(np.stack([t["cards"] for t in all_traj])).float().to(device),
             "actions": torch.from_numpy(np.stack([t["actions"] for t in all_traj])).float().to(device),
             "position": torch.from_numpy(np.stack([t["position"] for t in all_traj])).float().to(device),
             "legal_mask": torch.from_numpy(np.stack([t["legal_mask"] for t in all_traj])).bool().to(device),

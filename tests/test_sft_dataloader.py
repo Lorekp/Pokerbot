@@ -9,12 +9,15 @@ import torch
 
 from pokerbot.data.bc_parquet import BCParquetDataset, bc_sft_loss, collate_bc_batch
 from pokerbot.data.sft_dataloader import (
+    LABEL_SOURCE_POSTFLOP_SOLVER,
     LABEL_SOURCE_SOLVER,
     SolverAnnotatedParquetDataset,
     collate_sft_batch,
     weva_sft_loss,
 )
 from pokerbot.engine.actions import NUM_ACTIONS
+from pokerbot.encoding.spot_scope import encode_spot_scope, fuse_position_scope
+from pokerbot.encoding.tensors import SPEC
 from pokerbot.models.policy import PseudoSiamesePolicy
 
 
@@ -29,10 +32,14 @@ def _make_solver_row(weva_id: int = 3, label: int = 2) -> dict:
     legal[3] = True
     policy = policy * legal
     policy /= policy.sum()
+    pos = np.array([1.0, 0, 0, 0, 0, 0], dtype=np.float32)
+    scope = encode_spot_scope("hu_postflop_2p")
     return {
         "weva_bucket_id": weva_id,
+        "cards": np.zeros(SPEC.card_shape, dtype=np.float32).tolist(),
         "actions": np.zeros((6, 4, 12), dtype=np.float32).tolist(),
-        "position": [1.0, 0, 0, 0, 0, 0],
+        "position": pos.tolist(),
+        "spot_scope": scope.tolist(),
         "legal_mask": legal.tolist(),
         "solver_label": label,
         "solver_policy": policy.tolist(),
@@ -82,6 +89,59 @@ def test_solver_dataset_requires_label_source(solver_parquet: Path):
     assert item["solver_policy"].shape == (NUM_ACTIONS,)
 
 
+def _make_postflop_solver_row(**overrides) -> dict:
+    row = _make_solver_row()
+    row["label_source"] = LABEL_SOURCE_POSTFLOP_SOLVER
+    row["stage"] = "postflop"
+    row["spot_class"] = "hu_postflop_2p"
+    row["solver_converged"] = True
+    row["oop_range"] = "QQ+,AK"
+    row["ip_range"] = "TT-22,AQs+"
+    row["bet_sizes"] = "50%,a"
+    row.update(overrides)
+    return row
+
+
+def test_solver_dataset_rejects_unconverged_postflop(tmp_path: Path):
+    row = _make_postflop_solver_row(solver_converged=False)
+    path = tmp_path / "bad.parquet"
+    pd.DataFrame([row]).to_parquet(path, index=False)
+    with pytest.raises(ValueError, match="solver_converged=false"):
+        SolverAnnotatedParquetDataset(str(path))
+
+
+def test_solver_dataset_rejects_postflop_range_mismatch(tmp_path: Path):
+    row = _make_postflop_solver_row()
+    path = tmp_path / "scoped.parquet"
+    pd.DataFrame([row]).to_parquet(path, index=False)
+    with pytest.raises(ValueError, match="oop_range"):
+        SolverAnnotatedParquetDataset(
+            str(path),
+            expected_oop_range="66+",
+        )
+
+
+def test_solver_dataset_accepts_postflop_with_matching_scope(tmp_path: Path):
+    row = _make_postflop_solver_row()
+    path = tmp_path / "good.parquet"
+    pd.DataFrame([row]).to_parquet(path, index=False)
+    ds = SolverAnnotatedParquetDataset(
+        str(path),
+        expected_oop_range="QQ+,AK",
+        expected_ip_range="TT-22,AQs+",
+        expected_bet_sizes="50%,a",
+    )
+    assert len(ds) == 1
+
+
+def test_solver_dataset_accepts_postflop_solver_label_source(tmp_path: Path):
+    row = _make_postflop_solver_row()
+    path = tmp_path / "pf.parquet"
+    pd.DataFrame([row]).to_parquet(path, index=False)
+    ds = SolverAnnotatedParquetDataset(str(path))
+    assert len(ds) == 1
+
+
 def test_solver_dataset_rejects_bc_rows(tmp_path: Path):
     row = _make_bc_row()
     row["solver_label"] = row.pop("bc_label")
@@ -115,22 +175,17 @@ def test_bc_dataset_rejects_solver_columns(tmp_path: Path):
         BCParquetDataset(str(path))
 
 
-def test_weva_sft_loss_finite():
+def test_weva_sft_loss_finite(solver_parquet: Path):
+    ds = SolverAnnotatedParquetDataset(str(solver_parquet))
+    batch = collate_sft_batch([ds[0]])
     model = PseudoSiamesePolicy(hidden=32, num_weva_buckets=16)
-    row = _make_solver_row(1, 2)
-    batch = collate_sft_batch(
-        [
-            {
-                "weva_ids": torch.tensor(row["weva_bucket_id"], dtype=torch.long),
-                "actions": torch.tensor(row["actions"], dtype=torch.float32),
-                "position": torch.tensor(row["position"], dtype=torch.float32),
-                "legal_mask": torch.tensor(row["legal_mask"], dtype=torch.bool),
-                "solver_label": torch.tensor(row["solver_label"], dtype=torch.long),
-                "solver_policy": torch.tensor(row["solver_policy"], dtype=torch.float32),
-            }
-        ]
+    out = model(
+        batch["weva_ids"],
+        batch["actions"],
+        batch["position"],
+        batch["legal_mask"],
+        cards=batch["cards"],
     )
-    out = model(batch["weva_ids"], batch["actions"], batch["position"], batch["legal_mask"])
     loss, stats = weva_sft_loss(
         out,
         batch["solver_label"],
@@ -145,18 +200,18 @@ def test_weva_sft_loss_finite():
 def test_bc_sft_loss_finite():
     model = PseudoSiamesePolicy(hidden=32, num_weva_buckets=16)
     row = _make_bc_row(1, 2)
-    batch = collate_bc_batch(
-        [
-            {
-                "weva_ids": torch.tensor(row["weva_bucket_id"], dtype=torch.long),
-                "actions": torch.tensor(row["actions"], dtype=torch.float32),
-                "position": torch.tensor(row["position"], dtype=torch.float32),
-                "legal_mask": torch.tensor(row["legal_mask"], dtype=torch.bool),
-                "bc_label": torch.tensor(row["bc_label"], dtype=torch.long),
-            }
-        ]
+    ds = BCParquetDataset.__new__(BCParquetDataset)
+    from pokerbot.data.bc_parquet import _normalize_bc_record
+
+    ds.records = [_normalize_bc_record(row)]
+    batch = collate_bc_batch([ds.__getitem__(0)])
+    out = model(
+        batch["weva_ids"],
+        batch["actions"],
+        batch["position"],
+        batch["legal_mask"],
+        cards=batch["cards"],
     )
-    out = model(batch["weva_ids"], batch["actions"], batch["position"], batch["legal_mask"])
     loss, stats = bc_sft_loss(out, batch["bc_label"], batch["legal_mask"])
     assert torch.isfinite(loss)
     assert stats["ce_bc"] >= 0

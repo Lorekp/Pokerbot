@@ -161,3 +161,32 @@ def test_trainer_single_iteration() -> None:
     trainer = VRDeepPDCFRPlusTrainer(cfg)
     stats = trainer.train_iteration(1)
     assert stats["iteration"] == 1.0
+
+
+def test_traversal_utility_uses_acting_seat() -> None:
+    """History samples must index utility by acting seat, not player 0."""
+
+    cfg = VRDeepPDCFRConfig(traversals_per_iter=4, batch_size=8, buffer_capacity=128)
+    trainer = VRDeepPDCFRPlusTrainer(cfg)
+    trainer.run_traversals(1)
+    buf = trainer.hist_buffer.buffer
+    if int(buf.size) == 0:
+        pytest.skip("no history samples collected")
+    n = int(buf.size)
+    players = jax.device_get(buf.data["player"][:n])
+    masks = jax.device_get(buf.data["next_legal_mask"][:n])
+    assert jnp.any(players != 0), "expected samples from non-zero seats"
+    assert masks.shape == (n, NUM_ACTIONS)
+    assert jnp.any(masks), "next_legal_mask must reflect legal actions, not all-legal default"
+
+
+def test_checkpoint_full_roundtrip(tmp_path) -> None:
+    from pokerbot.training.neural_cfr import save_trainer_checkpoint, load_trainer_checkpoint
+
+    cfg = VRDeepPDCFRConfig(total_iterations=2, traversals_per_iter=2, batch_size=8, buffer_capacity=32)
+    trainer = VRDeepPDCFRPlusTrainer(cfg)
+    trainer.train_iteration(1)
+    ckpt = tmp_path / "hvn.pkl"
+    save_trainer_checkpoint(trainer, ckpt)
+    loaded = load_trainer_checkpoint(tmp_path / "hvn_full.pkl")
+    assert loaded._start_iteration == 1

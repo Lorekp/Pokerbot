@@ -1,0 +1,30 @@
+{
+  "build_git_commit": "fb3650f75c034ec1d49f1901979312660ab541e2",
+  "lut_schema_version": 1,
+  "n_ctx": 2,
+  "n_hand": 169,
+  "range_file_hashes": {
+    "aof_ranges.py": "5108752eb54f4550a390c75a16a8be1c83bd497bf1f0cad334736edb00d81340",
+    "aof_ranges_chart.py": "610ecc404ef7fcdc092d49bb7bd05ca6aa60413e050339dd4c491a68c099d8ba",
+    "aof_ranges_gto.py": "f237bfebbd7ce22ffa1a51c3b8fb3062c8a291a4c725fe4240769fcb763fe909",
+    "aof_ranges_tight.py": "2baafecff93ca37e15f1f69154c6edab3ece899e642399a8578547820ca8e140"
+  },
+  "stack_bb": 8.0,
+  "teacher_config_hash": "4f1a0c679f1ed91ac3f449087a7ca49d676c307808cb5c8c132cd1ba288e5a53",
+  "teacher_margin_bb": 0.4,
+  "teacher_min_samples": 50,
+  "teacher_samples": 80,
+  "teacher_version": 2,
+  "use_fast": false,
+  "v1_path_set": [
+    "static_profile_open",
+    "static_profile_clean_call",
+    "static_profile_call_behind"
+  ],
+  "value_keys": [
+    "q_fold_bb",
+    "q_shove_bb",
+    "p_fold",
+    "edge_bb"
+  ]
+}

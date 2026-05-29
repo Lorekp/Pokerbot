@@ -1,0 +1,49 @@
+experiment: aof_v3_ppo_league_smoke
+obs_version: 3
+teacher_version: 2
+seed: 42
+device: cpu
+allow_cpu: true
+out: checkpoints/aof_rl/policy_league_v3_smoke.pt
+
+model:
+  encoder: deep_sets
+  d_model: 64
+  n_blocks: 1
+  n_heads: 2
+  trunk_hidden: 64
+
+train:
+  algo: ppo_league
+  gamma: 1.0
+  gae_lambda: 1.0
+  lr: 0.0003
+  clip_ratio: 0.10
+  entropy_coef: 0.01
+  value_coef: 0.5
+  q_coef: 0.5
+  teacher_bc_coef: 0.25
+  uncertainty_coef: 0.1
+  batch_hands: 8
+  epochs_per_update: 2
+  total_updates: 2
+  teacher_samples: 80
+  payoff_samples: 200
+  use_fast_teacher: true
+  stack_bb: 8.0
+  deterministic_validation: true
+
+league:
+  scripted_pool: true
+  oracle_pool: true
+  adversarial_br_pool: false
+  snapshot_every_updates: 1
+  archive_top_k: 2
+
+curriculum:
+  stage_1: hu_only
+  stage_1_updates: 2
+
+validation:
+  seeds: [42]
+  deterministic: true

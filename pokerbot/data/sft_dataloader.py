@@ -24,32 +24,29 @@ from torch.utils.data import DataLoader, Dataset
 
 
 
+from pokerbot.data.solver_scope import validate_postflop_solver_row_scope
 from pokerbot.engine.actions import NUM_ACTIONS
-
+from pokerbot.encoding.spot_scope import fuse_position_scope
 from pokerbot.models.policy import PolicyOutput
 
 
 
 LABEL_SOURCE_SOLVER = "toolpoker_solver"
+LABEL_SOURCE_POSTFLOP_SOLVER = "postflop_solver"
+LABEL_SOURCES_SOLVER = frozenset({LABEL_SOURCE_SOLVER, LABEL_SOURCE_POSTFLOP_SOLVER})
 
 
 
 SOLVER_REQUIRED_COLUMNS = (
-
     "weva_bucket_id",
-
+    "cards",
     "actions",
-
     "position",
-
+    "spot_scope",
     "legal_mask",
-
     "solver_label",
-
     "solver_policy",
-
     "label_source",
-
 )
 
 
@@ -64,13 +61,13 @@ def _validate_solver_row(row: dict[str, Any], source: str) -> None:
 
             raise ValueError(f"Missing required solver column {col!r} in {source}")
 
-    if row["label_source"] != LABEL_SOURCE_SOLVER:
+    if row["label_source"] not in LABEL_SOURCES_SOLVER:
 
         raise ValueError(
 
             f"Invalid label_source {row['label_source']!r} in {source}; "
 
-            f"expected {LABEL_SOURCE_SOLVER!r}. "
+            f"expected one of {sorted(LABEL_SOURCES_SOLVER)!r}. "
 
             "Use BCParquetDataset for pokerbench_csv rows."
 
@@ -111,9 +108,9 @@ def _normalize_solver_record(rec: dict[str, Any]) -> dict[str, Any]:
     rec = dict(rec)
 
     rec["actions"] = _nested_to_array(rec["actions"], np.float32)
-
+    rec["cards"] = _nested_to_array(rec["cards"], np.float32)
     rec["position"] = _nested_to_array(rec["position"], np.float32)
-
+    rec["spot_scope"] = _nested_to_array(rec["spot_scope"], np.float32)
     rec["legal_mask"] = legal
 
     rec["solver_policy"] = _normalize_solver_policy(rec["solver_policy"], legal)
@@ -162,11 +159,23 @@ def _normalize_solver_policy(
 
 class SolverAnnotatedParquetDataset(Dataset):
 
-    """Strict ToolPoker solver Parquet loader (requires label_source=toolpoker_solver)."""
+    """Solver Parquet loader with optional postflop scope enforcement."""
 
-
-
-    def __init__(self, parquet_glob: str | Path) -> None:
+    def __init__(
+        self,
+        parquet_glob: str | Path,
+        *,
+        require_postflop_converged: bool = True,
+        expected_oop_range: str | None = None,
+        expected_ip_range: str | None = None,
+        expected_bet_sizes: str | None = None,
+        allowed_spot_classes: frozenset[str] | None = None,
+    ) -> None:
+        self._require_postflop_converged = require_postflop_converged
+        self._expected_oop_range = expected_oop_range
+        self._expected_ip_range = expected_ip_range
+        self._expected_bet_sizes = expected_bet_sizes
+        self._allowed_spot_classes = allowed_spot_classes
 
         pattern = str(parquet_glob)
 
@@ -220,6 +229,17 @@ class SolverAnnotatedParquetDataset(Dataset):
 
             _validate_solver_row(rec, source=f"{paths[0]} row {i}")
 
+            if rec["label_source"] == LABEL_SOURCE_POSTFLOP_SOLVER:
+                validate_postflop_solver_row_scope(
+                    rec,
+                    require_converged=self._require_postflop_converged,
+                    expected_oop_range=self._expected_oop_range,
+                    expected_ip_range=self._expected_ip_range,
+                    expected_bet_sizes=self._expected_bet_sizes,
+                    allowed_spot_classes=self._allowed_spot_classes,
+                    source=f"{paths[0]} row {i}",
+                )
+
             self.records.append(rec)
 
 
@@ -241,19 +261,15 @@ class SolverAnnotatedParquetDataset(Dataset):
         r = self.records[idx]
 
         return {
-
             "weva_ids": torch.tensor(r["weva_bucket_id"], dtype=torch.long),
-
+            "cards": torch.from_numpy(r["cards"]),
             "actions": torch.from_numpy(r["actions"]),
-
-            "position": torch.from_numpy(r["position"]),
-
+            "position": torch.from_numpy(
+                fuse_position_scope(r["position"], r["spot_scope"])
+            ),
             "legal_mask": torch.from_numpy(r["legal_mask"]),
-
             "solver_label": torch.tensor(r["solver_label"], dtype=torch.long),
-
             "solver_policy": torch.from_numpy(r["solver_policy"]),
-
         }
 
 
@@ -317,6 +333,38 @@ def weva_sft_loss(
     return loss, {"ce_hard": float(ce_hard.item()), "kl_soft": float(kl.item())}
 
 
+def compute_mean_train_kl(
+    model: torch.nn.Module,
+    parquet_glob: str | Path,
+    device: torch.device | str,
+) -> float:
+    """Mean KL(policy || solver_target) over all Parquet rows (fit-quality metric)."""
+    device = torch.device(device)
+    ds = SolverAnnotatedParquetDataset(parquet_glob)
+    model.eval()
+    kls: list[float] = []
+    with torch.no_grad():
+        for i in range(len(ds)):
+            s = ds[i]
+            b = {k: v.unsqueeze(0).to(device) for k, v in s.items()}
+            out = model(
+                b["weva_ids"],
+                b["actions"],
+                b["position"],
+                b["legal_mask"],
+                cards=b["cards"],
+            )
+            target = b["solver_policy"] * b["legal_mask"].float()
+            target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            kl = F.kl_div(
+                F.log_softmax(out.logits.float(), dim=-1),
+                target,
+                reduction="batchmean",
+            ).item()
+            kls.append(kl)
+    return float(np.mean(kls)) if kls else float("inf")
+
+
 
 
 
@@ -330,9 +378,11 @@ def make_sft_dataloader(
 
     num_workers: int = 0,
 
+    **dataset_kwargs: Any,
+
 ) -> DataLoader:
 
-    ds = SolverAnnotatedParquetDataset(parquet_glob)
+    ds = SolverAnnotatedParquetDataset(parquet_glob, **dataset_kwargs)
 
     return DataLoader(
 

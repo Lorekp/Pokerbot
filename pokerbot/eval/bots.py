@@ -57,6 +57,44 @@ class LAGBot:
         )
 
 
+class CallingStationBot:
+    """Loose-passive: calls wide, rarely folds or raises."""
+
+    def __init__(self, rng: random.Random | None = None) -> None:
+        self.rng = rng or random.Random()
+
+    def __call__(self, state: GameState) -> Action:
+        legal = state.legal_actions()
+        if Action(ActionType.CALL) in legal and self.rng.random() < 0.75:
+            return Action(ActionType.CALL)
+        if Action(ActionType.CHECK) in legal:
+            return Action(ActionType.CHECK)
+        if Action(ActionType.FOLD) in legal and self.rng.random() < 0.15:
+            return Action(ActionType.FOLD)
+        return legal[0]
+
+
+class TagBot:
+    """Tight-aggressive: selective but raises when continuing."""
+
+    def __init__(self, rng: random.Random | None = None) -> None:
+        self.rng = rng or random.Random()
+
+    def __call__(self, state: GameState) -> Action:
+        legal = state.legal_actions()
+        if state.street.name == "PREFLOP":
+            if self.rng.random() < 0.65:
+                return Action(ActionType.FOLD) if Action(ActionType.FOLD) in legal else legal[0]
+        if self.rng.random() < 0.45:
+            bets = [a for a in legal if a.action_type in (ActionType.BET, ActionType.RAISE)]
+            if bets:
+                return bets[-1]
+        return next(
+            (a for a in legal if a.action_type in (ActionType.CHECK, ActionType.CALL)),
+            legal[0],
+        )
+
+
 class DonkBot:
     """Leads into preflop aggressor postflop (exploitable donk-betting)."""
 
@@ -92,25 +130,43 @@ class RandomBot:
 class GTOCopyBot:
     """Wraps a policy network as a bot."""
 
-    def __init__(self, model, device="cpu", seat: int = 0) -> None:
+    def __init__(
+        self,
+        model,
+        device="cpu",
+        seat: int = 0,
+        *,
+        eval_spot_class: str | None = None,
+        require_scope: bool = True,
+    ) -> None:
         self.model = model
         self.device = device
         self.seat = seat
+        self.eval_spot_class = eval_spot_class
+        self.require_scope = require_scope
 
     def __call__(self, state: GameState) -> Action:
         import torch
 
-        from pokerbot.encoding.tensors import encode_state
+        from pokerbot.encoding.eval_scope import encode_state_for_policy
         from pokerbot.training.self_play import _index_to_action, _legal_mask
 
         seat = state.action_seat
-        enc = encode_state(state, seat)
+        enc = encode_state_for_policy(
+            state,
+            seat,
+            spot_class=self.eval_spot_class,
+            require_scope=self.require_scope,
+        )
         weva_ids = torch.tensor([enc["weva_id"]], dtype=torch.long, device=self.device)
+        cards = torch.from_numpy(enc["cards"]).unsqueeze(0).to(self.device)
         actions = torch.from_numpy(enc["actions"]).unsqueeze(0).to(self.device)
-        position = torch.from_numpy(enc["position"]).unsqueeze(0).to(self.device)
+        position = torch.from_numpy(enc["policy_position"]).unsqueeze(0).to(self.device)
         mask = torch.from_numpy(_legal_mask(state, seat)).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            idx, _ = self.model.act(weva_ids, actions, position, mask, deterministic=True)
+            idx, _ = self.model.act(
+                weva_ids, actions, position, mask, cards=cards, deterministic=True
+            )
         return _index_to_action(state, seat, int(idx.item()))
 
 
@@ -178,6 +234,10 @@ def build_bot(name: str, rng: random.Random | None = None, model=None, device: s
         return NitBot(rng)
     if name == "lag":
         return LAGBot(rng)
+    if name == "calling_station":
+        return CallingStationBot(rng)
+    if name == "tag":
+        return TagBot(rng)
     if name == "donk":
         return DonkBot(rng)
     if name == "random":
@@ -196,6 +256,8 @@ def build_bot(name: str, rng: random.Random | None = None, model=None, device: s
 BOT_REGISTRY = {
     "nit": NitBot,
     "lag": LAGBot,
+    "calling_station": CallingStationBot,
+    "tag": TagBot,
     "donk": DonkBot,
     "random": RandomBot,
     "human_like": HumanLikeBot,

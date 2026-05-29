@@ -1,0 +1,59 @@
+# Golden corpus for non-AoF solver label differential tests.
+# Covers: 3 board textures, 2 range shapes, bunching edge case, multiple action sets.
+# Run full golden capture (slow): see tests/test_non_aof_label_golden.py @pytest.mark.slow
+seed: 42
+
+stack_depths_bb: [100]
+
+boards:
+  strategy: fixed_list
+  fixed_boards:
+    - "Td9d6h"   # monotone-adjacent wet
+    - "Ah7c2s"   # rainbow dry ace-high
+    - "Ks8h3d"   # broadway dry
+
+bet_tree:
+  pot_fractions: [0.50]
+  include_all_in: true
+  raise_multiplier: 2.5
+
+solver:
+  max_iterations: 10000
+  target_exploitability_pct: 0.5
+  timeout_sec: 3600
+  include_unconverged: false
+  chip_unit_bb: 100
+
+decision_nodes:
+  sample_roots: true
+  sample_action_paths: false
+  max_nodes_per_board: 1
+
+ranges:
+  default_oop: "QQ+,AK"
+  default_ip: "TT-22,AQs+"
+  bunching_oop: "TT+,AQs+"
+  bunching_ip: "99-22,ATs+"
+
+hero_hands:
+  - ["Ah", "Kd"]
+
+spots:
+  - id: sb_vs_bb_flop
+    oop_position: SB
+    ip_position: BB
+    bunching: false
+    preflop_line: fold_to_sb_bb_limp
+
+  - id: btn_vs_bb_flop
+    oop_position: BB
+    ip_position: BTN
+    bunching: false
+    preflop_line: btn_open_bb_call
+
+  - id: bunching_postflop
+    oop_position: BB
+    ip_position: BTN
+    bunching: true
+    folded_seats: [0, 1, 2]
+    preflop_line: btn_open_bb_call

@@ -59,19 +59,27 @@ def canonicalize_cards(
     return canon_hole, canon_board, suit_map
 
 
-def canonicalize_history_encoding(raw_history: np.ndarray) -> np.ndarray:
+def canonicalize_history_encoding(
+    raw_history: np.ndarray,
+    *,
+    pot_bb: float | None = None,
+    spr_bucket: int | None = None,
+) -> np.ndarray:
     """
-    Pass-through with dtype/shape normalization.
+    Pass-through with dtype/shape normalization and optional chip-isomorphism buckets.
 
-    History vectors from encode_history_state are action-sequence dominated;
-    suit isomorphism for leaf caching is applied via history_cache_key().
+    When pot_bb/spr_bucket are provided, embeds bucket indices in the last two feature dims.
     """
     out = np.asarray(raw_history, dtype=np.float32)
     if out.shape[0] < HISTORY_FEATURE_DIM:
         pad = np.zeros(HISTORY_FEATURE_DIM, dtype=np.float32)
         pad[: out.shape[0]] = out
-        return pad
-    return out[:HISTORY_FEATURE_DIM]
+        out = pad
+    out = out[:HISTORY_FEATURE_DIM].copy()
+    if pot_bb is not None:
+        out[-2] = float(spr_bucket if spr_bucket is not None else int(pot_bb * 2) % 16)
+        out[-1] = float(min(pot_bb, 512.0))
+    return out
 
 
 def history_cache_key(

@@ -75,6 +75,19 @@ def _normalize_dist_key(key: str) -> str | None:
     return None
 
 
+def solver_action_keys_to_legal_mask(action_keys: list[str]) -> np.ndarray:
+    """Map postflop-solver bucket keys (check, bet_0.50, all_in) to policy indices."""
+    mask = np.zeros(NUM_ACTIONS, dtype=bool)
+    for key in action_keys:
+        norm_key = _normalize_dist_key(str(key))
+        if norm_key is None:
+            continue
+        mask[ACTION_VOCAB.index(norm_key)] = True
+    if not mask.any():
+        raise ValueError(f"No policy actions mapped from solver keys {action_keys!r}")
+    return mask
+
+
 def action_distribution_to_policy(
     distribution: dict[str, float],
     legal_mask: np.ndarray | None = None,

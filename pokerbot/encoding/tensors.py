@@ -9,6 +9,7 @@ import numpy as np
 from pokerbot.engine.actions import ActionType, NUM_ACTIONS
 from pokerbot.engine.cards import Card
 from pokerbot.engine.game import GameState, NUM_PLAYERS, Street
+from pokerbot.encoding.spot_scope import encode_spot_scope, fuse_position_scope
 from pokerbot.encoding.weva_encoder import WEVAMapper
 
 
@@ -36,7 +37,7 @@ def encode_card_plane(card: Card) -> np.ndarray:
 
 
 def encode_cards(state: GameState, hero_seat: int) -> np.ndarray:
-    """Card tensor: (slots, 4 suits, 13 ranks)."""
+    """Card tensor: (slots, 4 suits, 13 ranks). Absent slots stay zero vectors."""
     tensor = np.zeros(SPEC.card_shape, dtype=np.float32)
     hero = state.players[hero_seat]
     slot = 0
@@ -49,6 +50,18 @@ def encode_cards(state: GameState, hero_seat: int) -> np.ndarray:
             tensor[slot] = encode_card_plane(c)
             slot += 1
     return tensor
+
+
+def encode_cards_from_hole_board(
+    hole: tuple[Card, Card] | list[Card],
+    board: list[Card],
+    hero_seat: int = 0,
+) -> np.ndarray:
+    """encode_cards() wrapper for label repair when only hole/board strings exist."""
+    state = GameState.new_hand(button_seat=0)
+    state.players[hero_seat].hole = tuple(hole[:2])
+    state.board = list(board)
+    return encode_cards(state, hero_seat)
 
 
 def _street_index(street: Street) -> int:
@@ -111,6 +124,10 @@ def encode_state(
     state: GameState,
     hero_seat: int,
     mapper: WEVAMapper | None = None,
+    *,
+    spot_class: str = "",
+    oop_range: str = "",
+    ip_range: str = "",
 ) -> dict[str, np.ndarray | int]:
     hero = state.players[hero_seat]
     if hero.hole is None:
@@ -121,10 +138,15 @@ def encode_state(
             hero.hole,
             position=int(hero.position),
         )
+    position = encode_position(hero_seat, state)
+    spot_scope = encode_spot_scope(spot_class, oop_range, ip_range)
     return {
         "weva_id": weva_id,
+        "cards": encode_cards(state, hero_seat),
         "actions": encode_actions(state, hero_seat),
-        "position": encode_position(hero_seat, state),
+        "position": position,
+        "spot_scope": spot_scope,
+        "policy_position": fuse_position_scope(position, spot_scope),
     }
 
 
@@ -135,6 +157,8 @@ def batch_encode(
     encoded = [encode_state(s, h, mapper=mapper) for s, h in states]
     return {
         "weva_ids": np.array([e["weva_id"] for e in encoded], dtype=np.int64),
+        "cards": np.stack([e["cards"] for e in encoded]),
         "actions": np.stack([e["actions"] for e in encoded]),
-        "position": np.stack([e["position"] for e in encoded]),
+        "position": np.stack([e["policy_position"] for e in encoded]),
+        "spot_scope": np.stack([e["spot_scope"] for e in encoded]),
     }

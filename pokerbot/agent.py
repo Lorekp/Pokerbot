@@ -8,7 +8,7 @@ import torch
 
 from pokerbot.engine.actions import Action
 from pokerbot.engine.game import GameState, Street
-from pokerbot.encoding.tensors import encode_state
+from pokerbot.encoding.eval_scope import encode_state_for_policy
 from pokerbot.opponent.mixer import HybridPolicy
 from pokerbot.opponent.opponent_transformer import KVCache, OpponentTransformer, OpponentTransformerConfig
 from pokerbot.opponent.sequence_encoder import HandTrajectoryBuilder, trajectory_to_batch
@@ -56,6 +56,8 @@ class HybridAgent:
             self.transformer,
             device=self.device,
         )
+        self.eval_spot_class: str | None = None
+        self.require_scope = False
 
     @staticmethod
     def _resolve_ckpt(path: str | None) -> Path | None:
@@ -121,21 +123,31 @@ class HybridAgent:
         self.observe_decision(state, seat)
 
         opponent_id = (seat + 1) % 6
-        enc = encode_state(state, seat)
+        enc = encode_state_for_policy(
+            state,
+            seat,
+            spot_class=self.eval_spot_class,
+            require_scope=self.require_scope,
+        )
         weva_ids = torch.tensor([enc["weva_id"]], dtype=torch.long, device=self.device)
+        cards = torch.from_numpy(enc["cards"]).unsqueeze(0).to(self.device)
         actions = torch.from_numpy(enc["actions"]).unsqueeze(0).to(self.device)
-        position = torch.from_numpy(enc["position"]).unsqueeze(0).to(self.device)
+        position = torch.from_numpy(enc["policy_position"]).unsqueeze(0).to(self.device)
         legal = torch.from_numpy(_legal_mask(state, seat)).unsqueeze(0).to(self.device)
 
         tf_out = self._transformer_outputs(state, hero_seat)
         probs = self.hybrid.get_probs(
             weva_ids,
+            cards,
             actions,
             position,
             legal,
             opponent_id,
             transformer_out=tf_out,
             actor_seat=seat,
+            hero_seat=hero_seat,
+            board=state.board,
+            trajectory=self._trajectory,
         )
         idx = int(probs.argmax())
         action = _index_to_action(state, seat, idx)

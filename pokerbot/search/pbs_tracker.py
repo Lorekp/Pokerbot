@@ -136,6 +136,23 @@ class PBSTracker:
         post = np.where(self._combo_mask, post, 0.0)
         self.beliefs[seat] = post
         self._renormalize_seat(seat)
+        self._enforce_cross_seat_consistency()
+
+    def _enforce_cross_seat_consistency(self) -> None:
+        """Zero combos whose cards conflict with another seat's dominant combo (joint PBS v1)."""
+        for seat in self._opponent_seats():
+            row = self.beliefs[seat]
+            if row.max() < 0.85:
+                continue
+            dom = int(row.argmax())
+            c0, c1 = _COMBO_CARD_INDICES[dom]
+            for other in self._opponent_seats():
+                if other == seat:
+                    continue
+                for i, (a, b) in enumerate(_COMBO_CARD_INDICES):
+                    if a in (c0, c1) or b in (c0, c1):
+                        self.beliefs[other, i] = 0.0
+                self._renormalize_seat(other)
 
     def update_board(self, new_card: Card) -> None:
         """Zero combos conflicting with newly revealed board card."""
@@ -159,28 +176,82 @@ class PBSTracker:
         opps = self._opponent_seats()
         return np.stack([self.beliefs[s] for s in opps], axis=0)
 
-    def sample_opponent_holes(self, rng: np.random.Generator) -> dict[int, tuple[int, int]]:
+    def sample_opponent_holes(
+        self,
+        rng: np.random.Generator,
+        *,
+        max_resample: int = 8,
+    ) -> dict[int, tuple[int, int]]:
         """Sample one world line for SSMIG (card indices per opponent)."""
-        samples: dict[int, tuple[int, int]] = {}
+        for _attempt in range(max_resample):
+            samples: dict[int, tuple[int, int]] = {}
+            used = set(self.dead_cards)
+            failed = False
+            for seat in self._opponent_seats():
+                probs = self.beliefs[seat].copy()
+                for i, (c0, c1) in enumerate(_COMBO_CARD_INDICES):
+                    if c0 in used or c1 in used:
+                        probs[i] = 0.0
+                total = probs.sum()
+                if total < 1e-12:
+                    failed = True
+                    break
+                probs /= total
+                idx = int(rng.choice(NUM_BELIEF_COMBOS, p=probs))
+                c0, c1 = _COMBO_CARD_INDICES[idx]
+                samples[seat] = (c0, c1)
+                used.add(c0)
+                used.add(c1)
+            if not failed:
+                return samples
+        # Fallback: uniform over legal combos per seat
+        samples = {}
         used = set(self.dead_cards)
         for seat in self._opponent_seats():
-            probs = self.beliefs[seat].copy()
-            for i, (c0, c1) in enumerate(_COMBO_CARD_INDICES):
-                if c0 in used or c1 in used:
-                    probs[i] = 0.0
-            probs /= probs.sum() + 1e-12
-            idx = int(rng.choice(NUM_BELIEF_COMBOS, p=probs))
+            legal = [i for i, (c0, c1) in enumerate(_COMBO_CARD_INDICES) if c0 not in used and c1 not in used]
+            if not legal:
+                legal = [i for i in range(NUM_BELIEF_COMBOS) if self._combo_mask[i]]
+            idx = int(rng.choice(legal))
             c0, c1 = _COMBO_CARD_INDICES[idx]
             samples[seat] = (c0, c1)
-            used.add(c0)
-            used.add(c1)
+            used.update((c0, c1))
         return samples
 
     def action_likelihood_from_policy(
         self,
         action_idx: int,
         policy_probs: np.ndarray,
+        *,
+        transformer=None,
+        trajectory=None,
+        hero_seat: int | None = None,
+        opponent_seat: int | None = None,
+        device=None,
+        board: list | None = None,
+        top_k: int = 64,
+        full_1326: bool = False,
+        rng: np.random.Generator | None = None,
     ) -> np.ndarray:
-        """Uniform likelihood proxy: scale combo weights by policy prob for action."""
+        """
+        Combo-stratified likelihood when transformer context is provided;
+        otherwise uniform scalar proxy (legacy fallback).
+        """
+        if transformer is not None and trajectory is not None and hero_seat is not None and opponent_seat is not None:
+            from pokerbot.search.belief_likelihood import combo_action_likelihood_from_transformer
+
+            return combo_action_likelihood_from_transformer(
+                transformer,
+                trajectory,
+                hero_seat,
+                opponent_seat,
+                action_idx,
+                self._combo_mask,
+                self.beliefs[opponent_seat],
+                device,
+                board=board,
+                top_k=top_k,
+                full_1326=full_1326,
+                rng=rng,
+            )
         p = float(np.clip(policy_probs[action_idx], 1e-6, 1.0))
         return np.full(NUM_BELIEF_COMBOS, p, dtype=np.float32)

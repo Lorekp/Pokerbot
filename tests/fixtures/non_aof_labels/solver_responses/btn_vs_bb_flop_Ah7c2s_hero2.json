@@ -1,0 +1,26 @@
+{
+  "spot_key": "btn_vs_bb_flop|Ah7c2s|hero=2",
+  "spot_id": "btn_vs_bb_flop",
+  "solver_response": {
+    "exploitability": 0.008,
+    "target_exploitability": 0.01,
+    "exploitability_pct_of_pot": 0.4,
+    "converged": true,
+    "iterations": 10000,
+    "iterations_used": 380,
+    "available_actions": ["check", "bet_0.50", "all_in"],
+    "action_distribution": {
+      "check": 0.55,
+      "bet_0.50": 0.30,
+      "all_in": 0.15
+    },
+    "solver_version": "postflop-solver@main",
+    "error": null
+  },
+  "oop_range": "QQ+,AK",
+  "ip_range": "TT-22,AQs+",
+  "bet_sizes": "50%,a",
+  "raise_sizes": "2.5x",
+  "target_exploitability_pct": 0.5,
+  "notes": "Synthetic fixture: three nonzero actions for policy alignment tests."
+}

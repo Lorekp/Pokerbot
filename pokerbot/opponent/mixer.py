@@ -2,10 +2,35 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 
 from pokerbot.engine.actions import NUM_ACTIONS
 from pokerbot.opponent.stats import OpponentStats
+
+USE_BELIEF_BR = True
+
+# Default until `scripts/calibrate_mixer_threshold.py` writes checkpoints/mixer_threshold.json.
+# PROVISIONAL / UNCALIBRATED for live deployment — see docs/phase3-runbook.md § Mixer confidence.
+_DEFAULT_BELIEF_CONFIDENCE_THRESHOLD = 0.35
+
+
+def _load_calibrated_threshold() -> float:
+    path = Path("checkpoints/mixer_threshold.json")
+    if not path.exists():
+        return _DEFAULT_BELIEF_CONFIDENCE_THRESHOLD
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return float(data.get("chosen_threshold", _DEFAULT_BELIEF_CONFIDENCE_THRESHOLD))
+    except (OSError, ValueError, TypeError):
+        return _DEFAULT_BELIEF_CONFIDENCE_THRESHOLD
+
+
+BELIEF_CONFIDENCE_THRESHOLD = _load_calibrated_threshold()
+TRANSFORMER_LOGIT_WEIGHT = 1.0
+STATS_FALLBACK_WEIGHT = 0.2
 
 
 def exploit_adjustment(stats: OpponentStats) -> np.ndarray:
@@ -49,10 +74,20 @@ def safe_mix_policies(
     return mixed / mixed.sum()
 
 
-def _opponent_seat_index(actor_seat: int, hero_seat: int = 0) -> int:
+def _opponent_seat_index(actor_seat: int, hero_seat: int) -> int:
     """Map absolute seat to opponent index in [0, 4] relative to hero."""
-    offset = (actor_seat - hero_seat) % 6
-    return offset - 1 if offset > 0 else 0
+    from pokerbot.opponent.sequence_encoder import opponent_index_for_seat
+
+    return opponent_index_for_seat(actor_seat, hero_seat)
+
+
+def _belief_confidence(belief_logits) -> float:
+    import torch
+
+    belief = torch.softmax(belief_logits, dim=-1)
+    entropy = -(belief * torch.log(belief + 1e-8)).sum().item()
+    max_entropy = np.log(belief.shape[-1])
+    return float(1.0 - entropy / max(max_entropy, 1e-8))
 
 
 class HybridPolicy:
@@ -67,12 +102,16 @@ class HybridPolicy:
     def get_probs(
         self,
         weva_ids,
+        cards,
         actions,
         position,
         legal_mask,
         opponent_id: int,
         transformer_out: dict | None = None,
         actor_seat: int | None = None,
+        hero_seat: int = 0,
+        board: list | None = None,
+        trajectory=None,
     ) -> np.ndarray:
         import torch
 
@@ -82,31 +121,53 @@ class HybridPolicy:
                 actions.unsqueeze(0) if actions.dim() == 1 else actions,
                 position.unsqueeze(0) if position.dim() == 1 else position,
                 legal_mask.unsqueeze(0) if legal_mask.dim() == 1 else legal_mask,
+                cards=cards.unsqueeze(0) if cards.dim() == 3 else cards,
             )
             gto = out.probs.squeeze(0).cpu().numpy()
 
         stats = self.tracker.get(opponent_id)
-        exploit_logits = np.log(gto + 1e-8) + exploit_adjustment(stats)
-
         transformer_confidence = 0.0
+        exploit_logits = np.log(gto + 1e-8)
+
         if transformer_out is not None and actor_seat is not None:
             policy_logits = transformer_out.get("policy_logits")
+            belief_logits = transformer_out.get("belief_logits")
             if policy_logits is not None:
-                opp_idx = _opponent_seat_index(actor_seat)
+                opp_idx = _opponent_seat_index(actor_seat, hero_seat)
                 opp_idx = min(max(opp_idx, 0), 4)
-                logits = policy_logits[0, opp_idx].cpu().numpy()
-                exploit_logits = exploit_logits + 0.5 * logits
-                belief_logits = transformer_out.get("belief_logits")
+                tf_logits = policy_logits[0, opp_idx].cpu().numpy()
                 if belief_logits is not None:
-                    belief = torch.softmax(belief_logits[0, opp_idx], dim=-1)
-                    entropy = -(belief * torch.log(belief + 1e-8)).sum().item()
-                    max_entropy = np.log(belief.shape[-1])
-                    transformer_confidence = 1.0 - entropy / max_entropy
+                    transformer_confidence = _belief_confidence(belief_logits[0, opp_idx])
+                if transformer_confidence >= BELIEF_CONFIDENCE_THRESHOLD:
+                    if USE_BELIEF_BR and belief_logits is not None:
+                        from pokerbot.opponent.belief_br import belief_br_from_transformer_output
 
-        alpha = self.tracker.confidence(opponent_id) * 0.5
-        alpha += transformer_confidence * 0.3
-        if stats.archetype() == "unknown" and transformer_confidence < 0.1:
-            alpha = 0.0
+                        exploit_logits = belief_br_from_transformer_output(
+                            belief_logits,
+                            policy_logits,
+                            opp_idx,
+                            transformer=self.opponent_transformer,
+                            trajectory=trajectory,
+                            hero_seat=hero_seat,
+                            device=self.device,
+                            board=board,
+                        )
+                    else:
+                        exploit_logits = TRANSFORMER_LOGIT_WEIGHT * tf_logits
+                    exploit_logits = exploit_logits + STATS_FALLBACK_WEIGHT * exploit_adjustment(stats)
+                else:
+                    exploit_logits = exploit_logits + exploit_adjustment(stats)
+                    exploit_logits = exploit_logits + 0.35 * tf_logits
+        else:
+            exploit_logits = exploit_logits + exploit_adjustment(stats)
+
+        if transformer_confidence >= BELIEF_CONFIDENCE_THRESHOLD:
+            alpha = min(0.7, 0.35 + transformer_confidence * 0.35)
+        else:
+            alpha = self.tracker.confidence(opponent_id) * 0.5
+            alpha += transformer_confidence * 0.25
+            if stats.archetype() == "unknown" and transformer_confidence < 0.1:
+                alpha = 0.0
 
         final = safe_mix_policies(gto, exploit_logits, alpha)
         if legal_mask is not None:

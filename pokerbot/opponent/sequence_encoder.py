@@ -238,6 +238,18 @@ def opponent_seats(hero_seat: int) -> list[int]:
     return [s for s in range(NUM_PLAYERS) if s != hero_seat]
 
 
+def opponent_index_for_seat(seat: int, hero_seat: int) -> int:
+    """
+    Map absolute seat to MADT opponent query index in [0, 4].
+
+    Matches OpponentTransformer._opponent_queries clockwise offsets from hero.
+    """
+    offset = (seat - hero_seat) % NUM_PLAYERS
+    if offset == 0:
+        return 0
+    return offset - 1
+
+
 def trajectory_to_batch(
     trajectories: list[TrajectoryRecord],
     device: torch.device | None = None,

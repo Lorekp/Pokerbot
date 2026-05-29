@@ -1,0 +1,53 @@
+{
+  "variant": "NLH_AOF",
+  "table_size": 3,
+  "hero_seat_id": 0,
+  "hero_cards": [
+    28,
+    12
+  ],
+  "action_history": [],
+  "seats": [
+    {
+      "seat_id": 0,
+      "role": "first_to_act",
+      "is_hero": true,
+      "state": "pending",
+      "committed_bb": 0.0,
+      "stack_remaining_bb": 8.0,
+      "blind_posted_bb": 0.0,
+      "shover_rank": 0,
+      "eligible_pot_mask": 3
+    },
+    {
+      "seat_id": 1,
+      "role": "small_blind",
+      "is_hero": false,
+      "state": "pending",
+      "committed_bb": 0.5,
+      "stack_remaining_bb": 7.5,
+      "blind_posted_bb": 0.5,
+      "shover_rank": 0,
+      "eligible_pot_mask": 4
+    },
+    {
+      "seat_id": 2,
+      "role": "big_blind",
+      "is_hero": false,
+      "state": "pending",
+      "committed_bb": 1.0,
+      "stack_remaining_bb": 7.0,
+      "blind_posted_bb": 1.0,
+      "shover_rank": 0,
+      "eligible_pot_mask": 8
+    }
+  ],
+  "small_blind_bb": 0.5,
+  "big_blind_bb": 1.0,
+  "effective_stack_bb": 8.0,
+  "flat_rake_bb": 0.0,
+  "pct_rake": 0.0,
+  "rake_cap_bb": 0.0,
+  "equal_stacks": true,
+  "side_pots_present": false
+}

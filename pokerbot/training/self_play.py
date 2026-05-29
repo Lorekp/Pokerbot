@@ -11,7 +11,7 @@ import torch
 
 from pokerbot.engine.actions import Action, ActionType, index_to_bucket, NUM_ACTIONS
 from pokerbot.engine.game import GameState, NUM_PLAYERS, play_hand
-from pokerbot.encoding.tensors import encode_state
+from pokerbot.encoding.eval_scope import encode_state_for_policy
 from pokerbot.models.policy import PseudoSiamesePolicy
 from pokerbot.training.ppo import PPOConfig, compute_gae, trinal_clip_ppo_loss
 
@@ -84,19 +84,23 @@ def collect_trajectory(
     def make_policy(model: PseudoSiamesePolicy, seat: int):
         def policy(state: GameState) -> Action:
             nonlocal pending
-            enc = encode_state(state, seat)
+            enc = encode_state_for_policy(state, seat, require_scope=False)
             weva_ids = torch.tensor([enc["weva_id"]], dtype=torch.long, device=device)
+            cards = torch.from_numpy(enc["cards"]).unsqueeze(0).to(device)
             actions = torch.from_numpy(enc["actions"]).unsqueeze(0).to(device)
-            position = torch.from_numpy(enc["position"]).unsqueeze(0).to(device)
+            position = torch.from_numpy(enc["policy_position"]).unsqueeze(0).to(device)
             mask = torch.from_numpy(_legal_mask(state, seat)).unsqueeze(0).to(device)
             with torch.no_grad():
-                idx, out = model.act(weva_ids, actions, position, mask, deterministic=False)
+                idx, out = model.act(
+                    weva_ids, actions, position, mask, cards=cards, deterministic=False
+                )
             if seat == hero_seat:
                 log_probs = torch.log_softmax(out.logits, dim=-1)
                 pending = {
                     "weva_id": enc["weva_id"],
+                    "cards": enc["cards"],
                     "actions": enc["actions"],
-                    "position": enc["position"],
+                    "position": enc["policy_position"],
                     "legal_mask": _legal_mask(state, seat),
                     "action": int(idx.item()),
                     "log_prob": float(log_probs[0, idx].item()),
@@ -158,6 +162,7 @@ def train_self_play(
 
         batch = {
             "weva_ids": torch.tensor([t["weva_id"] for t in all_traj], dtype=torch.long, device=device),
+            "cards": torch.from_numpy(np.stack([t["cards"] for t in all_traj])).float().to(device),
             "actions": torch.from_numpy(np.stack([t["actions"] for t in all_traj])).float().to(device),
             "position": torch.from_numpy(np.stack([t["position"] for t in all_traj])).float().to(device),
             "legal_mask": torch.from_numpy(np.stack([t["legal_mask"] for t in all_traj])).bool().to(device),

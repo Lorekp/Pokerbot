@@ -3,6 +3,7 @@
 import numpy as np
 import torch
 
+from pokerbot.encoding.spot_scope import encode_spot_scope, fuse_position_scope
 from pokerbot.encoding.tensors import SPEC
 from pokerbot.models.policy import PseudoSiamesePolicy
 from pokerbot.opponent.mixer import exploit_adjustment, safe_mix_policies
@@ -13,10 +14,15 @@ def test_policy_forward():
     model = PseudoSiamesePolicy(hidden=64, num_weva_buckets=128)
     b = 2
     weva_ids = torch.randint(0, 128, (b,), dtype=torch.long)
+    cards = torch.randn(b, *SPEC.card_shape)
     actions = torch.randn(b, *SPEC.action_shape)
-    position = torch.zeros(b, 6)
-    position[:, 0] = 1.0
-    out = model(weva_ids, actions, position)
+    pos = np.zeros((b, 6), dtype=np.float32)
+    pos[:, 0] = 1.0
+    scope = encode_spot_scope("hu_postflop_2p")
+    position = torch.from_numpy(
+        np.stack([fuse_position_scope(pos[i], scope) for i in range(b)])
+    ).float()
+    out = model(weva_ids, actions, position, cards=cards)
     assert out.logits.shape == (b, model.num_actions)
     assert out.value.shape == (b,)
 

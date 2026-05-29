@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "eval_id": "golden_scripted",
+  "aggregate": {
+    "hands": 8
+  }
+}

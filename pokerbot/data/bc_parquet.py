@@ -12,6 +12,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from pokerbot.engine.actions import NUM_ACTIONS
+from pokerbot.encoding.spot_scope import encode_spot_scope, fuse_position_scope
+from pokerbot.encoding.tensors import SPEC
 from pokerbot.models.policy import PolicyOutput
 
 LABEL_SOURCE_BC = "pokerbench_csv"
@@ -73,6 +75,10 @@ def _normalize_bc_record(rec: dict[str, Any]) -> dict[str, Any]:
     rec["weva_bucket_id"] = int(rec["weva_bucket_id"])
     rec["bc_label"] = int(rec["bc_label"])
     rec["label_source"] = str(rec["label_source"])
+    if "cards" in rec and rec["cards"] is not None:
+        rec["cards"] = _nested_to_array(rec["cards"], np.float32)
+    if "spot_scope" in rec and rec["spot_scope"] is not None:
+        rec["spot_scope"] = _nested_to_array(rec["spot_scope"], np.float32)
     return rec
 
 
@@ -124,10 +130,17 @@ class BCParquetDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         r = self.records[idx]
+        cards = r.get("cards")
+        if cards is None:
+            cards = np.zeros(SPEC.card_shape, dtype=np.float32)
+        scope = r.get("spot_scope")
+        if scope is None:
+            scope = encode_spot_scope("")
         return {
             "weva_ids": torch.tensor(r["weva_bucket_id"], dtype=torch.long),
+            "cards": torch.from_numpy(cards),
             "actions": torch.from_numpy(r["actions"]),
-            "position": torch.from_numpy(r["position"]),
+            "position": torch.from_numpy(fuse_position_scope(r["position"], scope)),
             "legal_mask": torch.from_numpy(r["legal_mask"]),
             "bc_label": torch.tensor(r["bc_label"], dtype=torch.long),
         }

@@ -120,6 +120,7 @@ HISTORY_VALUE_BUFFER_SPEC = BufferSpec(
         "player": ((), jnp.int32),
         "iteration": ((), jnp.int32),
         "next_info_state": ((INFO_FEATURE_DIM,), jnp.float32),
+        "next_legal_mask": ((NUM_ACTIONS,), jnp.bool_),
     },
 )
 
@@ -247,6 +248,7 @@ def insert_history_value_sample(
     player: Array,
     iteration: Array,
     next_info_state: Array,
+    next_legal_mask: Array,
 ) -> BufferState:
     sample = {
         "history": history,
@@ -256,6 +258,7 @@ def insert_history_value_sample(
         "player": player,
         "iteration": iteration,
         "next_info_state": next_info_state,
+        "next_legal_mask": next_legal_mask,
     }
     return reservoir_insert(buf, key, sample)
 
