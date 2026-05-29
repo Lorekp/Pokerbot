@@ -163,6 +163,43 @@ def test_runtime_table_matches_exact_enum() -> None:
     assert max_err <= GATE_B_FLOAT32_ATOL
 
 
+@pytest.mark.skipif(
+    not PRODUCTION_NPZ.is_file(),
+    reason="production HU showdown table not built",
+)
+def test_payoff_hu_mode_rollback_exact_enum() -> None:
+    """Rollback flag: exact_enum must match table on runtime sanity samples."""
+    warmup()
+    clear_showdown_table_cache()
+    load_showdown_table(PRODUCTION_NPZ)
+
+    rows = []
+    with RUNTIME_SANITY.open(encoding="utf-8") as f:
+        for line in f:
+            rows.append(json.loads(line))
+    rng = random.Random(1)
+    picked = rng.sample(rows, min(50, len(rows)))
+
+    max_err_table = 0.0
+    max_err_enum = 0.0
+    for row in picked:
+        hero = tuple(row["hero"])
+        vill = tuple(row["vill"])
+        h0, h1, v0, v1 = row["h0"], row["h1"], row["v0"], row["v1"]
+        k = canonical_showdown_key(h0, h1, v0, v1)
+        expected = float(equity_float32_from_score2(score2_from_key(k)))
+        table_eq = equity_hu_showdown_exact(
+            hero, vill, table_path=PRODUCTION_NPZ, mode="table"
+        )
+        enum_eq = equity_hu_showdown_exact(
+            hero, vill, table_path=PRODUCTION_NPZ, mode="exact_enum"
+        )
+        max_err_table = max(max_err_table, abs(float(table_eq) - expected))
+        max_err_enum = max(max_err_enum, abs(float(enum_eq) - expected))
+    assert max_err_table <= GATE_B_FLOAT32_ATOL
+    assert max_err_enum <= 1e-7
+
+
 def test_comparator_sentinel_would_fail_if_flipped(native) -> None:
     warmup()
 

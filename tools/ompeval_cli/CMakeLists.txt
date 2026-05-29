@@ -19,6 +19,7 @@ if(USE_OMPEVAL)
   add_library(ompeval_core STATIC
     vendor/OMPEval/omp/HandEvaluator.cpp
   )
+  set_target_properties(ompeval_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_compile_definitions(ompeval_core PUBLIC USE_OMPEVAL=1)
   target_include_directories(ompeval_core PUBLIC "${OMPEVAL_VENDOR}")
 
@@ -28,6 +29,7 @@ if(USE_OMPEVAL)
     hu_score2_core.cpp
     hu_score2_batch.cpp
   )
+  set_target_properties(hu_score2_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(hu_score2_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(hu_score2_core PUBLIC ompeval_core OpenMP::OpenMP_CXX)
 

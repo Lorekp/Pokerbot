@@ -1,8 +1,8 @@
 {
   "artifact_schema_version": 2,
   "backend": "ompeval_native",
-  "build_git_commit": "fb3650f75c03",
-  "build_seconds": 107.89524379999784,
+  "build_git_commit": "48a69459787a",
+  "build_seconds": 113.61995399999432,
   "census_path": "artifacts\\audit\\hu_showdown_key_census.json",
   "denom2": 3424608,
   "evaluator_backend": "ompeval_native",
@@ -10,5 +10,8 @@
   "key_spec_version": 1,
   "keys_path": "bench\\datasets\\fixtures\\full_keys.uint64.npy",
   "n_canonical_keys": 97513,
-  "n_keys": 97513
+  "n_keys": 97513,
+  "ompeval_submodule_sha": "4aec210ff75b0851af0ee170b35a7899e1a4fe8f",
+  "openmp_enabled": true,
+  "portable_build": true
 }

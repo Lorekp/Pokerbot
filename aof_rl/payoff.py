@@ -14,6 +14,8 @@ RANKS = "23456789TJQKA"
 SUITS = "cdhs"
 
 # Module-level payoff config (set from RolloutConfig via league_trainer)
+# Default: native-built lookup table (artifact v2 at data/aof/hu_showdown_equity.npz).
+# Rollback for one release: payoff_hu_mode="exact_enum" (Python numba exact enum, no table).
 _payoff_hu_mode: str = "table"
 _hu_showdown_path: Path = Path("data/aof/hu_showdown_equity.npz")
 
