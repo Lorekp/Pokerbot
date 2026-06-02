@@ -117,7 +117,7 @@ def test_sd_cfr_leduc_infoset_br_gate() -> None:
     trainer = SDCFRTrainer(cfg)
     trainer.train(log_every=50)
     sd_expl, u0, u1, br0, br1 = infoset_exploitability_mbb_from_policy(
-        trainer.regret_matching_policy, samples=90
+        trainer.average_strategy_policy, samples=90
     )
     print(
         f"\nLeduc gate: tabular infoset BR={tab_expl:.2f} mbb, "

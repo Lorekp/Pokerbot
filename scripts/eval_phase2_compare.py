@@ -116,7 +116,7 @@ def _run_leduc_gate(leduc_iterations: int, leduc_traversals: int, seed: int) -> 
     trainer.train()
 
     sd_expl, u0, u1, br0, br1 = infoset_exploitability_mbb_from_policy(
-        trainer.regret_matching_policy, samples=90
+        trainer.average_strategy_policy, samples=90
     )
 
     gate = (

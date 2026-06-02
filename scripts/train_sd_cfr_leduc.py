@@ -55,8 +55,9 @@ def main() -> None:
         start_iter=start_iter,
     )
     trainer._completed_iterations = args.iterations
+    trainer.clear_policy_cache()
     sd_expl, u0, u1, br0, br1 = infoset_exploitability_mbb_from_policy(
-        trainer.regret_matching_policy, samples=90
+        trainer.average_strategy_policy, samples=90
     )
     out_path = Path(args.output)
     save_checkpoint(trainer, out_path)

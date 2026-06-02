@@ -49,7 +49,7 @@ def test_sd_cfr_leduc_converges_to_equilibrium() -> None:
     trainer = SDCFRTrainer(cfg)
     trainer.train()
     sd_expl, _, _, _, _ = infoset_exploitability_mbb_from_policy(
-        trainer.regret_matching_policy, samples=90
+        trainer.average_strategy_policy, samples=90
     )
     assert ref_expl <= LEDUC_TABULAR_EXPLOITABILITY_MBB
     assert sd_expl <= LEDUC_SD_CFR_EXPLOITABILITY_MBB

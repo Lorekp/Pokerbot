@@ -106,7 +106,15 @@ class SDCFRTrainer:
             params=params,
             tx=optax.adam(self.config.lr),
         )
-        self.adv_buffer: list[tuple[Array, Array, Array]] = []
+        self.adv_buffer: list[tuple[Array, int, Array, Array]] = []
+        self._strategy_snapshots: list[tuple[int, dict]] = []
+        self._avg_policy_cache: dict[tuple, np.ndarray] = {}
+
+    def clear_policy_cache(self) -> None:
+        self._avg_policy_cache.clear()
+
+    def _regret_matching_sigma(self, state: PyLeducState, seat: int) -> np.ndarray:
+        return self.regret_matching_policy(jax_from_py(state), seat)
 
     def traverse(self, state: PyLeducState, traverser: int, key: Array) -> float:
         """External-sampling traversal on pure-Python Leduc (no per-node JAX sync)."""
@@ -120,25 +128,27 @@ class SDCFRTrainer:
             for a in range(NUM_ACTIONS):
                 if mask[a]:
                     util[a] = self.traverse(apply_action_py(state, a), traverser, key)
-            masked = np.where(mask, util, -1e9)
-            exp_u = np.exp(masked - masked.max())
-            sigma = exp_u / exp_u.sum()
-            node_util = float((sigma * util).sum())
+            sigma = self._regret_matching_sigma(state, seat)
+            node_util = float(sum(sigma[a] * util[a] for a in range(NUM_ACTIONS) if mask[a]))
             for a in range(NUM_ACTIONS):
                 if mask[a]:
                     self.adv_buffer.append(
                         (
                             encode_leduc_py(state, seat),
+                            a,
                             jnp.float32(util[a] - node_util),
                             jnp.asarray(mask),
                         )
                     )
             return node_util
 
-        key, sub = jax.random.split(key)
+        sigma = self._regret_matching_sigma(state, seat)
         legal_idx = np.flatnonzero(mask)
-        action = int(jax.random.choice(sub, legal_idx.shape[0], p=jnp.ones(len(legal_idx)) / len(legal_idx)))
-        action = int(legal_idx[action])
+        probs = sigma[legal_idx]
+        probs = probs / probs.sum()
+        key, sub = jax.random.split(key)
+        pick = int(jax.random.choice(sub, legal_idx.shape[0], p=jnp.asarray(probs, dtype=jnp.float32)))
+        action = int(legal_idx[pick])
         return self.traverse(apply_action_py(state, action), traverser, key)
 
     def train_iteration(self) -> float:
@@ -153,12 +163,14 @@ class SDCFRTrainer:
             return 0.0
 
         xs = jnp.stack([b[0] for b in self.adv_buffer])
-        targets = jnp.stack([b[1] for b in self.adv_buffer])
-        masks = jnp.stack([b[2] for b in self.adv_buffer])
+        actions = jnp.array([b[1] for b in self.adv_buffer], dtype=jnp.int32)
+        targets = jnp.stack([b[2] for b in self.adv_buffer])
+        masks = jnp.stack([b[3] for b in self.adv_buffer])
 
         def loss_fn(params):
             pred = jax.vmap(lambda x, m: self.state.apply_fn(params, x, m))(xs, masks)
-            return jnp.mean(jnp.square(pred[:, 0] - targets))
+            picked = pred[jnp.arange(pred.shape[0]), actions]
+            return jnp.mean(jnp.square(picked - targets))
 
         grad_fn = jax.value_and_grad(loss_fn)
         loss, grads = grad_fn(self.state.params)
@@ -184,6 +196,7 @@ class SDCFRTrainer:
                     f"loss={losses[-1]:.6f} elapsed={elapsed:.1f}s",
                     flush=True,
                 )
+            self._record_strategy_snapshot(iter_num)
             if (
                 checkpoint_dir is not None
                 and checkpoint_every > 0
@@ -196,16 +209,52 @@ class SDCFRTrainer:
                 print(f"Checkpoint saved at iter {iter_num}", flush=True)
         return losses
 
-    def regret_matching_policy(self, state: LeducState, seat: int) -> np.ndarray:
-        """Regret-matching strategy from advantage net at this infoset."""
+    def _record_strategy_snapshot(self, iteration: int) -> None:
+        """Linear-CFR weighted snapshot for average-strategy recovery."""
+        params_copy = jax.tree.map(lambda x: np.asarray(x), self.state.params)
+        self._strategy_snapshots.append((iteration, params_copy))
+
+    def _sigma_from_params(
+        self, params: dict, state: LeducState, seat: int
+    ) -> np.ndarray:
         x = encode_leduc(state, seat)
         mask = np.asarray(legal_actions(state), dtype=bool)
-        adv = np.asarray(self.state.apply_fn(self.state.params, x, mask), dtype=np.float64)
+        adv = np.asarray(self.state.apply_fn(params, x, mask), dtype=np.float64)
         positive = np.maximum(adv, 0.0) * mask
         total = positive.sum()
         if total > 0:
             return positive / total
         return mask.astype(np.float64) / max(mask.sum(), 1)
+
+    def regret_matching_policy(self, state: LeducState, seat: int) -> np.ndarray:
+        """Regret-matching strategy from the current (final-iterate) advantage net."""
+        return self._sigma_from_params(self.state.params, state, seat)
+
+    def average_strategy_policy(self, state: LeducState, seat: int) -> np.ndarray:
+        """Linear-CFR average of regret-matched policies across iteration snapshots."""
+        cache_key = (tuple(np.asarray(encode_leduc(state, seat)).tolist()), int(seat))
+        cached = self._avg_policy_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        mask = np.asarray(legal_actions(state), dtype=bool)
+        if not self._strategy_snapshots:
+            sigma = self.regret_matching_policy(state, seat)
+            self._avg_policy_cache[cache_key] = sigma
+            return sigma
+        agg = np.zeros(NUM_ACTIONS, dtype=np.float64)
+        total_w = 0.0
+        for weight, params in self._strategy_snapshots:
+            agg += float(weight) * self._sigma_from_params(params, state, seat)
+            total_w += float(weight)
+        sigma = agg / total_w
+        sigma = sigma * mask
+        s = sigma.sum()
+        if s > 0:
+            sigma = sigma / s
+        else:
+            sigma = mask.astype(np.float64) / max(mask.sum(), 1)
+        self._avg_policy_cache[cache_key] = sigma
+        return sigma
 
 
 def save_checkpoint(trainer: SDCFRTrainer, path: Path) -> None:
@@ -218,6 +267,7 @@ def save_checkpoint(trainer: SDCFRTrainer, path: Path) -> None:
                 "params": trainer.state.params,
                 "config": trainer.config,
                 "completed_iterations": getattr(trainer, "_completed_iterations", 0),
+                "strategy_snapshots": getattr(trainer, "_strategy_snapshots", []),
             },
             f,
         )
@@ -232,6 +282,7 @@ def load_checkpoint(trainer: SDCFRTrainer, path: Path) -> int:
     trainer.state = trainer.state.replace(params=data["params"])
     if "config" in data:
         trainer.config = data["config"]
+    trainer._strategy_snapshots = list(data.get("strategy_snapshots", []))
     return int(data.get("completed_iterations", 0))
 
 
