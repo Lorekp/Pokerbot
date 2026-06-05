@@ -109,6 +109,143 @@ def _equity_two_combos_exact(h0: int, h1: int, v0: int, v1: int) -> float:
     return wins / total if total > 0 else 0.5
 
 
+@njit(cache=True)
+def _three_pair_equities_exact(
+    h0: int, h1: int, h2: int, h3: int, h4: int, h5: int
+) -> tuple[float, float, float]:
+    """btn-BB, btn-SB, sb-BB equities with all six hole cards dead (one runout pass)."""
+    dead = np.zeros(52, dtype=np.bool_)
+    dead[h0] = True
+    dead[h1] = True
+    dead[h2] = True
+    dead[h3] = True
+    dead[h4] = True
+    dead[h5] = True
+    deck = np.empty(46, dtype=np.int32)
+    nd = 0
+    for c in range(52):
+        if not dead[c]:
+            deck[nd] = c
+            nd += 1
+    btn_bb_w = 0.0
+    btn_sb_w = 0.0
+    sb_bb_w = 0.0
+    total = 0.0
+    for i0 in range(nd - 4):
+        c0 = deck[i0]
+        for i1 in range(i0 + 1, nd - 3):
+            c1 = deck[i1]
+            for i2 in range(i1 + 1, nd - 2):
+                c2 = deck[i2]
+                for i3 in range(i2 + 1, nd - 1):
+                    c3 = deck[i3]
+                    for i4 in range(i3 + 1, nd):
+                        c4 = deck[i4]
+                        hr_btn = _eval7(h0, h1, c0, c1, c2, c3, c4)
+                        vr_bb = _eval7(h4, h5, c0, c1, c2, c3, c4)
+                        if hr_btn < vr_bb:
+                            btn_bb_w += 1.0
+                        elif hr_btn == vr_bb:
+                            btn_bb_w += 0.5
+                        vr_sb = _eval7(h2, h3, c0, c1, c2, c3, c4)
+                        if hr_btn < vr_sb:
+                            btn_sb_w += 1.0
+                        elif hr_btn == vr_sb:
+                            btn_sb_w += 0.5
+                        if vr_sb < vr_bb:
+                            sb_bb_w += 1.0
+                        elif vr_sb == vr_bb:
+                            sb_bb_w += 0.5
+                        total += 1.0
+    if total <= 0.0:
+        return 0.5, 0.5, 0.5
+    inv = 1.0 / total
+    return btn_bb_w * inv, btn_sb_w * inv, sb_bb_w * inv
+
+
+@njit(cache=True)
+def _exact_six_card_combo_metrics(
+    h0: int, h1: int, h2: int, h3: int, h4: int, h5: int
+) -> tuple[float, float, float, float, float, float]:
+    """One runout pass: 3-way pot shares + btn-BB/btn-SB/sb-BB pair equities."""
+    dead = np.zeros(52, dtype=np.bool_)
+    dead[h0] = True
+    dead[h1] = True
+    dead[h2] = True
+    dead[h3] = True
+    dead[h4] = True
+    dead[h5] = True
+    deck = np.empty(46, dtype=np.int32)
+    nd = 0
+    for c in range(52):
+        if not dead[c]:
+            deck[nd] = c
+            nd += 1
+    share0 = 0.0
+    share1 = 0.0
+    share2 = 0.0
+    btn_bb_w = 0.0
+    btn_sb_w = 0.0
+    sb_bb_w = 0.0
+    total = 0.0
+    for i0 in range(nd - 4):
+        c0 = deck[i0]
+        for i1 in range(i0 + 1, nd - 3):
+            c1 = deck[i1]
+            for i2 in range(i1 + 1, nd - 2):
+                c2 = deck[i2]
+                for i3 in range(i2 + 1, nd - 1):
+                    c3 = deck[i3]
+                    for i4 in range(i3 + 1, nd):
+                        c4 = deck[i4]
+                        hr_btn = _eval7(h0, h1, c0, c1, c2, c3, c4)
+                        hr_sb = _eval7(h2, h3, c0, c1, c2, c3, c4)
+                        hr_bb = _eval7(h4, h5, c0, c1, c2, c3, c4)
+                        best = hr_btn
+                        if hr_sb < best:
+                            best = hr_sb
+                        if hr_bb < best:
+                            best = hr_bb
+                        nwin = 0
+                        if hr_btn == best:
+                            nwin += 1
+                        if hr_sb == best:
+                            nwin += 1
+                        if hr_bb == best:
+                            nwin += 1
+                        pot_share = 1.0 / nwin
+                        if hr_btn == best:
+                            share0 += pot_share
+                        if hr_sb == best:
+                            share1 += pot_share
+                        if hr_bb == best:
+                            share2 += pot_share
+                        if hr_btn < hr_bb:
+                            btn_bb_w += 1.0
+                        elif hr_btn == hr_bb:
+                            btn_bb_w += 0.5
+                        if hr_btn < hr_sb:
+                            btn_sb_w += 1.0
+                        elif hr_btn == hr_sb:
+                            btn_sb_w += 0.5
+                        if hr_sb < hr_bb:
+                            sb_bb_w += 1.0
+                        elif hr_sb == hr_bb:
+                            sb_bb_w += 0.5
+                        total += 1.0
+    if total <= 0.0:
+        return 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 0.5, 0.5, 0.5
+    inv = 1.0 / total
+    return (
+        share0 * inv,
+        share1 * inv,
+        share2 * inv,
+        btn_bb_w * inv,
+        btn_sb_w * inv,
+        sb_bb_w * inv,
+    )
+
+
 def _card_str_to_id(card: str) -> int:
     from phevaluator.card import Card as PeCard
 

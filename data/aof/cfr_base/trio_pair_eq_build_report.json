@@ -1,0 +1,14 @@
+{
+  "verify_only": true,
+  "shape": [
+    169,
+    169
+  ],
+  "complete": true,
+  "file_hash": "7e7438d3ecc33f7606168ff956f8d28a99318106e1518ad8b2f4732c01ed3c15",
+  "parity": {
+    "samples": 24,
+    "max_err": 2.9802322387695312e-08,
+    "ok": true
+  }
+}

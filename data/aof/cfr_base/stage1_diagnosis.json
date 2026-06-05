@@ -1,0 +1,41 @@
+{
+  "sampling_regime": "per_combo_mc_boards_then_uniform_combo_average",
+  "regime_note": "Legacy path: mc_nway_shares(..., mc_boards) once per valid combo, uniform combo average. Total draws ~ C * mc_boards.",
+  "eval_backend": "numba_eval7",
+  "recommended_branch": "bias_plus_variance_mitigated_by_exact_low_combo",
+  "branch_counts": {
+    "bias": 2,
+    "variance": 0,
+    "ambiguous": 1
+  },
+  "triples": [
+    {
+      "label": "22/22/33",
+      "combo_count": 36,
+      "expected_sigma_mean_at_768_per_combo_if_iid": 0.003,
+      "observed_at_8192_per_combo": 0.01772,
+      "fit": {
+        "branch": "bias",
+        "reason": "error flat ~1.7% from 128 to 8192 boards/combo; mean over 50 seeds ~0.7% at 8192 for single combo vs exact"
+      }
+    },
+    {
+      "label": "22/42o/97s",
+      "combo_count": 48,
+      "fit": {
+        "branch": "bias",
+        "reason": "flat ~1.3-1.5% across ladder"
+      }
+    }
+  ],
+  "four_max_spots": {
+    "note": "4-max FP/BR showdown uses exact enumeration via terminal_ev.showdown_terminal_returns, not mc_nway_shares. Shared MC kernel tested for collision deals only.",
+    "mc_kernel_collision_deals_at_8192": "run diagnose_trio_triple_mc.py for live values"
+  },
+  "mitigations_applied": [
+    "exact_shares_for_triple_oracle when combo_count <= EXACT_TRIPLE_COMBO_MAX (96)",
+    "per-triple adaptive MC budget for high-combo triples",
+    "frequency-weighted validation gate only (not tensor/FP path)",
+    "mc_nway_shares uses exact enum when n_boards >= C(remaining,5)"
+  ]
+}

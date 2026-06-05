@@ -1,0 +1,136 @@
+{
+  "field100": {
+    "profile": "field100",
+    "tensor_path": "data\\aof\\cfr_base\\trio_eq_tensor.npz",
+    "call_pct_effective": 1.0,
+    "opponent_profile": "all buckets call 100% when facing jam; no open-jam",
+    "probe_hands": [
+      "72o",
+      "22",
+      "A5o",
+      "KTo"
+    ],
+    "br_table": {
+      "BTN": {
+        "72o": 0.029515773257238885,
+        "22": 0.35457441966317704,
+        "A5o": 0.6873008648156577,
+        "KTo": 0.79279436994503
+      },
+      "SB": {
+        "72o": 0.14778894296418185,
+        "22": 0.9244424214838416,
+        "A5o": 0.8461538461538461,
+        "KTo": 0.8167431112356011
+      },
+      "BB": {
+        "72o": 0.0,
+        "22": 0.0,
+        "A5o": 0.0,
+        "KTo": 0.0
+      }
+    },
+    "spreads": {
+      "72o": {
+        "btn": 0.029515773257238885,
+        "sb": 0.14778894296418185,
+        "bb": 0.0,
+        "max_minus_min": 0.14778894296418185
+      },
+      "22": {
+        "btn": 0.35457441966317704,
+        "sb": 0.9244424214838416,
+        "bb": 0.0,
+        "max_minus_min": 0.9244424214838416
+      },
+      "A5o": {
+        "btn": 0.6873008648156577,
+        "sb": 0.8461538461538461,
+        "bb": 0.0,
+        "max_minus_min": 0.8461538461538461
+      },
+      "KTo": {
+        "btn": 0.79279436994503,
+        "sb": 0.8167431112356011,
+        "bb": 0.0,
+        "max_minus_min": 0.8167431112356011
+      }
+    },
+    "max_spread_across_seats": 0.9244424214838416,
+    "position_blind": false,
+    "trash_jam_into_callers": false,
+    "verdict": "sound_payoffs_solver_or_fixed_point",
+    "notes": {
+      "SB": "open jam after BTN fold (sb hist F)",
+      "BB": "call vs BTN jam + SB fold (bb hist AF)"
+    }
+  },
+  "field80": {
+    "profile": "field80",
+    "tensor_path": "data\\aof\\cfr_base\\trio_eq_tensor.npz",
+    "call_pct_effective": 0.8,
+    "opponent_profile": "all buckets call 80% when facing jam; no open-jam",
+    "probe_hands": [
+      "72o",
+      "22",
+      "A5o",
+      "KTo"
+    ],
+    "br_table": {
+      "BTN": {
+        "72o": 0.027134904240047608,
+        "22": 0.5995238261965617,
+        "A5o": 0.7216133888869438,
+        "KTo": 0.8343895521865482
+      },
+      "SB": {
+        "72o": 0.15955323693147994,
+        "22": 0.9260880221280767,
+        "A5o": 0.8521760442561536,
+        "KTo": 0.8523511081544763
+      },
+      "BB": {
+        "72o": 0.0,
+        "22": 0.0,
+        "A5o": 0.0,
+        "KTo": 0.0
+      }
+    },
+    "spreads": {
+      "72o": {
+        "btn": 0.027134904240047608,
+        "sb": 0.15955323693147994,
+        "bb": 0.0,
+        "max_minus_min": 0.15955323693147994
+      },
+      "22": {
+        "btn": 0.5995238261965617,
+        "sb": 0.9260880221280767,
+        "bb": 0.0,
+        "max_minus_min": 0.9260880221280767
+      },
+      "A5o": {
+        "btn": 0.7216133888869438,
+        "sb": 0.8521760442561536,
+        "bb": 0.0,
+        "max_minus_min": 0.8521760442561536
+      },
+      "KTo": {
+        "btn": 0.8343895521865482,
+        "sb": 0.8523511081544763,
+        "bb": 0.0,
+        "max_minus_min": 0.8523511081544763
+      }
+    },
+    "max_spread_across_seats": 0.9260880221280767,
+    "position_blind": false,
+    "trash_jam_into_callers": false,
+    "verdict": "sound_payoffs_solver_or_fixed_point",
+    "notes": {
+      "SB": "open jam after BTN fold (sb hist F)",
+      "BB": "call vs BTN jam + SB fold (bb hist AF)"
+    }
+  },
+  "verdict": "sound_payoffs_solver_or_fixed_point",
+  "trash_jams_at_100pct_field": false
+}

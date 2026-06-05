@@ -1,0 +1,641 @@
+{
+  "tensor_path": "data\\aof\\cfr_base\\trio_eq_tensor.npz",
+  "tensor_sha256": "babe82516019cb9fada1f64f61d5d80bad00f98ffbc414dc0c53ebf2d4dca3ed",
+  "trusted_sha256": "babe82516019cb9fada1f64f61d5d80bad00f98ffbc414dc0c53ebf2d4dca3ed",
+  "reference": "internal_br_equilibrium",
+  "margin_bb": 0.3,
+  "solver": {
+    "name": "fictitious_play_3max",
+    "max_rounds": 1000,
+    "rounds_run": 1000,
+    "damping": 1.0,
+    "seed": 42
+  },
+  "nash_gap": {
+    "metric": "legal_marginalized",
+    "total_bb": 0.001043936766278934,
+    "total_mbb_g": 1.043936766278934,
+    "per_seat_bb": {
+      "btn": 0.00016214895692943275,
+      "sb": 0.0003980695561663342,
+      "bb": 0.000483718253183167
+    },
+    "clairvoyant_total_mbb_g": 1391.2234619952555,
+    "clairvoyant_per_seat_bb": {
+      "btn": 0.677669776699821,
+      "sb": 0.4356252517943178,
+      "bb": 0.27792843350111673
+    },
+    "trivial_baselines_mbb_g": {
+      "always_push": 1243.44876767816,
+      "always_fold": 3000.0000000000055
+    },
+    "note": "legal gap recorded, not gated; n>=3 has no unique/low-gap Nash. clairvoyant is diagnostic (per-combo max, over-states by the Jensen gap)."
+  },
+  "cfr_plus_relook": {
+    "available": true,
+    "artifact_solver": "cfr_plus_trio_dcfr",
+    "legal_total_mbb_g": 48.75623105104301,
+    "legal_per_seat_bb": {
+      "btn": 0.005839647311616613,
+      "sb": 0.018936563699802813,
+      "bb": 0.023980020039623583
+    },
+    "clairvoyant_total_mbb_g": 1530.0989793783028,
+    "premium_thresholds": {
+      "BTN_AA": 0.999833345413208,
+      "BTN_77": 0.999833345413208,
+      "BB_AA_call_99": 0.999833345413208,
+      "BB_AA_call_TT": 0.999833345413208
+    }
+  },
+  "reconcile_per_hand_vs_nash_gap": {
+    "btn": {
+      "per_hand_sum": 0.00016214895692943275,
+      "nash_gap": 0.00016214895692943275,
+      "abs_diff": 0.0
+    },
+    "sb": {
+      "per_hand_sum": 0.0003980695561663342,
+      "nash_gap": 0.0003980695561663342,
+      "abs_diff": 0.0
+    },
+    "bb": {
+      "per_hand_sum": 0.000483718253183167,
+      "nash_gap": 0.000483718253183167,
+      "abs_diff": 0.0
+    }
+  },
+  "reconcile_ok": true,
+  "stability": {
+    "tail_gap_spread_mbb_g": 0.004058350090884177,
+    "max_tail_policy_delta": 0.0009989989989989988,
+    "gap_spread_tol": 0.5,
+    "policy_delta_tol": 0.001,
+    "tail_window": 5,
+    "stable": true
+  },
+  "br_consistency": {
+    "max_imp_bb_all": 0.01218788578005725,
+    "max_imp_bb_relevant": 0.01218788578005725,
+    "worst_all": [
+      "BB",
+      "AA",
+      "A8o",
+      0.01218788578005725
+    ],
+    "worst_relevant": [
+      "BB",
+      "AA",
+      "A8o",
+      0.01218788578005725
+    ],
+    "relevant_reach_frac_floor": 0.0001,
+    "br_consistent_all": true,
+    "br_consistent_relevant": true
+  },
+  "seats": [
+    {
+      "seat": "BTN",
+      "history": "-",
+      "max_imp_bb": 0.0025106006766362765,
+      "max_imp_bb_relevant": 0.0025106006766362765,
+      "n_hands_over_margin": 0,
+      "n_hands_over_margin_relevant": 0,
+      "top_hands_by_imp": [
+        {
+          "hand": "98s",
+          "imp_bb": 0.0025106006766362765,
+          "fp_push": 0.9689999999999996,
+          "br_push": 1.0,
+          "reach_frac": 0.005917159763313609,
+          "direction_disagree": false
+        },
+        {
+          "hand": "87s",
+          "imp_bb": 0.002457437821878787,
+          "fp_push": 0.9500000000000001,
+          "br_push": 1.0,
+          "reach_frac": 0.005917159763313609,
+          "direction_disagree": false
+        },
+        {
+          "hand": "K8o",
+          "imp_bb": 0.0015911312349127726,
+          "fp_push": 0.011999999999999995,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313609,
+          "direction_disagree": false
+        },
+        {
+          "hand": "T8s",
+          "imp_bb": 0.0013176538955319735,
+          "fp_push": 0.9560000000000005,
+          "br_push": 1.0,
+          "reach_frac": 0.005917159763313609,
+          "direction_disagree": false
+        },
+        {
+          "hand": "Q9o",
+          "imp_bb": 0.0007896952233042875,
+          "fp_push": 0.0059999999999999975,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313609,
+          "direction_disagree": false
+        },
+        {
+          "hand": "K7o",
+          "imp_bb": 0.0007880248435845933,
+          "fp_push": 0.004000000000000008,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313609,
+          "direction_disagree": false
+        },
+        {
+          "hand": "Q2o",
+          "imp_bb": 0.0006539370920398123,
+          "fp_push": 0.001000000000000002,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313609,
+          "direction_disagree": false
+        },
+        {
+          "hand": "J4o",
+          "imp_bb": 0.0006504460747551962,
+          "fp_push": 0.001000000000000002,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313609,
+          "direction_disagree": false
+        },
+        {
+          "hand": "Q3o",
+          "imp_bb": 0.0006022108264890742,
+          "fp_push": 0.001000000000000002,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313609,
+          "direction_disagree": false
+        },
+        {
+          "hand": "J5o",
+          "imp_bb": 0.0005976179151140876,
+          "fp_push": 0.001000000000000002,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313609,
+          "direction_disagree": false
+        }
+      ]
+    },
+    {
+      "seat": "SB",
+      "history": "F",
+      "max_imp_bb": 0.0019901064283840975,
+      "max_imp_bb_relevant": 0.0019901064283840975,
+      "n_hands_over_margin": 0,
+      "n_hands_over_margin_relevant": 0,
+      "top_hands_by_imp": [
+        {
+          "hand": "54s",
+          "imp_bb": 0.0019901064283840975,
+          "fp_push": 0.9830000000000004,
+          "br_push": 1.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "75s",
+          "imp_bb": 0.0016149455156784787,
+          "fp_push": 0.9830000000000004,
+          "br_push": 1.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "65s",
+          "imp_bb": 0.0015674900743108955,
+          "fp_push": 0.990999999999999,
+          "br_push": 1.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "64s",
+          "imp_bb": 0.0014448433970971064,
+          "fp_push": 0.9510000000000003,
+          "br_push": 1.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "85s",
+          "imp_bb": 0.0012001203028166318,
+          "fp_push": 0.9689999999999996,
+          "br_push": 1.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "J6o",
+          "imp_bb": 0.0011582041723113834,
+          "fp_push": 0.01300000000000003,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "J5o",
+          "imp_bb": 0.0008750080253389081,
+          "fp_push": 0.0059999999999999975,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "Q2o",
+          "imp_bb": 0.0007109989724348731,
+          "fp_push": 0.03200000000000004,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "76s",
+          "imp_bb": 0.0006796882506077684,
+          "fp_push": 0.9970000000000002,
+          "br_push": 1.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "82o",
+          "imp_bb": 0.0006589627480276805,
+          "fp_push": 0.001000000000000002,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        }
+      ]
+    },
+    {
+      "seat": "SB",
+      "history": "A",
+      "max_imp_bb": 0.003864546707334271,
+      "max_imp_bb_relevant": 0.003864546707334271,
+      "n_hands_over_margin": 0,
+      "n_hands_over_margin_relevant": 0,
+      "top_hands_by_imp": [
+        {
+          "hand": "K9o",
+          "imp_bb": 0.003864546707334271,
+          "fp_push": 0.010999999999999989,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313611,
+          "direction_disagree": false
+        },
+        {
+          "hand": "K8o",
+          "imp_bb": 0.003104200814169955,
+          "fp_push": 0.004000000000000008,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313611,
+          "direction_disagree": false
+        },
+        {
+          "hand": "QTo",
+          "imp_bb": 0.00304704394601496,
+          "fp_push": 0.010000000000000023,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313611,
+          "direction_disagree": false
+        },
+        {
+          "hand": "Q9s",
+          "imp_bb": 0.0029868243430246633,
+          "fp_push": 0.01300000000000003,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313611,
+          "direction_disagree": false
+        },
+        {
+          "hand": "K7o",
+          "imp_bb": 0.002976689914746755,
+          "fp_push": 0.003000000000000001,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313611,
+          "direction_disagree": false
+        },
+        {
+          "hand": "K7s",
+          "imp_bb": 0.0028881950115287047,
+          "fp_push": 0.009000000000000001,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313611,
+          "direction_disagree": false
+        },
+        {
+          "hand": "K6s",
+          "imp_bb": 0.002826696472121526,
+          "fp_push": 0.0059999999999999975,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313611,
+          "direction_disagree": false
+        },
+        {
+          "hand": "J9s",
+          "imp_bb": 0.002798249572386835,
+          "fp_push": 0.007000000000000008,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313611,
+          "direction_disagree": false
+        },
+        {
+          "hand": "JTo",
+          "imp_bb": 0.002711586902351848,
+          "fp_push": 0.005000000000000011,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313611,
+          "direction_disagree": false
+        },
+        {
+          "hand": "Q8s",
+          "imp_bb": 0.0026727590069662854,
+          "fp_push": 0.005000000000000011,
+          "br_push": 0.0,
+          "reach_frac": 0.005917159763313611,
+          "direction_disagree": false
+        }
+      ]
+    },
+    {
+      "seat": "BB",
+      "history": "FA",
+      "max_imp_bb": 0.0028669053058657523,
+      "max_imp_bb_relevant": 0.0028669053058657523,
+      "n_hands_over_margin": 0,
+      "n_hands_over_margin_relevant": 0,
+      "top_hands_by_imp": [
+        {
+          "hand": "T6s",
+          "imp_bb": 0.0028669053058657523,
+          "fp_push": 0.9560000000000005,
+          "br_push": 1.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "J3o",
+          "imp_bb": 0.0022456317058303643,
+          "fp_push": 0.003000000000000001,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "T3o",
+          "imp_bb": 0.0021443533926541747,
+          "fp_push": 0.002000000000000004,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "Q2o",
+          "imp_bb": 0.00194720080770594,
+          "fp_push": 0.007000000000000008,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "Q3o",
+          "imp_bb": 0.0018925935693643314,
+          "fp_push": 0.011999999999999995,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "T4o",
+          "imp_bb": 0.0018488164666097262,
+          "fp_push": 0.002000000000000004,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "J4o",
+          "imp_bb": 0.0017855299914839584,
+          "fp_push": 0.003000000000000001,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "95o",
+          "imp_bb": 0.0017274120897314837,
+          "fp_push": 0.002000000000000004,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "J2o",
+          "imp_bb": 0.0017006735056868116,
+          "fp_push": 0.002000000000000004,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "J6o",
+          "imp_bb": 0.001677710557392631,
+          "fp_push": 0.0059999999999999975,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        }
+      ]
+    },
+    {
+      "seat": "BB",
+      "history": "AF",
+      "max_imp_bb": 0.0035264607549807536,
+      "max_imp_bb_relevant": 0.0035264607549807536,
+      "n_hands_over_margin": 0,
+      "n_hands_over_margin_relevant": 0,
+      "top_hands_by_imp": [
+        {
+          "hand": "K5o",
+          "imp_bb": 0.0035264607549807536,
+          "fp_push": 0.0059999999999999975,
+          "br_push": 0.0,
+          "reach_frac": 0.0059171597633136085,
+          "direction_disagree": false
+        },
+        {
+          "hand": "K6o",
+          "imp_bb": 0.003518453995206894,
+          "fp_push": 0.00800000000000001,
+          "br_push": 0.0,
+          "reach_frac": 0.0059171597633136085,
+          "direction_disagree": false
+        },
+        {
+          "hand": "K3o",
+          "imp_bb": 0.0032885422444441925,
+          "fp_push": 0.004000000000000008,
+          "br_push": 0.0,
+          "reach_frac": 0.0059171597633136085,
+          "direction_disagree": false
+        },
+        {
+          "hand": "K7o",
+          "imp_bb": 0.0031799499289195676,
+          "fp_push": 0.011999999999999995,
+          "br_push": 0.0,
+          "reach_frac": 0.0059171597633136085,
+          "direction_disagree": false
+        },
+        {
+          "hand": "JTo",
+          "imp_bb": 0.0030491119521272037,
+          "fp_push": 0.945,
+          "br_push": 1.0,
+          "reach_frac": 0.0059171597633136085,
+          "direction_disagree": false
+        },
+        {
+          "hand": "Q8s",
+          "imp_bb": 0.0029855094158964812,
+          "fp_push": 0.9119999999999998,
+          "br_push": 1.0,
+          "reach_frac": 0.0059171597633136085,
+          "direction_disagree": false
+        },
+        {
+          "hand": "T9s",
+          "imp_bb": 0.0028589016509170673,
+          "fp_push": 0.9780000000000013,
+          "br_push": 1.0,
+          "reach_frac": 0.0059171597633136085,
+          "direction_disagree": false
+        },
+        {
+          "hand": "Q6o",
+          "imp_bb": 0.0028555441464424014,
+          "fp_push": 0.003000000000000001,
+          "br_push": 0.0,
+          "reach_frac": 0.0059171597633136085,
+          "direction_disagree": false
+        },
+        {
+          "hand": "K4o",
+          "imp_bb": 0.002850669790652738,
+          "fp_push": 0.004000000000000008,
+          "br_push": 0.0,
+          "reach_frac": 0.0059171597633136085,
+          "direction_disagree": false
+        },
+        {
+          "hand": "K2s",
+          "imp_bb": 0.002809649875520126,
+          "fp_push": 0.009000000000000001,
+          "br_push": 0.0,
+          "reach_frac": 0.0059171597633136085,
+          "direction_disagree": false
+        }
+      ]
+    },
+    {
+      "seat": "BB",
+      "history": "AA",
+      "max_imp_bb": 0.01218788578005725,
+      "max_imp_bb_relevant": 0.01218788578005725,
+      "n_hands_over_margin": 0,
+      "n_hands_over_margin_relevant": 0,
+      "top_hands_by_imp": [
+        {
+          "hand": "A8o",
+          "imp_bb": 0.01218788578005725,
+          "fp_push": 0.04100000000000005,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "A7o",
+          "imp_bb": 0.010746168862669991,
+          "fp_push": 0.015000000000000045,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "A4s",
+          "imp_bb": 0.010498561425544395,
+          "fp_push": 0.11300000000000053,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "KTo",
+          "imp_bb": 0.010023463796063448,
+          "fp_push": 0.07799999999999999,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "A3s",
+          "imp_bb": 0.00981097441406753,
+          "fp_push": 0.036000000000000004,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "A2s",
+          "imp_bb": 0.008573794412815472,
+          "fp_push": 0.020000000000000046,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "A6o",
+          "imp_bb": 0.008243285507108844,
+          "fp_push": 0.00800000000000001,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "A5o",
+          "imp_bb": 0.008156786469511568,
+          "fp_push": 0.009000000000000001,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "K9o",
+          "imp_bb": 0.007362096736179602,
+          "fp_push": 0.009000000000000001,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        },
+        {
+          "hand": "A4o",
+          "imp_bb": 0.006851182101764053,
+          "fp_push": 0.0059999999999999975,
+          "br_push": 0.0,
+          "reach_frac": 0.00591715976331361,
+          "direction_disagree": false
+        }
+      ]
+    }
+  ],
+  "verdict": "PASS_clean",
+  "ship": true
+}

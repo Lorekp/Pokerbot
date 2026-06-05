@@ -86,7 +86,16 @@ def canonical_showdown_pattern(
     Suit-isomorphism canonical 4-card pattern preserving hero/villain slots.
 
     Hero = (h0,h1), villain = (v0,v1). Only suit relabeling; no hero/villain swap.
+
+    Within-pair card order is normalized (ascending id) so the key is invariant to the order
+    cards arrive in (e.g. deal order). This matches how ``enumerate_all_disjoint_pairs`` built
+    the table (h0<h1, v0<v1); without it, deal-order lookups produce keys absent from the table
+    because suit-canonicalization depends on first-appearance order.
     """
+    if h0 > h1:
+        h0, h1 = h1, h0
+    if v0 > v1:
+        v0, v1 = v1, v0
     raw = [
         _card_rank_suit(h0),
         _card_rank_suit(h1),

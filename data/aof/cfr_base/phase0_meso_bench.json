@@ -1,0 +1,11 @@
+{
+  "row": 0,
+  "mc_boards": 2048,
+  "threads": 11,
+  "backend": "trio_native_openmp",
+  "triples": 28561,
+  "elapsed_s": 237.32,
+  "triples_per_sec": 120.35,
+  "projected_full_tensor_s": 40106.5,
+  "projected_full_tensor_h": 11.14
+}

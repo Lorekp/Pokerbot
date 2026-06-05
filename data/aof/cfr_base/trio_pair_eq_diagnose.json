@@ -1,0 +1,16 @@
+{
+  "one_bucket_triple_s": 6.378772400028538,
+  "one_bucket_triple_ms": 6378.772400028538,
+  "one_btn_row_1692_triples_s": 29166.5,
+  "one_btn_row_hours": 8.101805555555556,
+  "per_bucket_triple_ms": 1021.2002380869017,
+  "old_loop_ranges": "for btn_row: for j in 169: for k in 169: exact_pair_eq_for_triple(row,j,k) with triple-combo enumeration",
+  "one_btn_row_source": "prior_log_row0_29166s",
+  "correct_shape": "169\u00d7169 HU bucket pairs (28,561); expand to (btn,sb,bb) at lookup",
+  "hu_table_build_s": 7.2233653999865055,
+  "hu_table_complete": false,
+  "speedup_vs_one_row": 4037.7993338194533,
+  "existing_npz": "load_fail:ValueError",
+  "existing_npz_pairs": 0,
+  "pairs_not_triples_confirmed": true
+}

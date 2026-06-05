@@ -1,0 +1,154 @@
+{
+  "iterations": 100,
+  "regret_print": {
+    "99": {
+      "hand": "99",
+      "label_index": 7,
+      "BTN": {
+        "FOLD": 0.0,
+        "AGGRESS": 0.011777598129489936
+      },
+      "SB_hist_F": {
+        "FOLD": 0.0,
+        "AGGRESS": 0.00479348229129049
+      },
+      "SB_hist_A": {
+        "FOLD": 0.0,
+        "AGGRESS": 0.008093120448682635
+      },
+      "BB_hist_AF": {
+        "FOLD": 0.0,
+        "AGGRESS": 0.004054944313612008
+      }
+    },
+    "A5o": {
+      "hand": "A5o",
+      "label_index": 152,
+      "BTN": {
+        "FOLD": 0.0,
+        "AGGRESS": 0.004781090749737113
+      },
+      "SB_hist_F": {
+        "FOLD": 0.0,
+        "AGGRESS": 0.002820370991275714
+      },
+      "SB_hist_A": {
+        "FOLD": 0.0032871509891271443,
+        "AGGRESS": 0.0
+      },
+      "BB_hist_AF": {
+        "FOLD": 0.0,
+        "AGGRESS": 0.0020810745901945794
+      }
+    },
+    "32s": {
+      "hand": "32s",
+      "label_index": 13,
+      "BTN": {
+        "FOLD": 0.0032181688020233743,
+        "AGGRESS": 0.0
+      },
+      "SB_hist_F": {
+        "FOLD": 0.0020123980519730455,
+        "AGGRESS": 0.0
+      },
+      "SB_hist_A": {
+        "FOLD": 0.0022252612098573937,
+        "AGGRESS": 0.0
+      },
+      "BB_hist_AF": {
+        "FOLD": 0.0006230735305770709,
+        "AGGRESS": 0.0
+      }
+    },
+    "72o": {
+      "hand": "72o",
+      "label_index": 34,
+      "BTN": {
+        "FOLD": 0.004149103929757773,
+        "AGGRESS": 0.0
+      },
+      "SB_hist_F": {
+        "FOLD": 4.999134155109612e-05,
+        "AGGRESS": 0.0
+      },
+      "SB_hist_A": {
+        "FOLD": 0.002976790886661908,
+        "AGGRESS": 0.0
+      },
+      "BB_hist_AF": {
+        "FOLD": 0.000782171100458008,
+        "AGGRESS": 0.0
+      }
+    }
+  },
+  "aggress_identical_across_seats_99": false,
+  "aggress_identical_across_seats_A5o": false,
+  "aggress_regret_by_seat": {
+    "99": {
+      "BTN": 0.011777598129489936,
+      "SB_F": 0.00479348229129049,
+      "BB_AF": 0.004054944313612008
+    },
+    "A5o": {
+      "BTN": 0.004781090749737113,
+      "SB_F": 0.002820370991275714,
+      "BB_AF": 0.0020810745901945794
+    }
+  },
+  "time_avg_push_99": {
+    "BTN": 0.995,
+    "SB_F": 0.995,
+    "BB_AF": 0.995,
+    "identical_across_seats": true
+  },
+  "cutoff_analysis": {
+    "threshold_label": "32s",
+    "threshold_label_index": 13,
+    "midpoint_label_index": 84,
+    "midpoint_label": "T9o",
+    "threshold_is_near_label_midpoint": false,
+    "btn_ev_push_at_threshold": 1.4999999999999996,
+    "btn_ev_push_midpoint": 1.4999999999999996,
+    "btn_ev_push_A5o": 1.4999999999999996,
+    "btn_ev_push_99": 1.4999999999999996,
+    "btn_ev_push_72o": 1.4999999999999996,
+    "correlation_index_vs_ev": NaN,
+    "threshold_rank_by_btn_ev_push": 13,
+    "top5_by_btn_ev_push": [
+      {
+        "label": "22",
+        "index": 0,
+        "ev": 1.4999999999999996
+      },
+      {
+        "label": "33",
+        "index": 1,
+        "ev": 1.4999999999999996
+      },
+      {
+        "label": "44",
+        "index": 2,
+        "ev": 1.4999999999999996
+      },
+      {
+        "label": "55",
+        "index": 3,
+        "ev": 1.4999999999999996
+      },
+      {
+        "label": "66",
+        "index": 4,
+        "ev": 1.4999999999999996
+      }
+    ]
+  },
+  "cfr_vs_fp_structure": {
+    "cfr_plus": "Per-bucket regret from np.sum(deal_w * (u_action - u_node), axis=opponents); CFR+ max(regret,0); strategy=regret_matching(regret); exported_policy=mean(strategy) over all iterations (btn_sum/iterations).",
+    "fp": "No regrets: br=best_responses_3max(st, deal_w, avg_policy) per hand independently; avg_policy=(1-alpha)*avg+alpha*br with alpha=1/round; each bucket's BR uses full payoff tensor conditioned on opponent avg freqs.",
+    "delta_destroying_signal": "CFR+ time-average of regret-matching strategies: early uniform 50/50 iterations dominate btn_sum; once AGGRESS regret goes positive for a bucket it saturates to pure push for remaining ~2900 iters \u2192 ~99.98% time-average for all buckets that ever had positive push EV under early opponent mix. FP re-computes per-hand BR each round against current opponent profile \u2192 graded frequencies."
+  },
+  "fp_ladder_BTN": null,
+  "cfr_nash_gap_mbb_g": 1380.1097283893168,
+  "verdict_regret": "seats_differ_check_saturation"
+}

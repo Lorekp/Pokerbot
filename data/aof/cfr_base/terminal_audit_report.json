@@ -1,0 +1,177 @@
+{
+  "blind_structure": {
+    "stack_bb": 8.0,
+    "sb_post": 0.5,
+    "bb_post": 1.0,
+    "btn_post": 0.0,
+    "act_order": [
+      "BTN",
+      "SB",
+      "BB"
+    ]
+  },
+  "spots": [
+    {
+      "id": 1,
+      "line": "BTN jam, SB fold, BB fold",
+      "rows": [
+        {
+          "seat": "BTN",
+          "pencil_bb": 1.5,
+          "tabular_bb": 1.5,
+          "oracle_bb": 1.5,
+          "tabular_vs_pencil": 0.0,
+          "oracle_vs_pencil": 0.0,
+          "tabular_vs_oracle": 0.0
+        },
+        {
+          "seat": "SB",
+          "pencil_bb": -0.5,
+          "tabular_bb": -0.5,
+          "oracle_bb": -0.5,
+          "tabular_vs_pencil": 0.0,
+          "oracle_vs_pencil": 0.0,
+          "tabular_vs_oracle": 0.0
+        },
+        {
+          "seat": "BB",
+          "pencil_bb": -1.0,
+          "tabular_bb": -1.0,
+          "oracle_bb": -1.0,
+          "tabular_vs_pencil": 0.0,
+          "oracle_vs_pencil": 0.0,
+          "tabular_vs_oracle": 0.0
+        }
+      ],
+      "pot_notes": "pencil pot=9.5 (8+0.5+1)"
+    },
+    {
+      "id": 2,
+      "line": "BTN fold, SB jam, BB fold",
+      "rows": [
+        {
+          "seat": "BTN",
+          "pencil_bb": 0.0,
+          "tabular_bb": 0.0,
+          "oracle_bb": -0.0,
+          "tabular_vs_pencil": 0.0,
+          "oracle_vs_pencil": -0.0,
+          "tabular_vs_oracle": 0.0
+        },
+        {
+          "seat": "SB",
+          "pencil_bb": 1.0,
+          "tabular_bb": 1.0,
+          "oracle_bb": 1.0,
+          "tabular_vs_pencil": 0.0,
+          "oracle_vs_pencil": 0.0,
+          "tabular_vs_oracle": 0.0
+        },
+        {
+          "seat": "BB",
+          "pencil_bb": -1.0,
+          "tabular_bb": -1.0,
+          "oracle_bb": -1.0,
+          "tabular_vs_pencil": 0.0,
+          "oracle_vs_pencil": 0.0,
+          "tabular_vs_oracle": 0.0
+        }
+      ],
+      "pot_notes": "pencil pot=9.5; tabular SB win uses TERMINAL.sb_win_uncontested_after_btn_fold"
+    },
+    {
+      "id": 3,
+      "line": "BTN jam, SB fold, BB call (showdown)",
+      "sample_buckets": "AKs/72o/QQ",
+      "eq_btn_bb": 0.4685714840888977,
+      "rows": [
+        {
+          "seat": "BTN",
+          "pencil_bb": 0.20000097155570984,
+          "tabular_bb": 0.20000097155570984,
+          "oracle_bb": -1.085564222318924,
+          "tabular_vs_pencil": 0.0,
+          "oracle_vs_pencil": -1.2855651938746337,
+          "tabular_vs_oracle": 1.2855651938746337
+        },
+        {
+          "seat": "SB",
+          "pencil_bb": -0.5,
+          "tabular_bb": -0.5,
+          "oracle_bb": 1.2933057280883773,
+          "tabular_vs_pencil": 0.0,
+          "oracle_vs_pencil": 1.7933057280883773,
+          "tabular_vs_oracle": -1.7933057280883773
+        },
+        {
+          "seat": "BB",
+          "pencil_bb": 1.2999990284442902,
+          "tabular_bb": 1.2999990284442902,
+          "oracle_bb": -0.20774150576938322,
+          "tabular_vs_pencil": 0.0,
+          "oracle_vs_pencil": -1.5077405342136734,
+          "tabular_vs_oracle": 1.5077405342136734
+        }
+      ],
+      "static_payoffs": {
+        "BTN": 0.20000097155570984,
+        "SB": -0.5,
+        "BB": 1.2999990284442902
+      },
+      "static_vs_tabular_btn": 0.0,
+      "static_vs_tabular_bb": 0.0,
+      "pot_btn_bb": {
+        "code": 17.5,
+        "pencil": 17.5
+      }
+    }
+  ],
+  "suspects": [
+    {
+      "name": "sb_win_uncontested_after_btn_fold",
+      "code": 1.0,
+      "pencil_spot2_sb": 1.0,
+      "delta_vs_pencil": 0.0
+    },
+    {
+      "name": "pot_sb_bb",
+      "code": 17.5,
+      "pencil": 17.5,
+      "delta_vs_pencil": 0.0
+    },
+    {
+      "name": "pot_three",
+      "code": 25.5,
+      "pencil": 25.5,
+      "delta_vs_pencil": 0.0
+    },
+    {
+      "name": "pot_btn_sb",
+      "code": 17.5,
+      "pencil": 17.5,
+      "delta_vs_pencil": 0.0
+    },
+    {
+      "name": "pot_btn_bb",
+      "code": 17.5,
+      "pencil": 17.5,
+      "delta_vs_pencil": 0.0
+    }
+  ],
+  "advisor_crosscheck": {
+    "btn_blind_state": [
+      0.0,
+      1.5
+    ],
+    "call_pot_terms_btn": [
+      0.0,
+      8.0,
+      17.5,
+      0.45714285714285713
+    ]
+  },
+  "max_abs_fold_terminal_error_bb": 0.0,
+  "max_abs_spot3_tabular_vs_pencil_bb": 0.0,
+  "spot3_oracle_note": "oracle uses exact combo showdown; tabular uses bucket pair_eq",
+  "audit_pass": true
+}

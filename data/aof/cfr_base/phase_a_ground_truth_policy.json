@@ -1,0 +1,629 @@
+{
+  "tensor_path": "data\\aof\\cfr_base\\trio_eq_tensor.npz",
+  "tensor_sha256": "babe82516019cb9fada1f64f61d5d80bad00f98ffbc414dc0c53ebf2d4dca3ed",
+  "trusted_sha256": "babe82516019cb9fada1f64f61d5d80bad00f98ffbc414dc0c53ebf2d4dca3ed",
+  "cfr_iterations": 3000,
+  "trivial_baselines_mbb_g": {
+    "always_push": 2558.743402559028,
+    "always_fold": 3000.0000000000186
+  },
+  "cfr_plus": {
+    "nash_gap_mbb_g": 1395.5479612061743,
+    "elapsed_s": 3981.5622533999995,
+    "time_average_policy": {
+      "label": "time_average",
+      "hands": {
+        "AA": {
+          "BTN": 0.9998333333333334,
+          "SB_after_BTN_fold": 0.9998333333333334,
+          "BB_vs_BTN_jam_SB_fold": 0.9998333333333334
+        },
+        "QQ": {
+          "BTN": 0.9998333333333334,
+          "SB_after_BTN_fold": 0.9998333333333334,
+          "BB_vs_BTN_jam_SB_fold": 0.9998333333333334
+        },
+        "99": {
+          "BTN": 0.9998333333333334,
+          "SB_after_BTN_fold": 0.9998333333333334,
+          "BB_vs_BTN_jam_SB_fold": 0.9998333333333334
+        },
+        "77": {
+          "BTN": 0.9998333333333334,
+          "SB_after_BTN_fold": 0.9998333333333334,
+          "BB_vs_BTN_jam_SB_fold": 0.9998333333333334
+        },
+        "ATs": {
+          "BTN": 0.9998333333333334,
+          "SB_after_BTN_fold": 0.9998333333333334,
+          "BB_vs_BTN_jam_SB_fold": 0.9998333333333334
+        },
+        "A5o": {
+          "BTN": 0.9998333333333334,
+          "SB_after_BTN_fold": 0.9998333333333334,
+          "BB_vs_BTN_jam_SB_fold": 0.9998333333333334
+        },
+        "KTo": {
+          "BTN": 0.9998333333333334,
+          "SB_after_BTN_fold": 0.9998333333333334,
+          "BB_vs_BTN_jam_SB_fold": 0.9998333333333334
+        },
+        "KQo": {
+          "BTN": 0.9998333333333334,
+          "SB_after_BTN_fold": 0.9998333333333334,
+          "BB_vs_BTN_jam_SB_fold": 0.9998333333333334
+        },
+        "T9s": {
+          "BTN": 0.9998154583209807,
+          "SB_after_BTN_fold": 0.9998333333333334,
+          "BB_vs_BTN_jam_SB_fold": 0.998111831676766
+        },
+        "72o": {
+          "BTN": 0.00016666666666666666,
+          "SB_after_BTN_fold": 0.00016666666666666666,
+          "BB_vs_BTN_jam_SB_fold": 0.00016666666666666666
+        },
+        "32o": {
+          "BTN": 0.00016666666666666666,
+          "SB_after_BTN_fold": 0.00016666666666666666,
+          "BB_vs_BTN_jam_SB_fold": 0.00016666666666666666
+        }
+      },
+      "push_threshold_50pct": {
+        "BTN": "32s",
+        "SB_after_BTN_fold": "32s",
+        "BB_vs_BTN_jam_SB_fold": "32s"
+      },
+      "overall_push_pct": {
+        "BTN": 0.3691963161960729,
+        "SB_after_BTN_fold": 0.6513964087662332,
+        "BB_vs_BTN_jam_SB_fold": 0.353484281372057
+      }
+    },
+    "final_regret_matching_policy": {
+      "label": "final_regret_matching",
+      "hands": {
+        "AA": {
+          "BTN": 1.0,
+          "SB_after_BTN_fold": 1.0,
+          "BB_vs_BTN_jam_SB_fold": 1.0
+        },
+        "QQ": {
+          "BTN": 1.0,
+          "SB_after_BTN_fold": 1.0,
+          "BB_vs_BTN_jam_SB_fold": 1.0
+        },
+        "99": {
+          "BTN": 1.0,
+          "SB_after_BTN_fold": 1.0,
+          "BB_vs_BTN_jam_SB_fold": 1.0
+        },
+        "77": {
+          "BTN": 1.0,
+          "SB_after_BTN_fold": 1.0,
+          "BB_vs_BTN_jam_SB_fold": 1.0
+        },
+        "ATs": {
+          "BTN": 1.0,
+          "SB_after_BTN_fold": 1.0,
+          "BB_vs_BTN_jam_SB_fold": 1.0
+        },
+        "A5o": {
+          "BTN": 1.0,
+          "SB_after_BTN_fold": 1.0,
+          "BB_vs_BTN_jam_SB_fold": 1.0
+        },
+        "KTo": {
+          "BTN": 1.0,
+          "SB_after_BTN_fold": 1.0,
+          "BB_vs_BTN_jam_SB_fold": 1.0
+        },
+        "KQo": {
+          "BTN": 1.0,
+          "SB_after_BTN_fold": 1.0,
+          "BB_vs_BTN_jam_SB_fold": 1.0
+        },
+        "T9s": {
+          "BTN": 1.0,
+          "SB_after_BTN_fold": 1.0,
+          "BB_vs_BTN_jam_SB_fold": 1.0
+        },
+        "72o": {
+          "BTN": 0.0,
+          "SB_after_BTN_fold": 0.0,
+          "BB_vs_BTN_jam_SB_fold": 0.0
+        },
+        "32o": {
+          "BTN": 0.0,
+          "SB_after_BTN_fold": 0.0,
+          "BB_vs_BTN_jam_SB_fold": 0.0
+        }
+      },
+      "push_threshold_50pct": {
+        "BTN": "32s",
+        "SB_after_BTN_fold": "32s",
+        "BB_vs_BTN_jam_SB_fold": "32s"
+      },
+      "overall_push_pct": {
+        "BTN": 0.3699287484278626,
+        "SB_after_BTN_fold": 0.650887573964497,
+        "BB_vs_BTN_jam_SB_fold": 0.3522565605688169
+      }
+    },
+    "chart_sanity_time_average": {
+      "label": "cfr_time_average",
+      "checks": [
+        {
+          "spot": "BTN|-|AA",
+          "kind": "push",
+          "p_push": 0.9998333333333334,
+          "bound": 0.85,
+          "passed": true
+        },
+        {
+          "spot": "BTN|-|AKs",
+          "kind": "push",
+          "p_push": 0.9998333333333334,
+          "bound": 0.7,
+          "passed": true
+        },
+        {
+          "spot": "BTN|-|72o",
+          "kind": "fold",
+          "p_push": 0.00016666666666666666,
+          "bound": 0.15,
+          "passed": true
+        },
+        {
+          "spot": "SB|F|AA",
+          "kind": "push",
+          "p_push": 0.9998333333333334,
+          "bound": 0.8,
+          "passed": true
+        },
+        {
+          "spot": "SB|F|72o",
+          "kind": "fold",
+          "p_push": 0.00016666666666666666,
+          "bound": 0.2,
+          "passed": true
+        },
+        {
+          "spot": "SB|A|AA",
+          "kind": "call",
+          "p_push": 0.9998333333333334,
+          "bound": 0.85,
+          "passed": true
+        },
+        {
+          "spot": "SB|A|72o",
+          "kind": "fold",
+          "p_push": 0.00016666666666666666,
+          "bound": 0.15,
+          "passed": true
+        },
+        {
+          "spot": "BB|FA|AA",
+          "kind": "call",
+          "p_push": 0.9998333333333334,
+          "bound": 0.85,
+          "passed": true
+        },
+        {
+          "spot": "BB|FA|72o",
+          "kind": "fold",
+          "p_push": 0.00016666666666666666,
+          "bound": 0.15,
+          "passed": true
+        },
+        {
+          "spot": "BB|AF|AA",
+          "kind": "call",
+          "p_push": 0.9998333333333334,
+          "bound": 0.85,
+          "passed": true
+        },
+        {
+          "spot": "BB|AF|72o",
+          "kind": "fold",
+          "p_push": 0.00016666666666666666,
+          "bound": 0.15,
+          "passed": true
+        },
+        {
+          "spot": "BB|AA|AA",
+          "kind": "call",
+          "p_push": 0.9998333333333334,
+          "bound": 0.9,
+          "passed": true
+        },
+        {
+          "spot": "BB|AA|72o",
+          "kind": "fold",
+          "p_push": 0.00016666666666666666,
+          "bound": 0.1,
+          "passed": true
+        }
+      ],
+      "position_order_sample": [
+        {
+          "hand": "AA",
+          "BTN": 0.9998333333333334,
+          "SB_F": 0.9998333333333334,
+          "BB_FA": 0.9998333333333334
+        },
+        {
+          "hand": "KK",
+          "BTN": 0.9998333333333334,
+          "SB_F": 0.9998333333333334,
+          "BB_FA": 0.9998333333333334
+        },
+        {
+          "hand": "QQ",
+          "BTN": 0.9998333333333334,
+          "SB_F": 0.9998333333333334,
+          "BB_FA": 0.9998333333333334
+        },
+        {
+          "hand": "AKs",
+          "BTN": 0.9998333333333334,
+          "SB_F": 0.9998333333333334,
+          "BB_FA": 0.9998333333333334
+        },
+        {
+          "hand": "AJo",
+          "BTN": 0.9998333333333334,
+          "SB_F": 0.9998333333333334,
+          "BB_FA": 0.9998333333333334
+        },
+        {
+          "hand": "77",
+          "BTN": 0.9998333333333334,
+          "SB_F": 0.9998333333333334,
+          "BB_FA": 0.9998333333333334
+        },
+        {
+          "hand": "22",
+          "BTN": 0.9997970255325587,
+          "SB_F": 0.9998333333333334,
+          "BB_FA": 0.9998333333333334
+        },
+        {
+          "hand": "72o",
+          "BTN": 0.00016666666666666666,
+          "SB_F": 0.00016666666666666666,
+          "BB_FA": 0.00016666666666666666
+        },
+        {
+          "hand": "32o",
+          "BTN": 0.00016666666666666666,
+          "SB_F": 0.00016666666666666666,
+          "BB_FA": 0.00016666666666666666
+        }
+      ],
+      "position_order_ok": true,
+      "degenerate_push_all": true,
+      "passed": false
+    },
+    "br_vs_time_average": {
+      "btn_22_time_avg_policy_BR": 0.8073246735058296,
+      "btn_72o_time_avg_policy_BR": 0.486117432862995
+    }
+  },
+  "fp": {
+    "nash_gap_mbb_g": 1802.004387923386,
+    "elapsed_s": 267.4468713000024,
+    "time_average_policy": {
+      "label": "fp_time_average",
+      "hands": {
+        "AA": {
+          "BTN": 1.0,
+          "SB_after_BTN_fold": 1.0,
+          "BB_vs_BTN_jam_SB_fold": 1.0
+        },
+        "QQ": {
+          "BTN": 0.9763535940618324,
+          "SB_after_BTN_fold": 0.9881656804733726,
+          "BB_vs_BTN_jam_SB_fold": 0.9773238411045971
+        },
+        "99": {
+          "BTN": 0.9403042610552858,
+          "SB_after_BTN_fold": 0.9704142011834318,
+          "BB_vs_BTN_jam_SB_fold": 0.9443202302306087
+        },
+        "77": {
+          "BTN": 0.9159581247155217,
+          "SB_after_BTN_fold": 0.958579881656805,
+          "BB_vs_BTN_jam_SB_fold": 0.9230025378986927
+        },
+        "ATs": {
+          "BTN": 0.8742829382724692,
+          "SB_after_BTN_fold": 0.9349442564214115,
+          "BB_vs_BTN_jam_SB_fold": 0.8801427559383291
+        },
+        "A5o": {
+          "BTN": 0.721259584748433,
+          "SB_after_BTN_fold": 0.8522595066252956,
+          "BB_vs_BTN_jam_SB_fold": 0.7525766718995117
+        },
+        "KTo": {
+          "BTN": 0.7904590175414029,
+          "SB_after_BTN_fold": 0.8577989886976389,
+          "BB_vs_BTN_jam_SB_fold": 0.8110334172159702
+        },
+        "KQo": {
+          "BTN": 0.8630174013514933,
+          "SB_after_BTN_fold": 0.888334666212872,
+          "BB_vs_BTN_jam_SB_fold": 0.8593902295157099
+        },
+        "T9s": {
+          "BTN": 0.658300304611183,
+          "SB_after_BTN_fold": 0.7987274875585147,
+          "BB_vs_BTN_jam_SB_fold": 0.7047399285082172
+        },
+        "72o": {
+          "BTN": 0.12666608312033906,
+          "SB_after_BTN_fold": 0.369042818738706,
+          "BB_vs_BTN_jam_SB_fold": 0.057225918888101975
+        },
+        "32o": {
+          "BTN": 0.09311368649557085,
+          "SB_after_BTN_fold": 0.32808904877741496,
+          "BB_vs_BTN_jam_SB_fold": 0.010496743299227559
+        }
+      },
+      "push_threshold_50pct": {
+        "BTN": "32s",
+        "SB_after_BTN_fold": "32s",
+        "BB_vs_BTN_jam_SB_fold": "32s"
+      },
+      "overall_push_pct": {
+        "BTN": 0.5175655510711115,
+        "SB_after_BTN_fold": 0.6902010363990543,
+        "BB_vs_BTN_jam_SB_fold": 0.5208684784267824
+      }
+    },
+    "chart_sanity": {
+      "label": "fp",
+      "checks": [
+        {
+          "spot": "BTN|-|AA",
+          "kind": "push",
+          "p_push": 1.0,
+          "bound": 0.85,
+          "passed": true
+        },
+        {
+          "spot": "BTN|-|AKs",
+          "kind": "push",
+          "p_push": 0.975942018836876,
+          "bound": 0.7,
+          "passed": true
+        },
+        {
+          "spot": "BTN|-|72o",
+          "kind": "fold",
+          "p_push": 0.12666608312033906,
+          "bound": 0.15,
+          "passed": true
+        },
+        {
+          "spot": "SB|F|AA",
+          "kind": "push",
+          "p_push": 1.0,
+          "bound": 0.8,
+          "passed": true
+        },
+        {
+          "spot": "SB|F|72o",
+          "kind": "fold",
+          "p_push": 0.369042818738706,
+          "bound": 0.2,
+          "passed": false
+        },
+        {
+          "spot": "SB|A|AA",
+          "kind": "call",
+          "p_push": 1.0,
+          "bound": 0.85,
+          "passed": true
+        },
+        {
+          "spot": "SB|A|72o",
+          "kind": "fold",
+          "p_push": 0.029981243368030826,
+          "bound": 0.15,
+          "passed": true
+        },
+        {
+          "spot": "BB|FA|AA",
+          "kind": "call",
+          "p_push": 1.0,
+          "bound": 0.85,
+          "passed": true
+        },
+        {
+          "spot": "BB|FA|72o",
+          "kind": "fold",
+          "p_push": 0.1050462015156408,
+          "bound": 0.15,
+          "passed": true
+        },
+        {
+          "spot": "BB|AF|AA",
+          "kind": "call",
+          "p_push": 1.0,
+          "bound": 0.85,
+          "passed": true
+        },
+        {
+          "spot": "BB|AF|72o",
+          "kind": "fold",
+          "p_push": 0.057225918888101975,
+          "bound": 0.15,
+          "passed": true
+        },
+        {
+          "spot": "BB|AA|AA",
+          "kind": "call",
+          "p_push": 1.0,
+          "bound": 0.9,
+          "passed": true
+        },
+        {
+          "spot": "BB|AA|72o",
+          "kind": "fold",
+          "p_push": 0.04952987909549275,
+          "bound": 0.1,
+          "passed": true
+        }
+      ],
+      "position_order_sample": [
+        {
+          "hand": "AA",
+          "BTN": 1.0,
+          "SB_F": 1.0,
+          "BB_FA": 1.0
+        },
+        {
+          "hand": "KK",
+          "BTN": 0.9882125975981239,
+          "SB_F": 0.9940828402366861,
+          "BB_FA": 0.9914479602889998
+        },
+        {
+          "hand": "QQ",
+          "BTN": 0.9763535940618324,
+          "SB_F": 0.9881656804733726,
+          "BB_FA": 0.9829463492993719
+        },
+        {
+          "hand": "AKs",
+          "BTN": 0.975942018836876,
+          "SB_F": 0.9881485147073245,
+          "BB_FA": 0.9829272756317167
+        },
+        {
+          "hand": "AJo",
+          "BTN": 0.9010703406743459,
+          "SB_F": 0.952655328379677,
+          "BB_FA": 0.9325939413737775
+        },
+        {
+          "hand": "77",
+          "BTN": 0.9159581247155217,
+          "SB_F": 0.958579881656805,
+          "BB_FA": 0.9411947251718462
+        },
+        {
+          "hand": "22",
+          "BTN": 0.8103814642344459,
+          "SB_F": 0.9282220687622112,
+          "BB_FA": 0.8997516136893463
+        },
+        {
+          "hand": "72o",
+          "BTN": 0.12666608312033906,
+          "SB_F": 0.369042818738706,
+          "BB_FA": 0.1050462015156408
+        },
+        {
+          "hand": "32o",
+          "BTN": 0.09311368649557085,
+          "SB_F": 0.32808904877741496,
+          "BB_FA": 0.02426531070666186
+        }
+      ],
+      "position_order_ok": false,
+      "degenerate_push_all": false,
+      "passed": false
+    },
+    "stability": {
+      "final_gap_mbb_g": 1802.004387923386,
+      "tail_spread_mbb_g": 0.100216864943377,
+      "below_gap_floor": false,
+      "plateau": false,
+      "rounds": 200
+    },
+    "gap_floor_mbb_g": 639.685850639757
+  },
+  "reconcile_99pct": {
+    "stale_99pct_source": {
+      "artifact": "data\\aof\\cfr_base\\phase_a_1547_verdict_chip_flow.json",
+      "config": "phase_a_1547_verdict chip_flow: trusted tensor + tabular payoffs, 3000 CFR+ iters",
+      "policy_metric": "time_average (btn_sum/iterations) via trio_policy_rows",
+      "sample": {
+        "AA": {
+          "hand": "AA",
+          "BTN": 0.9998333333333334,
+          "SB_F": 0.9998333333333334,
+          "BB_FA": 0.9998333333333334
+        },
+        "KK": {
+          "hand": "KK",
+          "BTN": 0.9998333333333334,
+          "SB_F": 0.9998333333333334,
+          "BB_FA": 0.9998333333333334
+        },
+        "QQ": {
+          "hand": "QQ",
+          "BTN": 0.9998333333333334,
+          "SB_F": 0.9998333333333334,
+          "BB_FA": 0.9998333333333334
+        },
+        "AKs": {
+          "hand": "AKs",
+          "BTN": 0.9998333333333334,
+          "SB_F": 0.9998333333333334,
+          "BB_FA": 0.9998333333333334
+        },
+        "AJo": {
+          "hand": "AJo",
+          "BTN": 0.9998333333333334,
+          "SB_F": 0.9998333333333334,
+          "BB_FA": 0.9998333333333334
+        },
+        "77": {
+          "hand": "77",
+          "BTN": 0.9998333333333334,
+          "SB_F": 0.9998333333333334,
+          "BB_FA": 0.9998333333333334
+        },
+        "22": {
+          "hand": "22",
+          "BTN": 0.9997970255325587,
+          "SB_F": 0.9998333333333334,
+          "BB_FA": 0.9998333333333334
+        },
+        "72o": {
+          "hand": "72o",
+          "BTN": 0.00016666666666666666,
+          "SB_F": 0.00016666666666666666,
+          "BB_FA": 0.00016666666666666666
+        },
+        "32o": {
+          "hand": "32o",
+          "BTN": 0.00016666666666666666,
+          "SB_F": 0.00016666666666666666,
+          "BB_FA": 0.00016666666666666666
+        }
+      }
+    },
+    "current_run_time_average_BTN": {
+      "AA": 0.9998333333333334,
+      "77": 0.9998333333333334,
+      "22": 0.9997970255325587,
+      "72o": 0.00016666666666666666
+    },
+    "current_run_final_regret_matching_BTN_mean": 0.3699287484278626,
+    "explanation": "Iteration-sweep ~37% used final regret-matching btn_s[:,AGGRESS], not time-average. Verdict '99.98%' used time-average export; if time-average still ~99% on premiums while current ~37%, CFR+ oscillates between push/fold late vs early iterations."
+  },
+  "chart_plausible_3max_8bb": {
+    "passed_spot_checks": false,
+    "position_order_ok": true,
+    "not_degenerate_premium_vs_77": false,
+    "verdict": "mixed_not_shove_bot",
+    "note": "3-max has no unique Nash; wide BTN and gap above trivial can be normal."
+  },
+  "overwrite_cfr_base_3p": false
+}

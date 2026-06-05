@@ -1,0 +1,69 @@
+{
+  "tensor": "data\\aof\\cfr_base\\trio_eq_tensor.npz",
+  "samples_per_row": 20,
+  "total_triples_sampled": 3380,
+  "gate_elapsed_s": 578.4727967,
+  "gate_triples_per_s": 5.842971388251627,
+  "omp_threads": 6,
+  "validation_backend": "batch_exact_shares_native",
+  "structural": {
+    "shares_shape": [
+      169,
+      169,
+      169,
+      3
+    ],
+    "pair_eq_shape": [
+      169,
+      169,
+      169,
+      3
+    ],
+    "shape_ok": true,
+    "unique_bucket_labels": 169,
+    "labels_ok": true,
+    "sanity": {
+      "valid_triples": 4825860.0,
+      "invalid_triples": 949.0,
+      "max_share_sum_deviation": 4.470348358154297e-08,
+      "min_combo_count": 8.0,
+      "max_combo_count": 216.0,
+      "mean_combo_count": 56.457087441409406
+    },
+    "manifest": {
+      "build_mode": "combo_exact_adaptive_mc",
+      "boards_per_combo": 192,
+      "row_workers": 1,
+      "row_parallel": false,
+      "eval_backend": "trio_native_openmp",
+      "pair_eq_table": "data\\aof\\cfr_base\\trio_pair_eq_exact.npz",
+      "pair_eq_table_hash": "7e7438d3ecc33f7606168ff956f8d28a99318106e1518ad8b2f4732c01ed3c15",
+      "seed_scheme": "combo_sha256_v1",
+      "row_seeds_count": 169
+    },
+    "pair_eq_table_hash_match": true,
+    "current_pair_eq_table_hash": "7e7438d3ecc33f7606168ff956f8d28a99318106e1518ad8b2f4732c01ed3c15"
+  },
+  "pooled_gate": {
+    "n_triples": 3380,
+    "n_triples_deduped": 3379,
+    "weighted_mean": 0.004284458526512969,
+    "effective_n": 3378.9999999999986,
+    "stderr": 5.3438891012851675e-05,
+    "upper_bound_95": 0.00437236550222911,
+    "unweighted_max": 0.017441928386688232,
+    "worst_spot_label": "84s / 53o / T3s",
+    "pass_threshold": true,
+    "pass_margin": true
+  },
+  "gate_threshold": 0.005,
+  "pair_eq_parity": {
+    "samples": 24,
+    "max_err": 2.9802322387695312e-08,
+    "worst_spot": "Q6o / Q3s / JTs",
+    "ok": true
+  },
+  "hidden_exact_pair_eq_ns": 0.0,
+  "trusted_for_solve": true,
+  "log_file": "data\\aof\\cfr_base\\logs\\phase_a_full_tensor_validate_20260604_141658.log"
+}

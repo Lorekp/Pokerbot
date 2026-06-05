@@ -1,0 +1,60 @@
+{
+  "row": 0,
+  "budget": 2048,
+  "stderr_gate": 0.001,
+  "note": "frac_exact_by_threshold = triples with combo_count <= threshold (full exact enum). frac_mc_only = triples needing MC on all combos (runouts > per-combo budget). Stale 15% figure used threshold=36 on full tensor; re-measure here on row 0.",
+  "thresholds": [
+    {
+      "threshold": 0,
+      "total_triples": 28561,
+      "exact_by_threshold": 0,
+      "all_combos_runout_le_budget": 0,
+      "some_combo_runout_le_budget": 0,
+      "mc_only_triples": 28512,
+      "frac_exact_by_threshold": 0.0,
+      "frac_all_combos_runout_exact": 0.0,
+      "frac_mc_only": 0.9982843737964358,
+      "frac_any_exact_path": 0.0,
+      "max_combo_count_seen": 216
+    },
+    {
+      "threshold": 8,
+      "total_triples": 28561,
+      "exact_by_threshold": 24,
+      "all_combos_runout_le_budget": 0,
+      "some_combo_runout_le_budget": 0,
+      "mc_only_triples": 28488,
+      "frac_exact_by_threshold": 0.0008403067119498617,
+      "frac_all_combos_runout_exact": 0.0,
+      "frac_mc_only": 0.9974440670844859,
+      "frac_any_exact_path": 0.0008403067119498617,
+      "max_combo_count_seen": 216
+    },
+    {
+      "threshold": 16,
+      "total_triples": 28561,
+      "exact_by_threshold": 576,
+      "all_combos_runout_le_budget": 0,
+      "some_combo_runout_le_budget": 0,
+      "mc_only_triples": 27936,
+      "frac_exact_by_threshold": 0.02016736108679668,
+      "frac_all_combos_runout_exact": 0.0,
+      "frac_mc_only": 0.978117012709639,
+      "frac_any_exact_path": 0.02016736108679668,
+      "max_combo_count_seen": 216
+    },
+    {
+      "threshold": 36,
+      "total_triples": 28561,
+      "exact_by_threshold": 1956,
+      "all_combos_runout_le_budget": 0,
+      "some_combo_runout_le_budget": 0,
+      "mc_only_triples": 26556,
+      "frac_exact_by_threshold": 0.06848499702391372,
+      "frac_all_combos_runout_exact": 0.0,
+      "frac_mc_only": 0.929799376772522,
+      "frac_any_exact_path": 0.06848499702391372,
+      "max_combo_count_seen": 216
+    }
+  ]
+}

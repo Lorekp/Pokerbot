@@ -1,0 +1,60 @@
+{
+  "line": "BTN jam 72o, SB fold 32o, BB call AA",
+  "pot_hu_stacks_bb": 17.5,
+  "stack_committed_bb": 8.0,
+  "exact_combo": {
+    "btn": "7c2d",
+    "sb": "3h2s",
+    "bb": "AcAd",
+    "btn_bb_equity": 0.1102318863940048,
+    "pencil_bb": {
+      "BTN": -6.0709419881049165,
+      "SB": -0.5,
+      "BB": 7.570941988104915,
+      "pot_bb": 17.5,
+      "btn_eq": 0.1102318863940048,
+      "bb_eq": 0.8897681136059952
+    },
+    "oracle_3way_bb": {
+      "BTN": -6.6144072897109405,
+      "SB": 1.1607142857144908,
+      "BB": 5.453693003996326,
+      "note": "3-way settlement with folded SB still in hole list mis-allocates pot"
+    },
+    "oracle_hu_2player_bb": {
+      "BTN": -6.236289817695923,
+      "BB": 6.236289817695923,
+      "pot_from_invested_only": 16.0,
+      "note": "2-player oracle pot=16bb omits SB 0.5bb dead money; tabular uses 17.5bb"
+    },
+    "oracle_hu_vs_pencil": {
+      "BTN": -0.16534782959100625,
+      "BB": -1.334652170408992
+    },
+    "loser_stack_accounting": {
+      "committed_bb": 8.0,
+      "net_btn_ev_pencil": -6.0709419881049165,
+      "net_bb_ev_pencil": 7.570941988104915,
+      "interpretation": "Jammer does not net -8bb when called; nets equity\u00d7pot\u22128bb (~-6.1bb at 11% eq). Full stack is committed but equity share is returned \u2014 correct chip EV."
+    }
+  },
+  "bucket_tensor": {
+    "eq_btn_bb_channel": 0.10071190446615219,
+    "pencil_from_bucket_eq": {
+      "BTN": -6.237541671842337,
+      "SB": -0.5,
+      "BB": 7.737541671842337,
+      "pot_bb": 17.5,
+      "btn_eq": 0.10071190446615219,
+      "bb_eq": 0.8992880955338478
+    },
+    "tabular_btn_bb_call0": -6.237541671842337,
+    "tabular_btn_bb_call2": 7.737541671842337,
+    "tabular_vs_pencil_btn": 0.0,
+    "tabular_vs_pencil_bb": 0.0,
+    "tabular_matches_pencil_formula": true,
+    "bucket_eq_vs_exact_combo": -0.009519981927852611
+  },
+  "payoff_layer_pass": true,
+  "interpretation": "Tabular/payoff layer uses POT_HU_STACKS=17.5 (includes SB dead blind) and equity\u00d7pot\u2212STACK_BB per seat; matches pencil. Earlier audit oracle gap was oracle settlement (pot=sum(invested) or 3-way with folded SB), not tabular EV."
+}

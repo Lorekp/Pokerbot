@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "git_hash": "4377aefd764c5ffd7f7da1bed72a9b0700e2a9a8",
+  "infoset_key_spec_hash": "db1d62ba9e0e09a6",
+  "tables": [
+    {
+      "num_players": 2,
+      "solver": "cfr_plus_dcfr",
+      "iterations": 2500,
+      "seed": 0,
+      "exploitability_bb_per_hand": 0.0005214972968871495,
+      "exploitability_mbb_g": 0.5214972968871495,
+      "br_method": "exact",
+      "player_improvements": null,
+      "nash_disclaimer": "HU 2p0s: exact exploitability; depth grid in manifest.depth_grid.",
+      "n_infosets": 2366
+    },
+    {
+      "num_players": 3,
+      "solver": "fictitious_play_3max",
+      "iterations": 1000,
+      "seed": 42,
+      "exploitability_bb_per_hand": 0.001043936766278934,
+      "exploitability_mbb_g": 1.043936766278934,
+      "br_method": "exact_legal_marginalized",
+      "player_improvements": null,
+      "nash_disclaimer": "N=3 legal marginalized BR; per-depth exploitability in manifest.depth_grid.",
+      "n_infosets": 7098
+    },
+    {
+      "num_players": 4,
+      "solver": "fictitious_play_4max_vec",
+      "iterations": 400,
+      "seed": 42,
+      "exploitability_bb_per_hand": 0.0,
+      "exploitability_mbb_g": 0.0,
+      "br_method": "mc_combo_br_legal_split",
+      "player_improvements": null,
+      "nash_disclaimer": "N=4 vectorized legal FP; per-depth independent MC gap in manifest.depth_grid_4max.",
+      "n_infosets": 16562
+    }
+  ],
+  "depth_grid_4max": {
+    "4": 0.0,
+    "6": 0.0,
+    "8": 0.0,
+    "10": 10.184202959377359,
+    "12": 0.0,
+    "15": 0.0,
+    "20": 4.585203919091769
+  },
+  "fp_4max_vec": {
+    "deals": 15000,
+    "rounds": 400,
+    "seed": 42
+  }
+}

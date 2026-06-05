@@ -1,0 +1,92 @@
+{
+  "tensor_path": "data\\aof\\cfr_base\\trio_eq_tensor.npz",
+  "tight_call_range": "77+,A9s+,ATo+,KQs",
+  "tight_call_pct_buckets": 0.10650887573964497,
+  "opponent_profile": "call top chart range when facing jam; no open-jam",
+  "br_table": {
+    "BTN": {
+      "A5o": 0.809215363607717,
+      "22": 0.8980777983964146,
+      "KTo": 0.8209446447953503
+    },
+    "SB": {
+      "A5o": 1.0,
+      "22": 1.0,
+      "KTo": 1.0
+    },
+    "BB": {
+      "A5o": 0.0,
+      "22": 0.0,
+      "KTo": 0.0
+    }
+  },
+  "spreads": {
+    "A5o": {
+      "btn": 0.809215363607717,
+      "sb": 1.0,
+      "bb": 0.0,
+      "max_minus_min": 1.0
+    },
+    "22": {
+      "btn": 0.8980777983964146,
+      "sb": 1.0,
+      "bb": 0.0,
+      "max_minus_min": 1.0
+    },
+    "KTo": {
+      "btn": 0.8209446447953503,
+      "sb": 1.0,
+      "bb": 0.0,
+      "max_minus_min": 1.0
+    }
+  },
+  "max_spread_across_seats": 1.0,
+  "position_blind": false,
+  "verdict": "position_aware_payoffs_bug_likely_solver_or_weighting",
+  "topology_audit": {
+    "fold_terminals_bb": {
+      "BTN": 0.0,
+      "SB_after_btn_fold": -0.5,
+      "SB_after_btn_jam": -0.5,
+      "BB": -1.0
+    },
+    "uncontested_win_bb": {
+      "BTN_after_SB_fold": 1.5,
+      "SB_after_BTN_fold": 1.0
+    },
+    "showdown_commit_model": {
+      "btn_paths": "all use -STACK_BB (8bb)",
+      "sb_paths": "all use -STACK_BB (8bb)",
+      "bb_paths": "all use -STACK_BB (8bb)"
+    },
+    "live_opponents_behind": {
+      "BTN_push": "mix SB response (psa) then BB (paf/paa); 2 live behind",
+      "SB_open_after_BTN_fold": "BB only (pfa on sb_bb_call1); 1 live behind",
+      "BB_defense_AF": "single caller path btn_bb_call2; BTN jam SB fold",
+      "BB_defense_AA": "three-way three2; BTN jam SB call"
+    },
+    "action_order": {
+      "histories": "SB_HIST F/A, BB_HIST FA/AF/AA encode BTN\u2192SB\u2192BB sequence",
+      "btn_first": true
+    },
+    "pot_constants": {
+      "POT_HU_STACKS": 17.5,
+      "POT_THREE_STACKS": 25.5
+    },
+    "suspects": [
+      "BTN fold=0, SB fold=-SB_POST: per-seat fold EV present",
+      "BB fold=-BB_POST: per-seat fold EV present",
+      "HU pot includes dead blinds (chip-flow fix applied)"
+    ],
+    "pair_eq_channels": {
+      "0": "btn_bb (HU)",
+      "1": "btn_sb (HU)",
+      "2": "sb_bb (HU)",
+      "shares": "three0/1/2 seat-indexed 3-way"
+    }
+  },
+  "notes": {
+    "SB": "open jam after BTN fold (sb hist F)",
+    "BB": "call vs BTN jam + SB fold (bb hist AF)"
+  }
+}

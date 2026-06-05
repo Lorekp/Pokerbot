@@ -1,0 +1,47 @@
+{
+  "cfr_terminal_trace": {
+    "module": "pokerbot.solver.trio_preflop_dcfr",
+    "function": "solve_3max_pushfold",
+    "call_sites": [
+      "line 80: st, deal_w = load_3max_payoffs(...) -> build_static_payoffs",
+      "lines 107-110: u_sb_fa1/u_btn_* = mix(..., TERMINAL.*, st.sb_bb_call1|btn_bb_call0|three0)",
+      "lines 133-160: bb_reg += deal_w * (... TERMINAL.bb_fold, st.btn_bb_call2, st.three2)"
+    ],
+    "imports_terminal_ev_oracle": false,
+    "imports_pushfold_payoffs": true,
+    "audit_terminal_ev_only": true,
+    "payoff_source": "aof_cfr.pushfold_payoffs.TERMINAL + StaticPayoffs (st.*)",
+    "never_calls": "terminal_ev.showdown_terminal_returns (MCCFR/game_pushfold only)"
+  },
+  "oracle_used_by_cfr_regret_loop": false,
+  "single_infoset_BB_72o_hist_AF": {
+    "opponent_field": "BTN push 100%, SB fold after BTN jam",
+    "probe": {
+      "weighted_fold_ev_bb": -1.0,
+      "weighted_call_ev_bb": -2.0574953278185886,
+      "br_prefers_call": false,
+      "reach_weight": 0.005917159763315283
+    },
+    "cfr_regret_path_same_formula_field": {
+      "cf_fold_action_ev_bb": -1.0,
+      "cf_call_action_ev_bb": -2.0574953278185886,
+      "policy_node_ev_bb": -1.0,
+      "bb_fold_terminal_bb": -1.0,
+      "bb_call_terminal_avg_bb": -2.0574953278185886,
+      "regret_fold_increment_sign": "positive if fold better than node",
+      "sample_u_node_vs_fold": -1.0
+    },
+    "cfr_regret_path_late_self_play": null,
+    "probe_vs_cfr_formula_agree_100pct_field": true,
+    "probe_vs_cfr_late_self_play_agree": null,
+    "cfr_late_bb72o_strategy_hist_AF": null,
+    "cfr_late_btn22_strategy": null
+  },
+  "opponent_model_note": "Probe '100% field' = every bucket calls when facing jam. CFR self-play uses hand-dependent call/fold (e.g. SB call-after-jam ~25% at iter 100), so BTN-22 push EV stays positive in self-play while negative vs homogeneous field.",
+  "oracle_path_used_by": {
+    "trio_preflop_dcfr": false,
+    "game_pushfold_MCCFR": "aof_cfr/game_pushfold.py -> terminal_ev.showdown_terminal_returns"
+  },
+  "verdict": "no_second_payoff_path_cfr_uses_tabular_same_as_probe",
+  "note": "terminal_ev.py is used by game_pushfold.py / MCCFR only, not trio_preflop_dcfr. If paths agree but solve degenerate, inspect CFR regret weighting or self-play field."
+}

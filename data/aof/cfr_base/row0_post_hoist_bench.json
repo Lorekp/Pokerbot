@@ -1,0 +1,52 @@
+{
+  "fix": "mc_fused_pair_eq",
+  "hidden_pair_eq": {
+    "what": "3-way-conditioned btn-BB / btn-SB / sb-BB equities (6 cards dead, C(46,5) boards)",
+    "pre_hoist_call_site": "eval_combo_adaptive() -> exact_six_card_combo_metrics() before MC shares",
+    "invocations_per_mc_triple": "once per valid combo",
+    "pre_hoist_mc_path_cpu_share": "64782 / 64800 s (~100%)"
+  },
+  "hoist_options_ruled_out": {
+    "hu_table_lookup": "C(48,5) HU equity != C(46,5) trio-conditioned pair eq (third hand blockers)",
+    "bucket_169_squared_precompute": "pair_eq depends on triple (i,j,k) + combo averaging, already 169^3 in tensor"
+  },
+  "row": 0,
+  "mc_boards": 2048,
+  "threads": 11,
+  "logical_cpus": 12,
+  "backend": "trio_native_openmp",
+  "meso_elapsed_s": 237.32,
+  "meso_elapsed_min": 3.96,
+  "meso_triples_per_sec": 120.35,
+  "validate_build_elapsed_s": 230.16,
+  "validate_build_elapsed_min": 3.84,
+  "validate_triples_per_sec": 124.09,
+  "projected_full_tensor_s": 40106.5,
+  "projected_full_tensor_h": 11.14,
+  "mean_cpu_pct": 100.0,
+  "expected_saturation_pct": 91.7,
+  "cpu_note": "OpenMP triple-parallel build; ~100% CPU during meso re-bench",
+  "pre_hoist_elapsed_min": 101.0,
+  "speedup_vs_pre_hoist": 25.5,
+  "profile_counter_sanity": "eval_combo_adaptive mc_hidden_pair_exact_ns == 0 (test_trio_native_exact)",
+  "parity_tests": "14/14 pass (test_trio_native_exact + test_trio_eval_mc)",
+  "validate_row_samples_T2048": {
+    "pass": false,
+    "weighted_error": 0.015695,
+    "unweighted_max_error": 0.031547,
+    "gate_threshold": 0.005,
+    "worst_sample": "22 / 96o / K8o (96 combos, 21 boards/combo)",
+    "live_gate_15_samples_by_budget": {
+      "2048": {"pass": false, "weighted_error": 0.01569, "unweighted_max_error": 0.03155},
+      "4096": {"pass": false, "weighted_error": 0.01043, "unweighted_max_error": 0.02361},
+      "8192": {"pass": false, "weighted_error": 0.00827, "unweighted_max_error": 0.01775}
+    },
+      "2048": 0.03155,
+      "4096": 0.02361,
+      "8192": 0.01007,
+      "16384": 0.00344
+    },
+    "note": "Max error dominated by MC share variance on high-combo collision triples at 2048 budget; MC pair-eq adds secondary error vs pre-hoist exact pair-eq"
+  },
+  "fleet_recommendation": "Skip EC2 spot fleet — row-0 ~4 min post-hoist; full 169-row ~11 h serial locally (row-parallel feasible)"
+}

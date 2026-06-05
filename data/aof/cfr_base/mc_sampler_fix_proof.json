@@ -1,0 +1,41 @@
+{
+  "fix_summary": "Two bugs in shared MC kernel (aof_cfr/trio_eval_mc.py): (1) native OMPEval eval7 ranks higher=better but kernel selected lower=better, inverting winners when hu_table_native routed MC; (2) custom LCG index draw (state % rem) produced non-uniform board samples with ~0.7-1.7% systematic bias on rank-collision deals. Live-deck construction was already correct (46 cards, distinct, disjoint for 22/22/33 probe). Fix: always use numba _eval7 for n-way MC; partial Fisher-Yates board draw via np.random.randint.",
+  "deck_probe_22_22_33": {
+    "combo": [["2c", "2d"], ["2h", "2s"], ["3c", "3d"]],
+    "hole_ids": [0, 1, 2, 3, 4, 5],
+    "deck_size": 46,
+    "invariant_ok": true
+  },
+  "before_after_3max_triple_shares": {
+    "22/22/33": {
+      "exact": [0.033989, 0.033989, 0.932022],
+      "broken_mc": [0.042571, 0.043124, 0.914304],
+      "broken_max_err": 0.017717,
+      "fixed_mc": [0.033984, 0.033940, 0.932077],
+      "fixed_max_err": 0.000055
+    },
+    "22/42o/97s": {
+      "exact": [0.266796, 0.185030, 0.548175],
+      "broken_max_err": 0.001009,
+      "fixed_mc": [0.267015, 0.184645, 0.548340],
+      "fixed_max_err": 0.000385
+    },
+    "AKs/AQs/KQo": {
+      "exact": [0.681105, 0.239275, 0.079621],
+      "broken_max_err": 0.014525,
+      "fixed_mc": [0.680397, 0.239769, 0.079835],
+      "fixed_max_err": 0.000708
+    }
+  },
+  "before_after_4max_collision": {
+    "cards": ["2c", "2d", "2h", "2s", "3c", "3d", "4c", "5d"],
+    "note": "Stage 1 clean spots (four distinct pairs) were not collision tests; this deal has paired-rank overlap.",
+    "exact": [0.013270, 0.039358, 0.476768, 0.470604],
+    "broken_native_mc_single_seed_err": 0.906,
+    "fixed_mc_8192": [0.013733, 0.040466, 0.475037, 0.470764],
+    "fixed_max_err": 0.001731
+  },
+  "mc_boards_per_combo": 8192,
+  "eval_backend_hu_table": "hu_table_native",
+  "mc_eval_backend": "numba_eval7"
+}
