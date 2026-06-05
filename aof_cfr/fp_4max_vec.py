@@ -175,6 +175,58 @@ def rows_to_table(rows: dict[str, np.ndarray], stack_bb: float) -> _Policy:
     return pol
 
 
+def legal_nash_gap_4max(pol: _Policy, buckets: np.ndarray, payoffs: np.ndarray, infosets: list,
+                        *, split: bool = True):
+    """Vectorized legal NashConv (bb/hand) + per-player BR gains for a full 4-max table.
+
+    Each player's gain = reach-weighted ``BR_action_value - onpolicy`` over its infosets / n_deals.
+    With ``split`` (default) the BR ACTION is chosen on one half of the deal batch and EVALUATED on
+    the other — sample-splitting that removes the max-of-noisy-estimates bias (otherwise a
+    near-equilibrium table reads as ~20 bb/100 instead of ~0). Same debiased definition as
+    ``exploit_mc.estimate_nash_conv_mc``, but pure numpy over the precomputed payoff tensor.
+    """
+    n = buckets.shape[0]
+    if not split or n < 4:
+        num_push, num_fold, den = _br_marginals(pol, buckets, payoffs, infosets)
+        per_player = [0.0] * NUM_PLAYERS
+        for (pp, hpp) in infosets:
+            p = pol.table[(pp, hpp)]
+            ep, ef = num_push[(pp, hpp)], num_fold[(pp, hpp)]
+            per_player[pp] += float(np.sum(np.maximum(ep, ef) - ((1.0 - p) * ef + p * ep)))
+        gain_bb = [g / n for g in per_player]
+        return float(sum(max(0.0, g) for g in gain_bb)), gain_bb
+
+    h = n // 2  # split A (choose the BR action) | B (evaluate it) -> unbiased
+    npA, nfA, _dA = _br_marginals(pol, buckets[:h], payoffs[:, :h, :], infosets)
+    npB, nfB, _dB = _br_marginals(pol, buckets[h:], payoffs[:, h:, :], infosets)
+    nB = n - h
+    per_player = [0.0] * NUM_PLAYERS
+    for (pp, hpp) in infosets:
+        p = pol.table[(pp, hpp)]
+        push_better = npA[(pp, hpp)] >= nfA[(pp, hpp)]           # BR action decided on A
+        chosen_B = np.where(push_better, npB[(pp, hpp)], nfB[(pp, hpp)])  # ...its value on B
+        onpol_B = (1.0 - p) * nfB[(pp, hpp)] + p * npB[(pp, hpp)]
+        per_player[pp] += float(np.sum(chosen_B - onpol_B))
+    gain_bb = [g / nB for g in per_player]
+    return float(sum(max(0.0, g) for g in gain_bb)), gain_bb
+
+
+def nash_gap_4max_vec(rows: dict[str, np.ndarray], *, n_deals: int = 8000, seed: int = 7,
+                      stack_bb: float = 8.0, buckets: np.ndarray | None = None,
+                      payoffs: np.ndarray | None = None) -> float:
+    """Legal 4-max exploitability (bb/hand) of an infoset-key-v2 ``rows`` table.
+
+    Pass a precomputed ``(buckets, payoffs)`` batch to amortize the showdown precompute across many
+    tables (e.g. the practice-tier calibration). Drop-in fast replacement for
+    ``exploit_mc.estimate_nash_conv_mc(4, rows, ...)``."""
+    if buckets is None or payoffs is None:
+        buckets, holes = sample_deals(n_deals, seed)
+        payoffs = precompute_payoffs(holes, stack_bb)
+    pol = rows_to_table(rows, stack_bb)
+    infosets = _infoset_index(buckets)
+    return legal_nash_gap_4max(pol, buckets, payoffs, infosets)[0]
+
+
 def solve_4max_fp_vec(
     *,
     n_deals: int = 60000,
@@ -204,16 +256,7 @@ def solve_4max_fp_vec(
             pol.table[k] = (1.0 - alpha) * pol.table[k] + alpha * br
 
     # Final legal NashConv on the batch (sum of per-player BR gains).
-    num_push, num_fold, den = _br_marginals(pol, buckets, payoffs, infosets)
-    per_player_gain = [0.0] * NUM_PLAYERS
-    for (pp, hpp) in infosets:
-        p = pol.table[(pp, hpp)]
-        ep = np.where(den[(pp, hpp)] > 0, num_push[(pp, hpp)], 0.0)
-        ef = np.where(den[(pp, hpp)] > 0, num_fold[(pp, hpp)], 0.0)
-        onpol = (1.0 - p) * ef + p * ep
-        per_player_gain[pp] += float(np.sum(np.maximum(ep, ef) - onpol))
-    gain_bb = [g / n for g in per_player_gain]
-    gap = float(sum(max(0.0, g) for g in gain_bb))
+    gap, gain_bb = legal_nash_gap_4max(pol, buckets, payoffs, infosets)
 
     rows = _policy_to_rows(pol, stack_bb)
     return {
