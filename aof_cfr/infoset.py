@@ -33,6 +33,18 @@ def encode_infoset_key(
     return f"{position}|{hand_bucket}|{hist}|d{stack_depth_bucket(stack_bb)}"
 
 
+def aggregate_infoset_key(position: str, action_history: str, stack_bb: float = 8.0) -> str:
+    """Hand-agnostic key ``{position}|*|{history}|d{depth}`` for hidden-card opponents.
+
+    Live we rarely see an opponent's folded cards, so we can only observe their push/fold
+    frequency marginalized over their hand at a ``(position, history, depth)``. Recording under
+    this aggregate key keeps ``n_obs`` equal to the true decision count (no 169x inflation);
+    ``profiler.estimate_policy_rows_shift`` reconstructs a per-bucket policy from it.
+    """
+    hist = action_history if action_history else "-"
+    return f"{position}|*|{hist}|d{stack_depth_bucket(stack_bb)}"
+
+
 def decode_infoset_key(key: str) -> tuple[str, str, str, int]:
     """Return (position, hand_bucket, history, stack_depth_bb)."""
     parts = key.split("|")
