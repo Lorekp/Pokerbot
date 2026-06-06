@@ -25,8 +25,10 @@ Play-money / own-account / bot-arena use only.
 
 from __future__ import annotations
 
-import math
+import json
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
@@ -106,7 +108,10 @@ class AdaptiveOpponentModel:
     prior_strength: float = PRIOR_STRENGTH
     adapt_threshold: float = ADAPT_THRESHOLD
     min_fast_n: float = MIN_FAST_N
+    population_confidence: float = 0.0   # cold-start trust in the population prior (0 = unknown->base)
+    path: object = None                  # optional json for persistence
     _d: dict = field(default_factory=dict)        # (identity, agg_key) -> _Dual
+    _seeded: set = field(default_factory=set)     # (identity, n, depth) already seeded from the DB
 
     def __post_init__(self):
         self._lam_s = _lam(self.slow_halflife)
@@ -115,21 +120,33 @@ class AdaptiveOpponentModel:
     # -- feed --
     def observe(self, identity: str, num_players: int, seat: str, hist: str, stack_bb: float,
                 pushed: bool) -> None:
+        self.observe_key(identity, aggregate_infoset_key(seat, hist, stack_bb), pushed)
+
+    def observe_key(self, identity: str, agg_key: str, pushed: bool) -> None:
+        """Feed one observation by its aggregate infoset key (what the DB / ingest already produce)."""
         if not identity:
             return
-        key = (identity, aggregate_infoset_key(seat, hist, stack_bb))
-        self._d.setdefault(key, _Dual()).update(bool(pushed), self._lam_s, self._lam_f)
+        self._d.setdefault((identity, agg_key), _Dual()).update(bool(pushed), self._lam_s, self._lam_f)
 
     def seed_from_db(self, db, identity: str, num_players: int, stack_bb: float) -> None:
         """Cold-start a returning opponent: load lifetime aggregate counts as the SLOW estimate (the
-        fast estimate stays empty, so if they've changed since we last saw them the fast signal will
-        catch it fresh). Idempotent-ish: call once when an opponent re-appears."""
+        fast estimate stays empty, so a since-last-session change is caught fresh). Idempotent and
+        non-clobbering: only seeds infosets the live model hasn't already touched; runs the DB scan
+        once per (identity, players, depth)."""
+        if not identity:
+            return
+        tag = (identity, num_players, round(float(stack_bb), 3))
+        if tag in self._seeded:
+            return
+        self._seeded.add(tag)
         from aof_cfr.profiler import _base_arrays_seathist, _query_base_push
         for (seat, hist) in _base_arrays_seathist(num_players, stack_bb, _query_base_push):
-            push, total = db.cell(identity, aggregate_infoset_key(seat, hist, stack_bb))
+            agg = aggregate_infoset_key(seat, hist, stack_bb)
+            if (identity, agg) in self._d:
+                continue                                   # don't clobber a live read
+            push, total = db.cell(identity, agg)
             if total > 0:
-                key = (identity, aggregate_infoset_key(seat, hist, stack_bb))
-                d = self._d.setdefault(key, _Dual())
+                d = self._d.setdefault((identity, agg), _Dual())
                 d.ws, d.ss = float(total), float(push)     # seed slow with lifetime aggregate
 
     # -- read --
@@ -152,6 +169,17 @@ class AdaptiveOpponentModel:
         return {"rate": float(np.clip(rate, 0.0, 1.0)), "slow": float(slow),
                 "fast": (None if fast is None else float(fast)), "eff_n": float(eff),
                 "confidence": float(eff / (eff + S)), "adapting": bool(adapting)}
+
+    def opponent_confidence(self, identity: str) -> float:
+        """Per-opponent scalar for the router gate. Effective decayed sample over all infosets ->
+        confidence, floored by ``population_confidence`` (so cold-start exploitation of the field
+        prior can fire before any per-opponent data). Mirrors the DB ``n_obs`` confidence, but the
+        weight DECAYS, so a long-absent / changed opponent's confidence relaxes back down."""
+        if not identity:
+            return 0.0
+        eff = sum(d.ws for (i, _k), d in self._d.items() if i == identity)
+        personal = eff / (eff + self.prior_strength) if eff > 0 else 0.0
+        return float(max(self.population_confidence, personal))
 
     def push_rate(self, identity, num_players, seat, hist, stack_bb) -> float:
         return self.estimate(identity, num_players, seat, hist, stack_bb)["rate"]
@@ -178,6 +206,24 @@ class AdaptiveOpponentModel:
             ident, key = k.split("\x1f", 1)
             self._d[(ident, key)] = _Dual(*[float(x) for x in v])
         return self
+
+    # -- on-disk persistence (atomic; crash-safe) --
+    def load(self) -> "AdaptiveOpponentModel":
+        if self.path and Path(self.path).is_file():
+            try:
+                self.load_dict(json.loads(Path(self.path).read_text(encoding="utf-8")).get("duals", {}))
+            except (OSError, ValueError):
+                pass
+        return self
+
+    def save(self) -> None:
+        if not self.path:
+            return
+        p = Path(self.path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps({"duals": self.to_dict()}, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
 
 
 def estimate_policy_rows_adaptive(model: AdaptiveOpponentModel, identity: str, num_players: int,
