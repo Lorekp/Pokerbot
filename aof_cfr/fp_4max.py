@@ -80,11 +80,21 @@ def solve_4max_fp(
     method = "mc_combo_br_legal_split"
     converged = False
     per_player = br_per_round
+    # Held-out CRN seed for the gap, FIXED across rounds (disjoint from the BR seeds
+    # seed+10_000*rnd+p). Measuring every round on the SAME deal batch makes the stability window
+    # compare like-with-like, so a "stable" verdict reflects policy convergence, not MC luck between
+    # different batches (was seed+rnd -> a new batch each round).
+    gap_seed = seed + 777_001
+    if gap_every and (max_rounds // gap_every) < tracker.window:
+        print(f"  WARNING: max_rounds={max_rounds} / gap_every={gap_every} = "
+              f"{max_rounds // gap_every} gap measurements < stability window {tracker.window}; "
+              "convergence cannot be confirmed (converged will stay False). Raise max_rounds or "
+              "lower gap_every.", flush=True)
 
     def _measure(rnd: int) -> bool:
         nonlocal gap, imps, method, converged
         gap, imps, method = estimate_nash_conv_mc(
-            NUM_PLAYERS, avg, samples=br_samples, seed=seed + rnd, stack_bb=stack_bb
+            NUM_PLAYERS, avg, samples=br_samples, seed=gap_seed, stack_bb=stack_bb
         )
         utg_keys = sorted(k for k in avg if k.startswith("UTG|"))[:169]
         utg = np.array([avg[k][1] for k in utg_keys]) if len(utg_keys) == 169 else np.zeros(169)

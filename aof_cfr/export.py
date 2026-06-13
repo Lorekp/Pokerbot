@@ -26,13 +26,21 @@ def _git_hash() -> str:
 
 
 def export_policy_npz(path: Path, result: SolveResult) -> None:
+    from aof_cfr.pushfold_payoffs import flat_fee_default, game_model_default
+
     keys = sorted(result.policy_rows.keys())
     probs = np.stack([result.policy_rows[k] for k in keys], axis=0).astype(np.float32)
+    # Stamp the game model / fee / key-spec the policy was solved under, mirroring the 4-max batch
+    # stamp (exploit_router._router_batch). load_cfr_base hard-rejects a stamped NPZ that disagrees
+    # with the runtime model, closing the stale-base poisoning vector on the GTO blueprint path.
     np.savez_compressed(
         path,
         infoset_keys=np.array(keys, dtype=object),
         action_probs=probs,
         num_players=np.int32(result.num_players),
+        game_model=np.int64(game_model_default()),
+        flat_fee=np.float64(flat_fee_default()),
+        infoset_key_spec_hash=np.str_(infoset_key_spec_hash()),
     )
 
 

@@ -67,11 +67,13 @@ def _query_base_push(num_players: int, position: str, history: str, hand: str, s
 
 
 def posterior_push(push: int, total: int, base_p: float, prior_strength: float) -> float:
-    return (push + prior_strength * base_p) / (total + prior_strength)
+    s = max(float(prior_strength), 1e-9)   # guard 0/0 when prior_strength==0 and total==0
+    return (push + s * base_p) / (total + s)
 
 
 def infoset_confidence(total: int, prior_strength: float) -> float:
-    return total / (total + prior_strength)
+    s = max(float(prior_strength), 1e-9)   # guard 0/0 when prior_strength==0 and total==0
+    return total / (total + s)
 
 
 def _seat_infosets(num_players: int, seat_idx: int, stack_bb: float):

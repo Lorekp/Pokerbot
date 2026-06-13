@@ -44,7 +44,7 @@ def test_report_artifact_shape(tmp_path) -> None:
     import json
 
     from aof_cfr.evalsuite.ingest_audit import ingest_audit_cell
-    from aof_cfr.evalsuite.result import FLAT_FEE_BB100, AoFEvalCell, write_report
+    from aof_cfr.evalsuite.result import AoFEvalCell, write_report
     cells = [ingest_audit_cell(hands=50),
              AoFEvalCell(metric="winrate", players=3, depth=8.0, field_name="all_leaky",
                          arm="gto", hands=100, seeds=2, mean_bb100=10.0, se_bb100=1.0,
@@ -55,9 +55,22 @@ def test_report_artifact_shape(tmp_path) -> None:
     for k in ("suite_version", "git_sha", "cfr_base_manifest_hash", "infoset_key_spec_hash",
               "game_model_version", "flat_fee_bb_per_hand", "seeds", "timestamp"):
         assert k in h
-    wr = next(c for c in data["cells"] if c["metric"] == "winrate")
-    assert wr["net_bb100"] == pytest.approx(10.0 - FLAT_FEE_BB100)   # the breakeven bar
     assert p.parent.name == "testtag"
+
+
+def test_net_bb100_both_fee_branches(monkeypatch) -> None:
+    """net_bb100 must follow the ACTUAL fee config, not a hard-coded branch. Fee-in-model (the
+    shipped 0.12BB) -> net == gross (settlements already charge it); legacy no-fee artifact ->
+    net = gross - 12 bb/100 (the deliberately conservative breakeven floor). Pins both, since the
+    shipped path (net==gross) previously had no assertion and a flipped branch passed silently."""
+    import aof_cfr.pushfold_payoffs as pf
+    from aof_cfr.evalsuite.result import FLAT_FEE_BB100, AoFEvalCell
+    cell = AoFEvalCell(metric="winrate", players=3, depth=8.0, field_name="all_leaky", arm="gto",
+                       hands=100, seeds=2, mean_bb100=10.0, se_bb100=1.0, ci95_bb100=2.0)
+    monkeypatch.setattr(pf, "flat_fee_default", lambda: 0.12)
+    assert cell.net_bb100 == pytest.approx(10.0)                       # fee in model -> net == gross
+    monkeypatch.setattr(pf, "flat_fee_default", lambda: 0.0)
+    assert cell.net_bb100 == pytest.approx(10.0 - FLAT_FEE_BB100)      # legacy floor
 
 
 @needs_base

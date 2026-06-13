@@ -32,11 +32,7 @@ def card_id(card: str) -> int:
 
 
 def id_to_card(cid: int) -> str:
-    _ensure_card_ids()
-    for c, i in _CARD_ID_CACHE.items():
-        if i == cid:
-            return c
-    raise KeyError(cid)
+    return card_from_id(cid)   # reuse the cached reverse map (was an O(52) scan per call)
 
 
 def all_card_ids() -> tuple[int, ...]:

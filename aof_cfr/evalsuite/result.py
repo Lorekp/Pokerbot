@@ -107,8 +107,16 @@ def write_report(cells: list[AoFEvalCell], out_dir: str | Path, *, seeds=(), tag
     sub = tag if tag else f"{header['timestamp'].replace(':', '').replace('+0000', 'Z')}_{header['git_sha']}"
     d = Path(out_dir) / sub
     d.mkdir(parents=True, exist_ok=True)
+    # A GATED cell is one with a gate expression. passed True -> pass, False -> fail, None on a
+    # gated cell -> ABSTENTION (e.g. underpowered safety cell): it must NOT read as a pass. We fail
+    # the suite verdict on any failure OR abstention, and surface the counts so a "certified" run
+    # can't quietly have skipped a gate. (Ungated/informational cells have gate=None and are ignored.)
+    gated = [c for c in cells if c.gate is not None]
+    n_failed = sum(1 for c in gated if c.passed is False)
+    n_skipped = sum(1 for c in gated if c.passed is None)
     payload = {"header": header,
-               "gates": {"all_passed": all(c.passed for c in cells if c.passed is not None)},
+               "gates": {"all_passed": (n_failed == 0 and n_skipped == 0),
+                         "n_gated": len(gated), "n_failed": n_failed, "n_skipped": n_skipped},
                "cells": [c.to_dict() for c in cells]}
     p = d / "metrics.json"
     p.write_text(json.dumps(payload, indent=1), encoding="utf-8")

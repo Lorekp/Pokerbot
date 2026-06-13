@@ -87,9 +87,9 @@ def validate_manifest(base_dir: Path, *, trio_path: Path) -> dict[str, object]:
         if n == 2:
             ok = mbb <= TARGET_MBBG_HU
         elif n == 3:
-            # "exact" / "exact_legal_marginalized" are both exact BR methods (the latter is
-            # the legal, non-clairvoyant marginalization — the canonical one post-fix).
-            ok = str(table.get("br_method", "")).startswith("exact")
+            # "exact" / "exact_legal_marginalized" / "legal_fp" are all exact-BR methods; the
+            # "legal*" ones are the non-clairvoyant marginalization (the canonical one post-fix).
+            ok = str(table.get("br_method", "")).startswith(("exact", "legal"))
             ok = ok and solver == FP_SOLVER_3
             if trivial:
                 push_t = trivial["always_push"]

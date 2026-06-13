@@ -76,20 +76,34 @@ def nash_gap_mbbg(n: int, stack_bb: float, *, samples: int = 48000, seed: int = 
     return out
 
 
-def nash_gate_cells(depths=(4.0, 8.0, 12.0, 20.0), *, samples: int = 48000):
+def nash_gate_cells(depths=(4.0, 8.0, 12.0, 20.0), *, samples: int = 48000, seeds=(1234, 5678)):
+    """NashConv gate cells. n=2/3 are analytic (deterministic, exact — one pass). n=4 is split-MC
+    and seed-NOISY: run >=2 seeds, report the real se/ci95, and gate on the PESSIMISTIC bound
+    ``mean + ci95`` so a single lucky draw can't pass (was: one seed, fake se=ci=0)."""
+    from aof_cfr.evalsuite.paired_arena import ci95_from_seeds
     from aof_cfr.evalsuite.result import AoFEvalCell
     cells = []
     for n in (2, 3, 4):
         for d in depths:
-            r = nash_gap_mbbg(n, d, samples=samples)
             gate = GATE_MBBG[n]
+            if n == 4:
+                vals = [nash_gap_mbbg(n, d, samples=samples, seed=s)["mbbg"] for s in seeds]
+                mean, ci = ci95_from_seeds(vals)
+                se = (ci / 2.0) if ci != float("inf") else 0.0
+                passed = (mean + ci) <= gate            # conservative: lucky seed can't sneak through
+                method = f"split_mc_vec @ {samples} x{len(seeds)}seeds"
+                n_seeds = len(seeds)
+            else:
+                r = nash_gap_mbbg(n, d, samples=samples)  # analytic legal BR -> deterministic
+                mean, ci, se, method, n_seeds = r["mbbg"], 0.0, 0.0, r["method"], 1
+                passed = mean <= gate
             cells.append(AoFEvalCell(
                 metric="nash_gap", players=n, depth=d, field_name="-", arm="-",
-                hands=samples if n == 4 else 0, seeds=1,
-                mean_bb100=round(r["mbbg"], 3), se_bb100=0.0, ci95_bb100=0.0,
-                gate=f"legal NashConv <= {gate} mbb/g",
-                passed=r["mbbg"] <= gate,
-                meta={"method": r["method"], "unit": "mbb/g"}))
+                hands=samples if n == 4 else 0, seeds=n_seeds,
+                mean_bb100=round(mean, 3), se_bb100=round(se, 3), ci95_bb100=round(ci, 3),
+                gate=f"legal NashConv {'mean+ci95 ' if n == 4 else ''}<= {gate} mbb/g",
+                passed=passed,
+                meta={"method": method, "unit": "mbb/g"}))
     return cells
 
 

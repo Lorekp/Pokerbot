@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 
-from aof_cfr.buckets import LABELS_169, bucket_index
+from aof_cfr.buckets import COMBOS_169, LABELS_169, bucket_index
 
 INFOSET_KEY_VERSION = 2
 
@@ -64,6 +64,10 @@ def history_after_action(history: str, action_token: str) -> str:
 
 
 def infoset_key_spec_hash() -> str:
+    # Cover the ACTUAL bucket CONTENTS, not just the count + a label string: hash the ordered
+    # LABELS_169 (the index every cached NPZ / opponent-DB cell is aligned to) and a signature of the
+    # combo->bucket assignment (COMBOS_169). A bucket reorder or a card-assignment change now bumps
+    # the hash, so stale artifacts are detected instead of silently mis-indexing every push prob.
     payload = json.dumps(
         {
             "version": INFOSET_KEY_VERSION,
@@ -71,7 +75,8 @@ def infoset_key_spec_hash() -> str:
             "history_tokens": ["F", "A"],
             "root_history": "-",
             "n_buckets": len(LABELS_169),
-            "bucket_order": "hu_preflop_dcfr._build_169_buckets",
+            "bucket_labels": list(LABELS_169),
+            "bucket_combos_sig": hashlib.sha256(repr(COMBOS_169).encode()).hexdigest()[:16],
             "stack_depth_buckets": list(STACK_DEPTH_BUCKETS),
         },
         sort_keys=True,

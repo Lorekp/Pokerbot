@@ -86,13 +86,32 @@ def _file_lock(lock_path: Path, timeout: float = 10.0, poll: float = 0.03):
             pass
 
 
+def _ordered_set(*iterables) -> dict:
+    """An insertion-ordered set (dict keys). Earlier iterables = older entries, kept first; a
+    later duplicate does NOT move an id. Used so the seen_hands recency window is FIFO by arrival,
+    not lexicographic by id (hand ids are namespaced ``table_id:hid`` and do NOT sort by time)."""
+    out: dict = {}
+    for it in iterables:
+        for x in it:
+            if x not in out:
+                out[x] = None
+    return out
+
+
+def _cap_recent(seen: dict, cap: int) -> dict:
+    """Keep the most-recently-added ``cap`` ids (evict from the front), preserving order."""
+    if len(seen) <= cap:
+        return seen
+    return dict.fromkeys(list(seen)[-cap:])
+
+
 @dataclass
 class AoFOpponentDB:
     path: Path = field(default_factory=lambda: Path(DEFAULT_PATH))
     # identity -> {infoset_key: [push_count, total_count]}
     counts: dict[str, dict[str, list[int]]] = field(default_factory=dict)
     names: dict[str, str] = field(default_factory=dict)
-    seen_hands: set[str] = field(default_factory=set)
+    seen_hands: dict = field(default_factory=dict)   # insertion-ordered set (FIFO recency, see _ordered_set)
     _dirty: bool = False
     _lock: threading.RLock = field(default=None, init=False, repr=False, compare=False)
     _io_lock: threading.Lock = field(default=None, init=False, repr=False, compare=False)
@@ -129,7 +148,7 @@ class AoFOpponentDB:
                 return
             self.counts = _coerce_counts(raw.get("counts"))
             self.names = dict(raw.get("names") or {})
-            self.seen_hands = set(raw.get("seen_hands") or [])
+            self.seen_hands = dict.fromkeys(raw.get("seen_hands") or [])   # preserve persisted order
             self._persisted = copy.deepcopy(self.counts)  # baseline for delta-merge saves
         self._fold_sidecars()  # recover any lock-timeout deltas other runs left behind
 
@@ -151,7 +170,7 @@ class AoFOpponentDB:
             with self._lock:
                 counts_snap = copy.deepcopy(self.counts)  # consistent snapshot + matching baseline
                 names_snap = dict(self.names)
-                seen_snap = set(self.seen_hands)
+                seen_snap = dict(self.seen_hands)         # ordered copy
                 baseline = self._persisted or {}
             self.path.parent.mkdir(parents=True, exist_ok=True)
             out_counts, out_names, out_seen = counts_snap, names_snap, seen_snap
@@ -171,11 +190,11 @@ class AoFOpponentDB:
                     extra = self._collect_sidecars()
                     if disk:  # fold our delta over other processes' on-disk contributions
                         out_counts = _merge_counts(disk.get("counts", {}), baseline, counts_snap)
-                        out_seen = seen_snap | set(disk.get("seen_hands") or [])
+                        out_seen = _ordered_set(disk.get("seen_hands") or [], seen_snap)  # disk older, ours newer
                         out_names = dict(disk.get("names") or {}); out_names.update(names_snap)
                     for sc in extra:                          # fold parked deltas too
                         out_counts = _merge_counts(out_counts, {}, sc.get("counts", {}))
-                        out_seen |= set(sc.get("seen_hands") or [])
+                        out_seen = _ordered_set(out_seen, sc.get("seen_hands") or [])
                         out_names.update(sc.get("names") or {})
                     self._atomic_write(out_counts, out_names, out_seen)
                     self._remove_sidecars()
@@ -189,10 +208,10 @@ class AoFOpponentDB:
     def _sidecar_glob(self):
         return self.path.parent.glob(self.path.name + ".delta.*")
 
-    def _write_sidecar(self, counts_delta: dict, names: dict, seen: set) -> None:
+    def _write_sidecar(self, counts_delta: dict, names: dict, seen) -> None:
         sc = self.path.with_name(
             f"{self.path.name}.delta.{os.getpid()}-{threading.get_ident()}-{int(time.time()*1000)}")
-        payload = {"counts": counts_delta, "names": names, "seen_hands": sorted(seen)}
+        payload = {"counts": counts_delta, "names": names, "seen_hands": list(seen)}  # preserve order
         try:
             sc.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             print(f"AoFOpponentDB: merge lock timed out; parked delta in {sc.name}")
@@ -229,7 +248,8 @@ class AoFOpponentDB:
                     for k, v in rows.items():
                         cell = mine.setdefault(k, [0, 0])
                         cell[0] += int(v[0]); cell[1] += int(v[1])
-                self.seen_hands |= set(sc.get("seen_hands") or [])
+                for hid in sc.get("seen_hands") or []:
+                    self.seen_hands.setdefault(hid, None)
                 self.names.update(sc.get("names") or {})
             self._dirty = True
         self._remove_sidecars()
@@ -244,12 +264,12 @@ class AoFOpponentDB:
             return None  # corrupt -> caller skips merge, just overwrites with our snapshot
 
     def _atomic_write(self, counts, names, seen) -> None:
-        seen_sorted = sorted(seen)
-        if len(seen_sorted) > SEEN_HANDS_CAP:           # keep the recent window (ids sort by time)
-            seen_sorted = seen_sorted[-SEEN_HANDS_CAP:]
+        seen_list = list(seen)                          # insertion-ordered (dict keys); NOT re-sorted
+        if len(seen_list) > SEEN_HANDS_CAP:             # keep the most-recent window (FIFO by arrival)
+            seen_list = seen_list[-SEEN_HANDS_CAP:]
         payload = {"schema_version": SCHEMA_VERSION,
                    "infoset_key_spec_hash": _spec_hash(),
-                   "counts": counts, "names": names, "seen_hands": seen_sorted}
+                   "counts": counts, "names": names, "seen_hands": seen_list}
         tmp = self.path.with_suffix(self.path.suffix + f".tmp{os.getpid()}-{threading.get_ident()}")
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=0)
@@ -278,9 +298,9 @@ class AoFOpponentDB:
             if hand_id is not None:
                 if hand_id in self.seen_hands:
                     return 0
-                self.seen_hands.add(hand_id)
+                self.seen_hands[hand_id] = None
                 if len(self.seen_hands) > SEEN_HANDS_CAP + 50_000:   # bounded memory: keep the
-                    self.seen_hands = set(sorted(self.seen_hands)[-SEEN_HANDS_CAP:])  # recent window
+                    self.seen_hands = _cap_recent(self.seen_hands, SEEN_HANDS_CAP)  # recent window (FIFO)
             n = 0
             for identity, infoset_key, pushed in observations:
                 if not identity:

@@ -25,6 +25,7 @@ class SolveResult:
     player_improvements: list[float] | None
     policy_rows: dict[str, np.ndarray]
     nash_disclaimer: str | None = None
+    converged: bool = True   # analytic/CFR+ paths are exact; the MCCFR loop sets this from the target
 
 
 def _bb_to_mbbg(bb_per_hand: float) -> float:
@@ -99,8 +100,13 @@ def solve_hu_cfr_plus(
     *,
     iterations: int = 2000,
     eq_matrix_path: str = "",
-    use_efg: bool = True,
+    use_efg: bool = False,
 ) -> SolveResult:
+    """Solve the HU push/fold base. Default = the matrix DCFR path (``use_efg=False``), which prices
+    each seat's EV independently and is fee-correct. The EFG/OpenSpiel path (``use_efg=True``) mirrors
+    ``BB = -SB`` at every terminal, which is exactly zero-sum and therefore CANNOT represent the flat
+    showdown fee (``sum`` would be 0, not ``-fee``); it also uses a uniform 1/169² deal chance model.
+    It is guarded to refuse a fee'd solve below — keep it False for any shipped base under a fee."""
     from pathlib import Path
 
     from aof_cfr.efg_hu import load_hu_efg_game, write_hu_efg
@@ -115,6 +121,12 @@ def solve_hu_cfr_plus(
         eq = build_hu_bucket_equity_matrix(progress=False)
 
     if use_efg:
+        from aof_cfr.pushfold_payoffs import flat_fee_default
+        if flat_fee_default() > 0:
+            raise ValueError(
+                "EFG HU representation is fee-free (BB=-SB mirroring is exactly zero-sum) and cannot "
+                f"model the {flat_fee_default()}BB flat fee; solve with use_efg=False (matrix DCFR) "
+                "under a fee, or set AOF_FLAT_FEE_BB=0 to solve the no-fee base.")
         out_efg = Path("data/aof/cfr_base/hu_pushfold.efg")
         write_hu_efg(out_efg, eq)
         game = load_hu_efg_game(eq)
@@ -165,7 +177,7 @@ def solve_3max_cfr_plus(
         )
     from aof_cfr.trio_payoff_tensor import load_trio_tensor
 
-    from aof_cfr.fp_br import nash_gap_3max
+    from aof_cfr.fp_br import nash_gap_3max_legal
     from aof_cfr.pushfold_payoffs import build_static_payoffs
 
     shares, pair_eq, deal_w = load_trio_tensor(path)
@@ -179,7 +191,10 @@ def solve_3max_cfr_plus(
     )
     rows = trio_policy_rows(result)
     bb = result.exploitability_bb
-    _, imps = nash_gap_3max(
+    # LEGAL (imperfect-info) per-player improvements — NOT the clairvoyant nash_gap_3max, which sees
+    # opponents' cards and over-states the gap ~3x. The headline `bb` already comes from the solver's
+    # own legal exploitability; player_improvements must use the same legal metric to be consistent.
+    _, imps = nash_gap_3max_legal(
         build_static_payoffs(shares, pair_eq),
         deal_w,
         result.btn_push_freq,
@@ -197,11 +212,12 @@ def solve_3max_cfr_plus(
         seed=seed,
         exploitability_bb_per_hand=bb,
         exploitability_mbb_g=_bb_to_mbbg(bb),
-        br_method="exact",
+        br_method="legal_fp",
         player_improvements=imps,
         policy_rows=rows,
         nash_disclaimer=(
-            "N=3: exploitability is exact tabular best-response gain over bucket deal."
+            "N=3: exploitability is the legal (imperfect-information) best-response gain over the "
+            "bucket deal."
         ),
     )
 
@@ -364,6 +380,7 @@ def solve_pushfold_mccfr(
             player_improvements=imps,
             policy_rows=rows,
             nash_disclaimer=disclaimer,
+            converged=True,
         )
     for step in range(iterations + check_every, max_iterations + 1, check_every):
         print(f"  continuing to {step} iterations ...", flush=True)
@@ -383,6 +400,10 @@ def solve_pushfold_mccfr(
         "N>2: exploitability reported as sum of unilateral best-response gains "
         "(MC combo-deal estimate; not certified unique Nash equilibrium)."
     )
+    converged = mbb <= target_mbb_g
+    if not converged:
+        print(f"  WARNING: did not reach target {target_mbb_g} mbb/g after {done} iters "
+              f"(final {mbb:.2f}); returning UNCONVERGED policy (converged=False).", flush=True)
     return SolveResult(
         num_players=num_players,
         solver_name="external_sampling_mccfr",
@@ -394,4 +415,5 @@ def solve_pushfold_mccfr(
         player_improvements=imps,
         policy_rows=rows,
         nash_disclaimer=disclaimer,
+        converged=converged,
     )

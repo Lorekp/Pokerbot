@@ -447,7 +447,7 @@ def main() -> int:
     probs, keys, _ = q._LOADED[3]
     print(f"  3p infosets loaded: {len(keys)}")
     spec = infoset_key_spec_hash()
-    print(f"  infoset_key_spec_hash: {spec} (expect 81f2a6a86d2cc429)")
+    print(f"  infoset_key_spec_hash: {spec} (expect 4c5aa1d7e7048a2e)")
     man = json.loads(MANIFEST.read_text(encoding="utf-8"))
     t3 = next(t for t in man["tables"] if t["num_players"] == 3)
     print(f"  manifest 3p solver: {t3['solver']}  exploitability_mbb_g: {t3['exploitability_mbb_g']:.2f}")

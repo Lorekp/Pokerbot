@@ -81,7 +81,10 @@ def counter_exploiter_cell(cfg: ArenaConfig, *, refresh_every: int = 250,
         hands=out["arms"]["adaptive_online"].hands, seeds=len(cfg.seeds),
         mean_bb100=round(m, 3), se_bb100=round(ci / 2, 3), ci95_bb100=round(ci, 3),
         gate=f"uplift_vs_gto >= {loss_floor_bb100} bb/100 (cost of being modeled bounded)",
-        passed=(m - ci) >= loss_floor_bb100 or m >= loss_floor_bb100,
+        # Conservative: the LOWER CI bound of the (signed) uplift must clear the loss floor. The old
+        # `or m >= floor` clause was dead (m >= m-ci always) so it collapsed the gate to the point
+        # estimate, letting a noisy cell (e.g. -1.4 ± 5.0) pass the safety bound on luck.
+        passed=(m - ci) >= loss_floor_bb100,
         meta={"refresh_every": refresh_every})
 
 

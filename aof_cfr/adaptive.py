@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -221,6 +222,16 @@ class AdaptiveOpponentModel:
         personal = eff / (eff + self.prior_strength) if eff > 0 else 0.0
         return float(max(self.population_confidence, personal))
 
+    def opponent_eff_n(self, identity: str) -> float:
+        """The opponent's TRUE effective (decayed) sample size — the same ``eff`` that backs
+        ``opponent_confidence`` but WITHOUT the population-confidence floor. The router's LCB
+        pessimism uses this directly instead of inverting the floored confidence with a mismatched
+        prior strength (see exploit_router._eff_n_for)."""
+        if not identity:
+            return 0.0
+        with self._mu:
+            return float(sum(d.ws for (i, _k), d in self._d.items() if i == identity))
+
     def push_rate(self, identity, num_players, seat, hist, stack_bb) -> float:
         return self.estimate(identity, num_players, seat, hist, stack_bb)["rate"]
 
@@ -274,7 +285,7 @@ class AdaptiveOpponentModel:
         from aof_cfr.infoset import infoset_key_spec_hash
         p = Path(self.path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(p.suffix + f".tmp{os.getpid()}")
+        tmp = p.with_suffix(p.suffix + f".tmp{os.getpid()}-{threading.get_ident()}")
         payload = {"schema_version": 1, "infoset_key_spec_hash": infoset_key_spec_hash(),
                    "duals": self.to_dict()}
         with open(tmp, "w", encoding="utf-8") as fh:

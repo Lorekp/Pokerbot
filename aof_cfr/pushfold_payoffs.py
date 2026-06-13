@@ -48,7 +48,7 @@ def game_model_default() -> int:
     """Runtime game model: env ``AOF_GAME_MODEL`` override, else the shipped manifest's
     ``game_model_version`` (the model the base artifacts were SOLVED under), else 1."""
     env = os.environ.get("AOF_GAME_MODEL")
-    if env:
+    if env not in (None, ""):
         return int(env)
     if "v" not in _GM_CACHE:
         try:
@@ -80,7 +80,7 @@ def flat_fee_default() -> float:
     re-examination with more captures. Env ``AOF_FLAT_FEE_BB`` overrides the shipped
     manifest's ``flat_fee_bb``; 0.0 when neither is set (legacy no-fee artifacts)."""
     env = os.environ.get("AOF_FLAT_FEE_BB")
-    if env:
+    if env not in (None, ""):
         return float(env)
     if "fee" not in _GM_CACHE:
         try:
