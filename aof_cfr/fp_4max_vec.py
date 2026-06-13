@@ -72,15 +72,19 @@ def sample_deals(n_deals: int, seed: int) -> np.ndarray:
     return buckets, holes
 
 
-def precompute_payoffs(holes: list, stack_bb: float) -> np.ndarray:
-    """(n_outcomes, n_deals, 4) net-bb payoff per outcome, via the validated terminal model."""
+def precompute_payoffs(holes: list, stack_bb: float, *, game_model: int | None = None) -> np.ndarray:
+    """(n_outcomes, n_deals, 4) net-bb payoff per outcome, via the shared terminal model.
+
+    ``game_model`` selects the contested-pot convention (None -> the shipped manifest's);
+    batches written to disk embed it so the router can reject stale-model files."""
     seats = active_seats(NUM_PLAYERS)
     n = len(holes)
     pay = np.zeros((len(_OUTCOMES), n, NUM_PLAYERS), dtype=np.float64)
     for oi, o in enumerate(_OUTCOMES):
         folded = set(o["folded"])
         for d in range(n):
-            pay[oi, d, :] = _terminal_returns(NUM_PLAYERS, seats, holes[d], folded, stack_bb)
+            pay[oi, d, :] = _terminal_returns(NUM_PLAYERS, seats, holes[d], folded, stack_bb,
+                                              game_model=game_model)
     return pay
 
 
@@ -122,7 +126,16 @@ def _br_marginals(pol: _Policy, buckets: np.ndarray, payoffs: np.ndarray, infose
 
     Returns (num_push, num_fold, den) dicts keyed by (player, hist) -> (169,). For each player
     the legal best response is ``num_push >= num_fold`` per own-hand bucket; ``den`` is the
-    reach weight. Opponents act on-policy downstream (no clairvoyance)."""
+    infoset reach weight. Opponents act on-policy downstream (no clairvoyance).
+
+    ``den`` accumulates over the PUSH branch only: an infoset's outcomes split into
+    push-continuations and fold-continuations, and EACH branch's reach (own action factor
+    excluded) sums to the full infoset reach — downstream actors' F/A factors sum to 1, and
+    the collapsed FFF outcome (no BB act) mirrors the FFA·{F,A} pair exactly. Accumulating
+    both branches (the old behavior) double-counted: den = 2x reach, silently HALVING every
+    ``num/den`` EV downstream — the router's ev_gain gate demanded twice the configured edge
+    in 4-max only, and advise()/coach() reported 4-max EVs at half scale. The solver paths
+    (``legal_nash_gap_4max``, FP) never divide by den and were unaffected."""
     n = buckets.shape[0]
     facs = _reach_factors(pol, buckets)
     num_push = {k: np.zeros(N_BUCKETS) for k in infosets}
@@ -137,7 +150,8 @@ def _br_marginals(pol: _Policy, buckets: np.ndarray, payoffs: np.ndarray, infose
                     re = re * f
             tgt = num_push if app == "A" else num_fold
             np.add.at(tgt[(pp, hpp)], buckets[:, pp], re * payoffs[oi, :, pp])
-            np.add.at(den[(pp, hpp)], buckets[:, pp], re)
+            if app == "A":
+                np.add.at(den[(pp, hpp)], buckets[:, pp], re)
     return num_push, num_fold, den
 
 

@@ -52,6 +52,12 @@ def export_manifest(
     }
     if merge_existing and path.is_file():
         old = json.loads(path.read_text(encoding="utf-8"))
+        # Carry over EVERYTHING from the existing manifest, not just tables — otherwise a
+        # later per-table re-solve (e.g. the 4-max script) silently drops the other solvers'
+        # extras (depth_grid, stack_depth_buckets, ...). Fresh core fields + extra overwrite.
+        for k, v in old.items():
+            if k not in ("schema_version", "git_hash", "infoset_key_spec_hash"):
+                payload[k] = v
         payload["tables"] = list(old.get("tables", []))
     if hu_validation:
         payload["hu_validation"] = hu_validation

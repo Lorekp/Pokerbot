@@ -14,12 +14,20 @@ DEFAULT_EQ = Path("data/aof/cfr_base/hu_eq_matrix.npz")
 DEFAULT_JSON_ORACLE = Path("data/aof/hu_pushfold_8bb.json")
 
 
-def load_policy_freqs(npz_path: Path) -> tuple[np.ndarray, np.ndarray]:
+def load_policy_freqs(npz_path: Path, *, depth: float = 8.0) -> tuple[np.ndarray, np.ndarray]:
+    """SB jam / BB call freqs at ONE depth bucket (the oracle solves a single depth).
+
+    Previously unfiltered: every depth overwrote the arrays and the d8 result emerged only
+    because 'd8' happens to sort last among the bucket suffixes. Now explicit."""
+    from aof_cfr.infoset import stack_depth_bucket
+    want = float(stack_depth_bucket(depth))
     data = np.load(npz_path, allow_pickle=True)
     sb = np.zeros(len(LABELS_169), dtype=np.float64)
     bb = np.zeros(len(LABELS_169), dtype=np.float64)
     for key, probs in zip(data["infoset_keys"], data["action_probs"]):
-        pos, bucket, hist, _depth = decode_infoset_key(str(key))
+        pos, bucket, hist, d = decode_infoset_key(str(key))
+        if float(d) != want:
+            continue
         idx = LABEL_TO_INDEX[bucket]
         if pos == "SB" and hist == "-":
             sb[idx] = float(probs[1])
@@ -31,8 +39,8 @@ def load_policy_freqs(npz_path: Path) -> tuple[np.ndarray, np.ndarray]:
 def dcfr_oracle_freqs(
     eq_path: Path = DEFAULT_EQ,
     *,
-    iterations: int = 2500,
-    seed: int = 42,
+    iterations: int = 8000,   # must match-or-exceed the shipped solve's iterations: at 2500
+    seed: int = 42,           # vs 8000 the near-indifferent buckets differ by up to ~0.03
 ) -> tuple[np.ndarray, np.ndarray]:
     from pokerbot.solver.hu_preflop_dcfr import solve_hu_pushfold
 

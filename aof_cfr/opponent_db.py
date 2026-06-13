@@ -34,6 +34,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_PATH = "data/aof_player_profiles/profiles.json"
+SCHEMA_VERSION = 1
+SEEN_HANDS_CAP = 200_000   # dedup needs only a recent window; counts are already folded
+
+
+def _spec_hash() -> str:
+    from aof_cfr.infoset import infoset_key_spec_hash
+    return infoset_key_spec_hash()
 
 
 def identity_key(user_id: object | None, name: str | None) -> str | None:
@@ -111,10 +118,20 @@ class AoFOpponentDB:
                 self._backup_corrupt(exc)
                 self._persisted = {}
                 return
+            # Refuse-with-backup on an infoset-key-spec mismatch: counts keyed under a
+            # different spec would silently mix incompatible cells. Legacy files without the
+            # header are accepted (they predate the header, not the current spec).
+            stored_spec = raw.get("infoset_key_spec_hash")
+            if stored_spec is not None and stored_spec != _spec_hash():
+                self._backup_corrupt(ValueError(
+                    f"infoset key spec {stored_spec} != current {_spec_hash()}"))
+                self._persisted = {}
+                return
             self.counts = _coerce_counts(raw.get("counts"))
             self.names = dict(raw.get("names") or {})
             self.seen_hands = set(raw.get("seen_hands") or [])
             self._persisted = copy.deepcopy(self.counts)  # baseline for delta-merge saves
+        self._fold_sidecars()  # recover any lock-timeout deltas other runs left behind
 
     def _backup_corrupt(self, exc: Exception) -> None:
         try:
@@ -141,17 +158,81 @@ class AoFOpponentDB:
             if merge:
                 lock_path = self.path.with_suffix(self.path.suffix + ".lock")
                 with _file_lock(lock_path) as held:
-                    disk = self._read_disk() if held else None
+                    if not held:
+                        # NEVER clobber other processes' writes on a lock timeout: park OUR
+                        # delta in a sidecar; the next successful locked save/load folds it.
+                        self._write_sidecar(_delta_counts(baseline, counts_snap),
+                                            names_snap, seen_snap)
+                        with self._lock:
+                            self._persisted = counts_snap   # delta is parked, not pending
+                            self._dirty = False
+                        return
+                    disk = self._read_disk()
+                    extra = self._collect_sidecars()
                     if disk:  # fold our delta over other processes' on-disk contributions
                         out_counts = _merge_counts(disk.get("counts", {}), baseline, counts_snap)
                         out_seen = seen_snap | set(disk.get("seen_hands") or [])
                         out_names = dict(disk.get("names") or {}); out_names.update(names_snap)
+                    for sc in extra:                          # fold parked deltas too
+                        out_counts = _merge_counts(out_counts, {}, sc.get("counts", {}))
+                        out_seen |= set(sc.get("seen_hands") or [])
+                        out_names.update(sc.get("names") or {})
                     self._atomic_write(out_counts, out_names, out_seen)
+                    self._remove_sidecars()
             else:
                 self._atomic_write(out_counts, out_names, out_seen)
             with self._lock:
                 self._persisted = counts_snap  # baseline = what we just persisted our part of
                 self._dirty = False
+
+    # -- sidecar deltas (lock-timeout fallback that cannot clobber) -----------------------
+    def _sidecar_glob(self):
+        return self.path.parent.glob(self.path.name + ".delta.*")
+
+    def _write_sidecar(self, counts_delta: dict, names: dict, seen: set) -> None:
+        sc = self.path.with_name(
+            f"{self.path.name}.delta.{os.getpid()}-{threading.get_ident()}-{int(time.time()*1000)}")
+        payload = {"counts": counts_delta, "names": names, "seen_hands": sorted(seen)}
+        try:
+            sc.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            print(f"AoFOpponentDB: merge lock timed out; parked delta in {sc.name}")
+        except OSError:
+            pass  # best effort — worst case the delta persists at the next successful save
+
+    def _collect_sidecars(self) -> list[dict]:
+        out = []
+        for sc in self._sidecar_glob():
+            try:
+                raw = json.loads(sc.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    out.append(raw)
+            except (OSError, ValueError):
+                continue
+        return out
+
+    def _remove_sidecars(self) -> None:
+        for sc in self._sidecar_glob():
+            try:
+                os.unlink(sc)
+            except OSError:
+                pass
+
+    def _fold_sidecars(self) -> None:
+        """At load: adopt parked deltas into memory (they'll persist on the next save)."""
+        scs = self._collect_sidecars()
+        if not scs:
+            return
+        with self._lock:
+            for sc in scs:
+                for ident, rows in (sc.get("counts") or {}).items():
+                    mine = self.counts.setdefault(ident, {})
+                    for k, v in rows.items():
+                        cell = mine.setdefault(k, [0, 0])
+                        cell[0] += int(v[0]); cell[1] += int(v[1])
+                self.seen_hands |= set(sc.get("seen_hands") or [])
+                self.names.update(sc.get("names") or {})
+            self._dirty = True
+        self._remove_sidecars()
 
     def _read_disk(self) -> dict | None:
         if not self.path.exists():
@@ -163,7 +244,12 @@ class AoFOpponentDB:
             return None  # corrupt -> caller skips merge, just overwrites with our snapshot
 
     def _atomic_write(self, counts, names, seen) -> None:
-        payload = {"counts": counts, "names": names, "seen_hands": sorted(seen)}
+        seen_sorted = sorted(seen)
+        if len(seen_sorted) > SEEN_HANDS_CAP:           # keep the recent window (ids sort by time)
+            seen_sorted = seen_sorted[-SEEN_HANDS_CAP:]
+        payload = {"schema_version": SCHEMA_VERSION,
+                   "infoset_key_spec_hash": _spec_hash(),
+                   "counts": counts, "names": names, "seen_hands": seen_sorted}
         tmp = self.path.with_suffix(self.path.suffix + f".tmp{os.getpid()}-{threading.get_ident()}")
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=0)
@@ -193,6 +279,8 @@ class AoFOpponentDB:
                 if hand_id in self.seen_hands:
                     return 0
                 self.seen_hands.add(hand_id)
+                if len(self.seen_hands) > SEEN_HANDS_CAP + 50_000:   # bounded memory: keep the
+                    self.seen_hands = set(sorted(self.seen_hands)[-SEEN_HANDS_CAP:])  # recent window
             n = 0
             for identity, infoset_key, pushed in observations:
                 if not identity:
@@ -218,8 +306,24 @@ class AoFOpponentDB:
             return (int(c[0]), int(c[1])) if c else (0, 0)
 
     def n_obs(self, identity: str) -> int:
+        """True decision count for an identity.
+
+        When hand-agnostic aggregate cells exist (``pos|*|hist|d`` — the live keying), count
+        ONLY those: showdown reveals additionally record the same decision under its exact
+        per-bucket key, and counting both would double-count decisions and inflate confidence.
+        Per-bucket-only profiles (tests / offline analysis) keep the plain total."""
         with self._lock:
-            return sum(t for _, t in self.counts.get(identity, {}).values())
+            rows = self.counts.get(identity, {})
+            agg = sum(t for k, (_p, t) in rows.items() if "|*|" in k)
+            if agg:
+                return agg
+            return sum(t for _, t in rows.values())
+
+    def cells_for(self, identity: str) -> dict[str, tuple[int, int]]:
+        """Snapshot of every (infoset_key -> (push, total)) for an identity — one lock grab
+        instead of hundreds of ``cell()`` calls when an estimator scans buckets/depths."""
+        with self._lock:
+            return {k: (int(v[0]), int(v[1])) for k, v in self.counts.get(identity, {}).items()}
 
     def n_decisions(self, identity: str) -> int:
         """Distinct infosets observed for an identity (a cheap data-volume signal)."""
@@ -265,4 +369,17 @@ def _merge_counts(disk: dict, baseline: dict, current: dict) -> dict:
             cell = o.setdefault(k, [0, 0])
             cell[0] += int(cur[0]) - int(b[0])
             cell[1] += int(cur[1]) - int(b[1])
+    return out
+
+
+def _delta_counts(baseline: dict, current: dict) -> dict:
+    """current - baseline per cell (non-zero cells only) — this process's unsaved delta."""
+    out: dict = {}
+    for ident, rows in current.items():
+        base_rows = baseline.get(ident, {})
+        for k, cur in rows.items():
+            b = base_rows.get(k, (0, 0))
+            dp, dt = int(cur[0]) - int(b[0]), int(cur[1]) - int(b[1])
+            if dp or dt:
+                out.setdefault(ident, {})[k] = [dp, dt]
     return out

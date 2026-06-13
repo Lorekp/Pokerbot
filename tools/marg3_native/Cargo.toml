@@ -1,0 +1,26 @@
+[package]
+name = "marg3_native"
+version = "0.1.0"
+edition = "2021"
+description = "Bit-identical native cube kernel for the 3-max legal marginals (aof_cfr/fp_br.py)."
+
+[lib]
+name = "marg3_native"
+# rlib  -> `cargo test` runs the pure-Rust unit tests (no Python).
+# cdylib -> the importable CPython extension module (loaded by aof_cfr/marg3_native.py).
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# PyO3 with abi3 (stable ABI) so a single .pyd works across CPython 3.14+ without re-linking.
+pyo3 = { version = "0.28", features = ["abi3-py314", "extension-module"], optional = true }
+rayon = { version = "1", optional = true }
+
+[features]
+default = []
+python = ["dep:pyo3", "dep:rayon"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

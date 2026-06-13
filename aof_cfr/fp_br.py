@@ -105,6 +105,8 @@ def _legal_marginals_3max(
     btn_push: np.ndarray,
     sb_push: np.ndarray,
     bb_push: np.ndarray,
+    *,
+    keys: tuple[str, ...] | frozenset[str] | None = None,
 ) -> dict[str, tuple[np.ndarray, float, np.ndarray]]:
     """Single source for the LEGAL (imperfect-information) 3-max best response.
 
@@ -115,8 +117,19 @@ def _legal_marginals_3max(
     ``reach_w`` is the bucket's reach weight. The legal best response is pure: push iff
     ``E_push > E_fold``. ``best_responses_3max_legal`` / ``nash_gap_3max_legal`` /
     ``per_hand_legal_improvement_3max`` all read from here so they cannot drift.
+
+    ``keys`` (optional) restricts the computation to the requested marginal keys. Each
+    marginal is computed independently from byte-identical expressions, so skipping the
+    unrequested ones leaves the returned ones bit-for-bit unchanged — the arena's
+    ``routed_arrays`` only ever consumes the agent's own (1-3) marginals, so this avoids
+    the dominant cost of materializing the five unused 169^3 cubes per refresh.
     """
     t = TERMINAL
+    want = None if keys is None else frozenset(keys)
+
+    def need(k: str) -> bool:
+        return want is None or k in want
+
     pbtn = btn_push[:, None, None]
     psf = sb_push[0, :, None]
     psa = sb_push[1, :, None]
@@ -134,31 +147,83 @@ def _legal_marginals_3max(
         e_push = np.where(den > eps, np.sum(w * pc, axis=red) / np.maximum(den, eps), 0.0)
         return e_push, den
 
+    # Native fast path: a fused Rust kernel materializes the contiguous (w, prod=w*pc) cubes
+    # bit-identically (same per-element IEEE-754 op order as the NumPy broadcasts above), and we do the
+    # ORDER-SENSITIVE np.sum reductions here on those exact buffers — so the output equals the pure-NumPy
+    # path byte-for-byte (verified with np.array_equal in aof_cfr.marg3_native.verify_against_numpy).
+    # Absent the extension, _native_marg returns None and we fall through to the NumPy mix/_marg path.
+    _KEEP = {"btn": 0, "sb_f": 1, "sb_a": 1, "bb_fa": 2, "bb_af": 2, "bb_aa": 2}
+
+    def _native_marg(key: str):
+        try:
+            from aof_cfr import marg3_native
+        except Exception:
+            return None
+        built = marg3_native.build_cubes(key, st, deal_w, btn_push, sb_push, bb_push)
+        if built is None:
+            return None
+        w_cube, prod_cube = built
+        red = tuple(a for a in (0, 1, 2) if a != _KEEP[key])
+        den = np.sum(w_cube, axis=red)
+        e_push = np.where(den > eps, np.sum(prod_cube, axis=red) / np.maximum(den, eps), 0.0)
+        return e_push, den
+
+    out: dict[str, tuple[np.ndarray, float, np.ndarray]] = {}
+
     # BTN (axis 0): unconditional reach.
-    u_btn_after_sb_f = mix(paf, t.btn_win_uncontested_after_sb_fold, st.btn_bb_call0)
-    u_btn_after_sb_a = mix(paa, st.btn_sb_call0, st.three0)
-    u_btn_push0 = mix(psa, u_btn_after_sb_f, u_btn_after_sb_a)
-    btn_ep, btn_w = _marg(u_btn_push0, deal_w, 0)
+    if need("btn"):
+        nat = _native_marg("btn")
+        if nat is not None:
+            btn_ep, btn_w = nat
+        else:
+            u_btn_after_sb_f = mix(paf, t.btn_win_uncontested_after_sb_fold, st.btn_bb_call0)
+            u_btn_after_sb_a = mix(paa, st.btn_sb_call0, st.three0)
+            u_btn_push0 = mix(psa, u_btn_after_sb_f, u_btn_after_sb_a)
+            btn_ep, btn_w = _marg(u_btn_push0, deal_w, 0)
+        out["btn"] = (btn_ep, float(t.btn_fold), btn_w)
 
     # SB (axis 1): hist F on BTN fold, hist A on BTN jam.
-    u_sb_fa1 = mix(pfa, t.sb_win_uncontested_after_btn_fold, st.sb_bb_call1)
-    sb_f_ep, sb_f_w = _marg(u_sb_fa1, deal_w * (1.0 - pbtn), 1)
-    u_sb_aa1 = mix(paa, st.btn_sb_call1, st.three1)
-    sb_a_ep, sb_a_w = _marg(u_sb_aa1, deal_w * pbtn, 1)
+    if need("sb_f"):
+        nat = _native_marg("sb_f")
+        if nat is not None:
+            sb_f_ep, sb_f_w = nat
+        else:
+            u_sb_fa1 = mix(pfa, t.sb_win_uncontested_after_btn_fold, st.sb_bb_call1)
+            sb_f_ep, sb_f_w = _marg(u_sb_fa1, deal_w * (1.0 - pbtn), 1)
+        out["sb_f"] = (sb_f_ep, float(t.sb_fold_after_btn_fold), sb_f_w)
+    if need("sb_a"):
+        nat = _native_marg("sb_a")
+        if nat is not None:
+            sb_a_ep, sb_a_w = nat
+        else:
+            u_sb_aa1 = mix(paa, st.btn_sb_call1, st.three1)
+            sb_a_ep, sb_a_w = _marg(u_sb_aa1, deal_w * pbtn, 1)
+        out["sb_a"] = (sb_a_ep, float(t.sb_fold_after_btn_jam), sb_a_w)
 
     # BB (axis 2): FA / AF / AA call EVs.
-    bb_fa_ep, bb_fa_w = _marg(st.sb_bb_call2, deal_w * (1.0 - pbtn) * psf, 2)
-    bb_af_ep, bb_af_w = _marg(st.btn_bb_call2, deal_w * pbtn * (1.0 - psa), 2)
-    bb_aa_ep, bb_aa_w = _marg(st.three2, deal_w * pbtn * psa, 2)
+    if need("bb_fa"):
+        nat = _native_marg("bb_fa")
+        if nat is not None:
+            bb_fa_ep, bb_fa_w = nat
+        else:
+            bb_fa_ep, bb_fa_w = _marg(st.sb_bb_call2, deal_w * (1.0 - pbtn) * psf, 2)
+        out["bb_fa"] = (bb_fa_ep, float(t.bb_fold), bb_fa_w)
+    if need("bb_af"):
+        nat = _native_marg("bb_af")
+        if nat is not None:
+            bb_af_ep, bb_af_w = nat
+        else:
+            bb_af_ep, bb_af_w = _marg(st.btn_bb_call2, deal_w * pbtn * (1.0 - psa), 2)
+        out["bb_af"] = (bb_af_ep, float(t.bb_fold), bb_af_w)
+    if need("bb_aa"):
+        nat = _native_marg("bb_aa")
+        if nat is not None:
+            bb_aa_ep, bb_aa_w = nat
+        else:
+            bb_aa_ep, bb_aa_w = _marg(st.three2, deal_w * pbtn * psa, 2)
+        out["bb_aa"] = (bb_aa_ep, float(t.bb_fold), bb_aa_w)
 
-    return {
-        "btn": (btn_ep, float(t.btn_fold), btn_w),
-        "sb_f": (sb_f_ep, float(t.sb_fold_after_btn_fold), sb_f_w),
-        "sb_a": (sb_a_ep, float(t.sb_fold_after_btn_jam), sb_a_w),
-        "bb_fa": (bb_fa_ep, float(t.bb_fold), bb_fa_w),
-        "bb_af": (bb_af_ep, float(t.bb_fold), bb_af_w),
-        "bb_aa": (bb_aa_ep, float(t.bb_fold), bb_aa_w),
-    }
+    return out
 
 
 def seat_values_3max(

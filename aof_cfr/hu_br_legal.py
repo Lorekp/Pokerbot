@@ -22,7 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
-from aof_cfr.hu_payoff_matrix import load_equity_matrix, solver_hu_deal_weights
+from aof_cfr.hu_payoff_matrix import hu_deal_weights, load_equity_matrix, solver_hu_deal_weights  # noqa: F401
 
 DEFAULT_HU_EQ = Path("data/aof/cfr_base/hu_eq_matrix.npz")
 
@@ -41,8 +41,12 @@ def load_hu_eq(path: Path | str = DEFAULT_HU_EQ) -> np.ndarray:
     return _EQ_CACHE[key]
 
 
-def _pot_called(stack_bb: float) -> float:
-    return 1.5 + 2.0 * float(stack_bb)
+def _pot_called(stack_bb: float, *, game_model: int | None = None) -> float:
+    """HU contested pot. v2: both blinds count toward the 2 jammed stacks (16bb @8bb, exactly
+    zero-sum); v1 legacy: +1.5 dead on top (17.5bb). Follows the shipped manifest by default
+    so these marginals always price the same game the base was solved under."""
+    from aof_cfr.pushfold_payoffs import contested_pot_bb
+    return contested_pot_bb(2, 0.0, float(stack_bb), game_model=game_model)
 
 
 def _legal_marginals_hu(
@@ -59,7 +63,9 @@ def _legal_marginals_hu(
     if eq is None:
         eq = load_hu_eq()
     n = int(eq.shape[0])
-    w = solver_hu_deal_weights(n)            # (n,n) uniform 1/n^2
+    # v2: exact combo-pair counts (frequency + card removal -> blocker-aware conditionals via
+    # the row/col normalizations below); v1 legacy: uniform. Follows the shipped manifest.
+    w = hu_deal_weights(n)
     pot = _pot_called(stack_bb)
     sb_show = eq * pot - float(stack_bb)     # (i=SB, j=BB) SB chip-EV at showdown
     bb_show = (1.0 - eq) * pot - float(stack_bb)  # BB chip-EV at showdown
@@ -96,7 +102,7 @@ def seat_values_hu(
     if eq is None:
         eq = load_hu_eq()
     n = int(eq.shape[0])
-    w = solver_hu_deal_weights(n)
+    w = hu_deal_weights(n)
     pot = _pot_called(stack_bb)
     sb_show = eq * pot - float(stack_bb)
     bb_show = (1.0 - eq) * pot - float(stack_bb)

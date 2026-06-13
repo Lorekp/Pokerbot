@@ -27,9 +27,20 @@ from aof_ranges import active_seats
 
 DEFAULT_PRIOR_STRENGTH = 8.0
 
-# Combo weights (dealt-hand frequency) per bucket: pairs 6, suited 4, offsuit 12.
-_COMBO_W = np.array([len(c) for c in COMBOS_169], dtype=np.float64)
+# Combo weights = TRUE dealt-hand frequency per bucket: pairs 6, suited 4, offsuit 12.
+# NOTE: ``len(COMBOS_169[i])`` is WRONG for this — those lists store suit-canonical
+# REPRESENTATIVES (offsuit keeps only 4 of its 12 combos), which silently underweighted
+# offsuit hands 3x in every combo-weighted aggregate (base_agg targets, range-width shifts,
+# strength order). Classify by label instead.
+def _true_combo_count(label: str) -> float:
+    if len(label) == 2:          # pair ("AA")
+        return 6.0
+    return 4.0 if label.endswith("s") else 12.0
+
+
+_COMBO_W = np.array([_true_combo_count(lab) for lab in LABELS_169], dtype=np.float64)
 _COMBO_W_SUM = float(_COMBO_W.sum())
+assert _COMBO_W_SUM == 1326.0    # 13*6 + 78*4 + 78*12 — the full deck's combo count
 
 _STRENGTH_ORDER_CACHE: dict[str, np.ndarray] = {}
 
@@ -168,6 +179,47 @@ def _range_width_shift(base_p: np.ndarray, p_target: float) -> np.ndarray:
     return np.clip(new_p, 0.0, 1.0)
 
 
+# Hierarchical depth pooling (Phase 5): a depth cell shrinks toward the player's all-depth
+# (seat, hist) pool before the pool shrinks toward base — undoing the 7-bucket fragmentation
+# (~4-7x effective sample early). POOL_WEIGHT=0 + no cross-depth data collapses exactly to
+# the original single-cell estimator.
+POOL_PRIOR_STRENGTH = 10.0   # s2: pooled rate -> base shrinkage
+POOL_WEIGHT = 0.5            # rho: pooled observations count at half weight toward eff. n
+
+
+def _pooled_aggregate(cells: dict, seat: str, hist: str, stack_bb: float):
+    """(k_cell, n_cell, k_pool, n_pool): own-depth aggregate cell + the OTHER depth buckets'
+    cells for the same (seat, hist)."""
+    from aof_cfr.infoset import STACK_DEPTH_BUCKETS
+    own_key = aggregate_infoset_key(seat, hist, stack_bb)
+    k_cell, n_cell = cells.get(own_key, (0, 0))
+    k_pool = n_pool = 0
+    for d in STACK_DEPTH_BUCKETS:
+        key = aggregate_infoset_key(seat, hist, float(d))
+        if key == own_key:
+            continue
+        p_, t_ = cells.get(key, (0, 0))
+        k_pool += p_
+        n_pool += t_
+    return k_cell, n_cell, k_pool, n_pool
+
+
+def exact_bucket_override(est_p: np.ndarray, cells: dict, seat: str, hist: str,
+                          stack_bb: float, prior_strength: float) -> np.ndarray:
+    """Two-level posterior: where showdown reveals produced exact-bucket observations, the
+    per-bucket cell posterior overrides the range-width reconstruction (whose value becomes
+    the bucket's PRIOR MEAN). No reveals -> returns ``est_p`` unchanged (byte-identical)."""
+    out = est_p
+    for bi, lab in enumerate(LABELS_169):
+        cell = cells.get(encode_infoset_key(seat, lab, hist, stack_bb))
+        if cell and cell[1] > 0:
+            if out is est_p:
+                out = est_p.copy()
+            pb, tb = cell
+            out[bi] = (pb + prior_strength * float(est_p[bi])) / (tb + prior_strength)
+    return out
+
+
 def estimate_policy_rows_shift(
     db: AoFOpponentDB,
     identity: str,
@@ -176,23 +228,29 @@ def estimate_policy_rows_shift(
     *,
     prior_strength: float = DEFAULT_PRIOR_STRENGTH,
     base_push_fn=_query_base_push,
+    pool_strength: float = POOL_PRIOR_STRENGTH,
 ) -> dict[str, np.ndarray]:
     """Hidden-card posterior policy via the range-width shift (the live-play estimator).
 
-    For each ``(seat, history)`` reads the single aggregate cell (hand-agnostic push/fold count),
-    forms the posterior aggregate push rate ``(push + s*base_agg)/(total + s)``, and reconstructs
-    a per-bucket policy by widening/tightening the GTO base to match it (premiums preserved).
+    Three-level read per ``(seat, history)``:
+      1. depth-pooled (seat, hist) rate shrunk toward base (``pool_strength``),
+      2. own-depth cell shrunk toward the pool (``prior_strength``) -> range-width shift,
+      3. exact-bucket posteriors from showdown reveals override the shift where observed.
     Unknown ``(seat, history)`` -> exactly the base. Output shape matches ``estimate_policy_rows``.
     """
     rows: dict[str, np.ndarray] = {}
     base_arrs = _base_arrays_seathist(num_players, stack_bb, base_push_fn)
+    cells = db.cells_for(identity)
     for (seat, hist), base_p in base_arrs.items():
-        push, total = db.cell(identity, aggregate_infoset_key(seat, hist, stack_bb))
-        if total > 0:
+        k_cell, n_cell, k_pool, n_pool = _pooled_aggregate(cells, seat, hist, stack_bb)
+        if n_cell + n_pool > 0:
             base_agg = float((_COMBO_W * base_p).sum() / _COMBO_W_SUM)
-            est_p = _range_width_shift(base_p, posterior_push(push, total, base_agg, prior_strength))
+            m_pool = (k_pool + pool_strength * base_agg) / (n_pool + pool_strength)
+            target = (k_cell + prior_strength * m_pool) / (n_cell + prior_strength)
+            est_p = _range_width_shift(base_p, target)
         else:
             est_p = base_p
+        est_p = exact_bucket_override(est_p, cells, seat, hist, stack_bb, prior_strength)
         for bi, lab in enumerate(LABELS_169):
             p = float(est_p[bi])
             rows[encode_infoset_key(seat, lab, hist, stack_bb)] = np.array([1.0 - p, p], dtype=np.float64)

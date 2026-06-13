@@ -9,6 +9,7 @@ import numpy as np
 from numba import njit
 
 from aof_cfr.nway_eval_orientation import (
+    _load_native_eval7,
     eval7_backend_name,
     eval7_seat_rank,
     native_eval7_available,
@@ -189,12 +190,73 @@ def _mc_nway_shares_and_pair_eq_native(
     n_boards: int,
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Native OMPEval eval7 + Fisher-Yates boards; optional 3-way pair eq from same samples."""
+    """Native OMPEval eval7 + Fisher-Yates boards; optional 3-way pair eq from same samples.
+
+    Hot path (showdown MC for ``precompute_payoffs`` / arena terminals). Produces BYTE-IDENTICAL
+    shares to the original reference implementation — same ``random.Random`` Fisher-Yates board
+    sequence, same native eval7 ranks, same share/pair-eq arithmetic — but with the per-board
+    Python overhead stripped out: the native eval7 function and rank-comparison direction are
+    resolved ONCE (not re-dispatched per seat per board), the deck/hole ids are cached as Python
+    ints, and the per-board winner selection + share accumulation is inlined (no ``np.asarray`` /
+    ``seat_share_from_ranks`` temporaries, ~2.2M of which dominated the cold precompute).
+    """
     deck_arr, nd = build_live_deck(hole_ids_flat, n)
     if nd < 5:
         return np.full(n, 1.0 / n, dtype=np.float64), np.array([0.5, 0.5, 0.5], dtype=np.float64)
     deck = [int(deck_arr[i]) for i in range(nd)]
 
+    native = _load_native_eval7()
+    if not native:
+        # Preserve the exact reference behavior if native eval7 isn't present.
+        return _mc_nway_shares_and_pair_eq_native_ref(hole_ids_flat, n, n_boards, deck, seed)
+
+    holes = [int(hole_ids_flat[i]) for i in range(2 * n)]
+    wins = [0.0] * n
+    btn_bb_w = 0.0
+    btn_sb_w = 0.0
+    sb_bb_w = 0.0
+    rng = random.Random(seed & 0xFFFFFFFF)
+    randrange = rng.randrange  # bound method: same MT19937 stream as the reference
+    ev = native
+    ranks = [0] * n
+    is_three = n == 3
+    for _ in range(n_boards):
+        # Fisher-Yates first 5 on a FRESH deck copy (matches _pick_board_fisher_yates, which
+        # rebuilds ``work = list(deck)`` each board so swaps never accumulate). The C-level
+        # list copy is cheaper than undoing the swaps in Python.
+        work = list(deck)
+        for bi in range(5):
+            j = bi + randrange(nd - bi)
+            work[bi], work[j] = work[j], work[bi]
+        b0 = work[0]; b1 = work[1]; b2 = work[2]; b3 = work[3]; b4 = work[4]
+        best = -1
+        nwin = 0
+        for pi in range(n):
+            r = ev(holes[2 * pi], holes[2 * pi + 1], b0, b1, b2, b3, b4)
+            ranks[pi] = r
+            if r > best:          # native OMP: higher is better
+                best = r
+                nwin = 1
+            elif r == best:
+                nwin += 1
+        share = 1.0 / nwin
+        for pi in range(n):
+            if ranks[pi] == best:
+                wins[pi] += share
+        if is_three:
+            hr_btn = ranks[0]; hr_sb = ranks[1]; hr_bb = ranks[2]
+            btn_bb_w += 1.0 if hr_btn > hr_bb else (0.5 if hr_btn == hr_bb else 0.0)
+            btn_sb_w += 1.0 if hr_btn > hr_sb else (0.5 if hr_btn == hr_sb else 0.0)
+            sb_bb_w += 1.0 if hr_sb > hr_bb else (0.5 if hr_sb == hr_bb else 0.0)
+    inv = 1.0 / n_boards
+    pair_eq = np.array([btn_bb_w * inv, btn_sb_w * inv, sb_bb_w * inv], dtype=np.float64)
+    return np.array(wins, dtype=np.float64) * inv, pair_eq
+
+
+def _mc_nway_shares_and_pair_eq_native_ref(
+    hole_ids_flat: np.ndarray, n: int, n_boards: int, deck: list[int], seed: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Original reference loop (used only when native eval7 is unavailable)."""
     wins = np.zeros(n, dtype=np.float64)
     btn_bb_w = 0.0
     btn_sb_w = 0.0

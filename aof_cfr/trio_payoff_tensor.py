@@ -1062,10 +1062,21 @@ def save_trio_tensor(
     )
 
 
-def load_trio_tensor(path: Path | str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_trio_tensor(path: Path | str, *, game_model: int | None = None
+                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(shares, pair_eq, deal_weights). Deal weights per the game model: v2 derives the TRUE
+    chance distribution from the tensor's stored ``combo_counts`` (combo frequencies + card
+    removal over ordered bucket triples — the shipped tensor's ``deal_weights`` field is
+    exactly uniform, a v1 artifact); v1 legacy returns the stored uniform weights."""
+    from aof_cfr.pushfold_payoffs import game_model_default
     data = np.load(path, allow_pickle=True)
     shares = np.asarray(data["shares"], dtype=np.float64)
     deal_weights = np.asarray(data["deal_weights"], dtype=np.float64)
+    gm = game_model_default() if game_model is None else int(game_model)
+    if gm >= 2 and "combo_counts" in data:
+        cc = np.asarray(data["combo_counts"], dtype=np.float64)
+        if cc.sum() > 0:
+            deal_weights = cc / cc.sum()
     if "pair_eq" in data:
         pair_eq = np.asarray(data["pair_eq"], dtype=np.float64)
     else:

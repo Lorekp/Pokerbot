@@ -17,8 +17,66 @@ DENOM2 = 3_424_608
 
 
 def solver_hu_deal_weights(n: int = 169) -> np.ndarray:
-    """Uniform ordered bucket pairs — matches ``solver_hu_dcfr`` deal_w."""
+    """Uniform ordered bucket pairs — the LEGACY (game model v1) chance model."""
     return np.ones((n, n), dtype=np.float64) / (n * n)
+
+
+DEFAULT_PAIR_COUNTS = Path("data/aof/cfr_base/hu_combo_pair_counts.npz")
+_PAIR_COUNTS_CACHE: dict = {}
+
+
+def hu_combo_pair_counts(*, cache_path: Path = DEFAULT_PAIR_COUNTS) -> np.ndarray:
+    """(169,169) exact count of DISJOINT ordered (SB combo, BB combo) pairs per bucket pair.
+
+    This is the true preflop chance model over bucket pairs: combo frequencies (pairs 6,
+    suited 4, offsuit 12) AND card removal (blocked pairs excluded) in one table.
+    Row-normalizing gives the blocker-aware conditional w(bb_bucket | sb_hand).
+
+    Built from the FULL 1326-combo enumeration — NOT ``COMBOS_169``, whose lists are
+    suit-canonical representatives (offsuit keeps 4 of 12 combos) and would distort both
+    frequencies and blocker effects. Cached to NPZ; sums to exactly 1326*1225."""
+    if "n" in _PAIR_COUNTS_CACHE:
+        return _PAIR_COUNTS_CACHE["n"]
+    if cache_path.is_file():
+        data = np.load(cache_path, allow_pickle=False)
+        c = np.asarray(data["counts"], dtype=np.float64)
+        if float(c.sum()) == 1326.0 * 1225.0:        # reject stale reduced-combo builds
+            _PAIR_COUNTS_CACHE["n"] = c
+            return c
+    from aof_cfr.buckets import combo_to_bucket
+    ranks = "23456789TJQKA"
+    suits = "cdhs"
+    cards = [r + s for r in ranks for s in suits]
+    combos = [(a, b) for ai, a in enumerate(cards) for b in cards[ai + 1:]]
+    assert len(combos) == 1326
+    lab_to_idx = {lab: i for i, lab in enumerate(LABELS_169)}
+    bucket = np.array([lab_to_idx[combo_to_bucket(a, b)] for a, b in combos], dtype=np.int64)
+    masks = np.array([(1 << cards.index(a)) | (1 << cards.index(b)) for a, b in combos],
+                     dtype=np.int64)
+    n = len(LABELS_169)
+    counts = np.zeros((n, n), dtype=np.float64)
+    for i in range(len(combos)):
+        disjoint = (masks & masks[i]) == 0
+        np.add.at(counts[bucket[i]], bucket[disjoint], 1.0)
+    assert float(counts.sum()) == 1326.0 * 1225.0
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(cache_path, counts=counts)
+    _PAIR_COUNTS_CACHE["n"] = counts
+    return counts
+
+
+def hu_deal_weights(n: int = 169, *, game_model: int | None = None) -> np.ndarray:
+    """Deal distribution over ordered HU bucket pairs per the game model.
+
+    v2: exact disjoint combo-pair counts (combo frequency + card removal — uniform buckets
+    overweight pairs ~1.31x / suited ~1.96x and ignore blockers entirely); v1 legacy: uniform
+    (what the shipped v1 base was solved under). Follows the shipped manifest by default."""
+    from aof_cfr.pushfold_payoffs import game_model_default
+    gm = game_model_default() if game_model is None else int(game_model)
+    if gm >= 2 and n == len(LABELS_169):
+        c = hu_combo_pair_counts()
+        return c / c.sum()
+    return solver_hu_deal_weights(n)   # coarse bucket grids (tests) stay uniform
 
 
 def build_hu_bucket_equity_matrix_solver(

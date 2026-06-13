@@ -131,9 +131,11 @@ def hu_showdown_sb_utility(
     stack_bb: float = 8.0,
     sb_posted: float = 0.5,
     bb_posted: float = 1.0,
+    game_model: int | None = None,
 ) -> float:
-    """SB chip-EV when both players jam (matches solver_hu_dcfr)."""
-    pot_called = 1.5 + 2.0 * stack_bb
+    """SB chip-EV when both players jam (matches solver_hu_dcfr; game-model aware)."""
+    from aof_cfr.pushfold_payoffs import contested_pot_bb
+    pot_called = contested_pot_bb(2, 0.0, stack_bb, game_model=game_model)
     return float(eq[sb_bucket, bb_bucket] * pot_called - stack_bb)
 
 
