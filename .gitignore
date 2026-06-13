@@ -1,3 +1,4 @@
+.env
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -9,3 +10,12 @@ eval_results.json
 .external/
 .venv/
 venv/
+
+# transient run outputs / logs (eval metrics live under runs/, can be regenerated)
+runs/
+logs/
+*.log
+
+# native build artifacts (Rust kernel; source under tools/marg3_native/src is versioned)
+tools/marg3_native/target/
+*.pyd
