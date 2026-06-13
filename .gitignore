@@ -19,3 +19,18 @@ logs/
 # native build artifacts (Rust kernel; source under tools/marg3_native/src is versioned)
 tools/marg3_native/target/
 *.pyd
+
+# scratch / vendored reference checkouts (not part of any shipped project)
+_ck/
+_ck2/
+_ref_poker/
+_vendor/
+.cursor/
+trend.txt
+$OUT
+*.err
+
+# model blobs / scratch artifacts (sourced externally; cf. checkpoints/)
+models/
+data/_proftest.json
+data/aof/cfr_base/tensor_row_checkpoints/
