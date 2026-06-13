@@ -91,6 +91,7 @@ class HuSolveResult:
     call_range_str: str
     call_pct: float
     shove_range_str: str
+    eq_matrix: np.ndarray | None = None
     manifest: dict = field(default_factory=dict)
 
 
@@ -110,6 +111,8 @@ def solve_hu_pushfold(
     sb_posted: float = 0.5,
     bb_posted: float = 1.0,
     bucket_stride: int = 1,
+    eq_matrix: np.ndarray | None = None,
+    game_model: int | None = None,
 ) -> HuSolveResult:
     labels_full, combos_full = _build_169_buckets()
     if bucket_stride > 1:
@@ -119,16 +122,26 @@ def solve_hu_pushfold(
     else:
         labels, combos = labels_full, combos_full
     n = len(labels)
-    eq = _build_eq_matrix(labels, combos, samples=equity_samples, seed=seed)
-    pot_called = 1.5 + 2.0 * stack_bb
+    if eq_matrix is not None:
+        eq = np.asarray(eq_matrix, dtype=np.float64)
+        if eq.shape != (n, n):
+            raise ValueError(f"eq_matrix shape {eq.shape} != ({n}, {n})")
+    else:
+        eq = _build_eq_matrix(labels, combos, samples=equity_samples, seed=seed)
+    # Contested pot follows the game model (v2: blinds count toward the jammed stacks ->
+    # 2*stack, exactly zero-sum; v1 legacy: +1.5 dead). Re-solve scripts pass game_model=2.
+    from aof_cfr.pushfold_payoffs import contested_pot_bb
+    pot_called = contested_pot_bb(2, 0.0, stack_bb, game_model=game_model)
 
     sb_regret = np.zeros((n, 2), dtype=np.float64)
     bb_regret = np.zeros((n, 2), dtype=np.float64)
     sb_strat_sum = np.zeros((n, 2), dtype=np.float64)
     bb_strat_sum = np.zeros((n, 2), dtype=np.float64)
 
-    # Uniform deal weight over ordered hands (simplified: uniform buckets)
-    deal_w = np.ones((n, n), dtype=np.float64) / (n * n)
+    # Deal weights per the game model: v2 = exact disjoint combo-pair counts (frequency +
+    # card removal); v1 legacy = uniform buckets (what the shipped v1 base used).
+    from aof_cfr.hu_payoff_matrix import hu_deal_weights
+    deal_w = hu_deal_weights(n, game_model=game_model)
 
     for _ in range(iterations):
         sb_strat = _regret_matching(sb_regret)
@@ -207,6 +220,7 @@ def solve_hu_pushfold(
         call_range_str=call_rng,
         call_pct=call_pct,
         shove_range_str=shove_rng,
+        eq_matrix=eq,
         manifest=manifest,
     )
 
@@ -221,54 +235,35 @@ def _exploitability(
     bb_posted: float,
     deal_w: np.ndarray,
 ) -> float:
-    """Best-response gap (sum of players' BR improvements) in bb."""
-    n = eq.shape[0]
-    inv_n = 1.0 / n
+    """Best-response gap (sum of players' BR improvements) in bb.
 
-    def sb_push_ev(i: int) -> float:
-        return sum(
-            inv_n * ((1.0 - bb_call[j]) * 1.0 + bb_call[j] * (eq[i, j] * pot_called - stack_bb))
-            for j in range(n)
-        )
+    All terms weight hands by ``deal_w`` — the SAME chance model the regrets trained under.
+    (The old SB terms used uniform 1/n per bucket, which coincides with deal_w only in the
+    v1 uniform game; under v2 combo weights it measured a DIFFERENT game and produced a
+    phantom ~10 mbb/g floor that no number of iterations could close.)"""
+    bb_call_v = np.asarray(bb_call, dtype=np.float64)
+    sb_push_v = np.asarray(sb_push, dtype=np.float64)
+    w = np.asarray(deal_w, dtype=np.float64)
 
-    def sb_value() -> float:
-        return sum(
-            inv_n * ((1.0 - sb_push[i]) * (-sb_posted) + sb_push[i] * sb_push_ev(i))
-            for i in range(n)
-        )
+    # SB: own-hand weight = row marginal P(i); opponent weight = conditional w(j|i).
+    row_w = w.sum(axis=1)
+    cond = w / np.maximum(row_w[:, None], 1e-300)
+    u_push_cell = (1.0 - bb_call_v)[None, :] * 1.0 + bb_call_v[None, :] * (
+        eq * pot_called - stack_bb)
+    sb_push_ev = (cond * u_push_cell).sum(axis=1)
+    sb_value = float((row_w * ((1.0 - sb_push_v) * (-sb_posted) + sb_push_v * sb_push_ev)).sum())
+    sb_br = float((row_w * np.maximum(-sb_posted, sb_push_ev)).sum())
 
-    def sb_br() -> float:
-        return sum(inv_n * max(-sb_posted, sb_push_ev(i)) for i in range(n))
+    # BB: reach-weighted by P(i,j)*P(SB pushes i) (was already deal_w-correct; vectorized).
+    reach = w * sb_push_v[:, None]
+    u_call_cell = (1.0 - eq) * pot_called - stack_bb
+    bb_value = float((reach * ((1.0 - bb_call_v)[None, :] * (-bb_posted)
+                               + bb_call_v[None, :] * u_call_cell)).sum())
+    p_j = reach.sum(axis=0)
+    u_call_j = (reach * u_call_cell).sum(axis=0)
+    bb_br = float(np.maximum(-bb_posted * p_j, u_call_j).sum())
 
-    def bb_value() -> float:
-        v = 0.0
-        for i in range(n):
-            for j in range(n):
-                w = deal_w[i, j] * sb_push[i]
-                u = (1.0 - bb_call[j]) * (-bb_posted) + bb_call[j] * (
-                    (1.0 - eq[i, j]) * pot_called - stack_bb
-                )
-                v += w * u
-        return v
-
-    def bb_br() -> float:
-        v = 0.0
-        for j in range(n):
-            u_fold = -bb_posted
-            u_call = 0.0
-            for i in range(n):
-                p_ij = deal_w[i, j] * sb_push[i]
-                if p_ij < 1e-15:
-                    continue
-                u_call += p_ij * ((1.0 - eq[i, j]) * pot_called - stack_bb)
-            # Weight by marginal P(BB hand j | SB pushed)
-            p_j = sum(deal_w[i, j] * sb_push[i] for i in range(n))
-            if p_j < 1e-15:
-                continue
-            v += max(u_fold * p_j, u_call)
-        return v
-
-    return float(max((sb_br() - sb_value()) + (bb_br() - bb_value()), 0.0))
+    return float(max((sb_br - sb_value) + (bb_br - bb_value), 0.0))
 
 
 def _freqs_to_range_string(
