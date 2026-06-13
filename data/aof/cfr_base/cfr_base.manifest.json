@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "git_hash": "5058f25e1e419176c1beb860eb04c0698e627105",
-  "infoset_key_spec_hash": "db1d62ba9e0e09a6",
+  "infoset_key_spec_hash": "4c5aa1d7e7048a2e",
   "tables": [
     {
       "num_players": 2,
