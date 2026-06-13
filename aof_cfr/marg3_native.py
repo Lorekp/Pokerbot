@@ -109,6 +109,11 @@ def build_cubes(key: str, st, deal_w: np.ndarray, btn_push, sb_push, bb_push):
     mod = load_native()
     if mod is None:
         return None
+    # The native kernel is hardcoded to N=169 buckets. Fall back to numpy for any other size
+    # (e.g. small synthetic test tensors) so it degrades gracefully instead of raising
+    # "pushes must have 6*169+2 entries". Production always uses 169 -> stays on the native path.
+    if np.asarray(deal_w).shape != (N, N, N) or np.asarray(btn_push).reshape(-1).shape[0] != N:
+        return None
     from aof_cfr.pushfold_payoffs import TERMINAL as t
 
     dw = _c64(deal_w)

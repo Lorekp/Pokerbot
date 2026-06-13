@@ -192,8 +192,12 @@ def test_hu_oracle_agreement() -> None:
     from aof_cfr.hu_validate import compare_freqs, dcfr_oracle_freqs, load_policy_freqs
 
     sb_sol, bb_sol = load_policy_freqs(BASE_DIR / "cfr_base_2p.npz")
+    # 8000 iters (the oracle's canonical/default count, used during certification): at 2500 the
+    # oracle is under-converged on mixed-frequency indifference hands (84s/43s/98s) and disagrees
+    # ~0.1; at 8000 it agrees with the shipped base to max_diff 0.0000 (verified). The shipped base
+    # is well-converged; this measures the ORACLE's convergence, so it must match the cert setting.
     sb_oracle, bb_oracle = dcfr_oracle_freqs(
-        BASE_DIR / "hu_eq_matrix.npz", iterations=2500
+        BASE_DIR / "hu_eq_matrix.npz", iterations=8000
     )
     hu = compare_freqs(sb_sol, bb_sol, sb_oracle, bb_oracle, tolerance=0.02)
     assert hu["passed"], f"max_diff={hu['max_diff']} — fix payoff/deal model"
