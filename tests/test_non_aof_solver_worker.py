@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from pokerbot.solver.postflop_solver_client import DEFAULT_CLI_PATH, run_solver
-from pokerbot.solver.solver_worker import PersistentSolverWorker, WorkerError
+from pokerbot.solver.solver_worker import PersistentSolverWorker, SolverTimeoutError, WorkerError
 
 CLI_TEST_REQUEST = (
     Path(__file__).resolve().parents[1]
@@ -49,3 +49,17 @@ def test_worker_invalid_request_returns_structured_error() -> None:
         with pytest.raises(WorkerError) as exc:
             worker.solve({"bad": True}, request_id="bad-1", timeout_sec=30.0)
     assert exc.value.code in ("json_parse", "worker_failure", "missing_result")
+
+
+def test_worker_solve_times_out_when_no_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not DEFAULT_CLI_PATH.is_file():
+        pytest.skip("postflop_solver_cli not built")
+
+    import pokerbot.solver.solver_worker as sw
+
+    monkeypatch.setattr(sw, "_readline_with_timeout", lambda _stream, _timeout: None)
+
+    with PersistentSolverWorker(cli_path=DEFAULT_CLI_PATH) as worker:
+        with pytest.raises(SolverTimeoutError) as exc:
+            worker.solve({"noop": True}, request_id="timeout-1", timeout_sec=0.5)
+    assert exc.value.code == "timeout"

@@ -31,7 +31,14 @@ def _base_arrays(stack_bb: float):
 def test_chip_model_constants() -> None:
     from aof_cfr.hu_br_legal import _legal_marginals_hu, _pot_called, load_hu_eq
 
-    assert _pot_called(8.0) == pytest.approx(17.5)
+    # Game-model-aware pot: v2 = both blinds inside the two jammed stacks (exactly zero-sum
+    # pre-fee); v1 legacy = +1.5 dead on top. The defaults — model AND showdown fee — follow
+    # the shipped manifest.
+    from aof_cfr.pushfold_payoffs import flat_fee_default, game_model_default
+    fee = flat_fee_default()
+    assert _pot_called(8.0, game_model=2) == pytest.approx(16.0 - fee)
+    assert _pot_called(8.0, game_model=1) == pytest.approx(17.5 - fee)
+    assert _pot_called(8.0) == pytest.approx((16.0 if game_model_default() >= 2 else 17.5) - fee)
     eq = load_hu_eq()
     assert eq.shape == (169, 169)
     assert eq[0, 0] == pytest.approx(0.5)  # mirror matchup is 50%
@@ -56,14 +63,21 @@ def test_base_is_near_fixed_point() -> None:
             assert float(imp.max()) < 0.30, f"{key}@{stack_bb}bb max imp {imp.max():.4f}"
 
 
-def test_seat_values_dead_blind_relation() -> None:
+def test_seat_values_zero_sum_relation() -> None:
     from aof_cfr.hu_br_legal import load_hu_eq, seat_values_hu
+    from aof_cfr.pushfold_payoffs import flat_fee_default, game_model_default
 
     eq = load_hu_eq()
     sb, bb = _base_arrays(8.0)
     sb_val, bb_val = seat_values_hu(sb, bb, 8.0, eq)
-    # Sum equals dead money 1.5 * P(both jam) (the +1.5 convention), bounded by [0, 1.5].
-    assert 0.0 <= (sb_val + bb_val) <= 1.5 + 1e-9
+    fee = flat_fee_default()
+    if game_model_default() >= 2:
+        # v2: exactly zero-sum pre-fee; the showdown fee leaks exactly fee * P(both jam)
+        # to the house, so the sum sits in [-fee, 0].
+        assert -fee - 1e-9 <= (sb_val + bb_val) <= 1e-9
+    else:
+        # v1 legacy: sum equals dead 1.5 * P(both jam) minus the fee leak.
+        assert -fee - 1e-9 <= (sb_val + bb_val) <= 1.5 + 1e-9
 
 
 def test_route_hu_unknown_opponent_is_base() -> None:

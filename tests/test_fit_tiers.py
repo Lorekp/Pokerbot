@@ -43,3 +43,34 @@ def test_fit_recovers_vs_jam_sign_and_flags_unidentifiable(tmp_path) -> None:
     # Honesty: per-hand leaks are explicitly flagged as unfittable from aggregate (no hole cards).
     assert "ace_bias" in over_caller["unidentifiable_from_aggregate"]
     assert "per_hand_range_shape" in over_caller["unidentifiable_from_aggregate"]
+
+
+def test_emit_population_prior_artifact(tmp_path) -> None:
+    """Pooled per-(n, seat, hist) population rates round-trip into PopulationPrior(table=...)."""
+    import json
+
+    import aof_cfr.query as q
+    q.load_cfr_base()
+    from aof_cfr.live_exploit import ingest_jsonl
+    from aof_cfr.opponent_db import AoFOpponentDB
+    from scripts.fit_tiers_from_hands import emit_population_prior, simulate_jsonl
+
+    path = tmp_path / "syn.jsonl"
+    simulate_jsonl(path, ["professional", "intermediate", "beginner"], 3, 8.0, 1500, seed=2)
+    db = AoFOpponentDB(path=tmp_path / "db.json")
+    db.counts.clear(); db.seen_hands.clear()
+    ingest_jsonl(db, path)
+
+    out = tmp_path / "population_prior_aof.json"
+    payload = emit_population_prior(db, out, source="synthetic", min_cell_obs=30)
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["schema_version"] == 1
+    assert data["infoset_key_spec_hash"]
+    assert data["n_decisions"] > 1000
+    # the universal 3-max cells must be present and be probabilities
+    for cell in ("3|BTN|-", "3|SB|A"):
+        assert cell in data["table"], sorted(data["table"])
+        assert 0.0 <= data["table"][cell] <= 1.0
+    # thin cells are omitted (fallback to hand-set constants)
+    assert all(v >= 0 for v in data["table"].values())
+    assert payload["table"] == data["table"]
