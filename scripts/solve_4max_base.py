@@ -35,9 +35,32 @@ def main() -> int:
     ap.add_argument("--rounds", type=int, default=400)
     ap.add_argument("--gate-samples", type=int, default=6000)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--game-model", type=int, default=None,
+                    help="terminal chip model (default: the CODE's GAME_MODEL_VERSION)")
+    ap.add_argument("--flat-fee-bb", type=float, default=None,
+                    help="showdown fee on contested pots (default: official 0.12)")
     args = ap.parse_args()
     depths = [int(x) for x in args.depths.split(",")]
-    print(f"4-max base grid: depths={depths} deals={args.deals} rounds={args.rounds}")
+
+    import os
+
+    from aof_cfr.pushfold_payoffs import FLAT_FEE_BB_OFFICIAL, GAME_MODEL_VERSION
+    gm = args.game_model if args.game_model is not None else GAME_MODEL_VERSION
+    fee = args.flat_fee_bb if args.flat_fee_bb is not None else FLAT_FEE_BB_OFFICIAL
+    os.environ["AOF_GAME_MODEL"] = str(gm)   # pin every nested payoff default to one model
+    os.environ["AOF_FLAT_FEE_BB"] = str(fee)
+    print(f"4-max base grid: depths={depths} deals={args.deals} rounds={args.rounds} "
+          f"(game model v{gm}, flat fee {fee}bb)")
+
+    src = CFR_DIR / "cfr_base_4p.npz"        # rollback artifacts (v1 = pre-Phase-4,
+    if src.is_file():                        # v2nofee = v2 without the showdown fee)
+        for bak_name in ("cfr_base_4p_v1.npz", "cfr_base_4p_v2nofee.npz"):
+            bak = CFR_DIR / bak_name
+            if not bak.is_file():
+                import shutil
+                shutil.copy2(src, bak)
+                print(f"  backed up cfr_base_4p.npz -> {bak.name}")
+                break
 
     print("sampling deal batch (once) ...")
     buckets, holes = sample_deals(args.deals, args.seed)
@@ -70,7 +93,9 @@ def main() -> int:
     export_manifest(
         CFR_DIR / "cfr_base.manifest.json", [result], merge_existing=True,
         extra={"depth_grid_4max": {str(d): v for d, v in depth_gap.items()},
-               "fp_4max_vec": {"deals": args.deals, "rounds": args.rounds, "seed": args.seed}},
+               "fp_4max_vec": {"deals": args.deals, "rounds": args.rounds, "seed": args.seed},
+               "game_model_version": gm,
+               "flat_fee_bb": fee},
     )
     print(f"\nwrote cfr_base_4p.npz ({len(all_rows)} infosets across {len(depths)} depths) + manifest")
     return 0

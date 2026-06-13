@@ -37,11 +37,44 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--depths", type=str, default=",".join(str(d) for d in STACK_DEPTH_BUCKETS))
     ap.add_argument("--rounds", type=int, default=1000, help="3-max FP rounds per depth")
-    ap.add_argument("--hu-iters", type=int, default=2500)
+    # 8000: the v2 combo-weighted HU game converges slower than uniform-bucket v1 (2500 iters
+    # left a 10.5 mbb/g gap vs the 10.0 verify gate; CFR+ gap ~O(1/T) -> ~3.3 at 8000).
+    ap.add_argument("--hu-iters", type=int, default=8000)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--game-model", type=int, default=None,
+                    help="terminal chip model to solve under (default: the CODE's current "
+                         "GAME_MODEL_VERSION — v2 corrected pots + combo deal weights)")
+    ap.add_argument("--flat-fee-bb", type=float, default=None,
+                    help="showdown fee deducted from contested pots (default: the official "
+                         "schedule's FLAT_FEE_BB_OFFICIAL = 0.12)")
     args = ap.parse_args()
     depths = [int(x) for x in args.depths.split(",")]
-    print(f"depth grid: {depths}")
+
+    # Pin the game model + showdown fee for EVERY nested payoff default (solver pots, tensor
+    # deal weights, static payoffs) via the env overrides, so a re-solve can't mix conventions
+    # with the currently-shipped manifest. The manifest written at the end flips the runtime
+    # defaults.
+    import os
+
+    from aof_cfr.pushfold_payoffs import FLAT_FEE_BB_OFFICIAL, GAME_MODEL_VERSION
+    gm = args.game_model if args.game_model is not None else GAME_MODEL_VERSION
+    fee = args.flat_fee_bb if args.flat_fee_bb is not None else FLAT_FEE_BB_OFFICIAL
+    os.environ["AOF_GAME_MODEL"] = str(gm)
+    os.environ["AOF_FLAT_FEE_BB"] = str(fee)
+    print(f"depth grid: {depths}  (game model v{gm}, flat fee {fee}bb on contested pots)")
+
+    # keep the previous artifacts for instant rollback (env overrides + restore these):
+    # *_v1.npz = pre-Phase-4, *_v2nofee.npz = v2 without the showdown fee
+    for name in ("cfr_base_2p.npz", "cfr_base_3p.npz"):
+        src = CFR_DIR / name
+        if src.is_file():
+            for bak_suffix in ("_v1.npz", "_v2nofee.npz"):
+                bak = CFR_DIR / name.replace(".npz", bak_suffix)
+                if not bak.is_file():
+                    import shutil
+                    shutil.copy2(src, bak)
+                    print(f"  backed up {name} -> {bak.name}")
+                    break
 
     depth_expl: dict[int, dict[int, float]] = {2: {}, 3: {}}
 
@@ -97,7 +130,10 @@ def main() -> int:
         [hu_result, trio_result],
         merge_existing=True,
         extra={"depth_grid": {str(n): {str(d): v for d, v in depth_expl[n].items()} for n in (2, 3)},
-               "stack_depth_buckets": list(STACK_DEPTH_BUCKETS)},
+               "stack_depth_buckets": list(STACK_DEPTH_BUCKETS),
+               "game_model_version": gm,
+               "flat_fee_bb": fee,
+               "combo_deal_weights": gm >= 2},
     )
     print("\nwrote manifest with per-depth exploitability grid.")
     print("4-max base NOT solved (perf-blocked); machinery ready for vectorized/C++ solve.")
