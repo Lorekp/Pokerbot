@@ -88,6 +88,13 @@ include = ["pokerbot*", "aof_rl*", "aof_solver*", "aof_validation*", "bench*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Per-test wall-clock cap so a single hanging test can't stall the whole suite (a full `pytest tests/`
+# run once wedged for hours on a blocking test). 600s is generous enough for the heavy CFR/search/RL
+# tests; a genuinely stuck test is killed and named instead of hanging. `thread` method works on Windows
+# (the default `signal` method needs SIGALRM, which Windows lacks). Override per-test with
+# `@pytest.mark.timeout(N)` (0 disables).
+timeout = 600
+timeout_method = "thread"
 markers = [
     "slow: full CFR solve or long scripted RL rollouts (skip with -m 'not slow')",
 ]
