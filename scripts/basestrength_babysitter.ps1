@@ -36,6 +36,7 @@ $MAXLAUNCH = 8
 $start = Get-Date
 $launches = 0
 $prevBox = ""
+$tracked = ""   # instance id of the box we last launched (verified by id, not the laggy tag filter)
 
 function Test-Done {
   aws s3 ls "s3://$BUCKET/$MARKER" --region $REGION 2>$null | Out-Null
@@ -44,6 +45,13 @@ function Test-Done {
 function Get-Boxes([string]$states) {
   $r = (aws ec2 describe-instances --region $REGION --filters "Name=tag:Run,Values=$RUN" "Name=instance-state-name,Values=$states" --query "Reservations[].Instances[].[InstanceId,LaunchTime]" --output text 2>$null)
   if ($r) { return (($r -join " ") -replace "\s+", " ").Trim() } else { return "" }
+}
+function Get-StateById([string]$id) {
+  # Strongly-consistent check by instance id (the tag:Run filter lags ~minutes for a fresh spot box,
+  # which caused a relaunch storm - track the launched id and verify it directly instead).
+  if (-not $id) { return "" }
+  $s = (aws ec2 describe-instances --region $REGION --instance-ids $id --query "Reservations[].Instances[].State.Name" --output text 2>$null)
+  if ($s) { return $s.Trim() } else { return "" }
 }
 function Stop-Run {
   $ids = (Get-Boxes "running,pending,stopping")
@@ -59,6 +67,12 @@ while ($true) {
   $el = [int]((Get-Date) - $start).TotalSeconds
   $done = Test-Done
   $live = Get-Boxes "running,pending"
+  if (-not $live -and $tracked) {
+    # Tag filter hasn't caught up yet - verify the box we launched is still alive by id.
+    $st = Get-StateById $tracked
+    if ($st -eq "running" -or $st -eq "pending") { $live = "$tracked" }
+    else { $tracked = "" }  # it's gone (reclaimed/terminated) - allow a relaunch
+  }
   $boxId = ""; $up = ""
   if ($live) {
     $boxId = (@($live.Split(" ") | Where-Object { $_ -like "i-*" }) -join ",")
@@ -78,9 +92,17 @@ while ($true) {
   if ($launches -ge $MAXLAUNCH) { Write-Host "STOP: max launches ($MAXLAUNCH) hit"; break }
   $next = $launches + 1
   Write-Host "  no live box -> launching #$next (--mode basestrength sweep $CONFIGS)"
-  python scripts\launch_eval_suite_spot.py --run-subdir $RUN --mode basestrength --bs-configs $CONFIGS --bs-skip-sft --seeds $SEEDS --hands $HANDS
-  $launches++
-  Start-Sleep -Seconds 180
+  $out = (& python scripts\launch_eval_suite_spot.py --run-subdir $RUN --mode basestrength --bs-configs $CONFIGS --bs-skip-sft --seeds $SEEDS --hands $HANDS 2>&1)
+  $out | ForEach-Object { Write-Host $_ }
+  $txt = ($out | Out-String)
+  if ($txt -match "LAUNCHED (i-[0-9a-f]+)") {
+    $tracked = $Matches[1]; $launches++
+    Write-Host "  tracking $tracked; waiting for boot before any relaunch"
+    Start-Sleep -Seconds 300   # boot + tag-propagation grace so we never double-launch
+  } else {
+    Write-Host "  launch did not start a box (quota/capacity?) - backing off 180s"
+    Start-Sleep -Seconds 180
+  }
 }
 
 # Ingest the SUMMARY into the repo and print it.
