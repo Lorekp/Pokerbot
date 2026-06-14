@@ -63,6 +63,11 @@ function Stop-Run {
 
 $capH = [int]($MAXSEC / 3600)
 Write-Host "=== base-strength babysitter: $RUN (caps: ${capH}h / $MAXLAUNCH launches) ==="
+# One-time cleanup of stale FAIL_* logs + empty SUMMARY from a PRIOR failed run so the dashboard/watcher
+# reflects only this run (bs_*.json results are kept + resumed; the DONE marker is left alone).
+if (-not (Test-Done)) {
+  aws s3 rm "s3://$BUCKET/$PREFIX/results/" --region $REGION --recursive --exclude "*" --include "FAIL_*" --include "SUMMARY.json" 2>$null | Out-Null
+}
 while ($true) {
   $el = [int]((Get-Date) - $start).TotalSeconds
   $done = Test-Done
