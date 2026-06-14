@@ -86,7 +86,7 @@ def upload_blueprint(s3, bucket: str, prefix: str) -> str:
 
 def user_data(*, bucket, prefix, region, code_key, bp_key, run_subdir, workers, seeds, hands,
               mode="full", keep_alive=False, bs_configs="10:uniform", bs_skip_sft=False,
-              bs_pooled_profiles=False) -> str:
+              bs_pooled_profiles=False, ve_config="10:uniform") -> str:
     run_prefix = f"{prefix}/{run_subdir}"
     final = "echo BOOTSTRAP_DONE_KEEP_ALIVE" if keep_alive else "shutdown -h now"
     if mode == "calibrate":
@@ -104,6 +104,8 @@ def user_data(*, bucket, prefix, region, code_key, bp_key, run_subdir, workers, 
             bs_flags = (f"--bs-pluribus-configs {bs_configs} "
                         + ("--bs-skip-sft " if bs_skip_sft else "")
                         + ("--bs-pooled-profiles " if bs_pooled_profiles else ""))
+        elif mode == "valueextract":
+            bs_flags = f"--ve-config {ve_config} "
         main_cmd = (
             f"python3 scripts/run_cloud_eval_suite.py --bucket {bucket} --prefix {run_prefix} "
             f"--region {region} --workers {workers} --seeds {seeds} --hands {hands} "
@@ -160,7 +162,8 @@ def main() -> None:
     p.add_argument("--seeds", type=int, default=18)
     p.add_argument("--hands", type=int, default=3000)
     p.add_argument("--run-subdir", default="run_evalsuite1")
-    p.add_argument("--mode", choices=("full", "confirm", "hybrid", "calibrate", "basestrength"),
+    p.add_argument("--mode",
+                   choices=("full", "confirm", "hybrid", "calibrate", "basestrength", "valueextract"),
                    default="full")
     p.add_argument("--bucket", default=DEFAULT_BUCKET)
     p.add_argument("--prefix", default=DEFAULT_PREFIX)
@@ -176,6 +179,8 @@ def main() -> None:
     p.add_argument("--bs-pooled-profiles", action="store_true",
                    help="--mode basestrength: legacy ONE-pooled-profile exploit on mixed cells "
                         "(default is per-villain targeting)")
+    p.add_argument("--ve-config", default="10:uniform",
+                   help="--mode valueextract: pluribus '<iters>:<leaf>' for the gauntlet hero")
     args = p.parse_args()
 
     s3 = boto3.client("s3", region_name=args.region)
@@ -189,7 +194,7 @@ def main() -> None:
                    bp_key=bp_key, run_subdir=args.run_subdir, workers=args.workers,
                    seeds=args.seeds, hands=args.hands, mode=args.mode, keep_alive=args.keep_alive,
                    bs_configs=args.bs_configs, bs_skip_sft=args.bs_skip_sft,
-                   bs_pooled_profiles=args.bs_pooled_profiles)
+                   bs_pooled_profiles=args.bs_pooled_profiles, ve_config=args.ve_config)
     run_kwargs = dict(
         ImageId=ami,
         InstanceType=args.instance_type,

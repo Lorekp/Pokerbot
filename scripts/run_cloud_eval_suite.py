@@ -299,6 +299,78 @@ class Suite:
         else:
             print("BASESTRENGTH ALL-FAILED — no DONE marker (check FAIL_*.log)\n" + body, flush=True)
 
+    # ---- Phase 2: value-extraction gauntlet (unopened exploit vs realistic IRC villains) ----
+    _VE_FIELDS = ("irc_soft", "irc_station", "irc_mixed", "irc_tough", "irc_lag")
+    _VE_WEAK = ("irc_soft", "irc_station", "irc_mixed")
+    _VE_TOUGH = ("irc_tough", "irc_lag")
+
+    def _ve_config(self) -> tuple[int, str]:
+        raw = getattr(self.a, "ve_config", None) or "10:uniform"
+        it, leaf = raw.split(":")
+        return int(it), leaf
+
+    def valueextract_jobs(self) -> list[tuple[str, list[str], dict | None]]:
+        """One gauntlet cell per (field, seed): OFF=pure base vs ON=base+unopened-exploit, per-seat
+        profiles, vs the realistic IRC villains. Each cell self-uploads ve_<field>_s<seed>.json."""
+        a, jobs = self.a, []
+        it, leaf = self._ve_config()
+        for field in self._VE_FIELDS:
+            for seed in range(a.seeds):
+                n = f"ve_{field}_s{seed}"
+                cmd = [sys.executable, "scripts/value_extraction_gauntlet.py",
+                       "--blueprint-snapshot", a.bp, "--fields", field, "--seeds", "1",
+                       "--seed", str(seed), "--hands", str(a.hands),
+                       "--iterations", str(it), "--leaf-select", leaf,
+                       "--out", str(RUNS / f"{n}.json")]
+                jobs.append((n, cmd, None))
+        return jobs
+
+    def _pool_ve(self, field: str) -> dict | None:
+        offs, ons = [], []
+        for f in RUNS.glob(f"ve_{field}_s*.json"):
+            try:
+                fd = (json.loads(f.read_text(encoding="utf-8")).get("fields") or {}).get(field)
+            except (ValueError, OSError):
+                continue
+            if fd:
+                offs.append(float(fd["off"]))
+                ons.append(float(fd["on"]))
+        if not offs:
+            return None
+        import math
+        def _ms(xs):
+            m = sum(xs) / len(xs)
+            se = (math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) / math.sqrt(len(xs))
+                  ) if len(xs) > 1 else 0.0
+            return m, se
+        om, ose = _ms(offs)
+        nm, nse = _ms(ons)
+        return {"off": om, "off_se": ose, "on": nm, "on_se": nse, "value": nm - om, "k": len(offs)}
+
+    def run_valueextract(self) -> None:
+        a = self.a
+        jobs = self.valueextract_jobs()
+        print(f"valueextract: {len(jobs)} jobs ({len(self._existing)} already in S3)", flush=True)
+        with ThreadPoolExecutor(max_workers=a.workers) as ex:
+            list(ex.map(lambda j: self.run_job(*j), jobs))
+        it, leaf = self._ve_config()
+        fields = {f: self._pool_ve(f) for f in self._VE_FIELDS}
+        fields = {f: v for f, v in fields.items() if v}
+        weak = [v["value"] for f, v in fields.items() if f in self._VE_WEAK]
+        tough = [v["value"] for f, v in fields.items() if f in self._VE_TOUGH]
+        summary = {"mode": "valueextract", "hands": a.hands, "seeds": a.seeds,
+                   "config": f"{it}:{leaf}", "fields": fields,
+                   "value_vs_weak": (sum(weak) / len(weak)) if weak else None,
+                   "harm_vs_tough": (min(tough)) if tough else None}
+        body = json.dumps(summary, indent=1, default=str)
+        self.s3.put_object(Bucket=a.bucket, Key=f"{self.rk}/SUMMARY.json", Body=body.encode())
+        if fields:
+            self.s3.put_object(Bucket=a.bucket, Key=f"{a.prefix}/eval_suite_DONE.marker",
+                               Body=time.strftime("%Y-%m-%d %H:%M:%S").encode())
+            print("VALUEEXTRACT DONE\n" + body, flush=True)
+        else:
+            print("VALUEEXTRACT ALL-FAILED — no DONE marker (check FAIL_*.log)\n" + body, flush=True)
+
     def gate(self) -> tuple[str | None, dict]:
         """The pre-registered arm rule. Returns (winning arm or None, full table)."""
         table: dict = {}
@@ -447,6 +519,9 @@ class Suite:
         if getattr(self.a, "mode", "full") == "basestrength":
             self.run_basestrength()
             return
+        if getattr(self.a, "mode", "full") == "valueextract":
+            self.run_valueextract()
+            return
         a = self.a
         jobs = self.phase_a_jobs()
         print(f"phase A: {len(jobs)} jobs ({len(self._existing)} results already in S3)", flush=True)
@@ -491,7 +566,8 @@ def main() -> None:
     ap.add_argument("--seeds", type=int, default=18)
     ap.add_argument("--hands", type=int, default=3000)
     ap.add_argument("--bp", default="/tmp/bp6max_v2_iter200.pkl")
-    ap.add_argument("--mode", choices=("full", "confirm", "hybrid", "basestrength"), default="full",
+    ap.add_argument("--mode", choices=("full", "confirm", "hybrid", "basestrength", "valueextract"),
+                    default="full",
                     help="full = P0+sweep+priorAB+gate+phaseB; confirm = read-gated mixer ON vs "
                          "pure-search OFF (G1 verification); hybrid = HybridAgent production hero "
                          "exploit ON vs pure-GTO OFF vs the 4 fair archetypes + do-no-harm "
@@ -509,6 +585,8 @@ def main() -> None:
                     help="basestrength: use ONE pooled opponent profile across all seats on the mixed "
                          "(heterogeneous) cells (the legacy artifact that made +exploit regress). Default "
                          "is PER-SEAT targeting (one profile per villain, hero reads the aggressor).")
+    ap.add_argument("--ve-config", default="10:uniform",
+                    help="valueextract: pluribus '<iters>:<leaf>' for the gauntlet hero (e.g. 10:uniform)")
     ap.add_argument("--job-timeout", type=int, default=4 * 3600)
     args = ap.parse_args()
     Suite(args).run()

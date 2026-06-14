@@ -1,0 +1,86 @@
+# Autonomous babysitter for the PHASE-2 VALUE-EXTRACTION gauntlet (--mode valueextract).
+# Tests whether the UNOPENED value-bet exploit can be turned ON do-no-harm on the blueprint+search base,
+# vs the realistic IRC villains (pokerbot/eval/irc_villains.py). Relaunches the spot box on reclaim until
+# eval_suite_DONE.marker appears, then downloads SUMMARY.json and prints it. The on-box driver fans every
+# (field,seed) gauntlet cell across a thread pool and self-uploads each result + the marker.
+# Run from your terminal (your AWS creds):
+#   powershell -ExecutionPolicy Bypass -File scripts\valueextract_babysitter.ps1
+# ASCII ONLY (PS 5.1 + BOM-less UTF-8 mangles non-ASCII into string-breaking bytes).
+$ErrorActionPreference = "Continue"
+Set-Location (Join-Path $PSScriptRoot "..")   # repo root
+
+$REGION = "eu-central-1"
+$BUCKET = "video-processing-6789"
+# uniform leaf is cheap => high hands OK. The gauntlet cells are (5 fields x SEEDS), one base arm.
+$RUN     = "run_ve1"
+$VECONF  = "10:uniform"
+$SEEDS   = 12
+$HANDS   = 3000
+$PREFIX = "pokerbot/prod6000/eval_suite/$RUN"
+$MARKER = "$PREFIX/eval_suite_DONE.marker"
+$RESULT = "$PREFIX/results/SUMMARY.json"
+$LOCAL  = "runs/cloud_valueextract/SUMMARY.json"
+$MAXSEC = 12 * 3600
+$MAXLAUNCH = 8
+$start = Get-Date
+$launches = 0
+$prevBox = ""
+
+function Test-Done {
+  aws s3 ls "s3://$BUCKET/$MARKER" --region $REGION 2>$null | Out-Null
+  return $?
+}
+function Get-Boxes([string]$states) {
+  $r = (aws ec2 describe-instances --region $REGION --filters "Name=tag:Run,Values=$RUN" "Name=instance-state-name,Values=$states" --query "Reservations[].Instances[].[InstanceId,LaunchTime]" --output text 2>$null)
+  if ($r) { return (($r -join " ") -replace "\s+", " ").Trim() } else { return "" }
+}
+function Stop-Run {
+  $ids = (Get-Boxes "running,pending,stopping")
+  if ($ids) {
+    $idList = @($ids.Split(" ") | Where-Object { $_ -like "i-*" })
+    if ($idList.Count) { aws ec2 terminate-instances --instance-ids $idList --region $REGION | Out-Null; Write-Host "terminated: $idList" }
+  }
+}
+
+$capH = [int]($MAXSEC / 3600)
+Write-Host "=== value-extraction babysitter: $RUN (caps: ${capH}h / $MAXLAUNCH launches) ==="
+while ($true) {
+  $el = [int]((Get-Date) - $start).TotalSeconds
+  $done = Test-Done
+  $live = Get-Boxes "running,pending"
+  $boxId = ""; $up = ""
+  if ($live) {
+    $boxId = (@($live.Split(" ") | Where-Object { $_ -like "i-*" }) -join ",")
+    if ($live -match "(\d{4}-\d{2}-\d{2}T[\d:.]+)") {
+      try { $mins = [int](((Get-Date).ToUniversalTime() - [datetime]::Parse($Matches[1]).ToUniversalTime()).TotalMinutes); $up = " (up ${mins}m)" } catch {}
+    }
+  }
+  Write-Host "[t+${el}s] done=$(if ($done) {'yes'} else {'no'}) live='$boxId$up' launches=$launches"
+  if ($prevBox -and $boxId -and $boxId -ne $prevBox) {
+    Write-Host "          BOX CHANGED: $prevBox -> $boxId (spot reclaim + relaunch)" -ForegroundColor Yellow
+  }
+  if ($boxId) { $prevBox = $boxId }
+
+  if ($done) { Write-Host "DONE: eval_suite marker found"; Stop-Run; break }
+  if ($el -ge $MAXSEC) { Write-Host "STOP: time cap reached"; Stop-Run; break }
+  if ($live) { Start-Sleep -Seconds 180; continue }
+  if ($launches -ge $MAXLAUNCH) { Write-Host "STOP: max launches ($MAXLAUNCH) hit"; break }
+  $next = $launches + 1
+  Write-Host "  no live box -> launching #$next (--mode valueextract ve-config $VECONF)"
+  python scripts\launch_eval_suite_spot.py --run-subdir $RUN --mode valueextract --ve-config $VECONF --seeds $SEEDS --hands $HANDS
+  $launches++
+  Start-Sleep -Seconds 180
+}
+
+if (Test-Done) {
+  New-Item -ItemType Directory -Force "runs/cloud_valueextract" | Out-Null
+  aws s3 cp "s3://$BUCKET/$RESULT" $LOCAL --region $REGION --no-progress
+  Write-Host ""
+  Write-Host "=== VALUE-EXTRACTION SUMMARY (downloaded -> $LOCAL) ==="
+  Get-Content $LOCAL
+  Write-Host ""
+  Write-Host "value_vs_weak > 0 AND harm_vs_tough >= -0.05  =>  flip root_mixer_unopened ON (gated)."
+} else {
+  Write-Host "No DONE marker - the run did not complete (check the console / FAIL_*.log)."
+}
+Write-Host "BABYSITTER EXIT after ${el}s, $launches launches"
