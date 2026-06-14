@@ -35,6 +35,7 @@ _INCLUDE = [
     "pokerbot",
     "scripts/eval_exploitation_battery.py",
     "scripts/run_cloud_eval_suite.py",
+    "scripts/value_extraction_gauntlet.py",   # --mode valueextract per-cell driver (irc_villains via pokerbot/)
     "scripts/summarize_exploit_battery.py",
     "data/weva",
     "data/player_profiles/irc_population_prior.json",
