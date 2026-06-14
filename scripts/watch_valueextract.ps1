@@ -31,8 +31,10 @@ while ($true) {
   if ($boxRaw) {
     $f = ($boxRaw -split "\s+")
     $up = ""
-    if ($boxRaw -match "(\d{4}-\d{2}-\d{2}T[\d:.]+)") {
-      try { $m = [int](((Get-Date).ToUniversalTime() - [datetime]::Parse($Matches[1]).ToUniversalTime()).TotalMinutes); $up = "up ${m}m" } catch {}
+    if ($boxRaw -match "(\d{4}-\d{2}-\d{2}T[\d:.]+[+\-]\d{2}:?\d{2})") {
+      # Capture the FULL LaunchTime incl. the +00:00 offset and parse as DateTimeOffset, else the UTC
+      # stamp is read as local and uptime is inflated by the local offset (the phantom "+120m" bug).
+      try { $m = [int](((Get-Date).ToUniversalTime() - [datetimeoffset]::Parse($Matches[1]).UtcDateTime).TotalMinutes); $up = "up ${m}m" } catch {}
     }
     $boxLine = ("{0}  {1}  {2}  {3}" -f $f[0], $f[1], $f[2], $up)
   }

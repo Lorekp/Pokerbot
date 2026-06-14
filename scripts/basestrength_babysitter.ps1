@@ -81,8 +81,10 @@ while ($true) {
   $boxId = ""; $up = ""
   if ($live) {
     $boxId = (@($live.Split(" ") | Where-Object { $_ -like "i-*" }) -join ",")
-    if ($live -match "(\d{4}-\d{2}-\d{2}T[\d:.]+)") {
-      try { $mins = [int](((Get-Date).ToUniversalTime() - [datetime]::Parse($Matches[1]).ToUniversalTime()).TotalMinutes); $up = " (up ${mins}m)" } catch {}
+    if ($live -match "(\d{4}-\d{2}-\d{2}T[\d:.]+[+\-]\d{2}:?\d{2})") {
+      # Full LaunchTime incl. +00:00 offset via DateTimeOffset, else the UTC stamp is read as local and
+      # uptime is inflated by the local offset (the phantom "+120m" bug).
+      try { $mins = [int](((Get-Date).ToUniversalTime() - [datetimeoffset]::Parse($Matches[1]).UtcDateTime).TotalMinutes); $up = " (up ${mins}m)" } catch {}
     }
   }
   Write-Host "[t+${el}s] done=$(if ($done) {'yes'} else {'no'}) live='$boxId$up' launches=$launches"
