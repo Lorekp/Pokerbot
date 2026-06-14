@@ -23,9 +23,11 @@ def test_fit_recovers_vs_jam_sign_and_flags_unidentifiable(tmp_path) -> None:
     from scripts.fit_tiers_from_hands import fit_leakprofile, measure_player, simulate_jsonl
 
     # BTN never faces a jam in 3-max (acts first), so the vs-jam leakers must sit at SB/BB:
-    # seat0=BTN=professional, seat1=SB=intermediate (over-folder), seat2=BB=beginner (over-caller).
+    # seat0=BTN=superhuman (flawless GTO baseline), seat1=SB=intermediate (over-folder),
+    # seat2=BB=beginner (over-caller). Baseline is `superhuman` not `professional`: the latter now
+    # deliberately deviates ~3% on marginal hands, which would dilute the measured over-fold signal.
     path = tmp_path / "syn.jsonl"
-    simulate_jsonl(path, ["professional", "intermediate", "beginner"], 3, 8.0, 4000, seed=1)
+    simulate_jsonl(path, ["superhuman", "intermediate", "beginner"], 3, 8.0, 4000, seed=1)
     db = AoFOpponentDB(path=tmp_path / "db.json")
     db.counts.clear(); db.seen_hands.clear()
     n = ingest_jsonl(db, path)
