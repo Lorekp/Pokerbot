@@ -89,3 +89,72 @@ def test_cold_start_and_none_do_not_kill():
 
 def test_threshold_constant_is_three():
     assert AGG_KILL_COUNT == 3
+
+
+# ---- end-to-end: the kill-switch actually disables the exploit in SearchAgent (deterministic, no EV) ----
+
+def _facing_probs(agent, seed):
+    """Drive a facing-a-raise decision and return the hero's action probs. button=0 => seat 3 acts first
+    preflop; it raises, 4/5 fold => hero (seat 0) faces a raise (aggressor = seat 3)."""
+    import numpy as np
+    import random as _r
+
+    from pokerbot.engine.actions import Action, ActionType
+    from pokerbot.engine.game import GameState
+
+    st = GameState.new_hand(button_seat=0, rng=_r.Random(seed))
+    st.deal_hole_cards()
+    for _ in range(6):
+        if st.action_seat == 0:
+            break
+        legal = st.legal_actions()
+        raise_a = next((a for a in legal if a.action_type == ActionType.RAISE), None)
+        st.apply_action(raise_a if (st.action_seat == 3 and raise_a) else Action(ActionType.FOLD))
+        st.advance_to_next_actor()
+    if st.action_seat != 0:
+        return None
+    agent.enable_decision_capture(_r.Random(1))
+    agent.reset_hand(0)
+    agent(st)
+    return np.asarray(agent.pop_decisions_raw()[-1][0], dtype=float)
+
+
+def _make_agent():
+    from pokerbot.eval.search_agent import SearchAgent
+
+    ag = SearchAgent(use_pluribus_search=True, blueprint_snapshot={}, hero_seat=0,
+                     time_budget_ms=10 ** 9, transformer_checkpoint=None, root_exploit_mixer=True,
+                     root_mixer_unopened=True)
+    ag.solver.config.max_iterations = 4
+    ag.solver.config.leaf = type(ag.solver.config.leaf)(select="uniform", rollout_samples=1)
+    return ag
+
+
+def test_searchagent_kill_switch_zeroes_exploit_on_lag_table():
+    """A 5-lag table trips the kill-switch -> the hero plays the PURE base (== no-profile agent) on every
+    decision, so the exploit's harm vs a lag-dominated table is zero by construction (no EV run needed).
+    A 2-lag table is below threshold -> the exploit still fires (output shifts on >=1 seed), proving the
+    equality above isn't trivial."""
+    import numpy as np
+
+    base = _make_agent()
+    base.set_opponent_profiles(None)
+    killed = _make_agent()
+    killed.set_opponent_profiles({s: _lag() for s in range(1, 6)})   # 5 lags -> kill
+    for seed in range(8):
+        pb, pk = _facing_probs(base, seed), _facing_probs(killed, seed)
+        if pb is None or pk is None:
+            continue
+        assert np.allclose(pb, pk), f"kill-switch did not fully disable the exploit (seed {seed})"
+
+    active = _make_agent()
+    active.set_opponent_profiles({1: _lag(), 3: _lag()})             # 2 lags -> below threshold
+    shifted = False
+    for seed in range(12):
+        pb, pa = _facing_probs(base, seed), _facing_probs(active, seed)
+        if pb is None or pa is None:
+            continue
+        if not np.allclose(pb, pa):
+            shifted = True
+            break
+    assert shifted, "below-threshold exploit never fired -> the kill-equality test would be vacuous"
