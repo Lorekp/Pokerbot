@@ -91,6 +91,46 @@ def _all_live_villains_fish(state, hero: int, profiles: dict | None) -> bool:
     return all(_is_value_fish(profiles.get(s)) for s in live)
 
 
+# Table-aggression kill-switch (Phase 2): the cloud gauntlet showed the WHOLE exploit (solver opponent-
+# tail + facing branch, not just the unopened tilt) is +EV on every realistic field — incl. a 5-TAG "pro"
+# table (+0.99) — and loses ONLY vs a pathological 5-LAG table (-0.48). So disable the entire exploit when
+# >= AGG_KILL_COUNT live villains are confirmed LOOSE-aggressive (lags). Crucially this keys on LOOSE
+# aggression (raises AND folds little) so it fires on lags but NOT on tags — a tag raises but folds tight,
+# so the +0.99 vs pros is kept while the -0.48 vs lags is zeroed.
+AGG_KILL_COUNT = 3            # >= this many confirmed lags at the table -> exploit OFF (protect > extract)
+LAG_MIN_AGG_EXCESS = 0.10    # own-initiative OR facing-raise aggression this far above the Nash reference
+LAG_MAX_FOLD_EXCESS = 0.0    # LOOSE: folds to bets at most the population average (a tag folds MORE)
+
+
+def _is_dangerous_aggressor(prof) -> bool:
+    """True iff ``prof`` is a confident LOOSE-aggressive villain (a lag): elevated own-initiative or
+    facing-raise aggression AND does not fold tight. A TAG (raises but folds more than population) and a
+    station/nit/unknown all return False — so the kill-switch fires on lags, not on profitable tags."""
+    from pokerbot.opponent.bayes_exploit import aggregate_read
+
+    if prof is None or getattr(prof, "hands", 0) < FISH_MIN_HANDS:
+        return False
+    ur = aggregate_read(prof, facing="unopened")
+    init_agg = float((ur.post[2] + ur.post[3]) - (ur.pop[2] + ur.pop[3])) if ur is not None else 0.0
+    fr = aggregate_read(prof, facing="facing_bet")
+    if fr is None:
+        return False
+    fold_excess = float(fr.post[0] - fr.pop[0])
+    raise_excess = float((fr.post[2] + fr.post[3]) - (fr.pop[2] + fr.pop[3]))
+    aggressive = init_agg > LAG_MIN_AGG_EXCESS or raise_excess > LAG_MIN_AGG_EXCESS
+    loose = fold_excess <= LAG_MAX_FOLD_EXCESS
+    return aggressive and loose
+
+
+def _table_too_aggressive(profiles: dict | None, k: int = AGG_KILL_COUNT) -> bool:
+    """True iff at least ``k`` seated villains are confirmed lags -> disable the whole exploit for this
+    table (protect-over-extract). Counts ALL seated profiles (table composition), not just currently-live,
+    so a lag-dominated table stays guarded even in late-street heads-up spots."""
+    if not profiles:
+        return False
+    return sum(1 for p in profiles.values() if _is_dangerous_aggressor(p)) >= k
+
+
 def apply_root_exploit_mixer(state, seat: int, probs: np.ndarray, profiles: dict | None,
                              *, unopened: bool = False) -> np.ndarray:
     """Tilt the hero's own policy ``probs`` at ``state``/``seat`` by the villain read.

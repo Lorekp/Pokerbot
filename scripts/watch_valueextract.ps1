@@ -5,7 +5,7 @@
 # completion rate + ETA, and the DONE/SUMMARY status. Pair with valueextract_babysitter.ps1 (which does
 # the launching). ASCII ONLY (PS 5.1 reads BOM-less .ps1 as cp1252; non-ASCII bytes break strings).
 param(
-  [string]$Run = "run_ve2",
+  [string]$Run = "run_ve3",
   [int]$Refresh = 60,
   [int]$Seeds = 12
 )

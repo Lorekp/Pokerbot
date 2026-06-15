@@ -16,6 +16,8 @@ from pokerbot.search.leaf_evaluator import HistoryValueEvaluator, MockHistoryVal
 from pokerbot.search.pbs_tracker import PBSTracker
 from pokerbot.search.state_bridge import build_subgame_root
 from pokerbot.search.turbo_rebel_search import TurboReBeLConfig, TurboReBeLSolver
+from pokerbot.search.pluribus_search import PluribusReBeLConfig, PluribusReBeLSolver
+from pokerbot.search.pluribus_rollout import ContinuationLeafConfig
 from pokerbot.training.self_play import _index_to_action
 
 DEFAULT_VALUE_CKPT = Path("checkpoints/history_value_net.pkl")
@@ -45,24 +47,68 @@ class SearchAgent:
         max_depth: int = 4,
         use_mock_leaf: bool = False,
         hero_seat: int = 0,
+        use_pluribus_search: bool = False,
+        blueprint_snapshot: dict | None = None,
+        pluribus_leaf_select: str = "uniform",
+        root_exploit_mixer: bool = False,
+        root_mixer_unopened: bool = False,
+        aivat_leaf_q: bool = True,
     ) -> None:
         self.device = torch.device(device)
         self.time_budget_ms = time_budget_ms
+        self.use_pluribus_search = use_pluribus_search
         self._state = SearchAgentState(hero_seat=hero_seat)
         self._state.trajectory.reset(hero_seat)
 
-        ckpt = Path(value_checkpoint) if value_checkpoint else DEFAULT_VALUE_CKPT
-        if use_mock_leaf or not ckpt.exists():
-            self.leaf_eval = MockHistoryValueEvaluator()
-            self._value_ready = use_mock_leaf
+        if use_pluribus_search:
+            # Pluribus-faithful path: tabular blueprint + continuation-gadget leaf. The poisoned neural
+            # stack (HistoryValueEvaluator / AverageStrategyNet) is NEVER constructed here — the leaf is
+            # the continuation gadget, so no value_checkpoint is loaded and the gadget is always "ready".
+            self.leaf_eval = None
+            self._value_ready = True
+            self.solver = PluribusReBeLSolver(
+                blueprint_snapshot or {},
+                PluribusReBeLConfig(
+                    time_budget_ms=time_budget_ms,
+                    leaf=ContinuationLeafConfig(select=pluribus_leaf_select),
+                ),
+            )
         else:
-            self.leaf_eval = HistoryValueEvaluator(ckpt)
-            self._value_ready = self.leaf_eval.has_trained_checkpoint
+            ckpt = Path(value_checkpoint) if value_checkpoint else DEFAULT_VALUE_CKPT
+            if use_mock_leaf or not ckpt.exists():
+                self.leaf_eval = MockHistoryValueEvaluator()
+                self._value_ready = use_mock_leaf
+            else:
+                self.leaf_eval = HistoryValueEvaluator(ckpt)
+                self._value_ready = self.leaf_eval.has_trained_checkpoint
 
-        self.solver = TurboReBeLSolver(
-            self.leaf_eval,
-            TurboReBeLConfig(time_budget_ms=time_budget_ms, max_depth=max_depth),
-        )
+            self.solver = TurboReBeLSolver(
+                self.leaf_eval,
+                TurboReBeLConfig(time_budget_ms=time_budget_ms, max_depth=max_depth),
+            )
+
+        self._decision_rng = None
+        self._decision_capture: list | None = None
+        # Root-policy exploitation: apply the VALIDATED read->mixer_logits->safe_mix adjustment (the
+        # same mechanism the heuristic battery hero proved extracts CI>0 value from leaky archetypes)
+        # to the HERO'S OWN post-search policy. The search supplies the GTO base; the mixer supplies
+        # the exploitation. This also covers PREFLOP (served from the blueprint, where the solver's
+        # opponent-node exploit tail never runs). Off by default; with no profiles set it is inert.
+        self.root_exploit_mixer = root_exploit_mixer
+        # Re-enable the mixer's UNOPENED branch (tilt our own steals/value-bets from the villain's
+        # response read). Its nine-round losses were all measured against the range-free caricature
+        # bots; the fair-bot battery arbitrates. Default False = the validated facing-only subset.
+        self.root_mixer_unopened = root_mixer_unopened
+        self._opponent_profiles: dict | None = None
+        # AIVAT per-action baseline source. True (default) = the rigorous continuation-gadget Q-row
+        # (``solver._leaf_q``), which re-runs the leaf gadget for every legal hero action at every
+        # captured decision — measured at ~44% of the pluribus battery's wall time, entirely OUTSIDE
+        # ``solve()``. False = skip it and emit ``bv=None`` so the capturing adapter (ProductionHero)
+        # falls back to its cheap crude baseline. The estimator is unbiased for ANY baseline, so this
+        # changes ONLY the variance reduction on the SECONDARY per-arm absolute-EV columns
+        # (on_aivat/off_aivat) — the headline on-off ``uplift_bb_per_hand`` (raw chip delta), its SE,
+        # t, CI, zero_frac and bet_shift are byte-unchanged. Default True preserves the existing path.
+        self.aivat_leaf_q = aivat_leaf_q
 
         self.transformer: OpponentTransformer | None = None
         tf_path = Path(transformer_checkpoint) if transformer_checkpoint else DEFAULT_TRANSFORMER_CKPT
@@ -180,16 +226,78 @@ class SearchAgent:
         pbs = self._state.pbs
         assert pbs is not None
 
+        # TABLE-AGGRESSION KILL-SWITCH: when >= AGG_KILL_COUNT seated villains are confirmed lags, disable
+        # the WHOLE exploit (solver opponent-tail AND root mixer) for this decision — the exploit is +EV on
+        # every realistic field incl. a 5-tag pro table (+0.99) and loses only vs a lag-dominated table
+        # (-0.48). Keys on LOOSE aggression so it fires on lags, not on profitable tags. Re-evaluated each
+        # decision; opponent_model is set explicitly so a prior kill never lingers.
+        from pokerbot.opponent.root_mixer import _table_too_aggressive
+
+        kill = bool(self._opponent_profiles) and _table_too_aggressive(self._opponent_profiles)
+        self.solver.opponent_model = None if kill else self._opponent_profiles
+
         root = build_subgame_root(state, pbs, hero)
         result = self.solver.solve(root, pbs)
         self._state.last_solve_metadata = dict(result.metadata)
         self._state.last_solve_metadata["iterations"] = float(result.iterations)
         self._state.last_solve_metadata["ev"] = result.ev
 
-        idx = int(result.action_probs.argmax())
+        probs = np.asarray(result.action_probs, dtype=float)
+        if self.root_exploit_mixer and self._opponent_profiles and not kill:
+            probs = self._apply_root_mixer(state, seat, probs)
+        if self._decision_rng is not None and probs.sum() > 0:
+            w = np.clip(probs, 0.0, None)
+            idx = int(self._decision_rng.choices(range(len(w)), weights=w.tolist())[0])
+        else:
+            idx = int(probs.argmax())
+        if self._decision_capture is not None:
+            # The leaf value net's Q-row at the decision node = the rigorous per-action AIVAT baseline
+            # (value-net AIVAT). Cached in the solver from the just-completed solve. Skipped when
+            # ``aivat_leaf_q`` is False (the gadget Q-row is ~44% of the pluribus battery wall time and
+            # only feeds the SECONDARY absolute-EV variance reduction): emit bv=None so the capturing
+            # adapter falls back to its crude baseline. Headline uplift/SE/CI/zero_frac/bet_shift are
+            # unchanged either way (the on-off uplift uses raw chips, not the AIVAT-adjusted columns).
+            if self.aivat_leaf_q:
+                try:
+                    bv = np.asarray(self.solver._leaf_q(root.env), dtype=float).reshape(-1)
+                except Exception:  # noqa: BLE001
+                    bv = None
+            else:
+                bv = None
+            self._decision_capture.append((probs.copy(), bv, idx))
         action = _index_to_action(state, seat, idx)
         self._state.trajectory.on_action(state, seat, action)
         return action
+
+    def set_opponent_profiles(self, profiles: dict | None) -> None:
+        """Wire opponent profiles into BOTH exploitation seams: the solver's opponent-node tail
+        (postflop, inside the search) and the root mixer (the hero's own policy, all streets).
+        ``None`` disables both — the zero-deviation arm."""
+        self._opponent_profiles = profiles
+        self.solver.opponent_model = profiles
+
+    def _apply_root_mixer(self, state: GameState, seat: int, probs: np.ndarray) -> np.ndarray:
+        """Delegate to the shared root mixer (pokerbot.opponent.root_mixer) — the validated
+        read->mixer_logits->safe_mix step, extracted verbatim so the eval mirror and the live
+        bridge share one implementation. Behavior with ``root_mixer_unopened=False`` (default)
+        is the battle-tested facing-only subset, byte-identical to the pre-extraction code."""
+        from pokerbot.opponent.root_mixer import apply_root_exploit_mixer
+
+        return apply_root_exploit_mixer(state, seat, probs, self._opponent_profiles,
+                                        unopened=self.root_mixer_unopened)
+
+    def enable_decision_capture(self, rng=None) -> None:
+        """Capture per-decision ``(action_probs, leaf_q_row, taken_idx)`` for the exploitation battery
+        / AIVAT. ``rng`` makes the agent SAMPLE from the search strategy (needed for AIVAT's decision
+        control variate to be zero-mean). Off by default ⇒ argmax play unchanged."""
+        self._decision_capture = []
+        self._decision_rng = rng
+
+    def pop_decisions_raw(self) -> list:
+        if self._decision_capture is None:
+            return []
+        d, self._decision_capture = self._decision_capture, []
+        return d
 
     @property
     def last_solve_metadata(self) -> dict[str, float]:

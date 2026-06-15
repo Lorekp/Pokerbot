@@ -12,9 +12,10 @@ Set-Location (Join-Path $PSScriptRoot "..")   # repo root
 $REGION = "eu-central-1"
 $BUCKET = "video-processing-6789"
 # uniform leaf is cheap => high hands OK. The gauntlet cells are (6 fields x SEEDS), one base arm.
-# run_ve2 = the FISH-GATED unopened exploit (run_ve1 was the ungated baseline; a fresh prefix is required
-# because run_job skips ve_*.json cells already in S3, so reusing run_ve1 would re-pool the old numbers).
-$RUN     = "run_ve2"
+# run_ve3 = + the TABLE-AGGRESSION KILL-SWITCH (>=3 confirmed lags => whole exploit OFF). Fresh prefix
+# each iteration because run_job skips ve_*.json already in S3 (run_ve1=ungated, run_ve2=fish-gate only).
+# Predicted: irc_lag -0.48 -> ~0 (kill), every other field unchanged (station/soft/mixed/tough/pros).
+$RUN     = "run_ve3"
 $VECONF  = "10:uniform"
 $SEEDS   = 12
 $HANDS   = 3000
