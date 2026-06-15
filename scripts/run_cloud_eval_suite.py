@@ -300,9 +300,9 @@ class Suite:
             print("BASESTRENGTH ALL-FAILED — no DONE marker (check FAIL_*.log)\n" + body, flush=True)
 
     # ---- Phase 2: value-extraction gauntlet (unopened exploit vs realistic IRC villains) ----
-    _VE_FIELDS = ("irc_soft", "irc_station", "irc_mixed", "irc_tough", "irc_lag")
+    _VE_FIELDS = ("irc_soft", "irc_station", "irc_mixed", "irc_tough", "irc_lag", "irc_pros")
     _VE_WEAK = ("irc_soft", "irc_station", "irc_mixed")
-    _VE_TOUGH = ("irc_tough", "irc_lag")
+    _VE_TOUGH = ("irc_tough", "irc_lag", "irc_pros")
 
     def _ve_config(self) -> tuple[int, str]:
         raw = getattr(self.a, "ve_config", None) or "10:uniform"

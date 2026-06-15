@@ -46,6 +46,51 @@ def _select_profile(profiles: dict | None, last_aggressor):
     return next((p for p in profiles.values() if p is not None), None)
 
 
+# Value-fish gate (Phase 2): the UNOPENED value-bet tilt fires ONLY when EVERY live opponent who could
+# punish a thin value-bet is a CONFIRMED sticky caller (a station). A lag (raises/punishes), a reg/nit
+# (won't pay thin value), or an UNidentified villain each flip the gate OFF -> defer to the base policy.
+# This is what makes the +1.4 bb/100 value-extraction do-no-harm in ANY table constellation: it self-
+# disables the moment one dangerous/unknown opponent is in the pot (measured ungated leak: -0.55 bb/100
+# vs a 5-lag table). The loose-passive IRC population reference is self-correcting: a reg reads TIGHTER
+# than the fishy average (folds more -> excluded); a station reads looser (-> included).
+FISH_MIN_HANDS = 25            # below this a villain is "unknown" -> not fish -> defer (cold-start safe)
+FISH_MAX_FOLD_EXCESS = 0.05    # folds to bets at most pop+this (sticky; pays value). Tighter -> excluded.
+FISH_MAX_RAISE_EXCESS = 0.03   # rarely raises facing a bet (does not punish thin value)
+FISH_MAX_INIT_AGG = 0.05       # not a lag: own-initiative aggression at/below the Nash reference
+
+
+def _is_value_fish(prof) -> bool:
+    """True iff ``prof`` is a CONFIDENT sticky-caller (station) that pays thin value and does not punish:
+    enough hands AND does not fold-to-bets above population AND rarely raises AND low own-initiative
+    aggression. Unknown / aggressive (lag) / tight (nit, reg) all return False so the caller defers."""
+    from pokerbot.opponent.bayes_exploit import aggregate_read
+
+    if prof is None or getattr(prof, "hands", 0) < FISH_MIN_HANDS:
+        return False
+    fr = aggregate_read(prof, facing="facing_bet")
+    if fr is None:
+        return False
+    fold_excess = float(fr.post[0] - fr.pop[0])
+    raise_excess = float((fr.post[2] + fr.post[3]) - (fr.pop[2] + fr.pop[3]))
+    if fold_excess > FISH_MAX_FOLD_EXCESS or raise_excess > FISH_MAX_RAISE_EXCESS:
+        return False  # folds too much (nit/reg) or punishes (lag) -> not a thin-value target
+    ur = aggregate_read(prof, facing="unopened")
+    init_agg = float((ur.post[2] + ur.post[3]) - (ur.pop[2] + ur.pop[3])) if ur is not None else 0.0
+    return init_agg <= FISH_MAX_INIT_AGG
+
+
+def _all_live_villains_fish(state, hero: int, profiles: dict | None) -> bool:
+    """Unopened value-bet gate: True iff there is >=1 live opponent AND every live (not-folded) opponent
+    is a confirmed value-fish. Any lag / reg / nit / unidentified villain -> False -> defer. Robust in
+    any constellation (2 fish + 1 aggressor -> False; all-unknown at session start -> False)."""
+    if not profiles:
+        return False
+    live = [s for s, p in enumerate(state.players) if s != hero and not p.folded]
+    if not live:
+        return False
+    return all(_is_value_fish(profiles.get(s)) for s in live)
+
+
 def apply_root_exploit_mixer(state, seat: int, probs: np.ndarray, profiles: dict | None,
                              *, unopened: bool = False) -> np.ndarray:
     """Tilt the hero's own policy ``probs`` at ``state``/``seat`` by the villain read.
@@ -101,6 +146,11 @@ def apply_root_exploit_mixer(state, seat: int, probs: np.ndarray, profiles: dict
     # those losses were measured against bots with no human range structure, so the fair-bot
     # battery is the arbiter.
     if not facing and not unopened:
+        return probs
+    # VALUE-FISH GATE: the unopened thin-value tilt fires only when EVERY live opponent is a confirmed
+    # station (see _all_live_villains_fish). This is the do-no-harm guarantee that lets the +1.4 bb/100
+    # value-extraction run live: a single lag/reg/nit/unknown in the pot -> defer to the search policy.
+    if not facing and not _all_live_villains_fish(state, seat, profiles):
         return probs
     villain_ck = context_key(street, board, 0 if facing else 1)
     read = (context_read(prof, villain_ck) or aggregate_read(prof, facing=target))

@@ -5,14 +5,14 @@
 # completion rate + ETA, and the DONE/SUMMARY status. Pair with valueextract_babysitter.ps1 (which does
 # the launching). ASCII ONLY (PS 5.1 reads BOM-less .ps1 as cp1252; non-ASCII bytes break strings).
 param(
-  [string]$Run = "run_ve1",
+  [string]$Run = "run_ve2",
   [int]$Refresh = 60,
   [int]$Seeds = 12
 )
 $REGION = "eu-central-1"
 $BUCKET = "video-processing-6789"
 $PREFIX = "pokerbot/prod6000/eval_suite/$Run"
-$FIELDS = @("irc_soft", "irc_station", "irc_mixed", "irc_tough", "irc_lag")
+$FIELDS = @("irc_soft", "irc_station", "irc_mixed", "irc_tough", "irc_lag", "irc_pros")
 $WEAK   = @("irc_soft", "irc_station", "irc_mixed")
 $TOTAL  = $FIELDS.Count * $Seeds
 $t0 = Get-Date

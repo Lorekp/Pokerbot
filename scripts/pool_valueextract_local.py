@@ -19,7 +19,7 @@ from collections import defaultdict
 from pathlib import Path
 
 WEAK = ("irc_soft", "irc_station", "irc_mixed")
-TOUGH = ("irc_tough", "irc_lag")
+TOUGH = ("irc_tough", "irc_lag", "irc_pros")
 _FIELD_RE = re.compile(r"^ve_(.+)_s\d+\.json$")
 
 

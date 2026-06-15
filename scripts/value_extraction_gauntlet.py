@@ -45,9 +45,10 @@ FIELDS = {
     "irc_tough": ["irc_lag", "irc_lag", "irc_tag", "irc_tag", "irc_nit"],
     "irc_station": ["irc_station"] * 5,
     "irc_lag": ["irc_lag"] * 5,
+    "irc_pros": ["irc_tag"] * 5,   # all near-solid TAGs: the professional-table do-no-harm test
 }
 WEAK_FIELDS = ("irc_soft", "irc_station", "irc_mixed")
-TOUGH_FIELDS = ("irc_tough", "irc_lag")
+TOUGH_FIELDS = ("irc_tough", "irc_lag", "irc_pros")
 
 
 def _pool(xs):
