@@ -53,6 +53,7 @@ class SearchAgent:
         root_exploit_mixer: bool = False,
         root_mixer_unopened: bool = False,
         aivat_leaf_q: bool = True,
+        search_preflop: bool = False,
     ) -> None:
         self.device = torch.device(device)
         self.time_budget_ms = time_budget_ms
@@ -71,6 +72,11 @@ class SearchAgent:
                 PluribusReBeLConfig(
                     time_budget_ms=time_budget_ms,
                     leaf=ContinuationLeafConfig(select=pluribus_leaf_select),
+                    # search_preflop: LBR audit found the base is exploitable ~+180 bb/100 almost
+                    # entirely PREFLOP (the blueprint open/3bet ranges are too wide), and that searching
+                    # the preflop eliminates it (+180 -> <=0). Deployed paths pass True. Default False
+                    # keeps the eval/battery (and the basestrength +9.1 baseline) reproducible.
+                    search_preflop=search_preflop,
                 ),
             )
         else:
