@@ -36,6 +36,7 @@ _INCLUDE = [
     "scripts/eval_exploitation_battery.py",
     "scripts/run_cloud_eval_suite.py",
     "scripts/value_extraction_gauntlet.py",   # --mode valueextract per-cell driver (irc_villains via pokerbot/)
+    "scripts/lbr6_audit.py",                   # --mode lbr6 per-cell driver (certified 6-max best-response)
     "scripts/summarize_exploit_battery.py",
     "data/weva",
     "data/player_profiles/irc_population_prior.json",
@@ -87,7 +88,9 @@ def upload_blueprint(s3, bucket: str, prefix: str) -> str:
 
 def user_data(*, bucket, prefix, region, code_key, bp_key, run_subdir, workers, seeds, hands,
               mode="full", keep_alive=False, bs_configs="10:uniform", bs_skip_sft=False,
-              bs_pooled_profiles=False, ve_config="10:uniform") -> str:
+              bs_pooled_profiles=False, ve_config="10:uniform",
+              lbr6_rollouts=14, lbr6_no_allin=False, lbr6_passive=False, lbr6_menu="fcpa",
+              lbr6_target="blueprint", lbr6_search_leaf="uniform", lbr6_search_iters=10) -> str:
     run_prefix = f"{prefix}/{run_subdir}"
     final = "echo BOOTSTRAP_DONE_KEEP_ALIVE" if keep_alive else "shutdown -h now"
     if mode == "calibrate":
@@ -107,6 +110,12 @@ def user_data(*, bucket, prefix, region, code_key, bp_key, run_subdir, workers, 
                         + ("--bs-pooled-profiles " if bs_pooled_profiles else ""))
         elif mode == "valueextract":
             bs_flags = f"--ve-config {ve_config} "
+        elif mode == "lbr6":
+            bs_flags = (f"--lbr6-menu {lbr6_menu} --lbr6-target {lbr6_target} "
+                        + (f"--lbr6-search-leaf {lbr6_search_leaf} "
+                           f"--lbr6-search-iters {lbr6_search_iters} "
+                           if lbr6_target == "blueprint-search" else "")
+                        + ("--lbr6-passive " if lbr6_passive else ""))
         main_cmd = (
             f"python3 scripts/run_cloud_eval_suite.py --bucket {bucket} --prefix {run_prefix} "
             f"--region {region} --workers {workers} --seeds {seeds} --hands {hands} "
@@ -138,8 +147,12 @@ export PYTHONPATH=/opt/pokerbot JAX_PLATFORMS=cpu POKERBOT_BETTING_ABSTRACTION=1
 # them the pluribus hero gets ~0% postflop blueprint coverage (silent uniform fallback). Net is invariant.
 export POKERBOT_POSTFLOP_BUCKETS=1 POKERBOT_POSTFLOP_MODE=fast POKERBOT_POSTFLOP_NUM_BUCKETS=200
 export POKERBOT_BLUEPRINT_SNAPSHOT=/tmp/bp6max_v2_iter200.pkl
-# Thin single-thread workers (the many-process lesson from training: no nested threadpools).
+# Thin single-thread workers (the many-process lesson from training: no nested threadpools). OMP/BLAS alone
+# is NOT enough: every worker imports JAX, whose XLA CPU backend spins its OWN Eigen thread pool regardless,
+# so N workers become N*cores threads and search-heavy cells (lbr6 --target blueprint-search runs a solve
+# per opponent decision => ~5x the search calls of a 1-seat hero) thrash the box. Cap XLA too.
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NPY_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+export XLA_FLAGS="--xla_cpu_multi_thread_eigen=false --xla_force_host_platform_device_count=1"
 {main_cmd}
 echo "suite exit ${{PIPESTATUS[0]}}"
 python3 - <<'PYEOF'
@@ -164,7 +177,8 @@ def main() -> None:
     p.add_argument("--hands", type=int, default=3000)
     p.add_argument("--run-subdir", default="run_evalsuite1")
     p.add_argument("--mode",
-                   choices=("full", "confirm", "hybrid", "calibrate", "basestrength", "valueextract"),
+                   choices=("full", "confirm", "hybrid", "calibrate", "basestrength", "valueextract",
+                            "lbr6"),
                    default="full")
     p.add_argument("--bucket", default=DEFAULT_BUCKET)
     p.add_argument("--prefix", default=DEFAULT_PREFIX)
@@ -182,6 +196,21 @@ def main() -> None:
                         "(default is per-villain targeting)")
     p.add_argument("--ve-config", default="10:uniform",
                    help="--mode valueextract: pluribus '<iters>:<leaf>' for the gauntlet hero")
+    p.add_argument("--lbr6-rollouts", type=int, default=14,
+                   help="--mode lbr6: MC rollouts per candidate action per LBR decision")
+    p.add_argument("--lbr6-no-allin", action="store_true",
+                   help="--mode lbr6: drop all-in from LBR's bet menu (lower-variance adversary)")
+    p.add_argument("--lbr6-passive", action="store_true",
+                   help="--mode lbr6: use the legacy rollout adversary instead of the analytic LBR")
+    p.add_argument("--lbr6-menu", choices=("fc", "fcpa", "full"), default="fcpa",
+                   help="--mode lbr6: graded action menu for the analytic LBR (fc floor / fcpa / full)")
+    p.add_argument("--lbr6-target", choices=("blueprint", "blueprint-search"), default="blueprint",
+                   help="--mode lbr6: RAW blueprint or the DEPLOYED blueprint+SEARCH base (what the bot "
+                        "actually plays). blueprint-search runs Pluribus per opponent decision.")
+    p.add_argument("--lbr6-search-leaf", choices=("uniform", "gadget"), default="uniform",
+                   help="--mode lbr6 blueprint-search: Pluribus continuation leaf (uniform = deployed).")
+    p.add_argument("--lbr6-search-iters", type=int, default=10,
+                   help="--mode lbr6 blueprint-search: fixed CFR+ iters per opponent solve (10 = deployed).")
     args = p.parse_args()
 
     s3 = boto3.client("s3", region_name=args.region)
@@ -195,7 +224,11 @@ def main() -> None:
                    bp_key=bp_key, run_subdir=args.run_subdir, workers=args.workers,
                    seeds=args.seeds, hands=args.hands, mode=args.mode, keep_alive=args.keep_alive,
                    bs_configs=args.bs_configs, bs_skip_sft=args.bs_skip_sft,
-                   bs_pooled_profiles=args.bs_pooled_profiles, ve_config=args.ve_config)
+                   bs_pooled_profiles=args.bs_pooled_profiles, ve_config=args.ve_config,
+                   lbr6_rollouts=args.lbr6_rollouts, lbr6_no_allin=args.lbr6_no_allin,
+                   lbr6_passive=args.lbr6_passive, lbr6_menu=args.lbr6_menu,
+                   lbr6_target=args.lbr6_target, lbr6_search_leaf=args.lbr6_search_leaf,
+                   lbr6_search_iters=args.lbr6_search_iters)
     run_kwargs = dict(
         ImageId=ami,
         InstanceType=args.instance_type,

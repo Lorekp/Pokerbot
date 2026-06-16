@@ -371,6 +371,121 @@ class Suite:
         else:
             print("VALUEEXTRACT ALL-FAILED — no DONE marker (check FAIL_*.log)\n" + body, flush=True)
 
+    # ---- LBR6: certified 6-max best-response exploitability of the blueprint foundation ----
+    # GRADED Lisy-Bowling protocol: sweep the action menu (fc floor / fcpa / full) to map HOW the exploit
+    # grows with the adversary's betting options, with a per-seat deviation-gain breakdown. One cell per
+    # (menu, seed) self-uploads lbr6_<menu>_s<seed>.json; pooling independent seeds shrinks the CI like a
+    # single large-N run. Two calibration cells (foldbot, station) prove the adversary detects leaks.
+    _LBR6_MENUS = ("fc", "fcpa", "full")
+
+    def lbr6_jobs(self) -> list[tuple[str, list[str], dict | None]]:
+        a, jobs = self.a, []
+        extra = (["--rollout"] if getattr(a, "lbr6_passive", False) else [])  # legacy escape hatch only
+        menus = self._LBR6_MENUS if getattr(a, "lbr6_graded", True) else (getattr(a, "lbr6_menu", "fcpa"),)
+        # Target: the RAW blueprint (fast lookup) or the DEPLOYED blueprint+SEARCH base (what the bot really
+        # plays). For search the seats run Pluribus per decision (~30x slower) while the LBR range-tracks
+        # against the cheap blueprint -- so the same 3-menu sweep costs the same wall-clock as 1 menu (the
+        # opponent search cost is per-decision, independent of the LBR's own action menu).
+        target = getattr(a, "lbr6_target", "blueprint")
+        search = (["--search-leaf", getattr(a, "lbr6_search_leaf", "uniform"),
+                   "--search-iters", str(getattr(a, "lbr6_search_iters", 10))]
+                  if target == "blueprint-search" else [])
+        for tgt in ("foldbot", "station"):
+            n = f"lbr6_cal_{tgt}_s0"
+            jobs.append((n, [sys.executable, "scripts/lbr6_audit.py", "--target", tgt, "--menu", "full",
+                             "--hands", str(min(a.hands, 400)), "--seed", "0", "--unpaired",
+                             "--out", str(RUNS / f"{n}.json")], None))
+        for menu in menus:
+            for seed in range(a.seeds):
+                n = f"lbr6_{menu}_s{seed}"
+                jobs.append((n, [sys.executable, "scripts/lbr6_audit.py", "--target", target,
+                                 "--blueprint-snapshot", a.bp, "--menu", menu, "--hands", str(a.hands),
+                                 "--seed", str(seed), "--unpaired", "--out", str(RUNS / f"{n}.json")]
+                             + search + extra, None))
+        return jobs
+
+    @staticmethod
+    def _pool_stats(pairs: list[tuple[float, float, int]]) -> dict | None:
+        """Pool (mean_bb_per_hand, std_bb_per_hand, n) triples -> bb/100 + 95% CI via total-variance."""
+        pairs = [p for p in pairs if p[2]]
+        if not pairs:
+            return None
+        N = sum(n for _, _, n in pairs)
+        M = sum(m * n for m, _, n in pairs) / N
+        ss = sum(n * (sd ** 2) + n * (m - M) ** 2 for m, sd, n in pairs)
+        stderr = math.sqrt((ss / N) / N)
+        return {"bb_per_100": M * 100, "ci_lo": (M - 1.96 * stderr) * 100,
+                "ci_hi": (M + 1.96 * stderr) * 100, "stderr_bb_per_100": stderr * 100,
+                "total_hands": N, "k_seeds": len(pairs)}
+
+    def _pool_lbr6_menu(self, menu: str) -> dict | None:
+        """Pool one menu's seed cells -> overall + per-seat deviation gain."""
+        cells = []
+        for f in RUNS.glob(f"lbr6_{menu}_s*.json"):
+            try:
+                cells.append(json.loads(f.read_text(encoding="utf-8")))
+            except (ValueError, OSError):
+                continue
+        cells = [c for c in cells if c.get("hands")]
+        if not cells:
+            return None
+        overall = self._pool_stats([(c["ev_bb_per_hand"], c["std_bb_per_hand"], c["hands"]) for c in cells])
+        per_seat = {}
+        for s in range(6):
+            trip = [(ps["bb_per_100"] / 100.0, ps.get("std_bb_per_hand", 0.0), ps["n"])
+                    for c in cells for sk, ps in (c.get("detail", {}).get("per_seat", {}) or {}).items()
+                    if int(sk) == s]
+            pooled_s = self._pool_stats(trip)
+            if pooled_s:
+                per_seat[s] = {"bb_per_100": round(pooled_s["bb_per_100"], 1),
+                               "ci_lo": round(pooled_s["ci_lo"], 1), "ci_hi": round(pooled_s["ci_hi"], 1)}
+        return {**overall, "per_seat": per_seat}
+
+    def _read_lbr6_one(self, fn: str) -> dict | None:
+        f = RUNS / fn
+        if not f.exists():
+            return None
+        try:
+            r = json.loads(f.read_text(encoding="utf-8"))
+            return {"bb_per_100": r["bb_per_100"], "hands": r["hands"]}
+        except (ValueError, OSError, KeyError):
+            return None
+
+    def run_lbr6(self) -> None:
+        a = self.a
+        jobs = self.lbr6_jobs()
+        print(f"lbr6 graded: {len(jobs)} jobs ({len(self._existing)} already in S3)", flush=True)
+        with ThreadPoolExecutor(max_workers=a.workers) as ex:
+            list(ex.map(lambda j: self.run_job(*j), jobs))
+        menus = {m: self._pool_lbr6_menu(m) for m in self._LBR6_MENUS}
+        menus = {m: v for m, v in menus.items() if v}
+        cal = {t: self._read_lbr6_one(f"lbr6_cal_{t}_s0.json") for t in ("foldbot", "station")}
+        cal_ok = all(c and c["bb_per_100"] > 50 for c in cal.values())
+        # BEATABLE if ANY menu's pooled CI lower bound clears zero (the strongest menu defines the bound).
+        beatable = any(v["ci_lo"] > 0 for v in menus.values())
+        worst = max((v["bb_per_100"] for v in menus.values()), default=0.0)
+        target = getattr(a, "lbr6_target", "blueprint")
+        tgt_lbl = ("blueprint+search (DEPLOYED base)" if target == "blueprint-search"
+                   else "raw blueprint (lookup only)")
+        verdict = ("CALIBRATION-FAILED (adversary not detecting leaks)" if not cal_ok else
+                   (f"BEATABLE: best-responder profits vs {tgt_lbl} by up to {worst:+.1f} bb/100 "
+                    f"(a menu CI excludes 0)" if beatable else
+                    f"ROBUST at this CI: no menu's best-responder proves a positive exploit of {tgt_lbl}"))
+        summary = {"mode": "lbr6", "method": "analytic_1ply_lbr", "target": target,
+                   "search": ({"leaf": getattr(a, "lbr6_search_leaf", "uniform"),
+                               "iters": getattr(a, "lbr6_search_iters", 10)}
+                              if target == "blueprint-search" else None),
+                   "hands": a.hands, "seeds": a.seeds,
+                   "menus": menus, "calibration": cal, "verdict": verdict}
+        body = json.dumps(summary, indent=1, default=str)
+        self.s3.put_object(Bucket=a.bucket, Key=f"{self.rk}/SUMMARY.json", Body=body.encode())
+        if menus:
+            self.s3.put_object(Bucket=a.bucket, Key=f"{a.prefix}/eval_suite_DONE.marker",
+                               Body=time.strftime("%Y-%m-%d %H:%M:%S").encode())
+            print("LBR6 DONE\n" + body, flush=True)
+        else:
+            print("LBR6 ALL-FAILED — no DONE marker (check FAIL_*.log)\n" + body, flush=True)
+
     def gate(self) -> tuple[str | None, dict]:
         """The pre-registered arm rule. Returns (winning arm or None, full table)."""
         table: dict = {}
@@ -522,6 +637,9 @@ class Suite:
         if getattr(self.a, "mode", "full") == "valueextract":
             self.run_valueextract()
             return
+        if getattr(self.a, "mode", "full") == "lbr6":
+            self.run_lbr6()
+            return
         a = self.a
         jobs = self.phase_a_jobs()
         print(f"phase A: {len(jobs)} jobs ({len(self._existing)} results already in S3)", flush=True)
@@ -566,7 +684,8 @@ def main() -> None:
     ap.add_argument("--seeds", type=int, default=18)
     ap.add_argument("--hands", type=int, default=3000)
     ap.add_argument("--bp", default="/tmp/bp6max_v2_iter200.pkl")
-    ap.add_argument("--mode", choices=("full", "confirm", "hybrid", "basestrength", "valueextract"),
+    ap.add_argument("--mode",
+                    choices=("full", "confirm", "hybrid", "basestrength", "valueextract", "lbr6"),
                     default="full",
                     help="full = P0+sweep+priorAB+gate+phaseB; confirm = read-gated mixer ON vs "
                          "pure-search OFF (G1 verification); hybrid = HybridAgent production hero "
@@ -587,6 +706,23 @@ def main() -> None:
                          "is PER-SEAT targeting (one profile per villain, hero reads the aggressor).")
     ap.add_argument("--ve-config", default="10:uniform",
                     help="valueextract: pluribus '<iters>:<leaf>' for the gauntlet hero (e.g. 10:uniform)")
+    ap.add_argument("--lbr6-menu", choices=("fc", "fcpa", "full"), default="fcpa",
+                    help="lbr6: graded action menu for the analytic LBR adversary (fc floor / fcpa / full)")
+    ap.add_argument("--lbr6-rollouts", type=int, default=14,
+                    help="lbr6: (legacy rollout mode) MC rollouts per candidate action per LBR decision")
+    ap.add_argument("--lbr6-no-allin", action="store_true",
+                    help="lbr6: drop all-in from LBR's menu (lower-variance 'reasonable' adversary)")
+    ap.add_argument("--lbr6-passive", action="store_true",
+                    help="lbr6: use the passive (weaker, valid) continuation instead of the competent one")
+    ap.add_argument("--lbr6-target", choices=("blueprint", "blueprint-search"), default="blueprint",
+                    help="lbr6: RAW blueprint lookup (default) or the DEPLOYED blueprint+SEARCH base (what "
+                         "the bot actually plays). blueprint-search makes the seats run Pluribus per "
+                         "decision while the LBR range-tracks against the cheap blueprint (tractable, valid).")
+    ap.add_argument("--lbr6-search-leaf", choices=("uniform", "gadget"), default="uniform",
+                    help="lbr6 blueprint-search: Pluribus continuation leaf (uniform = deployed/floor).")
+    ap.add_argument("--lbr6-search-iters", type=int, default=10,
+                    help="lbr6 blueprint-search: FIXED CFR+ iters per opponent solve (box-independent). "
+                         "10 = the config the +9.1 basestrength base was measured at.")
     ap.add_argument("--job-timeout", type=int, default=4 * 3600)
     args = ap.parse_args()
     Suite(args).run()
