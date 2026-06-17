@@ -21,7 +21,7 @@ bet_tree:
 
 solver:
   max_iterations: 10000
-  target_exploitability_pct: 0.5
+  target_exploitability_pct: 1.0
   timeout_sec: 3600
   include_unconverged: false
   chip_unit_bb: 100

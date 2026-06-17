@@ -113,9 +113,11 @@ class AoFOpponentDB:
     names: dict[str, str] = field(default_factory=dict)
     seen_hands: dict = field(default_factory=dict)   # insertion-ordered set (FIFO recency, see _ordered_set)
     _dirty: bool = False
+    wal: bool = True                                  # crash journal between snapshots (see _wal_append)
     _lock: threading.RLock = field(default=None, init=False, repr=False, compare=False)
     _io_lock: threading.Lock = field(default=None, init=False, repr=False, compare=False)
     _persisted: dict = field(default=None, init=False, repr=False, compare=False)
+    _wal_replaying: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.path = Path(self.path)
@@ -126,31 +128,31 @@ class AoFOpponentDB:
     # ---- persistence ----------------------------------------------------------------
     def load(self) -> None:
         with self._lock:
-            if not self.path.exists():
-                self._persisted = {}
-                return
-            try:
-                raw = json.loads(self.path.read_text(encoding="utf-8"))
-                if not isinstance(raw, dict):
-                    raise ValueError("profiles root is not an object")
-            except (OSError, ValueError) as exc:
-                self._backup_corrupt(exc)
-                self._persisted = {}
-                return
-            # Refuse-with-backup on an infoset-key-spec mismatch: counts keyed under a
-            # different spec would silently mix incompatible cells. Legacy files without the
-            # header are accepted (they predate the header, not the current spec).
-            stored_spec = raw.get("infoset_key_spec_hash")
-            if stored_spec is not None and stored_spec != _spec_hash():
-                self._backup_corrupt(ValueError(
-                    f"infoset key spec {stored_spec} != current {_spec_hash()}"))
-                self._persisted = {}
-                return
-            self.counts = _coerce_counts(raw.get("counts"))
-            self.names = dict(raw.get("names") or {})
-            self.seen_hands = dict.fromkeys(raw.get("seen_hands") or [])   # preserve persisted order
-            self._persisted = copy.deepcopy(self.counts)  # baseline for delta-merge saves
+            self._persisted = {}
+            raw = None
+            if self.path.exists():
+                try:
+                    raw = json.loads(self.path.read_text(encoding="utf-8"))
+                    if not isinstance(raw, dict):
+                        raise ValueError("profiles root is not an object")
+                except (OSError, ValueError) as exc:
+                    self._backup_corrupt(exc)
+                    raw = None
+            if raw is not None:
+                # Refuse-with-backup on an infoset-key-spec mismatch: counts keyed under a
+                # different spec would silently mix incompatible cells. Legacy files without the
+                # header are accepted (they predate the header, not the current spec).
+                stored_spec = raw.get("infoset_key_spec_hash")
+                if stored_spec is not None and stored_spec != _spec_hash():
+                    self._backup_corrupt(ValueError(
+                        f"infoset key spec {stored_spec} != current {_spec_hash()}"))
+                else:
+                    self.counts = _coerce_counts(raw.get("counts"))
+                    self.names = dict(raw.get("names") or {})
+                    self.seen_hands = dict.fromkeys(raw.get("seen_hands") or [])  # preserve order
+                    self._persisted = copy.deepcopy(self.counts)  # baseline for delta-merge saves
         self._fold_sidecars()  # recover any lock-timeout deltas other runs left behind
+        self._replay_wal()     # recover hands journaled but not yet snapshotted (hard-kill safety)
 
     def _backup_corrupt(self, exc: Exception) -> None:
         try:
@@ -172,6 +174,10 @@ class AoFOpponentDB:
                 names_snap = dict(self.names)
                 seen_snap = dict(self.seen_hands)         # ordered copy
                 baseline = self._persisted or {}
+                # Rotate the WAL under the SAME lock as the snapshot so the rotated file holds
+                # exactly the hands captured in counts_snap; appends racing in from the ingest
+                # thread land in a fresh WAL and are never discarded by this save.
+                flushing = self._rotate_wal_locked()
             self.path.parent.mkdir(parents=True, exist_ok=True)
             out_counts, out_names, out_seen = counts_snap, names_snap, seen_snap
             if merge:
@@ -185,6 +191,7 @@ class AoFOpponentDB:
                         with self._lock:
                             self._persisted = counts_snap   # delta is parked, not pending
                             self._dirty = False
+                        self._discard_flushing(flushing)    # data is durable in the sidecar now
                         return
                     disk = self._read_disk()
                     extra = self._collect_sidecars()
@@ -203,6 +210,7 @@ class AoFOpponentDB:
             with self._lock:
                 self._persisted = counts_snap  # baseline = what we just persisted our part of
                 self._dirty = False
+            self._discard_flushing(flushing)   # rotated WAL is now folded into the snapshot
 
     # -- sidecar deltas (lock-timeout fallback that cannot clobber) -----------------------
     def _sidecar_glob(self):
@@ -277,6 +285,75 @@ class AoFOpponentDB:
             os.fsync(fh.fileno())
         os.replace(tmp, self.path)  # atomic on same volume (POSIX + Windows)
 
+    # -- write-ahead crash journal (lossless between snapshots) ---------------------------
+    # Mirrors PlayerProfileStore's WAL: record_hand appends its delta to <path>.wal.jsonl
+    # immediately (cheap), load() replays anything not yet in the snapshot (idempotent by
+    # hand_id), and save() rotates+discards it. A hard kill between saves loses nothing.
+    @property
+    def wal_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".wal.jsonl")
+
+    def _wal_append(self, entry: dict) -> None:
+        """Append one journal line. Caller holds ``self._lock`` (serializes multi-table writers)."""
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.wal_path, "a", encoding="utf-8") as wf:
+                wf.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except (OSError, TypeError):
+            pass  # journaling is best-effort; the snapshot is still the source of truth
+
+    def _rotate_wal_locked(self) -> Path | None:
+        """Atomically move the active WAL aside so its lines match the just-taken snapshot; fresh
+        appends create a new WAL. Returns the rotated path (discarded once the snapshot is durable)."""
+        if not self.wal or not self.wal_path.exists():
+            return None
+        dest = self.path.with_name(
+            f"{self.path.name}.wal.flushing.{os.getpid()}-{threading.get_ident()}-{int(time.time()*1000)}")
+        try:
+            os.replace(self.wal_path, dest)
+            return dest
+        except OSError:
+            return None
+
+    def _discard_flushing(self, path: Path | None) -> None:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def _replay_wal(self) -> None:
+        if not self.wal:
+            return
+        # Fold any crashed mid-flush files back into the active WAL so the next save truncates them
+        # (don't apply-then-delete: a crash before that save would lose them).
+        for fp in sorted(self.path.parent.glob(self.path.name + ".wal.flushing.*")):
+            try:
+                data = fp.read_text(encoding="utf-8")
+                with open(self.wal_path, "a", encoding="utf-8") as wf:
+                    wf.write(data)
+                fp.unlink()
+            except OSError:
+                pass
+        if not self.wal_path.exists():
+            return
+        self._wal_replaying = True   # record_hand applies to memory but does NOT re-append
+        try:
+            for line in self.wal_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue  # torn tail line from a mid-write kill — ignore
+                obs = [tuple(o) for o in (e.get("o") or [])]
+                self.record_hand(e.get("id"), obs, names=e.get("n") or None)
+        except OSError:
+            pass
+        finally:
+            self._wal_replaying = False
+
     # ---- mutation -------------------------------------------------------------------
     def record_action(self, identity: str, infoset_key: str, pushed: bool) -> None:
         """Fold one observed push/fold decision into the counts for ``identity``."""
@@ -289,8 +366,10 @@ class AoFOpponentDB:
             cell[1] += 1
             self._dirty = True
 
-    def record_hand(self, hand_id: str | None, observations: list[tuple[str, str, bool]]) -> int:
-        """Idempotently fold one hand's observations ``[(identity, infoset_key, pushed)]``.
+    def record_hand(self, hand_id: str | None, observations: list[tuple[str, str, bool]],
+                    names: dict[str, str] | None = None) -> int:
+        """Idempotently fold one hand's observations ``[(identity, infoset_key, pushed)]`` (and
+        optional ``{identity: display_name}``) into the profile.
 
         Re-recording the same ``hand_id`` is a no-op (restart / log reprocessing safe).
         Returns the number of observations recorded (0 if the hand was already seen)."""
@@ -310,7 +389,17 @@ class AoFOpponentDB:
                 cell[0] += 1 if pushed else 0
                 cell[1] += 1
                 n += 1
+            if names:
+                for ident, nm in names.items():
+                    if ident and nm:
+                        self.names[ident] = nm
             self._dirty = True
+            # Crash journal (only dedup-safe hands with an id): append the delta immediately so a
+            # hard kill before the next snapshot replays losslessly. Skipped during replay.
+            if self.wal and not self._wal_replaying and hand_id is not None:
+                self._wal_append({"id": hand_id,
+                                  "o": [list(o) for o in observations],
+                                  "n": names or {}})
             return n
 
     def set_name(self, identity: str, name: str | None) -> None:

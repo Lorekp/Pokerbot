@@ -26,8 +26,10 @@ from pokerbot.engine.jax_engine import (
     EnvState,
     encode_history_state,
     encode_info_state,
+    is_chance_node,
     legal_action_mask,
     reset_state,
+    sample_chance,
     step_state,
 )
 from pokerbot.training.replay_buffers import (
@@ -322,6 +324,7 @@ def traversal_step(
     key, ka = jax.random.split(key)
     action = jax.random.choice(ka, NUM_ACTIONS, p=xi)
 
+    state = jax.lax.cond(is_chance_node(state), sample_chance, lambda s: s, state)
     next_state = step_state(state, action)
     next_seat = next_state.action_seat
     next_mask = legal_action_mask(next_state)
@@ -335,7 +338,7 @@ def traversal_step(
     q_next = hv_mod.apply(hv_params, next_hist)
     bootstrap = jnp.sum(next_policy * q_next)
     # Acting-player payoff at terminal; regret-matched bootstrap otherwise.
-    terminal_payoff = next_state.rewards[seat]
+    terminal_payoff = next_state.rewards[seat].astype(jnp.float32)
     child_value = jax.lax.cond(next_state.done, lambda: terminal_payoff, lambda: bootstrap)
 
     q = hv_mod.apply(hv_params, hist)
@@ -360,7 +363,7 @@ def traversal_step(
         "history": hist,
         "next_history": next_hist,
         "action": action,
-        "utility": next_state.rewards[seat],
+        "utility": next_state.rewards[seat].astype(jnp.float32),
         "player": seat,
         "iteration": iteration,
         "next_info_state": next_info,

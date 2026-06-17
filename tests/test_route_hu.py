@@ -92,19 +92,22 @@ def test_route_hu_unknown_opponent_is_base() -> None:
 
 
 def test_route_hu_exploits_overfolding_bb() -> None:
-    """A BB that folds every hand facing a jam -> SB should jam wider (exploit a trash hand)."""
+    """A BB that folds every hand facing a jam -> SB should jam wider. Tested at 15bb: at 8bb the
+    GTO SB already jams everything above the steal-equity floor (no room to widen) and pure trash
+    like 32o is now capped (see tests/test_steal_cap.py). K4o is an above-floor GTO-fold the
+    over-fold read legitimately turns into a jam."""
     from aof_cfr.exploit_router import route_hu
 
     db = AoFOpponentDB(path=Path("data/aof_player_profiles/_test_route_hu_overfold.json"))
     db.counts.clear()
     ident = "villain"
     for lab in LABELS_169:  # BB folds (pushed=False) at every bucket facing a jam
-        key = encode_infoset_key("BB", lab, "A", 8.0)
+        key = encode_infoset_key("BB", lab, "A", 15.0)
         for _ in range(40):
             db.record_action(ident, key, pushed=False)
 
-    d = route_hu(db, {"BB": ident}, "SB", "32o", "-", 8.0)
+    d = route_hu(db, {"BB": ident}, "SB", "K4o", "-", 15.0)
     assert d.source == "exploit"
-    assert d.exploit_p == pytest.approx(1.0)   # jam any two vs a pure folder
+    assert d.exploit_p == pytest.approx(1.0)   # jam an above-floor hand vs a pure folder
     assert d.p_push > d.base_p
     assert d.ev_gain_bb >= 0.30

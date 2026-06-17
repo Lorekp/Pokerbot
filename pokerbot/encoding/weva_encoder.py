@@ -5,13 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from itertools import combinations
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
-import torch
+
+if TYPE_CHECKING:
+    import torch
 
 from pokerbot.engine.actions import NUM_ACTIONS
 from pokerbot.engine.cards import Card, Rank, Suit
@@ -26,6 +29,55 @@ WEVA_MAX_NODES = 4
 WEVA_PREFLOP_ACTIONS = 3
 WEVA_DEFAULT_ROLLOUTS = 128
 WEVA_PRODUCTION_NUM_ROOTS = 1326  # hole_only full combo set
+
+# Lossless suit-isomorphic preflop abstraction (Pluribus-faithful). Preflop, suits are fully
+# interchangeable (no board) so collapsing the 1326 hole combos to the 169 canonical rank-classes is
+# EXACTLY lossless — unlike the K=10k WEVA EV-clustering, which merges strategically-distinct hands and
+# was the certified +180 bb/100 preflop leak. When POKERBOT_PREFLOP_LOSSLESS=1, the preflop card bucket
+# becomes ``position*169 + canonical_preflop_class`` (≤1014) and the preflop KEY uses the LOSSLESS betting
+# history (preflop trees are shallow → bounded) instead of the bucketed betting state. Postflop is
+# untouched. Read at import (single source of truth referenced via this module by the encode/serve paths,
+# so tests monkeypatch ``weva_encoder._PREFLOP_LOSSLESS`` and clear the bucket-table lru_cache).
+_PREFLOP_LOSSLESS = os.environ.get("POKERBOT_PREFLOP_LOSSLESS", "0").lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+)
+# OPT-IN second stage: also make the PREFLOP BETTING lossless (full preflop action history) instead of the
+# bounded betting_state. Pluribus-exact, but the preflop history combinatorics explode the infoset count
+# (~10^7-10^8 vs ~10^6 for cards-only) -> overflows the hogwild table AND is under-trainable in 200 iters.
+# DEFAULT OFF: lossless CARDS + bounded betting fixes the proven card-merge leak and is SMALLER than the
+# deployed 10k-WEVA blueprint (1014 < 10000 preflop card-contexts), so it fits the existing capacity.
+_PREFLOP_LOSSLESS_BETTING = os.environ.get("POKERBOT_PREFLOP_LOSSLESS_BETTING", "0").lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+)
+PREFLOP_NUM_CLASSES = 169  # 13 pairs + 78 suited + 78 offsuit
+PREFLOP_LOSSLESS_NUM = 6 * PREFLOP_NUM_CLASSES  # 1014: 169 classes x 6 position enums
+
+
+def canonical_preflop_class(c0: int, c1: int) -> int:
+    """Lossless suit-isomorphic preflop class in ``[0, 168]`` for two card indices (0..51).
+
+    Card index = ``(rank-2)*4 + suit`` (see ``Card.index``), so ``rank_ordinal = idx // 4`` (0=deuce …
+    12=ace) and ``suit = idx % 4``. Layout (169 = 13 + 78 + 78):
+      * pocket pair  -> ``rank_ordinal``                          (0..12)
+      * suited       -> ``13 + tri(hr, lr)``                      (13..90)
+      * offsuit      -> ``13 + 78 + tri(hr, lr)``                 (91..168)
+    where ``tri(hr, lr) = hr*(hr-1)//2 + lr`` uniquely indexes the C(13,2)=78 rank-pairs with
+    ``0 <= lr < hr <= 12``. Suit identity is discarded (lossless preflop); position is added by the caller.
+    """
+    r0, s0 = c0 // 4, c0 % 4
+    r1, s1 = c1 // 4, c1 % 4
+    if r0 == r1:
+        return r0
+    hr, lr = (r0, r1) if r0 > r1 else (r1, r0)
+    tri = hr * (hr - 1) // 2 + lr
+    return (13 + tri) if s0 == s1 else (13 + 78 + tri)
+
 
 FeatureMode = Literal["hole_only", "hole_plus_context"]
 
@@ -121,6 +173,8 @@ class PreflopRootGame:
         num_actions: int = WEVA_PREFLOP_ACTIONS,
         device: torch.device | None = None,
     ) -> None:
+        import torch
+
         self.num_roots = num_roots
         self.num_depths = num_depths
         self.num_actions = num_actions
@@ -140,6 +194,8 @@ class TabularCFR:
         strengths: torch.Tensor,
         warmup_iterations: int = WEVA_WARMUP_ITERATIONS,
     ) -> None:
+        import torch
+
         self.game = game
         self.strengths = strengths.to(game.device)
         self.w = warmup_iterations
@@ -148,12 +204,16 @@ class TabularCFR:
         self.strategy_sum = torch.zeros(n, d, a, device=game.device)
 
     def _regret_matching(self, regrets: torch.Tensor) -> torch.Tensor:
+        import torch
+
         pos = regrets.clamp(min=0.0)
         totals = pos.sum(dim=-1, keepdim=True)
         uniform = torch.full_like(pos, 1.0 / regrets.shape[-1])
         return torch.where(totals > 0, pos / totals.clamp(min=1e-8), uniform)
 
     def _action_evs(self, depth: int) -> torch.Tensor:
+        import torch
+
         n = self.game.num_roots
         fold_ev = torch.zeros(n, device=self.game.device)
         call_ev = self.strengths * (1.0 + 0.15 * depth)
@@ -196,6 +256,8 @@ class EVExtractor:
         feature_mode: FeatureMode,
     ) -> np.ndarray:
         """Build ev-nd feature matrix (num_roots, feature_dim)."""
+        import torch
+
         device = avg_strategy.device
         n = avg_strategy.shape[0]
         fold_ev = torch.zeros(n, device=device)
@@ -610,9 +672,13 @@ class WEVAMapper:
         position: int = 0,
         context: WEVAContext | None = None,
     ) -> int:
-        ctx = context or WEVAContext(hero_position=position)
         if hole[0].index > hole[1].index:
             hole = (hole[1], hole[0])
+        if _PREFLOP_LOSSLESS:
+            # Identity: lossless 169-class x position; no WEVA index/feature cache needed.
+            cls = canonical_preflop_class(hole[0].index, hole[1].index)
+            return (position % 6) * PREFLOP_NUM_CLASSES + cls
+        ctx = context or WEVAContext(hero_position=position)
         root = RootInfoSet(hole=hole, context=ctx)
         feat = self._lookup_feature(root)
         return self.index.assign_nearest(feat)

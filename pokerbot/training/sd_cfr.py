@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from pokerbot.engine.leduc_bridge import (
     init_py_from_key,
     jax_from_py,
     py_legal,
+    py_state_from_deal,
 )
 from pokerbot.engine.leduc_jax import (
     ANTE,
@@ -33,6 +35,16 @@ from pokerbot.engine.leduc_jax import (
 )
 
 LEDUC_ENCODE_DIM = 7 + MAX_HISTORY  # card, pub, pot, seat, round, to_call, raises + history
+
+
+def _leduc_max_instant_adv() -> float:
+    from pokerbot.training.leduc_tabular_cfr import derive_leduc_max_instant_cf_bound
+
+    return derive_leduc_max_instant_cf_bound()
+
+
+# opp_reach <= 1; |util[a]-node_util| <= max action-value spread on tree (see derive_*).
+LEDUC_MAX_INSTANT_ADV = _leduc_max_instant_adv()
 
 
 class LeducAdvantageNet(nn.Module):
@@ -88,6 +100,23 @@ class SDCFRConfig:
     traversals_per_iter: int = 32
     lr: float = 1e-3
     seed: int = 0
+    buffer_capacity: int = 50_000
+    train_batch_size: int = 2048
+    # Full Leduc deal enumeration (90 deals × 2 seats) per sweep; repeat via deal_sweeps.
+    enumerate_all_deals: bool = False
+    deal_sweeps: int = 1
+
+
+@dataclass
+class _RegretVisit:
+    """One traverser-node sample before infoset-level reach aggregation."""
+
+    opp_reach: float
+    util: np.ndarray
+    sigma: np.ndarray
+    mask: np.ndarray
+    enc: Array
+    opponent_card: int
 
 
 class SDCFRTrainer:
@@ -106,71 +135,238 @@ class SDCFRTrainer:
             params=params,
             tx=optax.adam(self.config.lr),
         )
-        self.adv_buffer: list[tuple[Array, int, Array, Array]] = []
-        self._strategy_snapshots: list[tuple[int, dict]] = []
+        # Tabular cumulative regrets for policy; strat_sum for average (reach-weighted, all acting nodes).
+        self._cum_regret: dict[tuple, np.ndarray] = {}
+        self._strat_sum: dict[tuple, np.ndarray] = defaultdict(
+            lambda: np.zeros(NUM_ACTIONS, dtype=np.float64)
+        )
+        self._strategy_snapshots: list[tuple[int, dict[tuple, np.ndarray]]] = []
+        self._iter_weight: float = 1.0
         self._avg_policy_cache: dict[tuple, np.ndarray] = {}
+        self._reservoir: list[tuple[Array, np.ndarray, np.ndarray]] = []
+        self._reservoir_insert_count = 0
+        self._target_max_history: list[float] = []
 
     def clear_policy_cache(self) -> None:
         self._avg_policy_cache.clear()
 
-    def _regret_matching_sigma(self, state: PyLeducState, seat: int) -> np.ndarray:
-        return self.regret_matching_policy(jax_from_py(state), seat)
+    def _reservoir_add(self, enc: Array, inst_adv: np.ndarray, mask: np.ndarray) -> None:
+        """Reservoir sample: (info_state, instantaneous advantage vector, legal_mask)."""
+        sample = (enc, inst_adv.astype(np.float32), mask)
+        cap = self.config.buffer_capacity
+        self._reservoir_insert_count += 1
+        if len(self._reservoir) < cap:
+            self._reservoir.append(sample)
+            return
+        j = int(np.random.randint(0, self._reservoir_insert_count))
+        if j < cap:
+            self._reservoir[j] = sample
 
-    def traverse(self, state: PyLeducState, traverser: int, key: Array) -> float:
-        """External-sampling traversal on pure-Python Leduc (no per-node JAX sync)."""
+    def _log_and_check_target_scale(self, iter_samples: list[tuple[Array, np.ndarray, np.ndarray]]) -> None:
+        if not iter_samples:
+            return
+        abs_vals = [
+            abs(float(inst[a]))
+            for _, inst, mask in iter_samples
+            for a in range(NUM_ACTIONS)
+            if mask[a]
+        ]
+        mx = float(max(abs_vals))
+        self._target_max_history.append(mx)
+        print(
+            f"  target_scale max_abs={mx:.4f} (Leduc bound {LEDUC_MAX_INSTANT_ADV:.1f})",
+            flush=True,
+        )
+        if mx > LEDUC_MAX_INSTANT_ADV:
+            raise AssertionError(
+                f"instantaneous advantage target {mx:.4f} exceeds bound {LEDUC_MAX_INSTANT_ADV}"
+            )
+        # Catch runaway targets (cumulative-regret bug), not normal CF variance.
+        if len(self._target_max_history) >= 5:
+            baseline = float(np.median(self._target_max_history[-5:-1]))
+            if baseline > 1.0 and mx > baseline * 10.0:
+                raise AssertionError(
+                    f"advantage target scale runaway: median_recent={baseline:.4f}, "
+                    f"now={mx:.4f} (likely cumulative-regret regression bug)"
+                )
+
+    @staticmethod
+    def _sigma_from_regrets(reg: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        positive = np.maximum(reg, 0.0) * mask
+        total = positive.sum()
+        if total > 0:
+            return positive / total
+        return mask.astype(np.float64) / max(mask.sum(), 1)
+
+    def _encode_key(self, state: PyLeducState, seat: int) -> tuple:
+        return tuple(np.asarray(encode_leduc_py(state, seat)).tolist())
+
+    @staticmethod
+    def _opponent_hole_card(state: PyLeducState, acting_seat: int) -> int:
+        """Opponent hole card for the acting player's hidden world (not in py_info_key)."""
+        return int(state.cards[1 - acting_seat])
+
+    def _regret_matching_sigma(self, state: PyLeducState, seat: int) -> np.ndarray:
+        """Strategy during traversal: regret-match tabular cumulative regrets (same as vanilla CFR)."""
+        mask = py_legal(state)
+        key = self._encode_key(state, seat)
+        reg = self._cum_regret.get(key)
+        if reg is None:
+            return mask.astype(np.float64) / max(mask.sum(), 1)
+        return self._sigma_from_regrets(reg, mask)
+
+    def _begin_iteration_regret(self) -> None:
+        """Collect traverser visits; flush reach-weighted targets once per infoset per iteration."""
+        self._pending_regret: dict[tuple, list[_RegretVisit]] = defaultdict(list)
+
+    def _flush_pending_regret(self) -> None:
+        """Belief-weighted instantaneous targets for the net (reach sum/count, not count avg over worlds)."""
+        for info_key, visits in self._pending_regret.items():
+            if not visits:
+                continue
+            reg_inc = np.zeros(NUM_ACTIONS, dtype=np.float64)
+            total_opp_reach = 0.0
+            reach_by_world: dict[int, float] = defaultdict(float)
+            for visit in visits:
+                mask = visit.mask
+                node_util = float(
+                    sum(visit.sigma[a] * visit.util[a] for a in range(NUM_ACTIONS) if mask[a])
+                )
+                for a in range(NUM_ACTIONS):
+                    if mask[a]:
+                        reg_inc[a] += visit.opp_reach * (visit.util[a] - node_util)
+                total_opp_reach += visit.opp_reach
+                reach_by_world[visit.opponent_card] += visit.opp_reach
+            last = visits[-1]
+            if not hasattr(self, "_iter_samples"):
+                self._iter_samples = []
+            scale = max(total_opp_reach, 1e-12)
+            inst_net = (reg_inc / scale).astype(np.float32)
+            self._iter_samples.append((last.enc, inst_net, last.mask.copy()))
+            if getattr(self, "_log_regret_aggregation", False):
+                print(
+                    f"  regret_flush key={info_key[:4]}... "
+                    f"visits={len(visits)} opp_reach_sum={total_opp_reach:.4f} "
+                    f"worlds={dict(reach_by_world)} inc={reg_inc}",
+                    flush=True,
+                )
+        self._pending_regret.clear()
+
+    def traverse(
+        self,
+        state: PyLeducState,
+        traverser: int,
+        key: Array,
+        p0: float = 1.0,
+        p1: float = 1.0,
+    ) -> float:
+        """External-sampling traversal; collect bounded instantaneous CF advantages."""
         if state.done:
             return float(state.rewards[traverser])
 
         seat = state.acting
         mask = py_legal(state)
+        opp_reach = p1 if traverser == 0 else p0
+        sigma = self._regret_matching_sigma(state, seat)
+        info_key = self._encode_key(state, seat)
+        acting_reach = p0 if seat == 0 else p1
+        self._strat_sum[info_key] += self._iter_weight * acting_reach * sigma
+
         if seat == traverser:
             util = np.zeros(NUM_ACTIONS, dtype=np.float64)
             for a in range(NUM_ACTIONS):
                 if mask[a]:
-                    util[a] = self.traverse(apply_action_py(state, a), traverser, key)
-            sigma = self._regret_matching_sigma(state, seat)
+                    util[a] = self.traverse(
+                        apply_action_py(state, a), traverser, key, p0, p1
+                    )
             node_util = float(sum(sigma[a] * util[a] for a in range(NUM_ACTIONS) if mask[a]))
+            inst = np.zeros(NUM_ACTIONS, dtype=np.float64)
             for a in range(NUM_ACTIONS):
                 if mask[a]:
-                    self.adv_buffer.append(
-                        (
-                            encode_leduc_py(state, seat),
-                            a,
-                            jnp.float32(util[a] - node_util),
-                            jnp.asarray(mask),
-                        )
+                    inst[a] = opp_reach * (util[a] - node_util)
+            if info_key not in self._cum_regret:
+                self._cum_regret[info_key] = np.zeros(NUM_ACTIONS, dtype=np.float64)
+            self._cum_regret[info_key] += inst
+            pending = getattr(self, "_pending_regret", None)
+            if pending is not None:
+                pending[info_key].append(
+                    _RegretVisit(
+                        opp_reach=float(opp_reach),
+                        util=util.copy(),
+                        sigma=sigma.copy(),
+                        mask=mask.copy(),
+                        enc=encode_leduc_py(state, seat),
+                        opponent_card=self._opponent_hole_card(state, seat),
                     )
+                )
             return node_util
 
-        sigma = self._regret_matching_sigma(state, seat)
         legal_idx = np.flatnonzero(mask)
+        if self.config.enumerate_all_deals:
+            util = 0.0
+            for action in legal_idx:
+                action = int(action)
+                np0 = p0 * sigma[action] if seat == 0 else p0
+                np1 = p1 * sigma[action] if seat == 1 else p1
+                util += sigma[action] * self.traverse(
+                    apply_action_py(state, action), traverser, key, np0, np1
+                )
+            return float(util)
+
         probs = sigma[legal_idx]
         probs = probs / probs.sum()
         key, sub = jax.random.split(key)
-        pick = int(jax.random.choice(sub, legal_idx.shape[0], p=jnp.asarray(probs, dtype=jnp.float32)))
+        pick = int(
+            jax.random.choice(sub, legal_idx.shape[0], p=jnp.asarray(probs, dtype=jnp.float32))
+        )
         action = int(legal_idx[pick])
-        return self.traverse(apply_action_py(state, action), traverser, key)
+        np0 = p0 * sigma[action] if seat == 0 else p0
+        np1 = p1 * sigma[action] if seat == 1 else p1
+        return self.traverse(apply_action_py(state, action), traverser, key, np0, np1)
 
-    def train_iteration(self) -> float:
-        self.adv_buffer.clear()
-        for _ in range(self.config.traversals_per_iter):
-            self.key, k1, k2 = jax.random.split(self.key, 3)
-            state = init_py_from_key(k1)
-            for seat in range(NUM_PLAYERS):
-                self.traverse(state, seat, k2)
+    def train_iteration(self, iteration_weight: float = 1.0) -> float:
+        from pokerbot.training.leduc_tabular_cfr import all_leduc_deals
 
-        if not self.adv_buffer:
+        self._iter_weight = iteration_weight
+        self._iter_samples = []
+        self._begin_iteration_regret()
+        if self.config.enumerate_all_deals:
+            deals = all_leduc_deals()
+            for _ in range(max(1, self.config.deal_sweeps)):
+                for cards, pub in deals:
+                    state = py_state_from_deal(cards, pub)
+                    for seat in range(NUM_PLAYERS):
+                        self.key, k2 = jax.random.split(self.key)
+                        self.traverse(state, seat, k2)
+        else:
+            for _ in range(self.config.traversals_per_iter):
+                self.key, k1, k2 = jax.random.split(self.key, 3)
+                state = init_py_from_key(k1)
+                for seat in range(NUM_PLAYERS):
+                    self.traverse(state, seat, k2)
+
+        self._flush_pending_regret()
+
+        if not self._iter_samples:
             return 0.0
 
-        xs = jnp.stack([b[0] for b in self.adv_buffer])
-        actions = jnp.array([b[1] for b in self.adv_buffer], dtype=jnp.int32)
-        targets = jnp.stack([b[2] for b in self.adv_buffer])
-        masks = jnp.stack([b[3] for b in self.adv_buffer])
+        self._log_and_check_target_scale(self._iter_samples)
+        for enc, inst, mask in self._iter_samples:
+            self._reservoir_add(enc, inst, mask)
+
+        batch_n = min(self.config.train_batch_size, len(self._reservoir))
+        idx = np.random.randint(0, len(self._reservoir), size=batch_n)
+        batch = [self._reservoir[i] for i in idx]
+
+        xs = jnp.stack([b[0] for b in batch])
+        masks = jnp.stack([jnp.asarray(b[2]) for b in batch])
+        targets = jnp.stack([jnp.asarray(b[1], dtype=jnp.float32) for b in batch])
 
         def loss_fn(params):
             pred = jax.vmap(lambda x, m: self.state.apply_fn(params, x, m))(xs, masks)
-            picked = pred[jnp.arange(pred.shape[0]), actions]
-            return jnp.mean(jnp.square(picked - targets))
+            diff = (pred - targets) * masks
+            denom = jnp.maximum(jnp.sum(masks), 1.0)
+            return jnp.sum(jnp.square(diff)) / denom
 
         grad_fn = jax.value_and_grad(loss_fn)
         loss, grads = grad_fn(self.state.params)
@@ -187,8 +383,8 @@ class SDCFRTrainer:
         losses: list[float] = []
         t0 = time.perf_counter()
         for i in range(start_iter, self.config.iterations):
-            losses.append(self.train_iteration())
             iter_num = i + 1
+            losses.append(self.train_iteration(iteration_weight=float(iter_num)))
             if log_every > 0 and iter_num % log_every == 0:
                 elapsed = time.perf_counter() - t0
                 print(
@@ -207,52 +403,66 @@ class SDCFRTrainer:
                 save_checkpoint(self, ckpt_dir / f"sd_cfr_leduc_iter_{iter_num:04d}.pkl")
                 save_checkpoint(self, ckpt_dir / "sd_cfr_leduc_latest.pkl")
                 print(f"Checkpoint saved at iter {iter_num}", flush=True)
+                self._log_checkpoint_eval(iter_num)
         return losses
 
-    def _record_strategy_snapshot(self, iteration: int) -> None:
-        """Linear-CFR weighted snapshot for average-strategy recovery."""
-        params_copy = jax.tree.map(lambda x: np.asarray(x), self.state.params)
-        self._strategy_snapshots.append((iteration, params_copy))
+    def _log_checkpoint_eval(self, iter_num: int) -> None:
+        from pokerbot.training.leduc_tabular_cfr import (
+            infoset_exploitability_mbb_from_policy,
+            mean_l1_recovered_avg_vs_tabular,
+        )
 
-    def _sigma_from_params(
-        self, params: dict, state: LeducState, seat: int
-    ) -> np.ndarray:
-        x = encode_leduc(state, seat)
-        mask = np.asarray(legal_actions(state), dtype=bool)
-        adv = np.asarray(self.state.apply_fn(params, x, mask), dtype=np.float64)
-        positive = np.maximum(adv, 0.0) * mask
-        total = positive.sum()
-        if total > 0:
-            return positive / total
-        return mask.astype(np.float64) / max(mask.sum(), 1)
+        self.clear_policy_cache()
+        expl, u0, u1, br0, br1 = infoset_exploitability_mbb_from_policy(
+            self.average_strategy_policy, samples=90
+        )
+        l1_mean = float("nan")
+        tabular_avg = getattr(self, "_tabular_avg_ref", None)
+        if tabular_avg is not None:
+            l1_mean, _ = mean_l1_recovered_avg_vs_tabular(
+                self.average_strategy_policy, tabular_avg
+            )
+        from pokerbot.training.leduc_tabular_cfr import LEDUC_SD_CFR_EXPLOITABILITY_MBB
+
+        gate = "PASS" if expl <= LEDUC_SD_CFR_EXPLOITABILITY_MBB else "above_gate"
+        print(
+            f"Checkpoint eval iter {iter_num}: infoset BR={expl:.2f} mbb "
+            f"(gate {LEDUC_SD_CFR_EXPLOITABILITY_MBB:.0f} {gate}) "
+            f"L1_vs_tabular_mean={l1_mean:.4f} "
+            f"u0={u0:.4f} u1={u1:.4f} br0={br0:.4f} br1={br1:.4f}",
+            flush=True,
+        )
+
+    def _record_strategy_snapshot(self, iteration: int) -> None:
+        """Linear-CFR weighted snapshot of regret-matched policies from cumulative regrets."""
+        snap = {k: v.copy() for k, v in self._cum_regret.items()}
+        self._strategy_snapshots.append((iteration, snap))
 
     def regret_matching_policy(self, state: LeducState, seat: int) -> np.ndarray:
-        """Regret-matching strategy from the current (final-iterate) advantage net."""
-        return self._sigma_from_params(self.state.params, state, seat)
+        """Regret-matching strategy from accumulated CFR regrets (not the advantage net)."""
+        py = PyLeducState.from_jax(state)
+        mask = np.asarray(legal_actions(state), dtype=bool)
+        key = self._encode_key(py, seat)
+        reg = self._cum_regret.get(key, np.zeros(NUM_ACTIONS, dtype=np.float64))
+        return self._sigma_from_regrets(reg, mask)
 
     def average_strategy_policy(self, state: LeducState, seat: int) -> np.ndarray:
-        """Linear-CFR average of regret-matched policies across iteration snapshots."""
+        """Reach-weighted linear-CFR average from strat_sum (same accumulation as tabular CFR)."""
         cache_key = (tuple(np.asarray(encode_leduc(state, seat)).tolist()), int(seat))
         cached = self._avg_policy_cache.get(cache_key)
         if cached is not None:
             return cached
         mask = np.asarray(legal_actions(state), dtype=bool)
-        if not self._strategy_snapshots:
-            sigma = self.regret_matching_policy(state, seat)
-            self._avg_policy_cache[cache_key] = sigma
-            return sigma
-        agg = np.zeros(NUM_ACTIONS, dtype=np.float64)
-        total_w = 0.0
-        for weight, params in self._strategy_snapshots:
-            agg += float(weight) * self._sigma_from_params(params, state, seat)
-            total_w += float(weight)
-        sigma = agg / total_w
-        sigma = sigma * mask
-        s = sigma.sum()
-        if s > 0:
-            sigma = sigma / s
-        else:
-            sigma = mask.astype(np.float64) / max(mask.sum(), 1)
+        key = cache_key[0]
+        s = self._strat_sum.get(key)
+        if s is not None:
+            sigma = np.asarray(s, dtype=np.float64) * mask
+            tot = sigma.sum()
+            if tot > 0:
+                sigma = sigma / tot
+                self._avg_policy_cache[cache_key] = sigma
+                return sigma
+        sigma = self.regret_matching_policy(state, seat)
         self._avg_policy_cache[cache_key] = sigma
         return sigma
 
@@ -268,6 +478,8 @@ def save_checkpoint(trainer: SDCFRTrainer, path: Path) -> None:
                 "config": trainer.config,
                 "completed_iterations": getattr(trainer, "_completed_iterations", 0),
                 "strategy_snapshots": getattr(trainer, "_strategy_snapshots", []),
+                "cum_regret": getattr(trainer, "_cum_regret", {}),
+                "strat_sum": dict(getattr(trainer, "_strat_sum", {})),
             },
             f,
         )
@@ -283,120 +495,27 @@ def load_checkpoint(trainer: SDCFRTrainer, path: Path) -> int:
     if "config" in data:
         trainer.config = data["config"]
     trainer._strategy_snapshots = list(data.get("strategy_snapshots", []))
+    trainer._cum_regret = dict(data.get("cum_regret", {}))
+    if "strat_sum" in data:
+        trainer._strat_sum = defaultdict(
+            lambda: np.zeros(NUM_ACTIONS, dtype=np.float64),
+            {k: np.asarray(v) for k, v in data["strat_sum"].items()},
+        )
     return int(data.get("completed_iterations", 0))
 
 
 # ---------------------------------------------------------------------------
-# HU NLHE SD-CFR (Phase 2b)
+# HU NLHE SD-CFR (Phase 2b) — see sd_cfr_nlhe.py
 # ---------------------------------------------------------------------------
 
-from pokerbot.engine.jax_engine import (
-    CHIP_UNIT,
-    INFO_FEATURE_DIM,
-    NUM_ACTIONS as NLHE_NUM_ACTIONS,
-    EnvState,
-    encode_info_state,
-    is_chance_node,
-    legal_action_mask,
-    reset_state,
-    sample_chance,
-    step_state,
+from pokerbot.training.sd_cfr_nlhe import (  # noqa: E402
+    NLHE_MAX_INSTANT_ADV,
+    SDCFRNLHEConfig,
+    SDCFRNLHETrainer,
+    load_nlhe_checkpoint,
+    save_nlhe_checkpoint,
 )
+from pokerbot.training.nlhe_policy_net import NLHEWEVAPolicyNet  # noqa: E402
 
-
-class NLHEAdvantageNet(nn.Module):
-    hidden: int = 256
-
-    @nn.compact
-    def __call__(self, x: Array, legal_mask: Array) -> Array:
-        h = nn.relu(nn.Dense(self.hidden)(x))
-        h = nn.relu(nn.Dense(self.hidden)(h))
-        logits = nn.Dense(NLHE_NUM_ACTIONS)(h)
-        return jnp.where(legal_mask, logits, -1e9)
-
-
-@dataclass
-class SDCFRNLHEConfig:
-    iterations: int = 10
-    traversals_per_iter: int = 8
-    lr: float = 1e-4
-    seed: int = 0
-    occupancy: tuple[bool, ...] = (True, True, False, False, False, False)
-
-
-class SDCFRNLHETrainer:
-    """External-sampling SD-CFR on validated JAX NLHE env (HU by default)."""
-
-    def __init__(self, config: SDCFRNLHEConfig | None = None) -> None:
-        self.config = config or SDCFRNLHEConfig()
-        self.key = jax.random.PRNGKey(self.config.seed)
-        self.occupancy = jnp.array(self.config.occupancy, dtype=bool)
-        net = NLHEAdvantageNet()
-        self.key, k = jax.random.split(self.key)
-        dummy_x = jnp.zeros(INFO_FEATURE_DIM)
-        dummy_m = jnp.ones(NLHE_NUM_ACTIONS, dtype=bool)
-        params = net.init(k, dummy_x, dummy_m)
-        self.state = train_state.TrainState.create(
-            apply_fn=net.apply,
-            params=params,
-            tx=optax.adam(self.config.lr),
-        )
-        self.adv_buffer: list[tuple[Array, Array, Array]] = []
-
-    def _init_state(self, key: Array) -> EnvState:
-        return reset_state(key, occupancy=self.occupancy)
-
-    def traverse(self, state: EnvState, traverser: int, key: Array, depth: int = 0) -> Array:
-        if depth > 200 or bool(state.done):
-            return state.rewards[traverser].astype(jnp.float32) / float(CHIP_UNIT)
-        if bool(is_chance_node(state)):
-            state = sample_chance(state)
-        seat = int(state.action_seat)
-        mask = legal_action_mask(state)
-        if seat == traverser:
-            util = jnp.zeros(NLHE_NUM_ACTIONS, dtype=jnp.float32)
-            for a in range(NLHE_NUM_ACTIONS):
-                if bool(mask[a]):
-                    util = util.at[a].set(self.traverse(step_state(state, jnp.int32(a)), traverser, key, depth + 1))
-            sigma = jax.nn.softmax(jnp.where(mask, util, -1e9))
-            node_util = jnp.sum(sigma * util)
-            for a in range(NLHE_NUM_ACTIONS):
-                if bool(mask[a]):
-                    self.adv_buffer.append(
-                        (
-                            encode_info_state(state, jnp.int32(seat)),
-                            jnp.float32(util[a] - node_util),
-                            mask,
-                        )
-                    )
-            return node_util
-        key, sub = jax.random.split(key)
-        legal = jnp.where(mask, 1.0, 0.0)
-        probs = legal / jnp.maximum(jnp.sum(legal), 1.0)
-        action = jax.random.choice(sub, NLHE_NUM_ACTIONS, p=probs)
-        return self.traverse(step_state(state, action), traverser, key, depth + 1)
-
-    def train_iteration(self) -> float:
-        self.adv_buffer.clear()
-        for _ in range(self.config.traversals_per_iter):
-            self.key, k1, k2 = jax.random.split(self.key, 3)
-            state = self._init_state(k1)
-            for seat in range(int(jnp.sum(self.occupancy))):
-                self.traverse(state, seat, k2)
-        if not self.adv_buffer:
-            return 0.0
-        xs = jnp.stack([b[0] for b in self.adv_buffer])
-        targets = jnp.stack([b[1] for b in self.adv_buffer])
-        masks = jnp.stack([b[2] for b in self.adv_buffer])
-
-        def loss_fn(params):
-            pred = jax.vmap(lambda x, m: self.state.apply_fn(params, x, m))(xs, masks)
-            return jnp.mean(jnp.square(pred[:, 0] - targets))
-
-        loss, grads = jax.value_and_grad(loss_fn)(self.state.params)
-        self.state = self.state.apply_gradients(grads=grads)
-        return float(loss)
-
-    def train(self) -> list[float]:
-        return [self.train_iteration() for _ in range(self.config.iterations)]
+NLHEAdvantageNet = NLHEWEVAPolicyNet  # backwards-compatible alias
 

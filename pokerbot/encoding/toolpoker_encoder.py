@@ -21,7 +21,7 @@ from pokerbot.encoding.csv_encoder import (
     encode_prev_line,
     position_one_hot,
 )
-from pokerbot.data.sft_dataloader import LABEL_SOURCE_SOLVER
+from pokerbot.data.label_sources import LABEL_SOURCE_SOLVER
 from pokerbot.encoding.weva_encoder import WEVAContext, WEVAMapper
 
 

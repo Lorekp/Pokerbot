@@ -1,0 +1,68 @@
+# 50-spot interleaved validation gate (2:1 vanilla/bunching, all 3 spot types).
+# Deterministic: 1 stack × 9 boards × 3 types × 2 heroes = 54 → cap at 50 via --max-spots.
+# Same solver/range/bet-tree settings as prod6000.
+
+seed: 42
+enumeration_mode: interleaved
+
+stack_depths_bb: [100]
+
+boards:
+  strategy: fixed_list
+  fixed_boards:
+    - "QcJsTs"
+    - "9hKh4h"
+    - "Kc8s2d"
+    - "AdTc7d"
+    - "5h2c4d"
+    - "3dAhQs"
+    - "QcQh6d"
+    - "9hAh5d"
+    - "3s8s7s"
+
+bet_tree:
+  pot_fractions: [0.50]
+  include_all_in: true
+  raise_multiplier: 2.5
+
+solver:
+  max_iterations: 10000
+  target_exploitability_pct: 1.0
+  timeout_sec: 3600
+  include_unconverged: false
+  chip_unit_bb: 100
+
+decision_nodes:
+  sample_roots: true
+  sample_action_paths: false
+  max_nodes_per_board: 1
+
+ranges:
+  default_oop: "QQ+,AK"
+  default_ip: "TT-22,AQs+"
+  bunching_oop: "TT+,AQs+"
+  bunching_ip: "99-22,ATs+"
+
+hero_hands:
+  - ["Ah", "Kd"]
+  - ["Qs", "Qh"]
+
+spots:
+  - id: sb_vs_bb_flop
+    oop_position: SB
+    ip_position: BB
+    bunching: false
+    preflop_line: fold_to_sb_bb_limp
+
+  - id: btn_vs_bb_flop
+    oop_position: BB
+    ip_position: BTN
+    bunching: false
+    preflop_line: btn_open_bb_call
+
+  - id: bunching_postflop
+    oop_position: BB
+    ip_position: BTN
+    bunching: true
+    folded_seats: [0, 1, 2]
+    preflop_line: btn_open_bb_call

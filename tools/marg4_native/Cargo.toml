@@ -1,0 +1,26 @@
+[package]
+name = "marg4_native"
+version = "0.1.0"
+edition = "2021"
+description = "Bit-identical native kernel for the 4-max AoF marginal payoff precompute (fp_4max_vec.precompute_payoffs)."
+
+[lib]
+name = "marg4_native"
+# rlib  -> `cargo test` runs the pure-Rust unit tests (MT19937 / evaluator goldens, no Python).
+# cdylib -> the importable CPython extension module (loaded by aof_cfr/marg4_native.py).
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# PyO3 with abi3 (stable ABI) so a single .pyd works across CPython 3.14+ without re-linking.
+pyo3 = { version = "0.28", features = ["abi3-py314", "extension-module"], optional = true }
+rayon = { version = "1", optional = true }
+
+[features]
+default = []
+python = ["dep:pyo3", "dep:rayon"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

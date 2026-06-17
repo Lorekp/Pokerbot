@@ -1,5 +1,12 @@
 """Gauntlet tournament: prove the exploitation uplift in bb/100 (train/test split).
 
+DEPRECATED for certification — superseded by ``aof_cfr.evalsuite`` (scripts/run_aof_eval_suite.py),
+which adds multi-seed CIs, seat rotation, an AIVAT decision term, the SHIPPING adaptive-online
+arm, and fixes this script's field-composition bug (``bots[i % len(bots)]`` keyed by SLOT means
+HU "mixed" fields only ever played the overfolder, and 3-max never fielded depth_blind). This
+script is kept byte-compatible so its historical runs/gauntlet_tournament.json and tests remain
+reproducible; do NOT quote its numbers for new work.
+
 The agent first OBSERVES a field of bots (near-GTO "Pluribus-level" and leaky archetypes) for a
 warmup phase, building a persistent profile of every opponent. It then precomputes its routed
 exploit policy ONCE from that frozen profile (the confidence-gated legal best response), and a

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -31,10 +32,10 @@ DEFAULT_CPP_CLI_PATH = (
 )
 
 
-def resolve_cli_path(cli_path: Path | None = None) -> Path:
+def resolve_cli_path(cli_path: Path | str | None = None) -> Path:
     """Resolve solver CLI: explicit arg, POSTFLOP_SOLVER_CLI env, or Rust default."""
     if cli_path is not None:
-        return cli_path
+        return Path(cli_path)
     env = __import__("os").environ.get("POSTFLOP_SOLVER_CLI")
     if env:
         return Path(env)
@@ -100,6 +101,14 @@ def _canonical_action_distribution(data: dict[str, Any]) -> dict[str, float]:
     return canonicalize_action_distribution({str(k): float(v) for k, v in dist.items()})
 
 
+def solver_subprocess_env(solver_threads_per_worker: int | None = None) -> dict[str, str]:
+    """Build subprocess env for postflop_solver_cli; honor existing RAYON_NUM_THREADS."""
+    env = os.environ.copy()
+    if "RAYON_NUM_THREADS" not in env and solver_threads_per_worker is not None:
+        env["RAYON_NUM_THREADS"] = str(solver_threads_per_worker)
+    return env
+
+
 def parse_solve_response(data: dict[str, Any]) -> SolverSolveResult:
     return SolverSolveResult(
         exploitability=float(data.get("exploitability", 0.0)),
@@ -121,6 +130,7 @@ def run_solver(
     *,
     cli_path: Path | None = None,
     timeout_sec: float = 120.0,
+    solver_threads_per_worker: int | None = None,
 ) -> SolverSolveResult:
     exe = resolve_cli_path(cli_path)
     if not exe.is_file():
@@ -135,6 +145,7 @@ def run_solver(
         text=True,
         timeout=timeout_sec,
         check=False,
+        env=solver_subprocess_env(solver_threads_per_worker),
     )
     stdout = proc.stdout.strip()
     if not stdout:
@@ -177,6 +188,9 @@ def solve_spot(
     cli_path: Path | None = None,
     worker: Any | None = None,
     request_id: str | None = None,
+    solver_threads_per_worker: int | None = None,
+    max_iterations_override: int | None = None,
+    target_exploitability_pct_override: float | None = None,
 ) -> SolverSolveResult:
     bet_tree = config.get("bet_tree", {})
     solver_cfg = config.get("solver", {})
@@ -184,8 +198,10 @@ def solve_spot(
         spot,
         bet_fractions=[float(x) for x in bet_tree.get("pot_fractions", [0.33, 0.5, 0.75, 1.0])],
         raise_multiplier=float(bet_tree.get("raise_multiplier", 2.5)),
-        max_iterations=int(solver_cfg.get("max_iterations", 10000)),
-        target_exploitability_pct=float(solver_cfg.get("target_exploitability_pct", 0.5)),
+        max_iterations=int(max_iterations_override or solver_cfg.get("max_iterations", 10000)),
+        target_exploitability_pct=float(
+            target_exploitability_pct_override or solver_cfg.get("target_exploitability_pct", 0.5)
+        ),
         chip_unit_bb=float(solver_cfg.get("chip_unit_bb", 100)),
     )
     timeout_sec = float(solver_cfg.get("timeout_sec", 3600))
@@ -195,4 +211,5 @@ def solve_spot(
         req,
         cli_path=cli_path,
         timeout_sec=timeout_sec,
+        solver_threads_per_worker=solver_threads_per_worker,
     )

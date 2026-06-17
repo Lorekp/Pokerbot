@@ -64,6 +64,8 @@ class ArenaConfig:
     confidence_mode: str | None = None     # None -> router default; "min" = legacy veto
     gate_mode: str | None = None           # None -> router default; "point" = legacy gate
     population_confidence: float = 0.0     # adaptive arm cold-start floor (engine default)
+    exploit_cap: float | None = None       # RNR ceiling for a stable read; None -> N-dependent default
+    cap_floor: float | None = None         # RNR floor for a fully non-stationary read; None -> CAP_FLOOR
     depth_mode: str = "fixed"              # "fixed" | "drift"
     rebuy_below_bb: float = 2.0
     aivat: bool = True
@@ -141,6 +143,7 @@ class _AgentPolicy:
             return
         est = self.model.as_estimator() if self.model is not None else None
         conf = self.model.opponent_confidence if self.model is not None else None
+        stab = self.model.opponent_stability if self.model is not None else None
         # adaptive estimator takes (db, ident, n, stack, **kw); routed_arrays' default shim
         # matches the same call shape.
         wrapped = (lambda d, i, n_, s: est(d, i, n_, s)) if est is not None else None
@@ -148,8 +151,9 @@ class _AgentPolicy:
             self._routed[(phase, _snap_depth(depth))] = routed_arrays(
                 self.db, self.cfg.players, self.seat, _snap_depth(depth), self._opp_map(phase),
                 min_conf=self.cfg.min_confidence, margin=self.cfg.margin_bb,
-                estimator=wrapped, confidence_fn=conf,
-                confidence_mode=self.cfg.confidence_mode, gate_mode=self.cfg.gate_mode)
+                estimator=wrapped, confidence_fn=conf, stability_fn=stab,
+                confidence_mode=self.cfg.confidence_mode, gate_mode=self.cfg.gate_mode,
+                exploit_cap=self.cfg.exploit_cap, cap_floor=self.cfg.cap_floor)
         self._since_refresh = 0
 
     def maybe_refresh(self, depth: float) -> None:

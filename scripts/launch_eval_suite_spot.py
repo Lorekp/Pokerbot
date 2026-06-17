@@ -71,9 +71,10 @@ def build_and_upload_code(s3, bucket: str, prefix: str) -> str:
     return key
 
 
-def upload_blueprint(s3, bucket: str, prefix: str) -> str:
+def upload_blueprint(s3, bucket: str, prefix: str, local_bp: Path | None = None) -> str:
+    local_bp = local_bp or LOCAL_BP
     key = f"{prefix}/blueprint/bp6max_v2_iter200.pkl"
-    size = LOCAL_BP.stat().st_size
+    size = local_bp.stat().st_size
     try:
         head = s3.head_object(Bucket=bucket, Key=key)
         if head["ContentLength"] == size:
@@ -82,7 +83,7 @@ def upload_blueprint(s3, bucket: str, prefix: str) -> str:
     except Exception:  # noqa: BLE001
         pass
     print(f"Uploading blueprint ({size / 1e6:.0f} MB)...", flush=True)
-    s3.upload_file(str(LOCAL_BP), bucket, key)
+    s3.upload_file(str(local_bp), bucket, key)
     return key
 
 
@@ -90,7 +91,8 @@ def user_data(*, bucket, prefix, region, code_key, bp_key, run_subdir, workers, 
               mode="full", keep_alive=False, bs_configs="10:uniform", bs_skip_sft=False,
               bs_pooled_profiles=False, ve_config="10:uniform",
               lbr6_rollouts=14, lbr6_no_allin=False, lbr6_passive=False, lbr6_menu="fcpa",
-              lbr6_target="blueprint", lbr6_search_leaf="uniform", lbr6_search_iters=10) -> str:
+              lbr6_target="blueprint", lbr6_search_leaf="uniform", lbr6_search_iters=10,
+              preflop_lossless=False, preflop_lossless_betting=False) -> str:
     run_prefix = f"{prefix}/{run_subdir}"
     final = "echo BOOTSTRAP_DONE_KEEP_ALIVE" if keep_alive else "shutdown -h now"
     if mode == "calibrate":
@@ -123,6 +125,11 @@ def user_data(*, bucket, prefix, region, code_key, bp_key, run_subdir, workers, 
             f"--checkpoint checkpoints/policy_sft_prod6000.pt "
             f"{bs_flags}"
             f"2>&1 | tee /var/log/eval-suite.log")
+    # Lossless-preflop snapshot serve: the preflop key uses the 169 class + lossless history, so serve
+    # MUST set the same flag as training (stamped + cross-checked) or every preflop lookup misses.
+    preflop_lossless_env = "export POKERBOT_PREFLOP_LOSSLESS=1" if preflop_lossless else ""
+    if preflop_lossless_betting:
+        preflop_lossless_env = (preflop_lossless_env + "\nexport POKERBOT_PREFLOP_LOSSLESS_BETTING=1").strip()
     return f"""#!/bin/bash
 set -uxo pipefail
 export DEBIAN_FRONTEND=noninteractive AWS_DEFAULT_REGION={region}
@@ -146,6 +153,7 @@ export PYTHONPATH=/opt/pokerbot JAX_PLATFORMS=cpu POKERBOT_BETTING_ABSTRACTION=1
 # Blueprint serve keys must match the trained table postflop (the encoder bakes these at import). Without
 # them the pluribus hero gets ~0% postflop blueprint coverage (silent uniform fallback). Net is invariant.
 export POKERBOT_POSTFLOP_BUCKETS=1 POKERBOT_POSTFLOP_MODE=fast POKERBOT_POSTFLOP_NUM_BUCKETS=200
+{preflop_lossless_env}
 export POKERBOT_BLUEPRINT_SNAPSHOT=/tmp/bp6max_v2_iter200.pkl
 # Thin single-thread workers (the many-process lesson from training: no nested threadpools). OMP/BLAS alone
 # is NOT enough: every worker imports JAX, whose XLA CPU backend spins its OWN Eigen thread pool regardless,
@@ -211,12 +219,22 @@ def main() -> None:
                    help="--mode lbr6 blueprint-search: Pluribus continuation leaf (uniform = deployed).")
     p.add_argument("--lbr6-search-iters", type=int, default=10,
                    help="--mode lbr6 blueprint-search: fixed CFR+ iters per opponent solve (10 = deployed).")
+    p.add_argument("--preflop-lossless", action="store_true",
+                   help="serve a LOSSLESS-PREFLOP-CARDS blueprint (POKERBOT_PREFLOP_LOSSLESS=1) — use when "
+                        "the snapshot (--local-bp) was trained with --preflop-lossless.")
+    p.add_argument("--preflop-lossless-betting", action="store_true",
+                   help="also serve lossless preflop BETTING (match a snapshot trained with "
+                        "--preflop-lossless-betting).")
+    p.add_argument("--local-bp", default=None,
+                   help="local blueprint pkl to upload+serve (default: the v2 cache path). Point at the "
+                        "lossless retrain's snapshot for the lossless gate.")
     args = p.parse_args()
 
     s3 = boto3.client("s3", region_name=args.region)
     ec2 = boto3.client("ec2", region_name=args.region)
     code_key = build_and_upload_code(s3, args.bucket, args.prefix)
-    bp_key = upload_blueprint(s3, args.bucket, args.prefix)
+    bp_key = upload_blueprint(s3, args.bucket, args.prefix,
+                              Path(args.local_bp) if args.local_bp else None)
     ami = resolve_ubuntu_ami(ec2, "arm64")
     print(f"AMI: {ami}  instance: {args.instance_type}  region: {args.region}", flush=True)
 
@@ -228,7 +246,8 @@ def main() -> None:
                    lbr6_rollouts=args.lbr6_rollouts, lbr6_no_allin=args.lbr6_no_allin,
                    lbr6_passive=args.lbr6_passive, lbr6_menu=args.lbr6_menu,
                    lbr6_target=args.lbr6_target, lbr6_search_leaf=args.lbr6_search_leaf,
-                   lbr6_search_iters=args.lbr6_search_iters)
+                   lbr6_search_iters=args.lbr6_search_iters, preflop_lossless=args.preflop_lossless,
+                   preflop_lossless_betting=args.preflop_lossless_betting)
     run_kwargs = dict(
         ImageId=ami,
         InstanceType=args.instance_type,

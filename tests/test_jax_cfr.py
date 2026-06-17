@@ -10,12 +10,14 @@ from pokerbot.engine.jax_engine import (
     NUM_ACTIONS,
     NUM_PLAYERS,
     EnvState,
-    JAXNLHEnv,
+    JAXNLHEEnv,
     batched_reset,
     batched_step,
     encode_info_state,
     legal_action_mask,
     reset_state,
+    is_chance_node,
+    sample_chance,
     step_state,
 )
 from pokerbot.training.neural_cfr import (
@@ -48,12 +50,12 @@ def test_reset_state_shapes() -> None:
     assert not bool(state.done)
 
 
-def test_legal_mask_has_fold() -> None:
+def test_legal_mask_has_check_or_call() -> None:
     key = jax.random.PRNGKey(1)
     state = reset_state(key)
     mask = legal_action_mask(state)
     assert mask.shape == (NUM_ACTIONS,)
-    assert bool(mask[0])  # fold always legal when facing action
+    assert bool(mask[1]) or bool(mask[2])
 
 
 def test_step_until_terminal() -> None:
@@ -62,12 +64,15 @@ def test_step_until_terminal() -> None:
     for _ in range(200):
         if bool(state.done):
             break
+        if bool(is_chance_node(state)):
+            state = sample_chance(state)
+            continue
         mask = legal_action_mask(state)
         legal = jnp.where(mask, 1.0, 0.0)
         action = jnp.argmax(legal)
         state = step_state(state, action)
     assert bool(state.done)
-    assert jnp.allclose(jnp.sum(state.rewards), 0.0, atol=1e-3)
+    assert int(jnp.sum(state.rewards)) == 0
 
 
 def test_batched_vmap() -> None:
@@ -77,7 +82,7 @@ def test_batched_vmap() -> None:
     assert states.stacks.shape == (8, NUM_PLAYERS)
     actions = jnp.zeros(8, dtype=jnp.int32)
     next_states = batched_step(states, actions)
-    assert next_states.pot.shape == (8,)
+    assert next_states.pot_dead.shape == (8,)
 
 
 def test_info_state_fixed_dim() -> None:

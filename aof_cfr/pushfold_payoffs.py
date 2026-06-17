@@ -59,16 +59,34 @@ def game_model_default() -> int:
     return _GM_CACHE["v"]
 
 
-# Official CoinPoker AoF Hold'em flat-fee schedule (user-provided 2026-06-12), keyed by
-# (sb, bb) in dollars. Per DC2 capture evidence the fee is deducted from the CONTESTED pot
-# at showdown (folded players pay nothing; an uncontested steal pays nothing).
+# Official CoinPoker Hold'em flat-fee schedule (re-confirmed by the user 2026-06-15 against the
+# published rake table), keyed by (sb, bb) in dollars. Per DC2 capture evidence the fee is deducted
+# from the CONTESTED pot at showdown (folded players pay nothing; an uncontested steal pays nothing).
+# Every tier is an 8bb buy-in; the fee is the only thing that varies by stake. (Omaha is OUT of scope.)
 OFFICIAL_HOLDEM_FEE_BB = {
-    (0.10, 0.25): 0.16,
-    (0.25, 0.50): 0.12, (0.50, 1.0): 0.12, (1.0, 2.0): 0.12, (2.0, 5.0): 0.12,
-    (5.0, 10.0): 0.12, (10.0, 20.0): 0.12,
-    (50.0, 100.0): 0.10,
+    (0.10, 0.25): 0.16,                                            # buy-in $2
+    (0.25, 0.50): 0.12, (0.50, 1.0): 0.12, (1.0, 2.0): 0.12,      # buy-in $4 / $8 / $16
+    (2.0, 5.0): 0.12, (5.0, 10.0): 0.12, (10.0, 20.0): 0.12,      # buy-in $40 / $80 / $160
+    (50.0, 100.0): 0.10,                                           # buy-in $800
 }
-FLAT_FEE_BB_OFFICIAL = 0.12  # the fee at every Hold'em stake from 0.25/0.50 through 10/20
+FLAT_FEE_BB_OFFICIAL = 0.12  # the modal fee (0.25/0.50 through 10/20); also the solved-base fee
+
+
+def holdem_fee_bb(sb, bb=None) -> float:
+    """Official Hold'em flat fee (in bb) for a stake tier. Robust to float noise and to unlisted
+    tiers: the schedule is uniquely keyed by the BIG BLIND (each bb has one Hold'em fee), so match on
+    bb (the SB is informational); fall back to the modal 0.12 for any stake not in the table. Call as
+    ``holdem_fee_bb(sb, bb)`` or ``holdem_fee_bb(bb)``."""
+    if bb is None:
+        bb = sb
+    try:
+        target = round(float(bb), 4)
+    except (TypeError, ValueError):
+        return FLAT_FEE_BB_OFFICIAL
+    for (_s, b), fee in OFFICIAL_HOLDEM_FEE_BB.items():
+        if abs(b - target) < 1e-6:
+            return fee
+    return FLAT_FEE_BB_OFFICIAL
 
 
 def flat_fee_default() -> float:

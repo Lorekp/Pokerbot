@@ -23,8 +23,11 @@ from pokerbot.solver.export import merge_shards, write_shard, write_solver_parqu
 from pokerbot.solver.label_build_state import LabelBuildState, apply_solve_error, apply_solve_result
 from pokerbot.solver.label_completion import (
     CompletionLedger,
+    analyze_shard_completion,
     bootstrap_and_validate,
+    has_shard,
     spot_key_hash,
+    unique_manifest_keys,
     write_completion_report,
 )
 from pokerbot.solver.postflop_solver_client import (
@@ -126,6 +129,7 @@ def build_labels(
     bootstrap_log: Path | None = None,
     bootstrap_expected_count: int | None = None,
     shard_dir: Path | None = None,
+    spot_keys_filter: set[str] | None = None,
 ) -> dict[str, Any]:
     raw_cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     config = load_solver_config(config_path)
@@ -166,7 +170,7 @@ def build_labels(
             shard_dir=shard_dir,
             parquet_path=output if output.is_file() else None,
             expected_count=bootstrap_expected_count,
-            write_ledger=resume,
+            write_ledger=False,
         )
         if bootstrap_expected_count is not None and not bootstrap_result.ok:
             raise SystemExit(
@@ -195,8 +199,6 @@ def build_labels(
 
     import time
 
-    from aof_rl.profiling.league_profiler import start_cprofile, stop_cprofile
-
     state = LabelBuildState(
         included_rows=included_rows,
         excluded_by_reason=excluded_by_reason,
@@ -217,7 +219,9 @@ def build_labels(
         total_candidates += 1
         spot_idx = total_candidates - 1
         key = format_spot_key(spot)
-        if resume and ledger.contains(key):
+        if spot_keys_filter is not None and key not in spot_keys_filter:
+            continue
+        if resume and has_shard(shard_dir, key):
             skipped_resume += 1
             continue
         if prof is not None:
@@ -349,6 +353,8 @@ def build_labels(
 
                 do_cprof = cprofile_spot is not None and spot_idx == cprofile_spot
                 if do_cprof:
+                    from aof_rl.profiling.league_profiler import start_cprofile
+
                     start_cprofile()
                 try:
                     print(f"[{cand_num}] solving {spot_key}", flush=True)
@@ -362,6 +368,7 @@ def build_labels(
                                     cli_path=cli_path,
                                     worker=worker,
                                     request_id=str(spot_idx),
+                                    solver_threads_per_worker=solver_threads_per_worker,
                                 )
                         else:
                             result = solve_spot(
@@ -370,6 +377,7 @@ def build_labels(
                                 cli_path=cli_path,
                                 worker=worker,
                                 request_id=str(spot_idx),
+                                solver_threads_per_worker=solver_threads_per_worker,
                             )
                     except subprocess.TimeoutExpired:
                         apply_solve_error(
@@ -419,6 +427,8 @@ def build_labels(
                         prof.inc_counter("spots_solved", 1)
                 finally:
                     if do_cprof:
+                        from aof_rl.profiling.league_profiler import stop_cprofile
+
                         stop_cprofile()
                     if prof is not None:
                         prof.end_spot()
@@ -467,6 +477,28 @@ def build_labels(
         range_scopes[key] = range_scopes.get(key, 0) + 1
 
     completed_without_shard = ledger.keys_without_shards(shard_dir) if resume else []
+
+    scope_keys: list[str] = []
+    if spot_keys_filter is not None:
+        scope_keys = sorted(spot_keys_filter)
+    else:
+        for spot in enumerate_spots(config):
+            key = format_spot_key(spot)
+            validity = is_two_player_valid(
+                spot_node_from_state(spot.state, spot.hero_seat, bunching=spot.bunching)
+            )
+            if validity.valid:
+                scope_keys.append(key)
+        if max_spots is not None:
+            scope_keys = scope_keys[:max_spots]
+
+    scope_unique = unique_manifest_keys(scope_keys)
+    shard_completion = analyze_shard_completion(
+        manifest_keys=scope_unique,
+        shard_dir=shard_dir,
+        ledger_path=completion_ledger if resume else None,
+    )
+    shard_complete = shard_completion.shard_backed >= shard_completion.expected_count
 
     flagged_count = len(flagged_failures)
     manifest: dict[str, Any] = {
@@ -520,6 +552,11 @@ def build_labels(
             "shard_dir": str(shard_dir),
             "ledger_completed": len(ledger.completed),
             "completed_without_shard": len(completed_without_shard),
+            "shard_authority": True,
+            "shard_completion": shard_completion.to_dict(),
+            "shard_complete": shard_complete,
+            "scope_unique_keys": len(scope_unique),
+            "scope_manifest_entries": len(scope_keys),
             "bootstrap_log": str(bootstrap_log) if bootstrap_log else None,
             "bootstrap_valid_count": (
                 bootstrap_result.valid_count if bootstrap_result is not None else None
@@ -605,6 +642,14 @@ def build_labels(
                 f"Example not-converged: {json.dumps(not_converged_details[0], indent=2)}",
                 file=sys.stderr,
             )
+
+    if resume and scope_keys and not shard_complete:
+        manifest["shard_incomplete"] = True
+        print(
+            f"\n*** INCOMPLETE: {shard_completion.shard_backed}/{shard_completion.expected_count} "
+            f"shard-backed spots (todo={shard_completion.todo_count}). ***",
+            file=sys.stderr,
+        )
 
     return manifest
 
@@ -787,7 +832,30 @@ def main() -> None:
         default=None,
         help="Directory for per-spot Parquet shards (default: {output_stem}_shards)",
     )
+    p.add_argument(
+        "--work-manifest",
+        type=Path,
+        default=None,
+        help="JSON manifest with spot_keys list — only solve keys in manifest",
+    )
+    p.add_argument(
+        "--manifest-slice",
+        type=str,
+        default=None,
+        help="Optional slice start:end into work-manifest spot_keys (for parallel workers)",
+    )
     args = p.parse_args()
+
+    spot_keys_filter: set[str] | None = None
+    if args.work_manifest is not None:
+        wm = json.loads(args.work_manifest.read_text(encoding="utf-8"))
+        keys = list(wm.get("spot_keys", []))
+        if args.manifest_slice:
+            start_s, end_s = args.manifest_slice.split(":", 1)
+            start_i = int(start_s) if start_s else 0
+            end_i = int(end_s) if end_s else len(keys)
+            keys = keys[start_i:end_i]
+        spot_keys_filter = set(keys)
 
     manifest = build_labels(
         args.config,
@@ -811,9 +879,17 @@ def main() -> None:
         bootstrap_log=args.bootstrap_log,
         bootstrap_expected_count=args.bootstrap_expected_count,
         shard_dir=args.shard_dir,
+        spot_keys_filter=spot_keys_filter,
     )
     print(json.dumps(manifest["enumeration"], indent=2))
     if not args.dry_run and manifest["gto_acceptable"] and manifest["enumeration"]["included"] == 0:
+        sys.exit(1)
+    if (
+        not args.dry_run
+        and args.resume
+        and manifest.get("resume", {}).get("enabled")
+        and not manifest.get("resume", {}).get("shard_complete", True)
+    ):
         sys.exit(1)
 
 

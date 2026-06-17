@@ -215,11 +215,25 @@ def main() -> None:
 
         results["leduc_gate"] = _run_leduc_gate(args.leduc_iterations, args.leduc_traversals, args.seed)
 
-        results["gate_passed"] = bool(results["leduc_gate"]["gate_passed"])
+        gate0_path = Path("logs/nlhe_gate0_encode_report.json")
+        if gate0_path.exists():
+            import json as _json
+
+            results["nlhe_gate0"] = _json.loads(gate0_path.read_text(encoding="utf-8"))
+        else:
+            from pokerbot.training.nlhe_collision_check import run_gate0_report
+
+            results["nlhe_gate0"] = run_gate0_report()
+
+        results["gate_passed"] = bool(results["leduc_gate"]["gate_passed"]) and bool(
+            results["nlhe_gate0"].get("gate0_passed", False)
+        )
 
         results["gate_criteria"] = {
 
             "leduc": "SD-CFR infoset BR <= 100 mbb; tabular ref infoset BR <= 5 mbb; SD-CFR >= tabular",
+
+            "nlhe_gate0": "WEVA encoding injectivity + Parquet WEVA replay (blocking before NLHE train)",
 
             "legacy_baseline": "informational only when null — not used for gate_passed",
 

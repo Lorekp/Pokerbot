@@ -2,11 +2,31 @@
 
 from __future__ import annotations
 
+import pathlib
+import sys
 from pathlib import Path
 
 import torch
 
 from pokerbot.models.policy import PseudoSiamesePolicy, num_weva_buckets_from_checkpoint
+
+
+def _torch_load_xplat(ckpt_path, device):
+    """torch.load with a cross-platform pathlib shim. Checkpoints saved on Windows pickle a
+    ``WindowsPath`` (and POSIX a ``PosixPath``); unpickling the other flavor raises
+    ``NotImplementedError: cannot instantiate 'WindowsPath'/'PosixPath' on your system``. Temporarily
+    alias the foreign class to the native one so the cloud (Linux) can load a Windows-trained .pt.
+    Restored in a finally so global pathlib behavior is unchanged outside this load."""
+    if sys.platform == "win32":
+        foreign, native = "PosixPath", pathlib.WindowsPath
+    else:
+        foreign, native = "WindowsPath", pathlib.PosixPath
+    orig = getattr(pathlib, foreign)
+    setattr(pathlib, foreign, native)
+    try:
+        return torch.load(ckpt_path, map_location=device, weights_only=False)
+    finally:
+        setattr(pathlib, foreign, orig)
 
 LEGACY_CARD_ENCODER_KEYS = ("card_encoder.0.net.0.weight", "card_encoder.1.net.0.weight")
 POLICY_ENCODING_V2_CARD_KEY = "card_encoder.0.net.0.weight"
@@ -72,7 +92,7 @@ def load_pseudo_siamese_policy(
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Policy checkpoint not found: {ckpt_path}")
 
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    ckpt = _torch_load_xplat(ckpt_path, device)
     if not isinstance(ckpt, dict) or "model" not in ckpt:
         raise ValueError(f"Invalid policy checkpoint format (missing 'model' key): {ckpt_path}")
 

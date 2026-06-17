@@ -90,20 +90,26 @@ def base_marginals(n: int, agent_seat: str, stack_bb: float) -> dict:
 
 
 def routed_arrays(db, n, agent_seat, stack_bb, opp_at_seat, *, min_conf, margin,
-                  estimator=None, confidence_fn=None,
-                  confidence_mode: str | None = None, gate_mode: str | None = None) -> dict:
+                  estimator=None, confidence_fn=None, stability_fn=None,
+                  confidence_mode: str | None = None, gate_mode: str | None = None,
+                  exploit_cap: float | None = None, cap_floor: float | None = None) -> dict:
     """``{history: (p_push(169,), is_exploit(169,), gain(169,))}`` for the agent.
 
     Vectorized mirror of the router's gating over every (history, hand) at once.
     ``estimator``/``confidence_fn`` default to the legacy DB shift path; pass the adaptive
     model's hooks for the shipping configuration. ``confidence_mode``/``gate_mode`` default to
     the router's shipping defaults — pass ("min", "point") to reproduce the legacy gauntlet
-    behavior (the frozen pre-Phase-3 baseline)."""
+    behavior (the frozen pre-Phase-3 baseline). ``stability_fn`` (optional) supplies the
+    per-opponent read stability that drives the Restricted-Nash-Response cap (default: all
+    stable -> cap == ``exploit_cap``, behaviour unchanged)."""
     from aof_cfr.exploit_router import (
-        DEFAULT_CONFIDENCE_MODE, DEFAULT_GATE_MODE, _confidence, _kappa, _n_eff, lcb_thresholds)
+        DEFAULT_CONFIDENCE_MODE, DEFAULT_GATE_MODE,
+        _confidence, _kappa, _n_eff, default_cap_floor, default_exploit_cap, lcb_thresholds)
 
     confidence_mode = confidence_mode or DEFAULT_CONFIDENCE_MODE
     gate_mode = gate_mode or DEFAULT_GATE_MODE
+    exploit_cap = default_exploit_cap(n) if exploit_cap is None else exploit_cap
+    cap_floor = default_cap_floor(n) if cap_floor is None else cap_floor
     est = estimator or (lambda d, ident, np_, s: estimate_policy_rows_shift(d, ident, np_, s))
     if confidence_fn is None:
         confidence_fn = lambda ident: _confidence(db, ident, 8.0)  # noqa: E731
@@ -113,7 +119,7 @@ def routed_arrays(db, n, agent_seat, stack_bb, opp_at_seat, *, min_conf, margin,
 
     # per-opponent estimate objects + confidences (None ident -> base, no read)
     seats = active_seats(n)
-    est_by_seat, conf_by_seat = {}, {}
+    est_by_seat, conf_by_seat, stab_by_seat = {}, {}, {}
     legacy_confs = []
     for seat in seats:
         if seat == agent_seat:
@@ -122,6 +128,7 @@ def routed_arrays(db, n, agent_seat, stack_bb, opp_at_seat, *, min_conf, margin,
         if ident:
             est_by_seat[seat] = est(db, ident, n, stack_bb)
             conf_by_seat[seat] = float(confidence_fn(ident))
+            stab_by_seat[seat] = float(stability_fn(ident)) if stability_fn else 1.0
             legacy_confs.append(conf_by_seat[seat])
         else:
             legacy_confs.append(0.0)
@@ -167,25 +174,36 @@ def routed_arrays(db, n, agent_seat, stack_bb, opp_at_seat, *, min_conf, margin,
     joint = _marg(est_by_seat)
     base_seat = _agent_base_array(n, agent_seat, stack_bb)
 
-    # decision confidence per (hist, hand)
+    # decision confidence + read stability (RNR cap) per (hist, hand)
+    stab_floor = min(stab_by_seat.values(), default=1.0)
     if confidence_mode == "min" or not est_by_seat:
         conf = min(legacy_confs) if legacy_confs else 0.0
         conf_arr = {hist: np.full(len(LABELS_169), conf) for hist in hists}
+        stab_arr = {hist: np.full(len(LABELS_169), stab_floor) for hist in hists}
     else:
         solo = {seat: _marg({seat: est_by_seat[seat]}) for seat in est_by_seat}
-        conf_arr = {}
+        conf_arr, stab_arr = {}, {}
         for hi, hist in enumerate(hists):
             base_p = base_seat[hi]
             num = np.zeros(len(LABELS_169))
+            snum = np.zeros(len(LABELS_169))
             den = np.zeros(len(LABELS_169))
             for seat, m_o in solo.items():
                 ep_o, ef_o = m_o[hist]
                 g = np.maximum(np.maximum(ef_o, ep_o)
                                - ((1.0 - base_p) * ef_o + base_p * ep_o), 0.0)
                 num += g * conf_by_seat[seat]
+                snum += g * stab_by_seat[seat]
                 den += g
             fallback = max(conf_by_seat.values(), default=0.0)
             conf_arr[hist] = np.where(den > 1e-12, num / np.maximum(den, 1e-12), fallback)
+            # pure-synergy reads (den==0) fall back to the most conservative (min) stability
+            stab_arr[hist] = np.where(den > 1e-12, snum / np.maximum(den, 1e-12), stab_floor)
+
+    def _capped(c, hist):
+        """Apply the RNR cap: bound the played exploitation weight by cap_floor + span*stability."""
+        cap = cap_floor + (exploit_cap - cap_floor) * stab_arr[hist]
+        return np.minimum(c, cap)
 
     # gate
     out = {}
@@ -197,7 +215,8 @@ def routed_arrays(db, n, agent_seat, stack_bb, opp_at_seat, *, min_conf, margin,
             gain = np.maximum(e_fold, e_push) - ((1.0 - base_p) * e_fold + base_p * e_push)
             c = conf_arr[hist]
             gated = (c >= min_conf) & (gain >= margin)
-            p = np.where(gated, (1.0 - c) * base_p + c * exploit_p, base_p)
+            cp = _capped(c, hist)
+            p = np.where(gated, (1.0 - cp) * base_p + cp * exploit_p, base_p)
             out[hist] = (p, gated, gain)
         return out
 
@@ -216,6 +235,7 @@ def routed_arrays(db, n, agent_seat, stack_bb, opp_at_seat, *, min_conf, margin,
         gain_lcb = v_act - ((1.0 - base_p) * ef_l + base_p * ep_l)
         c = conf_arr[hist]
         gated = (c >= eff_min_conf) & (gain_lcb >= eff_margin)
-        p = np.where(gated, (1.0 - c) * base_p + c * exploit_p, base_p)
+        cp = _capped(c, hist)
+        p = np.where(gated, (1.0 - cp) * base_p + cp * exploit_p, base_p)
         out[hist] = (p, gated, gain)
     return out

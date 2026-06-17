@@ -32,6 +32,12 @@ def main() -> None:
 
     with open(args.blueprint_snapshot, "rb") as f:
         snap = pickle.load(f)
+    # Serve-env guard: a flag skew (e.g. forgetting POKERBOT_PREFLOP_LOSSLESS=1 for a lossless snapshot)
+    # silently misses every key and would make the gate read a uniform-fallback policy. Cross-check the
+    # snapshot's abstraction stamp BEFORE attributing anything.
+    from pokerbot.eval.lbr import check_blueprint_serve_env
+    stamp = snap.get("abstraction") if isinstance(snap, dict) else None
+    check_blueprint_serve_env(strict=True, expected=stamp)
     snap = snap["strat_sum"] if isinstance(snap, dict) and "strat_sum" in snap else snap
     act = make_search_policy_fn(snap, leaf_select="uniform", iterations=args.search_iters, seed=args.seed)
     model = make_blueprint_policy(snap)

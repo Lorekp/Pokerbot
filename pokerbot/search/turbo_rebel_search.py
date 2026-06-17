@@ -11,11 +11,16 @@ import numpy as np
 from pokerbot.engine.jax_engine import (
     NUM_ACTIONS,
     NUM_PLAYERS,
+    SEAT_FOLDED,
     encode_history_state,
     encode_info_state,
     legal_action_mask,
     step_state,
 )
+from pokerbot.opponent.bayes_exploit import DEFAULT_MAX_ALPHA as _CTX_MAX_ALPHA
+from pokerbot.opponent.bayes_exploit import context_read
+from pokerbot.opponent.context import context_key_rs as _ctx_key_rs
+from pokerbot.opponent.context import is_aggressive_action as _is_aggressive_action
 from pokerbot.search.isomorphism import cached_canonicalize_key, canonicalize_history_encoding
 from pokerbot.search.leaf_evaluator import HistoryValueEvaluator
 from pokerbot.search.pbs_tracker import PBSTracker
@@ -50,6 +55,108 @@ def _regret_match(regrets: np.ndarray, legal: np.ndarray) -> np.ndarray:
     return legal.astype(np.float64) / max(legal.sum(), 1)
 
 
+def _blend_bias(strategy: np.ndarray, tilt: np.ndarray, alpha: float, legal: np.ndarray) -> np.ndarray:
+    """Nash-anchored safe-mix tail shared by the archetype and contextual exploit paths:
+    ``mixed = (1-alpha)*GTO + alpha*normalize(GTO * tilt)``, renormalized over legal actions.
+    ``alpha`` (confidence-gated upstream) bounds the exploitability exposed; alpha=0 ⇒ unchanged."""
+    n = strategy.shape[0]
+    t = np.asarray(tilt, dtype=np.float64)[:n]
+    biased = strategy * t * legal
+    s = biased.sum()
+    if s <= 0:
+        return strategy
+    biased = biased / s
+    mixed = ((1.0 - float(alpha)) * strategy + float(alpha) * biased) * legal
+    ms = mixed.sum()
+    return mixed / ms if ms > 0 else strategy
+
+
+def apply_opponent_bias(
+    strategy: np.ndarray, stats, legal: np.ndarray, *, max_alpha: float = 0.5
+) -> np.ndarray:
+    """Tilt a regret-matched/blueprint OPPONENT strategy toward their observed ARCHETYPE (the
+    fallback when no per-context Bayesian read is available), so the hero best-response becomes
+    exploitative. Nash-anchored + sample-size-confidence-gated: 'unknown'/'tag'/sparse ⇒ unchanged.
+    Action indices: 0=fold, 2=call, 3+=bet/raise/all-in."""
+    arch = stats.archetype()
+    conf = min(1.0, max(0, stats.hands) / 50.0)
+    if arch in ("unknown", "tag") or conf <= 0.0:
+        return strategy
+    # Data-proportional exploitation: deviate MORE the more exploitable the read actually is (a
+    # 2%-VPIP hyper-nit is punished harder than a borderline one). extremity in [0.3, 1.0].
+    if arch == "nit":
+        extremity = (0.15 - stats.vpip_pct) / 0.15
+    elif arch == "calling_station":
+        extremity = (stats.vpip_pct - 0.45) / 0.45
+    elif arch == "lag":
+        extremity = (stats.aggression_factor - 2.5) / 3.0
+    else:
+        extremity = 0.0
+    extremity = float(min(1.0, max(0.3, extremity + 0.3)))
+    n = strategy.shape[0]
+    tilt = np.ones(n, dtype=np.float64)
+    fold_i, call_i = 0, 2
+    agg = np.zeros(n, dtype=bool)
+    if n > 3:
+        agg[3:] = True  # bet / raise / all-in
+    if arch == "nit":  # folds too much -> we should apply more pressure
+        tilt[fold_i] *= 1.8
+        tilt[agg] *= 0.7
+    elif arch == "calling_station":  # won't fold, calls too much -> value-bet, don't bluff
+        tilt[call_i] *= 1.8
+        tilt[fold_i] *= 0.4
+        tilt[agg] *= 0.85
+    elif arch == "lag":  # over-aggressive -> let them barrel, trap
+        tilt[agg] *= 1.5
+        tilt[call_i] *= 1.2
+        tilt[fold_i] *= 0.8
+    return _blend_bias(strategy, tilt, max_alpha * conf * extremity, legal)
+
+
+def apply_context_bias(
+    strategy: np.ndarray, read, legal: np.ndarray, *, max_alpha: float = _CTX_MAX_ALPHA
+) -> np.ndarray:
+    """Tilt the OPPONENT strategy from a per-context Bayesian read (bayes_exploit.ContextRead). The
+    read's posterior-vs-population deviation drives a per-action tilt; its per-context confidence
+    drives alpha. Strictly preferred over the archetype path when contextual data exists."""
+    tilt, alpha = read.search_tilt(max_alpha=max_alpha)
+    return _blend_bias(strategy, tilt, alpha, legal)
+
+
+_CTX_BOARD_LEN = (0, 3, 4, 5)
+
+
+def _context_key_from_env(env, actor: int) -> str:
+    """Serve-side per-context key from the live env — the SAME spec as offline ingestion
+    (pokerbot.opponent.context), so the DB lookup matches what was recorded. Card id ⇒ rank/suit via
+    the engine convention (rank = id//4 + 2, suit = id%4)."""
+    street = int(np.asarray(env.street))
+    n_board = _CTX_BOARD_LEN[street] if 0 <= street < len(_CTX_BOARD_LEN) else 0
+    board = np.asarray(env.board)
+    ranks, suits = [], []
+    for i in range(n_board):
+        c = int(board[i])
+        if c < 0:
+            continue
+        ranks.append(c // 4 + 2)
+        suits.append(c % 4)
+    n_aggr = _facing_count_from_env(env, street, actor)
+    return _ctx_key_rs(street, ranks, suits, n_aggr)
+
+
+def _facing_count_from_env(env, street: int, actor: int) -> int:
+    """Raw per-street aggression count for the facing bucket, computed IDENTICALLY to offline ingest.
+    Preflop the whole flat history is the preflop action sequence ⇒ count its aggressive entries
+    (full open/3bet/4bet depth). Postflop the flat env can't recover raise-depth without replay, so
+    return the binary to_call signal (``context.facing_token`` caps postflop at 1 anyway)."""
+    if street == 0:
+        hist_len = int(np.asarray(env.hist_len))
+        actions = np.asarray(env.hist_action)[:hist_len]
+        return int(sum(1 for a in actions if _is_aggressive_action(int(a))))
+    to_call = int(np.asarray(env.current_bet)) - int(np.asarray(env.committed_street)[actor])
+    return 0 if to_call <= 0 else 1
+
+
 class TurboReBeLSolver:
     """Depth-limited CFR+ with single-sample multi-iteration generation."""
 
@@ -58,10 +165,18 @@ class TurboReBeLSolver:
         leaf_eval: HistoryValueEvaluator,
         config: TurboReBeLConfig | None = None,
         rng: np.random.Generator | None = None,
+        opponent_model: dict | None = None,
     ) -> None:
         self.leaf_eval = leaf_eval
         self.config = config or TurboReBeLConfig()
         self.rng = rng or np.random.default_rng(0)
+        # Optional seat -> OpponentStats for opponent-conditioned safe exploitation. None (default)
+        # => the solve assumes regret-matched/blueprint opponents (unchanged). The exploitation bias
+        # that consumes this is built later (see docs/exploitation-design.md).
+        self.opponent_model = opponent_model
+        # Optional GiftRegister (pokerbot.opponent.safety_budget): banked opponent gifts relax the
+        # per-context alpha cap (gift-modulated bounded-ε). None ⇒ the static Pmax cap (unchanged).
+        self.gift_register = None
         self._regrets: dict[str, np.ndarray] = {}
         self._strategy_sum: dict[str, np.ndarray] = {}
         self._leaf_cache: dict[str, np.ndarray] = {}
@@ -83,9 +198,9 @@ class TurboReBeLSolver:
         seats = tuple(int(x) for x in np.asarray(env.hist_seat[:hist_len]))
         actions = tuple(int(x) for x in np.asarray(env.hist_action[:hist_len]))
         board = tuple(int(x) for x in np.asarray(env.board) if int(x) >= 0)
-        pot = float(np.asarray(env.pot))
+        pot = float(np.asarray(env.pot_dead + jnp.sum(env.committed_street)))
         stacks = np.asarray(env.stacks, dtype=np.float64)
-        folded = np.asarray(env.folded, dtype=bool)
+        folded = np.asarray(env.seat_status == SEAT_FOLDED, dtype=bool)
         active_mean = float(stacks[~folded].mean()) if (~folded).any() else float(stacks.mean())
         spr_bucket = int(pot / max(active_mean, 1.0) * 4)
         return f"{seat}|{int(np.asarray(env.street))}|{board}|{seats}|{actions}|spr{spr_bucket}"
@@ -101,9 +216,9 @@ class TurboReBeLSolver:
         action_seq = tuple(int(x) for x in np.asarray(env.hist_action[:hist_len]))
         board = tuple(int(x) for x in np.asarray(env.board) if int(x) >= 0)
         street = int(np.asarray(env.street))
-        pot = float(np.asarray(env.pot))
+        pot = float(np.asarray(env.pot_dead + jnp.sum(env.committed_street)))
         stacks = np.asarray(env.stacks, dtype=np.float64)
-        folded = np.asarray(env.folded, dtype=bool)
+        folded = np.asarray(env.seat_status == SEAT_FOLDED, dtype=bool)
         active_mean = float(stacks[~folded].mean()) if (~folded).any() else float(stacks.mean())
         pot_bucket = int(pot * 2)
         spr_bucket = int(pot / max(active_mean, 1.0) * 4)
@@ -115,9 +230,9 @@ class TurboReBeLSolver:
             self._leaf_cache_hits += 1
             return cache_key
         hist = np.asarray(encode_history_state(env), dtype=np.float32)
-        pot = float(np.asarray(env.pot))
+        pot = float(np.asarray(env.pot_dead + jnp.sum(env.committed_street)))
         stacks = np.asarray(env.stacks, dtype=np.float64)
-        folded = np.asarray(env.folded, dtype=bool)
+        folded = np.asarray(env.seat_status == SEAT_FOLDED, dtype=bool)
         active_mean = float(stacks[~folded].mean()) if (~folded).any() else float(stacks.mean())
         spr_bucket = int(pot / max(active_mean, 1.0) * 4)
         hist = canonicalize_history_encoding(hist, pot_bb=pot, spr_bucket=spr_bucket)
@@ -173,6 +288,23 @@ class TurboReBeLSolver:
                 strategy = strategy / s
             else:
                 strategy = legal.astype(np.float64) / max(legal.sum(), 1)
+        # Opponent-conditioned safe exploitation: bias the assumed opponent strategy toward their
+        # persistent-DB read. Prefer the per-context Bayesian posterior (DBR, confidence-gated);
+        # fall back to the discrete archetype when that context has no data. None / no-profile /
+        # low-confidence => unchanged (GTO).
+        if self.opponent_model is not None:
+            stats = self.opponent_model.get(actor)
+            if stats is not None:
+                read = context_read(stats, _context_key_from_env(env, actor))
+                if read is not None:
+                    # Gift-modulated bounded-ε: a banked-gift budget relaxes the Pmax cap for THIS
+                    # opponent (exploit demonstrable leakers harder). None / zero gift ⇒ base cap.
+                    max_alpha = _CTX_MAX_ALPHA
+                    if self.gift_register is not None:
+                        max_alpha = self.gift_register.capped_max_alpha(actor, _CTX_MAX_ALPHA)
+                    strategy = apply_context_bias(strategy, read, legal, max_alpha=max_alpha)
+                else:
+                    strategy = apply_opponent_bias(strategy, stats, legal)
         return strategy
 
     def _cfv(

@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
+
+# Fast-timescale decay — env-overridable for the G4 adaptation tuning sweep (must match
+# bayes_exploit.GAMMA_FAST, which reads the same variable at import).
+_GAMMA_FAST_DEFAULT = float(os.environ.get("POKERBOT_GAMMA_FAST", "0.90"))
 
 
 @dataclass
@@ -17,6 +22,109 @@ class OpponentStats:
     aggression_calls: int = 0
     wtsd: int = 0  # went to showdown
     saw_flop: int = 0
+    # Per-context Dirichlet sufficient stats: {context_key -> K=4 outcome-bin counts}
+    # (see pokerbot.opponent.context). Empty for legacy/cold profiles ⇒ all scalar math below and
+    # archetype()/confidence() are unaffected; the contextual Bayesian model uses it when present.
+    ctx_counts: dict[str, list[int]] = field(default_factory=dict)
+    # Dual-timescale DISCOUNTED counts (non-stationarity): fast (γ≈0.90, ~10-hand window) tracks gear-
+    # changes; slow (γ≈0.99, ~100-hand) is the low-variance lifetime view. Decayed toward the
+    # population-prior floor so unseen actions never collapse to zero. ctx_last = the `hands` index at
+    # each context's last update (for LAZY decay). Empty for v2/legacy ⇒ bayes falls back to ctx_counts.
+    ctx_fast: dict[str, list[float]] = field(default_factory=dict)
+    ctx_slow: dict[str, list[float]] = field(default_factory=dict)
+    ctx_last: dict[str, int] = field(default_factory=dict)
+    # BOCPD-style MAP run-length per context: # of hands since the last detected regime change. Drives a
+    # smooth post-change confidence ramp in bayes_exploit. Empty for v3/legacy ⇒ bayes falls back to the
+    # binary fast/slow switch. ``ctx_shift_active`` is a TRANSIENT (not persisted) rising-edge latch.
+    ctx_runlen: dict[str, int] = field(default_factory=dict)
+    ctx_shift_active: dict[str, bool] = field(default_factory=dict)
+    # SHOWDOWN-CONDITIONED bluff-ratio Beta counts (schema v5): {context_key -> [n_bluff, n_value]},
+    # discounted (γ≈0.98, lazy decay like ctx_fast/slow but toward ZERO — the Beta prior is applied at
+    # READ time by bayes_exploit.bluff_read, not embedded here). An entry is added only when a
+    # villain's aggressive action was later GROUND-TRUTHED by a showdown reveal: hand strength at the
+    # action < 0.45 ⇒ bluff, > 0.60 ⇒ value, middle ⇒ skipped (thin-value ambiguity stays out of the
+    # posterior). Parallel keyspace over the LOCKED 22-context spec — context.py/spec_hash untouched.
+    # Empty for v4/legacy profiles ⇒ bluff_read returns None ⇒ frequency-only exploitation (unchanged).
+    ctx_bluff: dict[str, list[float]] = field(default_factory=dict)
+    ctx_bluff_last: dict[str, int] = field(default_factory=dict)
+
+    def add_ctx(self, context_key: str, bin_increments) -> None:
+        """Element-wise fold a hand's per-context bin increments into the running counts."""
+        from pokerbot.opponent.context import NUM_BINS
+
+        row = self.ctx_counts.get(context_key)
+        if row is None:
+            row = [0] * NUM_BINS
+            self.ctx_counts[context_key] = row
+        for i, v in enumerate(bin_increments):
+            if i < len(row):
+                row[i] += int(v)
+
+    def decay_and_add(
+        self,
+        context_key: str,
+        bin_increments,
+        prior_per_bin,
+        hands_now: int,
+        *,
+        gamma_fast: float = _GAMMA_FAST_DEFAULT,
+        gamma_slow: float = 0.99,
+    ) -> None:
+        """Stabilized discounted update for BOTH timescales (non-stationarity). Lazily decays over
+        Δ = hands_now − last_update toward the population-prior floor, then adds this hand's bin counts:
+            α ← γ^Δ·α + (1−γ^Δ)·prior_per_bin ;  α += bins
+        The prior floor prevents zero-collapse of never-seen actions. ``prior_per_bin`` is the
+        population pseudocount vector (sums to the prior strength)."""
+        from pokerbot.opponent.context import NUM_BINS
+
+        bins = list(bin_increments) + [0] * NUM_BINS
+        prior = list(prior_per_bin) + [0.0] * NUM_BINS
+        delta = max(0, int(hands_now) - int(self.ctx_last.get(context_key, hands_now)))
+        for store, gamma in ((self.ctx_fast, gamma_fast), (self.ctx_slow, gamma_slow)):
+            row = store.get(context_key)
+            if row is None:
+                row = list(prior[:NUM_BINS])  # seed at the population floor
+            g = gamma ** delta
+            for i in range(NUM_BINS):
+                row[i] = g * row[i] + (1.0 - g) * prior[i] + float(bins[i])
+            store[context_key] = row
+        self.ctx_last[context_key] = int(hands_now)
+        # BOCPD-style MAP run-length: reset to 0 on the RISING EDGE of a regime change (fast/slow
+        # diverge for the first time), then INCREMENT every hand thereafter — even while the slow model
+        # is still catching up (TV stays high) — so the post-change confidence ramp recovers promptly
+        # rather than stalling for the slow half-life. A single counter + a transient edge latch.
+        nf, ns = self.ctx_fast[context_key], self.ctx_slow[context_key]
+        nfs, nss = sum(nf), sum(ns)
+        if nfs <= 0 or nss <= 0:
+            self.ctx_runlen[context_key] = 0
+        else:
+            from pokerbot.opponent.bayes_exploit import CHANGE_TV
+
+            tv = 0.5 * sum(abs(nf[i] / nfs - ns[i] / nss) for i in range(NUM_BINS))
+            shifting = tv > CHANGE_TV
+            if shifting and not self.ctx_shift_active.get(context_key, False):
+                self.ctx_runlen[context_key] = 0          # rising edge = a fresh change
+            else:
+                self.ctx_runlen[context_key] = self.ctx_runlen.get(context_key, 0) + 1
+            self.ctx_shift_active[context_key] = shifting
+
+    def bluff_decay_and_add(self, context_key: str, is_bluff: bool, hands_now: int,
+                            *, weight: float = 1.0, gamma: float = 0.98) -> None:
+        """Fold one showdown-ground-truthed aggressive action into the discounted bluff/value Beta
+        counts. Lazy decay over Δ = hands_now − last_update toward zero (recency: a player who
+        stops bluffing stops being called down within ~35 effective hands). ``weight`` < 1 down-
+        weights low-confidence captures (live OCR parse confidence)."""
+        row = self.ctx_bluff.get(context_key) or [0.0, 0.0]
+        delta = max(0, int(hands_now) - int(self.ctx_bluff_last.get(context_key, hands_now)))
+        g = gamma ** delta
+        row = [g * row[0], g * row[1]]
+        row[0 if is_bluff else 1] += float(weight)
+        self.ctx_bluff[context_key] = row
+        self.ctx_bluff_last[context_key] = int(hands_now)
+
+    def ctx_total(self, context_key: str) -> int:
+        """Total observed decisions at a context (the DBR sample size n for confidence)."""
+        return int(sum(self.ctx_counts.get(context_key, ())))
 
     @property
     def vpip_pct(self) -> float:

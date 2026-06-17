@@ -9,7 +9,7 @@ import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from pokerbot.solver.postflop_solver_client import (
     DEFAULT_CLI_PATH,
@@ -32,6 +32,42 @@ class WorkerError(Exception):
         return f"worker error [{rid}] {self.code}: {self.message}"
 
 
+class SolverTimeoutError(WorkerError):
+    """Raised when the worker subprocess does not respond within timeout_sec."""
+
+
+def _readline_with_timeout(stream: TextIO, timeout_sec: float) -> str | None:
+    """Read one line from stream, or None on timeout. Cross-platform."""
+    if timeout_sec <= 0:
+        return stream.readline()
+
+    if sys.platform != "win32":
+        import select
+
+        ready, _, _ = select.select([stream], [], [], timeout_sec)
+        if not ready:
+            return None
+        return stream.readline()
+
+    result: list[str | None] = [None]
+    error: list[BaseException | None] = [None]
+
+    def _read() -> None:
+        try:
+            result[0] = stream.readline()
+        except OSError as exc:
+            error[0] = exc
+
+    thread = threading.Thread(target=_read, daemon=True)
+    thread.start()
+    thread.join(timeout_sec)
+    if thread.is_alive():
+        return None
+    if error[0] is not None:
+        raise error[0]
+    return result[0]
+
+
 class PersistentSolverWorker:
     """Long-lived postflop_solver_cli worker (--protocol jsonl)."""
 
@@ -43,21 +79,29 @@ class PersistentSolverWorker:
         disable_worker_cache: bool = False,
         worker_cache_size: int | None = None,
     ) -> None:
-        exe = cli_path or DEFAULT_CLI_PATH
-        if not exe.is_file():
+        self._cli_path = cli_path or DEFAULT_CLI_PATH
+        self._solver_threads_per_worker = solver_threads_per_worker
+        self._disable_worker_cache = disable_worker_cache
+        self._worker_cache_size = worker_cache_size
+        if not self._cli_path.is_file():
             raise FileNotFoundError(
-                f"postflop_solver_cli not found at {exe}. "
+                f"postflop_solver_cli not found at {self._cli_path}. "
                 "Build with: cd external/postflop_solver_cli && cargo build --release"
             )
-        self._cli_path = exe
+        self._proc: subprocess.Popen[str] | None = None
+        self._lock = threading.Lock()
+        self._closed = False
+        self._start_process()
+
+    def _start_process(self) -> None:
         env = os.environ.copy()
-        if solver_threads_per_worker is not None:
-            env["RAYON_NUM_THREADS"] = str(solver_threads_per_worker)
-        cmd = [str(exe), "worker", "--protocol", "jsonl"]
-        if disable_worker_cache:
+        if self._solver_threads_per_worker is not None:
+            env["RAYON_NUM_THREADS"] = str(self._solver_threads_per_worker)
+        cmd = [str(self._cli_path), "worker", "--protocol", "jsonl"]
+        if self._disable_worker_cache:
             cmd.append("--no-cache")
-        elif worker_cache_size is not None:
-            cmd.extend(["--cache-size", str(worker_cache_size)])
+        elif self._worker_cache_size is not None:
+            cmd.extend(["--cache-size", str(self._worker_cache_size)])
         self._proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -67,8 +111,21 @@ class PersistentSolverWorker:
             bufsize=1,
             env=env,
         )
-        self._lock = threading.Lock()
-        self._closed = False
+
+    def _kill_process(self) -> None:
+        proc = self._proc
+        if proc is None:
+            return
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def _respawn(self) -> None:
+        self._kill_process()
+        self._start_process()
 
     def solve(
         self,
@@ -79,7 +136,7 @@ class PersistentSolverWorker:
     ) -> SolverSolveResult:
         if self._closed:
             raise RuntimeError("worker already closed")
-        if self._proc.stdin is None or self._proc.stdout is None:
+        if self._proc is None or self._proc.stdin is None or self._proc.stdout is None:
             raise RuntimeError("worker process missing stdio pipes")
 
         envelope = {
@@ -98,15 +155,24 @@ class PersistentSolverWorker:
                 raise RuntimeError(f"worker stdin write failed: {exc}") from exc
 
             try:
-                resp_line = self._proc.stdout.readline()
+                resp_line = _readline_with_timeout(self._proc.stdout, timeout_sec)
             except OSError as exc:
                 raise RuntimeError(f"worker stdout read failed: {exc}") from exc
+
+            if resp_line is None:
+                self._respawn()
+                raise SolverTimeoutError(
+                    "timeout",
+                    f"no worker response within {timeout_sec}s",
+                    request_id=request_id,
+                )
 
         if not resp_line:
             code = self._proc.poll()
             stderr_tail = ""
             if self._proc.stderr is not None:
                 stderr_tail = self._proc.stderr.read(500)
+            self._respawn()
             raise RuntimeError(
                 f"worker exited unexpectedly (code={code}); stderr={stderr_tail[:500]!r}"
             )
@@ -114,6 +180,7 @@ class PersistentSolverWorker:
         try:
             resp = json.loads(resp_line.strip())
         except json.JSONDecodeError as exc:
+            self._respawn()
             raise RuntimeError(f"invalid worker json: {exc}; line={resp_line[:200]!r}") from exc
 
         if resp.get("protocol_version") != PROTOCOL_VERSION:
@@ -144,17 +211,18 @@ class PersistentSolverWorker:
         if self._closed:
             return
         self._closed = True
-        if self._proc.stdin is not None:
+        proc = self._proc
+        if proc is not None and proc.stdin is not None:
             try:
-                self._proc.stdin.write("shutdown\n")
-                self._proc.stdin.flush()
+                proc.stdin.write("shutdown\n")
+                proc.stdin.flush()
             except OSError:
                 pass
-        try:
-            self._proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            self._proc.kill()
-            self._proc.wait(timeout=5)
+        if proc is not None:
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self._kill_process()
 
     def __enter__(self) -> PersistentSolverWorker:
         return self

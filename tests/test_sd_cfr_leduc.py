@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import jax
+import numpy as np
 import pytest
 
 from pokerbot.engine.leduc_jax import apply_action, init_hand, legal_actions
@@ -13,7 +14,7 @@ from pokerbot.training.leduc_tabular_cfr import (
     infoset_exploitability_mbb_from_policy,
     tabular_cfr,
 )
-from pokerbot.training.sd_cfr import SDCFRConfig, SDCFRTrainer
+from pokerbot.training.sd_cfr import SDCFRConfig, SDCFRTrainer, _RegretVisit
 
 
 def test_leduc_init_legal() -> None:
@@ -22,6 +23,36 @@ def test_leduc_init_legal() -> None:
     mask = legal_actions(s)
     assert mask.shape == (3,)
     assert bool(mask.any())
+
+
+def test_reach_weighted_regret_flush_sums_worlds() -> None:
+    """Regret flush uses opp_reach weights, not uniform count over worlds."""
+    trainer = SDCFRTrainer(SDCFRConfig())
+    mask = np.array([True, True, True])
+    visits = [
+        _RegretVisit(
+            opp_reach=2.0,
+            util=np.array([0.0, 5.0, 0.0]),
+            sigma=np.array([1.0, 0.0, 0.0]),
+            mask=mask,
+            enc=np.zeros(7, dtype=np.float32),
+            opponent_card=0,
+        ),
+        _RegretVisit(
+            opp_reach=1.0,
+            util=np.array([0.0, -5.0, 0.0]),
+            sigma=np.array([1.0, 0.0, 0.0]),
+            mask=mask,
+            enc=np.zeros(7, dtype=np.float32),
+            opponent_card=1,
+        ),
+    ]
+    trainer._pending_regret = {(0.0,): visits}
+    trainer._flush_pending_regret()
+    assert len(trainer._iter_samples) == 1
+    inst = trainer._iter_samples[0][1]
+    # Reach-weighted belief avg: (2*5 + 1*-5) / 3 > 0 for CALL vs FOLD
+    assert float(inst[1]) > float(inst[0])
 
 
 def test_leduc_apply_purity() -> None:

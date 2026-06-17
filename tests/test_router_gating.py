@@ -4,11 +4,12 @@ Pins the two EV unlocks on the canonical single-read spot (hero SB after a BTN f
 over-folding BB): an anonymous seat can no longer veto exploitation of a well-profiled opponent
 (per-read confidence, Johanson & Bowling AISTATS'09), and small samples with large apparent
 gains are blocked while solid reads fire (pessimistic LCB gate replacing the blunt point
-margin). Measured separation that motivated the design (32o jam, BB folding vs jam):
+margin). Measured separation that motivated the design (a marginal above-floor open, BB folding
+vs jam — pure trash like 32o is now capped at opening spots, see test_steal_cap.py):
 
-    n=10 obs: point gain +0.51 bb (point gate FIRES) but 1σ-pessimistic gain −0.64 bb — the
-              jam LOSES under a plausible misread; LCB blocks.
-    n=80 obs: gain +1.26, pessimistic +0.77 — both gates fire.
+    n=10 obs: point gain ~+0.58 bb (point gate FIRES) but 1σ-pessimistic gain ~−0.07 bb — the
+              jam loses under a plausible misread; LCB blocks.
+    n=80 obs: gain ~+1.15, pessimistic ~+0.77 — both gates fire.
     legacy min(): NEVER fires here — the anonymous (already folded!) BTN vetoes the table.
 """
 
@@ -39,9 +40,15 @@ def _fold_to_sb_jam(db, ident, n_obs):
         record_observed_decision(db, ident, "BB", "FA", 8.0, pushed=False)
 
 
-def _trash(q):
-    return next(h for h in ("32o", "42o", "52o", "72o")
-                if q.base_strategy(3, "SB", "F", h, 8.0) < 0.5)
+def _marginal_fold(q):
+    """A hand the SB folds at GTO after a BTN fold, but ABOVE the steal-equity floor so the
+    steal-jam cap allows the exploit to widen it. (Pure trash like 32o is now capped at opening
+    spots regardless of read — that's pinned by tests/test_steal_cap.py — so the gating-mechanism
+    tests here must use a legitimately-widenable hand.)"""
+    from aof_cfr.exploit_router import STEAL_EQUITY_FLOOR, _equity_vs_random
+    return next(h for h in ("Q5o", "K4o", "J6s", "Q7s", "96s", "T6s", "Q4s", "J7s")
+                if q.base_strategy(3, "SB", "F", h, 8.0) < 0.5
+                and _equity_vs_random(h) >= STEAL_EQUITY_FLOOR)
 
 
 # ---- per-read confidence (C1/C4) ------------------------------------------------------------
@@ -52,14 +59,14 @@ def test_anonymous_seat_does_not_veto(tmp_path) -> None:
     q.load_cfr_base()
     db = _db(tmp_path)
     _fold_to_sb_jam(db, "bb_fish", 80)
-    trash = _trash(q)
+    marg = _marginal_fold(q)
     opp = {"BTN": None, "BB": "bb_fish"}
 
-    legacy = decide(db, 3, "SB", trash, "F", 8.0, opp, confidence_mode="min", gate_mode="point")
+    legacy = decide(db, 3, "SB", marg, "F", 8.0, opp, confidence_mode="min", gate_mode="point")
     assert legacy.source == "base"
     assert legacy.confidence == 0.0                    # the anonymous veto
 
-    new = decide(db, 3, "SB", trash, "F", 8.0, opp)    # defaults: per_read/lcb
+    new = decide(db, 3, "SB", marg, "F", 8.0, opp)    # defaults: per_read/lcb
     assert new.source == "exploit"
     assert new.p_push > new.base_p
     assert new.confidence > 0.8                        # driven by the BB read
@@ -85,8 +92,8 @@ def test_per_read_weights_the_driving_read(tmp_path) -> None:
     _fold_to_sb_jam(db, "bb_fish", 80)
     for pushed in (True, False, True):                 # BTN: 3 obs, roughly base-like opens
         record_observed_decision(db, "btn_reg", "BTN", "-", 8.0, pushed=pushed)
-    trash = _trash(q)
-    d = decide(db, 3, "SB", trash, "F", 8.0, {"BTN": "btn_reg", "BB": "bb_fish"})
+    marg = _marginal_fold(q)
+    d = decide(db, 3, "SB", marg, "F", 8.0, {"BTN": "btn_reg", "BB": "bb_fish"})
     weak_conf = 3 / (3 + 8.0)
     assert d.confidence > weak_conf + 0.3              # min() would have returned ~0.27
     assert d.source == "exploit"
@@ -100,11 +107,11 @@ def test_low_n_big_apparent_gain_blocked(tmp_path) -> None:
     q.load_cfr_base()
     db = _db(tmp_path)
     _fold_to_sb_jam(db, "bb_fish", 10)
-    trash = _trash(q)
+    marg = _marginal_fold(q)
     opp = {"BTN": None, "BB": "bb_fish"}
-    point = decide(db, 3, "SB", trash, "F", 8.0, opp, gate_mode="point",
+    point = decide(db, 3, "SB", marg, "F", 8.0, opp, gate_mode="point",
                    min_confidence=0.10, margin_bb=0.10)
-    lcb = decide(db, 3, "SB", trash, "F", 8.0, opp)
+    lcb = decide(db, 3, "SB", marg, "F", 8.0, opp)
     assert point.source == "exploit"
     assert point.ev_gain_bb > 0.3
     assert lcb.source == "base"
@@ -116,8 +123,8 @@ def test_high_n_read_fires_with_positive_lcb(tmp_path) -> None:
     q.load_cfr_base()
     db = _db(tmp_path)
     _fold_to_sb_jam(db, "bb_fish", 80)
-    trash = _trash(q)
-    d = decide(db, 3, "SB", trash, "F", 8.0, {"BTN": None, "BB": "bb_fish"})
+    marg = _marginal_fold(q)
+    d = decide(db, 3, "SB", marg, "F", 8.0, {"BTN": None, "BB": "bb_fish"})
     assert d.source == "exploit"
     assert 0.10 <= d.ev_gain_lcb_bb <= d.ev_gain_bb    # pessimism never inflates the gain
 
@@ -127,8 +134,8 @@ def test_zero_n_everything_blocks(tmp_path) -> None:
     q.load_cfr_base()
     db = _db(tmp_path)
     _fold_to_sb_jam(db, "bb_fish", 3)
-    trash = _trash(q)
-    d = decide(db, 3, "SB", trash, "F", 8.0, {"BTN": None, "BB": "bb_fish"})
+    marg = _marginal_fold(q)
+    d = decide(db, 3, "SB", marg, "F", 8.0, {"BTN": None, "BB": "bb_fish"})
     assert d.source == "base"                          # 3 obs cannot move a shrunk posterior
 
 

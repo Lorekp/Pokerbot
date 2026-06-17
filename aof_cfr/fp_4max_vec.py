@@ -23,7 +23,7 @@ import numpy as np
 
 from aof_cfr.buckets import LABELS_169
 from aof_cfr.combo_deal import FULL_DECK, bucket_from_card_ids, card_id
-from aof_cfr.exploit_mc import _terminal_returns
+from aof_cfr.exploit_mc import _N_BOARDS, _SHARE_CACHE, _seat_blind, _terminal_returns
 from aof_cfr.infoset import encode_infoset_key
 from aof_ranges import active_seats
 
@@ -76,9 +76,25 @@ def precompute_payoffs(holes: list, stack_bb: float, *, game_model: int | None =
     """(n_outcomes, n_deals, 4) net-bb payoff per outcome, via the shared terminal model.
 
     ``game_model`` selects the contested-pot convention (None -> the shipped manifest's);
-    batches written to disk embed it so the router can reject stale-model files."""
-    seats = active_seats(NUM_PLAYERS)
+    batches written to disk embed it so the router can reject stale-model files.
+
+    Optional native path: a bit-identical Rust kernel (``aof_cfr.marg4_native``) reproduces the
+    production MC exactly (matched CPython MT19937 board RNG + winner-equivalent eval7), so its
+    output is ``np.array_equal`` to the Python loop below. It is **opt-in** (env ``AOF_MARG4_NATIVE=1``)
+    and OFF by default: because it must replay CPython's exact serial RNG per showdown to stay
+    bit-identical, it is ~2x SLOWER per core than this Python path, and its only lever (rayon across
+    deals in one process) is redundant with the production driver, which already parallelizes across
+    deals via ProcessPoolExecutor (one core per worker). See bench/marg4_native.py. A future
+    statistically-equivalent kernel (fast native RNG + SIMD eval7, validated to MC tolerance instead
+    of bit-identity) is where a real speedup lives."""
     n = len(holes)
+    nat = _precompute_payoffs_native(holes, stack_bb, game_model)
+    if nat is not None:
+        return nat
+    fast = _precompute_payoffs_batched(holes, stack_bb, game_model)
+    if fast is not None:
+        return fast
+    seats = active_seats(NUM_PLAYERS)
     pay = np.zeros((len(_OUTCOMES), n, NUM_PLAYERS), dtype=np.float64)
     for oi, o in enumerate(_OUTCOMES):
         folded = set(o["folded"])
@@ -86,6 +102,162 @@ def precompute_payoffs(holes: list, stack_bb: float, *, game_model: int | None =
             pay[oi, d, :] = _terminal_returns(NUM_PLAYERS, seats, holes[d], folded, stack_bb,
                                               game_model=game_model)
     return pay
+
+
+# --- batched showdown fast path -------------------------------------------------------------
+# The Python loop above spends ~all its time in _terminal_returns -> _showdown_shares -> the native
+# mc_nway_shares, one Python->native crossing per (deal, alive-subset) showdown (~11 per deal). The
+# native MC math is already fast; the cost is the boundary crossings and the single-thread evaluator.
+# This path collects EVERY distinct alive-subset showdown for the chunk, dedups them, runs ONE
+# batched OpenMP-parallel native call (mc_nway_shares_batch, same OMPEval evaluator + Fisher-Yates
+# sampler + _N_BOARDS as _showdown_shares), then assembles the (15, n, 4) tensor exactly as
+# _terminal_returns does. Same per-showdown seed scheme => populates _SHARE_CACHE identically.
+#
+# threads default = 1: process-pool-safe. The production driver runs many chunks under a
+# ProcessPoolExecutor (one core per worker), so each chunk must stay single-threaded or it
+# oversubscribes all cores. A single-process caller can set AOF_MARG4_BATCH_THREADS to use OpenMP.
+import os as _os  # noqa: E402
+
+_DISABLE_BATCH = _os.environ.get("AOF_MARG4_BATCH", "1").lower() in ("0", "false", "no")
+
+
+def _showdown_seed(flat: tuple[int, ...]) -> int:
+    seed = 0
+    for c in flat:
+        seed = (seed * 131 + int(c) + 1) & 0xFFFFFFFF
+    return seed
+
+
+def _precompute_payoffs_batched(holes: list, stack_bb: float, game_model: int | None):
+    """Native batched showdown tensor (statistically identical to the Python loop), or ``None`` to
+    fall back. See the module comment above ``precompute_payoffs``'s fast-path wiring."""
+    if _DISABLE_BATCH:
+        return None
+    try:
+        from tools.ompeval_cli.native import (
+            mc_nway_shares_batch_available,
+            mc_nway_shares_batch_native,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if not mc_nway_shares_batch_available():
+        return None
+    from aof_cfr.pushfold_payoffs import contested_pot_bb
+
+    n = len(holes)
+    seats = active_seats(NUM_PLAYERS)
+    blinds = [_seat_blind(seats[i]) for i in range(NUM_PLAYERS)]
+    threads = int(_os.environ.get("AOF_MARG4_BATCH_THREADS", "1"))
+
+    # The contested outcomes only ever use a handful of distinct alive-index patterns (the 4-way set,
+    # the four 3-way sets, the six 2-way pairs). Group outcomes by pattern so we build each deal's
+    # showdown key ONCE per pattern (not once per outcome), and so step 3 can be a vectorized gather.
+    alive_of = [tuple(i for i in range(NUM_PLAYERS) if i not in o["folded"]) for o in _OUTCOMES]
+    patterns: dict[tuple[int, ...], list[int]] = {}
+    for oi, alive in enumerate(alive_of):
+        if len(alive) >= 2:
+            patterns.setdefault(alive, []).append(oi)
+
+    # 1) Collect every distinct alive-subset showdown across deals (deduped CHUNK-LOCALLY via
+    #    key_to_idx), and record, per pattern, a per-deal index into the share table. We deliberately
+    #    do NOT use the module-global _SHARE_CACHE here: over millions of distinct random precompute
+    #    deals it essentially never hits and grows without bound, OOM-ing each ProcessPool worker
+    #    (~1.9 GB+ observed -> BrokenProcessPool). All useful dedup is chunk-local and freed on return.
+    needed: dict[tuple[int, ...], list[float] | None] = {}
+    key_to_idx: dict[tuple[int, ...], int] = {}
+    pat_idx: dict[tuple[int, ...], np.ndarray] = {}   # alive-pattern -> (n,) row index into `table`
+    n_keys = 0
+    for alive in patterns:
+        idx = np.empty(n, dtype=np.int64)
+        for d in range(n):
+            hd = holes[d]
+            flat = tuple(c for i in alive for c in hd[i])
+            j = key_to_idx.get(flat)
+            if j is None:
+                j = n_keys
+                key_to_idx[flat] = j
+                n_keys += 1
+                needed[flat] = None   # chunk-local only (see note below); never the global cache
+            idx[d] = j
+        pat_idx[alive] = idx
+
+    try:
+        # 2) One batched native call over the not-yet-cached showdowns; fill a (n_keys, 4) share table.
+        table = np.zeros((max(n_keys, 1), NUM_PLAYERS), dtype=np.float64)
+        to_eval = [f for f, v in needed.items() if v is None]
+        if to_eval:
+            holes_flat: list[int] = []
+            sizes: list[int] = []
+            seeds: list[int] = []
+            for flat in to_eval:
+                holes_flat.extend(int(c) for c in flat)
+                sizes.append(len(flat) // 2)
+                seeds.append(_showdown_seed(flat))
+            shares = mc_nway_shares_batch_native(
+                np.asarray(holes_flat, dtype=np.int32),
+                np.asarray(sizes, dtype=np.int32),
+                np.asarray(seeds, dtype=np.uint32),
+                _N_BOARDS,
+                threads,
+            )
+            for si, flat in enumerate(to_eval):
+                k = len(flat) // 2
+                needed[flat] = [float(x) for x in shares[si, :k]]
+        # Pack all (cached + freshly evaluated) shares into the dense table by row index.
+        for flat, j in key_to_idx.items():
+            sh = needed[flat]
+            table[j, : len(sh)] = sh
+    except Exception:  # noqa: BLE001 — any native hiccup -> safe Python fallback
+        return None
+
+    # 3) Assemble (15, n, 4) exactly as _terminal_returns: blinds, uncontested steal, contested pot.
+    #    Vectorized: per alive-pattern, gather each deal's share row (table[idx]) and apply
+    #    share*pot - stack to the alive columns in one shot for every outcome sharing that pattern.
+    pay = np.zeros((len(_OUTCOMES), n, NUM_PLAYERS), dtype=np.float64)
+    base = np.array([-blinds[i] for i in range(NUM_PLAYERS)], dtype=np.float64)
+    fold_blind_sum = [sum(blinds[j] for j in o["folded"]) for o in _OUTCOMES]
+    # Uncontested (<=1 alive) outcomes: deterministic, no showdown.
+    for oi, alive in enumerate(alive_of):
+        if len(alive) <= 1:
+            slab = np.tile(base, (n, 1))
+            if len(alive) == 1:
+                slab[:, alive[0]] = fold_blind_sum[oi]
+            pay[oi] = slab
+    # Contested outcomes, grouped by alive-pattern (one gather per pattern). The share table stores
+    # each showdown's shares in ALIVE ORDER (columns 0..k-1), so gather those columns and scatter
+    # them to the alive SEAT columns.
+    for alive, ois in patterns.items():
+        cols = np.array(alive, dtype=np.int64)
+        k = len(alive)
+        gathered = table[pat_idx[alive]][:, :k]      # (n, k) share per deal, in alive order
+        for oi in ois:
+            pot = contested_pot_bb(len(alive), fold_blind_sum[oi], stack_bb, game_model=game_model)
+            slab = np.tile(base, (n, 1))
+            slab[:, cols] = gathered * pot - stack_bb
+            pay[oi] = slab
+    return pay
+
+
+def _precompute_payoffs_native(holes: list, stack_bb: float, game_model: int | None):
+    """Native tensor (bit-identical), or ``None`` to fall back. Resolves the runtime game-model /
+    flat-fee here so the native kernel uses the exact same contested-pot convention as the Python
+    ``contested_pot_bb`` would."""
+    import os
+    if os.environ.get("AOF_MARG4_NATIVE", "") not in ("1", "true", "yes"):
+        return None  # opt-in only: the bit-identical kernel is ~2x slower/core (see precompute_payoffs)
+    try:
+        from aof_cfr.marg4_native import native_available, precompute_payoffs_native
+    except Exception:  # noqa: BLE001
+        return None
+    if not native_available():
+        return None
+    from aof_cfr.pushfold_payoffs import flat_fee_default, game_model_default
+    gm = game_model_default() if game_model is None else int(game_model)
+    fee = flat_fee_default()
+    try:
+        return precompute_payoffs_native(holes, stack_bb, game_model=gm, fee_bb=fee)
+    except Exception:  # noqa: BLE001 — any native hiccup -> safe Python fallback
+        return None
 
 
 @dataclass
@@ -155,6 +327,92 @@ def _br_marginals(pol: _Policy, buckets: np.ndarray, payoffs: np.ndarray, infose
     return num_push, num_fold, den
 
 
+def marginal_sums(rows: dict[str, np.ndarray], stack_bb: float, n_deals: int, seed: int):
+    """One chunk of the EXACT (true-game) 4-max BR marginal: the ADDITIVE reach-weighted sums
+    ``(num_push, num_fold, den)`` over ``n_deals`` real-card deals at ``seed``.
+
+    These are pure sums, so chunks from different seeds add: ``num/den`` over the concatenation of
+    all chunks is the unbiased marginal of the full sample. That makes the high-N precompute
+    embarrassingly parallel — run many chunks (different seeds) across cores/boxes and sum. Unlike
+    the analytic 3-max reuse (which is biased ~0.3bb because it drops the folded UTG hand), this is
+    the TRUE 4-max game (UTG present, real card removal + fold-range reach), so its only error is
+    sampling variance, which → 0 as the total deal count grows.
+    """
+    pol = rows_to_table(rows, stack_bb)
+    buckets, holes = sample_deals(n_deals, seed)
+    payoffs = precompute_payoffs(holes, stack_bb)
+    infosets = _infoset_index(buckets)
+    return _br_marginals(pol, buckets, payoffs, infosets)
+
+
+def accumulate_marginal_sums(chunks):
+    """Sum a list of ``(num_push, num_fold, den)`` chunk dicts into one, then divide to EV dicts.
+    Returns ``{(seat, hist): (ev_push(169,), ev_fold(169,))}`` keyed by SEAT NAME."""
+    from aof_cfr.exploit_router import _SEATS_4MAX
+    np_tot: dict = {}
+    nf_tot: dict = {}
+    den_tot: dict = {}
+    for num_push, num_fold, den in chunks:
+        for k in den:
+            np_tot[k] = np_tot.get(k, 0.0) + num_push[k]
+            nf_tot[k] = nf_tot.get(k, 0.0) + num_fold[k]
+            den_tot[k] = den_tot.get(k, 0.0) + den[k]
+    out: dict = {}
+    for (si, hist), d in den_tot.items():
+        safe = np.where(d > 0, d, 1.0)
+        out[(_SEATS_4MAX[si], hist)] = (np_tot[(si, hist)] / safe, nf_tot[(si, hist)] / safe)
+    return out, den_tot
+
+
+_HIGHN_CACHE: dict = {}
+
+
+HIGHN_MIN_DEN = 400.0   # only trust a high-N cell with >=this effective sample (std ~6/sqrt(den)<=0.3bb)
+SAMPLE_MIN_DEN = 250.0  # only trust an 8k-batch cell with >=this effective sample; below it (the rare
+#                         UTG-jammed/4-way nodes) the marginal is too noisy -> defer to the equilibrium
+
+
+def load_highN_marginals(stack_bb: float):
+    """Load the EXACT high-N precomputed 4-max marginals for a depth (see
+    scripts/aof/precompute_4max_marginals.py), or ``None`` if absent / stale. Returns
+    ``{(seat, hist): (ev_push(169,), ev_fold(169,), den(169,))}`` — the per-bucket effective sample
+    ``den`` lets callers trust only well-sampled cells (the ultra-rare 4-way nodes need a very large
+    deal count, so a cell below ``HIGHN_MIN_DEN`` should fall back to the stable analytic/sampled
+    value — graceful degradation that makes ANY file safe at ANY deal count). Rejects a file built
+    under a different game model / showdown fee (same guard as the router's deal batch). Cached."""
+    import numpy as np
+
+    key = round(float(stack_bb), 3)
+    if key in _HIGHN_CACHE:
+        return _HIGHN_CACHE[key]
+    from pathlib import Path
+    path = Path("data/aof/cfr_base") / f"marginals_4p_d{key:g}.npz"
+    out = None
+    if path.is_file():
+        try:
+            from aof_cfr.pushfold_payoffs import flat_fee_default, game_model_default
+            data = np.load(path, allow_pickle=False)
+            gm_ok = int(data["game_model"]) == game_model_default() if "game_model" in data else False
+            fee_ok = abs(float(data["flat_fee"]) - flat_fee_default()) < 1e-9 if "flat_fee" in data else False
+            if gm_ok and fee_ok:
+                d: dict = {}
+                for f in data.files:
+                    if f.endswith("|push"):
+                        seat, hist, _ = f.split("|")
+                        den = data.get(f"{seat}|{hist}|den")
+                        if den is None:
+                            den = np.full(N_BUCKETS, np.inf)   # legacy file w/o den: trust all
+                        d[(seat, hist)] = (data[f], data[f"{seat}|{hist}|fold"], den)
+                out = d or None
+            else:
+                print(f"fp_4max_vec: ignoring {path.name} (game model/fee mismatch); "
+                      "regenerate via scripts/aof/precompute_4max_marginals.py")
+        except Exception:  # noqa: BLE001 — corrupt/old file -> treat as absent
+            out = None
+    _HIGHN_CACHE[key] = out
+    return out
+
+
 def onpolicy_seat_ev(pol: _Policy, buckets: np.ndarray, payoffs: np.ndarray) -> list[float]:
     """Exact-ish expected chip-EV (bb/hand) per seat over the deal batch for a full table.
 
@@ -187,6 +445,61 @@ def rows_to_table(rows: dict[str, np.ndarray], stack_bb: float) -> _Policy:
             continue
         pol.get(seat_idx[pos], hist)[lab_to_idx[bucket]] = float(row[1])
     return pol
+
+
+_UTG_FOLDED_MAP = {                       # 4-max (seat, history)  ->  3-max marginal key
+    ("BTN", "F"): "btn",                  # UTG folded -> BTN opens the BTN/SB/BB sub-game
+    ("SB", "FF"): "sb_f", ("SB", "FA"): "sb_a",
+    ("BB", "FFA"): "bb_fa", ("BB", "FAF"): "bb_af", ("BB", "FAA"): "bb_aa",
+}
+
+
+def analytic_marginals_4max_utg_folded(stack_bb: float, *, btn_rows, sb_rows, bb_rows):
+    """EXACT legal push/fold EVs for the UTG-FOLDED branch of 4-max, via the validated 3-max engine.
+
+    When UTG folds, AoF leaves a BTN/SB/BB sub-game that is chip-identical to 3-max push/fold: UTG
+    posts no blind, so it contributes no dead money, and the showdown equities depend only on the
+    hands at war. So the legal marginals for (BTN,'F'), (SB,'FF'/'FA'), (BB,'FFA'/'FAF'/'FAA')
+    equal the 3-max marginals (btn / sb_f / sb_a / bb_fa / bb_af / bb_aa) fed the **4-max** ranges
+    at those nodes. This is the variance-free analytic that replaces the deal-sampled
+    ``_br_marginals`` EVs — whose effective per-bucket sample collapses to ~1 at these deep nodes
+    (e.g. BB facing two jams), producing EVs that contradict the equilibrium.
+
+    ``btn_rows`` is the BTN push array at 'F' (169,). ``sb_rows`` is [SB@'FF', SB@'FA'] (2,169).
+    ``bb_rows`` is [BB@'FFA', BB@'FAF', BB@'FAA'] (3,169) — the (fa, af, aa) order the 3-max
+    engine expects. Returns ``{(seat, hist): (E_push(169,), E_fold(169,))}``. The opponents' ranges
+    can be substituted (exploit BR) by passing exploited rows; pass the base rows for the GTO EVs.
+    """
+    from aof_cfr.exploit_router import _payoffs_3max
+    from aof_cfr.fp_br import _legal_marginals_3max
+    st, deal_w = _payoffs_3max(stack_bb)
+    m = _legal_marginals_3max(st, deal_w, np.asarray(btn_rows, dtype=np.float64),
+                              np.asarray(sb_rows, dtype=np.float64), np.asarray(bb_rows, dtype=np.float64))
+    out: dict = {}
+    for (seat, hist), key in _UTG_FOLDED_MAP.items():
+        ep, ef, _w = m[key]
+        ef_arr = ef if hasattr(ef, "__len__") else np.full(N_BUCKETS, float(ef))
+        out[(seat, hist)] = (np.asarray(ep, dtype=np.float64), np.asarray(ef_arr, dtype=np.float64))
+    return out
+
+
+def _utg_folded_marginals_from_rows(rows: dict[str, np.ndarray], stack_bb: float):
+    """Convenience: pull the 4-max ranges for the UTG-folded nodes out of an infoset-rows dict and
+    return the exact analytic marginals (see ``analytic_marginals_4max_utg_folded``)."""
+    from aof_cfr.infoset import encode_infoset_key
+
+    def arr(seat: str, hist: str) -> np.ndarray:
+        a = np.zeros(N_BUCKETS, dtype=np.float64)
+        for bi, lab in enumerate(LABELS_169):
+            a[bi] = float(rows[encode_infoset_key(seat, lab, hist, stack_bb)][1])
+        return a
+
+    return analytic_marginals_4max_utg_folded(
+        stack_bb,
+        btn_rows=arr("BTN", "F"),
+        sb_rows=np.stack([arr("SB", "FF"), arr("SB", "FA")]),
+        bb_rows=np.stack([arr("BB", "FFA"), arr("BB", "FAF"), arr("BB", "FAA")]),
+    )
 
 
 def legal_nash_gap_4max(pol: _Policy, buckets: np.ndarray, payoffs: np.ndarray, infosets: list,

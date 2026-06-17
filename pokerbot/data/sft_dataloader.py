@@ -31,9 +31,11 @@ from pokerbot.models.policy import PolicyOutput
 
 
 
-LABEL_SOURCE_SOLVER = "toolpoker_solver"
-LABEL_SOURCE_POSTFLOP_SOLVER = "postflop_solver"
-LABEL_SOURCES_SOLVER = frozenset({LABEL_SOURCE_SOLVER, LABEL_SOURCE_POSTFLOP_SOLVER})
+from pokerbot.data.label_sources import (
+    LABEL_SOURCE_POSTFLOP_SOLVER,
+    LABEL_SOURCE_SOLVER,
+    LABEL_SOURCES_SOLVER,
+)
 
 
 

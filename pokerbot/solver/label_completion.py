@@ -26,6 +26,194 @@ def spot_key_hash(spot_key: str) -> str:
     return hashlib.sha256(spot_key.encode("utf-8")).hexdigest()[:16]
 
 
+def shard_path(shard_dir: Path, spot_key: str) -> Path:
+    return shard_dir / f"{spot_key_hash(spot_key)}.parquet"
+
+
+def has_shard(shard_dir: Path, spot_key: str) -> bool:
+    return shard_path(shard_dir, spot_key).is_file()
+
+
+def completed_keys_from_shards(shard_dir: Path, manifest_keys: list[str]) -> list[str]:
+    """Return manifest keys whose Parquet shard exists (ground-truth completion)."""
+    if not shard_dir.is_dir():
+        return []
+    return [k for k in manifest_keys if has_shard(shard_dir, k)]
+
+
+def unique_manifest_keys(manifest_keys: list[str]) -> list[str]:
+    """Deduplicate manifest keys (stack depth duplicates share one shard)."""
+    return sorted(set(manifest_keys))
+
+
+def shard_hashes_present_local(shard_dir: Path) -> set[str]:
+    if not shard_dir.is_dir():
+        return set()
+    return {
+        p.stem
+        for p in shard_dir.glob("*.parquet")
+        if not p.name.endswith(".tmp")
+    }
+
+
+def completed_keys_from_shard_hashes(
+    manifest_keys: list[str], shard_hashes: set[str]
+) -> set[str]:
+    return {k for k in manifest_keys if spot_key_hash(k) in shard_hashes}
+
+
+def shard_hashes_present_s3(s3: Any, *, bucket: str, prefix: str) -> set[str]:
+    """List shard digests under prefix/shards/."""
+    hashes: set[str] = set()
+    paginator = s3.get_paginator("list_objects_v2")
+    shards_prefix = f"{prefix.rstrip('/')}/shards/"
+    for page in paginator.paginate(Bucket=bucket, Prefix=shards_prefix):
+        for obj in page.get("Contents", []):
+            rel = obj["Key"][len(shards_prefix) :]
+            if rel.endswith(".parquet"):
+                hashes.add(rel[: -len(".parquet")])
+    return hashes
+
+
+def analyze_shard_completion_s3(
+    s3: Any,
+    *,
+    bucket: str,
+    prefix: str,
+    manifest_keys: list[str],
+) -> ShardCompletionReport:
+    """Shard-authoritative completion report for an S3 labelgen prefix."""
+    unique_keys = unique_manifest_keys(manifest_keys)
+    shard_hashes = shard_hashes_present_s3(s3, bucket=bucket, prefix=prefix)
+    shard_set = completed_keys_from_shard_hashes(unique_keys, shard_hashes)
+
+    from collections import Counter
+
+    usable_by_type: Counter[str] = Counter()
+    never_by_type: Counter[str] = Counter()
+    never_touched = 0
+    for key in unique_keys:
+        t = spot_type(key)
+        if key in shard_set:
+            usable_by_type[t] += 1
+        else:
+            never_touched += 1
+            never_by_type[t] += 1
+
+    return ShardCompletionReport(
+        expected_count=len(unique_keys),
+        shard_backed=len(shard_set),
+        ledger_unique=0,
+        ledger_lines=0,
+        duplicate_ledger_lines=0,
+        ledger_done_no_shard=0,
+        never_touched=never_touched,
+        usable_by_type=dict(sorted(usable_by_type.items())),
+        ledger_done_no_shard_by_type={},
+        never_touched_by_type=dict(sorted(never_by_type.items())),
+        todo_count=len(unique_keys) - len(shard_set),
+    )
+
+
+def shard_completed_keys_s3(
+    s3: Any, *, bucket: str, prefix: str, manifest_keys: list[str]
+) -> set[str]:
+    """Return unique manifest keys with a shard object in S3."""
+    unique_keys = unique_manifest_keys(manifest_keys)
+    shard_hashes = shard_hashes_present_s3(s3, bucket=bucket, prefix=prefix)
+    return completed_keys_from_shard_hashes(unique_keys, shard_hashes)
+
+
+def spot_type(spot_key: str) -> str:
+    return spot_key.split("|", 1)[0]
+
+
+@dataclass
+class ShardCompletionReport:
+    expected_count: int
+    shard_backed: int
+    ledger_unique: int
+    ledger_lines: int
+    duplicate_ledger_lines: int
+    ledger_done_no_shard: int
+    never_touched: int
+    usable_by_type: dict[str, int]
+    ledger_done_no_shard_by_type: dict[str, int]
+    never_touched_by_type: dict[str, int]
+    todo_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "expected_count": self.expected_count,
+            "shard_backed": self.shard_backed,
+            "ledger_unique": self.ledger_unique,
+            "ledger_lines": self.ledger_lines,
+            "duplicate_ledger_lines": self.duplicate_ledger_lines,
+            "ledger_done_no_shard": self.ledger_done_no_shard,
+            "never_touched": self.never_touched,
+            "usable_by_type": self.usable_by_type,
+            "ledger_done_no_shard_by_type": self.ledger_done_no_shard_by_type,
+            "never_touched_by_type": self.never_touched_by_type,
+            "todo_count": self.todo_count,
+        }
+
+
+def analyze_shard_completion(
+    *,
+    manifest_keys: list[str],
+    shard_dir: Path,
+    ledger_path: Path | None = None,
+) -> ShardCompletionReport:
+    """Compare manifest vs shard files vs optional log-derived ledger (unique keys)."""
+    from collections import Counter
+
+    unique_keys = unique_manifest_keys(manifest_keys)
+    shard_set = set(completed_keys_from_shards(shard_dir, unique_keys))
+    ledger_unique: set[str] = set()
+    ledger_lines = 0
+    if ledger_path is not None and ledger_path.is_file():
+        for line in ledger_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            ledger_lines += 1
+            rec = json.loads(line)
+            key = str(rec.get("spot_key", ""))
+            if key:
+                ledger_unique.add(key)
+
+    usable_by_type: Counter[str] = Counter()
+    no_shard_by_type: Counter[str] = Counter()
+    never_by_type: Counter[str] = Counter()
+
+    ledger_done_no_shard = 0
+    never_touched = 0
+    for key in unique_keys:
+        t = spot_type(key)
+        if key in shard_set:
+            usable_by_type[t] += 1
+        elif key in ledger_unique:
+            ledger_done_no_shard += 1
+            no_shard_by_type[t] += 1
+        else:
+            never_touched += 1
+            never_by_type[t] += 1
+
+    return ShardCompletionReport(
+        expected_count=len(unique_keys),
+        shard_backed=len(shard_set),
+        ledger_unique=len(ledger_unique),
+        ledger_lines=ledger_lines,
+        duplicate_ledger_lines=max(0, ledger_lines - len(ledger_unique)),
+        ledger_done_no_shard=ledger_done_no_shard,
+        never_touched=never_touched,
+        usable_by_type=dict(sorted(usable_by_type.items())),
+        ledger_done_no_shard_by_type=dict(sorted(no_shard_by_type.items())),
+        never_touched_by_type=dict(sorted(never_by_type.items())),
+        todo_count=len(unique_keys) - len(shard_set),
+    )
+
+
 def validate_spot_key(spot_key: str) -> bool:
     return _SPOT_KEY_RE.match(spot_key.strip()) is not None
 
@@ -274,10 +462,40 @@ class CompletionLedger:
     def keys_without_shards(self, shard_dir: Path) -> list[str]:
         missing: list[str] = []
         for key in self.completed:
-            shard_path = shard_dir / f"{spot_key_hash(key)}.parquet"
-            if not shard_path.is_file():
+            if not has_shard(shard_dir, key):
                 missing.append(key)
         return sorted(missing)
+
+    @classmethod
+    def rebuild_from_shards(
+        cls,
+        path: Path,
+        shard_dir: Path,
+        manifest_keys: list[str],
+        *,
+        source: str = "shard_scan",
+    ) -> "CompletionLedger":
+        """Replace ledger contents with one record per shard-backed manifest key."""
+        ledger = cls(path=path)
+        now = datetime.now(timezone.utc).isoformat()
+        for key in manifest_keys:
+            if has_shard(shard_dir, key):
+                ledger.completed[key] = {
+                    "spot_key": key,
+                    "completed_at": now,
+                    "source": source,
+                }
+        ledger.write_atomic()
+        return ledger
+
+    def write_atomic(self) -> None:
+        """Rewrite ledger file from in-memory completed dict (deduplicated)."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            json.dumps(self.completed[k], sort_keys=True)
+            for k in sorted(self.completed)
+        ]
+        self.path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
 def bootstrap_and_validate(

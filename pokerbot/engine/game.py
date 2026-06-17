@@ -191,9 +191,12 @@ class GameState:
             self._advance_street()
 
     def _street_complete(self) -> bool:
+        # NOTE: no ``len(active) <= 1`` shortcut — it skipped the LAST live player's response to an
+        # all-in raise (the jammer goes all_in ⇒ drops out of ``active`` ⇒ the lone remaining player
+        # was never asked to call/fold and free-rolled the showdown for their blind). Betting on a
+        # street is complete iff EVERY live (non-folded, non-all-in) player has acted and matched the
+        # current bet; with zero live players (everyone all-in) the loop is empty ⇒ complete (run out).
         active = [p for p in self.players if not p.folded and not p.all_in]
-        if len(active) <= 1:
-            return True
         for p in active:
             if p.seat not in self._acted_this_street:
                 return False
@@ -296,23 +299,44 @@ def play_hand(
     policies: dict[int, callable],
     state: GameState | None = None,
     rng: random.Random | None = None,
+    allin_settle: "callable | None" = None,
 ) -> tuple[GameState, dict[int, float]]:
-    """Play one hand; policies map seat -> callable(state) -> Action."""
+    """Play one hand; policies map seat -> callable(state) -> Action.
+
+    ``allin_settle``: optional hook ``(state, n_board_seen) -> deltas | None`` called when betting is
+    over (everyone left is all-in). ``n_board_seen`` = board cards the LAST action conditioned on —
+    cards dealt after that (``_advance_street`` auto-deals the next street when the closing call
+    completes it) are information-free runout luck the hook may integrate out. If it returns a deltas
+    dict, the hand settles on that (all-in EV / equity settlement — a mean-preserving variance reducer
+    for evals); on None the board runs out as usual. Default None ⇒ behavior unchanged."""
     state = state or GameState.new_hand(rng=rng)
     state.deal_hole_cards()
+    n_board_seen = 0
+
+    def _runout_or_settle():
+        if allin_settle is not None:
+            deltas = allin_settle(state, n_board_seen)
+            if deltas is not None:
+                return deltas
+        state.run_out_board()
+        return None
 
     max_actions = 500
     for _ in range(max_actions):
         if state.is_terminal():
             break
         if not state.actors_remaining():
-            state.run_out_board()
+            settled = _runout_or_settle()
+            if settled is not None:
+                return state, settled
             break
         seat = state.action_seat
         if state.players[seat].folded or state.players[seat].all_in:
             state.advance_to_next_actor()
             if not state.actors_remaining():
-                state.run_out_board()
+                settled = _runout_or_settle()
+                if settled is not None:
+                    return state, settled
                 break
             continue
         policy = policies.get(seat)
@@ -327,6 +351,7 @@ def play_hand(
                     (a for a in legal if a.action_type in (ActionType.CHECK, ActionType.CALL, ActionType.FOLD)),
                     Action(ActionType.FOLD),
                 )
+        n_board_seen = len(state.board)
         state.apply_action(action)
         if state.is_terminal():
             break

@@ -43,6 +43,11 @@ ADAPT_THRESHOLD = 0.20    # |fast - slow| push-rate gap that flags a change
 MIN_FAST_N = 4.0          # effective recent obs before we trust the fast signal
 POOL_PRIOR_STRENGTH = 10.0  # s2: depth-pooled (seat,hist) rate -> population-prior shrinkage
 POOL_WEIGHT = 0.5           # rho: pooled decayed obs count at half weight toward confidence
+# Instability memory (drives the router's Restricted-Nash-Response cap, exploit_router._route_epilogue):
+# once an opponent's fast read diverges from its slow read (a gear change / an ADAPTING counter-
+# exploiter), the opponent is flagged unstable and the flag DECAYS slowly, so a proven adapter stays
+# clamped between its move windows instead of letting us re-commit to a pure BR they will punish.
+INSTAB_DECAY = 0.997        # per-qualifying-obs decay of the instability memory (~230 obs half-life)
 
 
 def _lam(halflife: float) -> float:
@@ -112,8 +117,10 @@ class AdaptiveOpponentModel:
     adapt_threshold: float = ADAPT_THRESHOLD
     min_fast_n: float = MIN_FAST_N
     population_confidence: float = 0.0   # cold-start trust in the population prior (0 = unknown->base)
+    instab_decay: float = INSTAB_DECAY   # slow decay of the per-opponent instability memory
     path: object = None                  # optional json for persistence
     _d: dict = field(default_factory=dict)        # (identity, agg_key) -> _Dual
+    _instab: dict = field(default_factory=dict)   # identity -> instability memory in [0,1]
     _seeded: set = field(default_factory=set)     # (identity, n, depth) already seeded from the DB
 
     def __post_init__(self):
@@ -136,7 +143,15 @@ class AdaptiveOpponentModel:
         if not identity:
             return
         with self._mu:
-            self._d.setdefault((identity, agg_key), _Dual()).update(bool(pushed), self._lam_s, self._lam_f)
+            d = self._d.setdefault((identity, agg_key), _Dual())
+            d.update(bool(pushed), self._lam_s, self._lam_f)
+            # Instability memory: the fast read diverging from the slow read at this infoset means the
+            # opponent is changing (or actively counter-adapting to us). Jump the memory up to any new
+            # divergence immediately; otherwise decay it slowly so a proven adapter stays flagged.
+            if d.wf >= self.min_fast_n and d.ws > 0:
+                div = min(abs(d.sf / d.wf - d.ss / d.ws) / max(self.adapt_threshold, 1e-9), 1.0)
+                cur = self._instab.get(identity, 0.0)
+                self._instab[identity] = div if div >= cur else self.instab_decay * cur
 
     def seed_from_db(self, db, identity: str, num_players: int, stack_bb: float) -> None:
         """Cold-start a returning opponent: load lifetime aggregate counts as the SLOW estimate (the
@@ -232,6 +247,20 @@ class AdaptiveOpponentModel:
         with self._mu:
             return float(sum(d.ws for (i, _k), d in self._d.items() if i == identity))
 
+    def opponent_stability(self, identity: str) -> float:
+        """Per-opponent read stability in [0, 1] for the router's Restricted-Nash-Response cap.
+
+        1.0 = a stable, stationary read (the fast EWMA agrees with the slow EWMA, or we have no
+        fast data yet) — the exploit may commit fully (a static leak has no downside). It falls
+        toward 0 as the opponent is seen to ADAPT (fast diverges from slow), with hysteresis so a
+        counter-exploiter we have already caught moving stays clamped between its move windows.
+        The router multiplies the exploit-cap by this, so a non-stationary opponent only ever pulls
+        us a bounded fraction toward the pure best response they would otherwise punish."""
+        if not identity:
+            return 1.0
+        with self._mu:
+            return float(1.0 - min(max(self._instab.get(identity, 0.0), 0.0), 1.0))
+
     def push_rate(self, identity, num_players, seat, hist, stack_bb) -> float:
         return self.estimate(identity, num_players, seat, hist, stack_bb)["rate"]
 
@@ -275,6 +304,8 @@ class AdaptiveOpponentModel:
                           f"backed up to {bad}, starting fresh")
                     return self
                 self.load_dict(raw.get("duals", {}))
+                with self._mu:
+                    self._instab.update({k: float(v) for k, v in (raw.get("instab", {}) or {}).items()})
             except (OSError, ValueError):
                 pass
         return self
@@ -286,8 +317,10 @@ class AdaptiveOpponentModel:
         p = Path(self.path)
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(p.suffix + f".tmp{os.getpid()}-{threading.get_ident()}")
+        with self._mu:
+            instab = dict(self._instab)
         payload = {"schema_version": 1, "infoset_key_spec_hash": infoset_key_spec_hash(),
-                   "duals": self.to_dict()}
+                   "duals": self.to_dict(), "instab": instab}
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False)
             fh.flush()

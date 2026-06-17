@@ -52,6 +52,14 @@ class Card:
     def to_str(self) -> str:
         return f"{RANK_CHARS[self.rank - 2]}{SUIT_CHARS[self.suit]}"
 
+    # str(card) == 'Jh' (the canonical parseable form). Without this, str() fell through to the
+    # dataclass repr, which board_texture() cannot parse — so every site that built a context key
+    # via str(card) (agent, heuristic battery hero) silently collapsed postflop textures to '-',
+    # splitting a player's history across keys incompatible with the context_key_rs sites
+    # (train/serve skew). repr() stays the verbose dataclass form.
+    def __str__(self) -> str:
+        return self.to_str()
+
     @property
     def index(self) -> int:
         """Unique index 0-51."""

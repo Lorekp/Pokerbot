@@ -41,6 +41,12 @@ live = [
     "easyocr>=1.7",
     "pytesseract>=0.3.10",
     "UnityPy>=1.10",
+    "onnxruntime>=1.17",
+]
+# Trained-model recognition for the local vision path (digits/cards/badges CNNs).
+# Inference needs only onnxruntime; training scripts additionally use torch (core dep).
+vision-ml = [
+    "onnxruntime>=1.17",
 ]
 vl = [
     "instructor>=1.6",
@@ -49,6 +55,8 @@ vl = [
     "pillow>=10.0",
     "mss>=9.0",
     "opencv-python>=4.8",
+    "python-dotenv>=1.0",
+    "onnxruntime>=1.17",
 ]
 aof-native = [
     "pybind11>=2.11",
@@ -58,6 +66,13 @@ cfr = [
     "flax>=0.8",
     "optax>=0.2",
     "chex>=0.1.86",
+]
+aof-cfr = [
+    "open-spiel>=1.6",
+    "numpy>=1.26.0,<3",
+    "pokerkit>=0.5.0,<1",
+    "phevaluator>=0.5.0,<1",
+    "numba>=0.59.0,<1",
 ]
 server = [
     "fastapi>=0.110",
@@ -84,7 +99,7 @@ py-modules = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["pokerbot*", "aof_rl*", "aof_solver*", "aof_validation*", "bench*"]
+include = ["pokerbot*", "aof_rl*", "aof_solver*", "aof_cfr*", "aof_validation*", "bench*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
