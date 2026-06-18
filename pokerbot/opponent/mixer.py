@@ -11,6 +11,7 @@ from pokerbot.engine.actions import NUM_ACTIONS
 from pokerbot.opponent.bayes_exploit import context_read
 from pokerbot.opponent.context import context_key as _context_key
 from pokerbot.opponent.stats import OpponentStats
+from pokerbot.opponent.value_sizing import value_sizing_logits
 
 # board card count -> street index (preflop/flop/turn/river)
 _BOARD_LEN_TO_STREET = {0: 0, 3: 1, 4: 2, 5: 3}
@@ -41,11 +42,16 @@ def _mixer_context_key(board, legal_mask, n_prior_aggr: int | None = None) -> st
 def _context_or_archetype_logits(stats, hand_strength, board, legal_mask,
                                  n_prior_aggr: int | None = None) -> np.ndarray:
     """OUR exploit logit adjustment, preferring the per-context Bayesian read (bayes_exploit) when
-    that context has data, else the discrete-archetype ``exploit_adjustment`` (cold-start fallback)."""
+    that context has data, else the discrete-archetype ``exploit_adjustment`` (cold-start fallback).
+
+    On top of the frequency read we add the HUD-driven value-SIZING overlay (``value_sizing_logits``):
+    the per-context/archetype path tilts WHETHER we bet; this tilts HOW BIG, escalating value sizing
+    vs a sticky/weak-showdown station (server HUD wtsd/wsd/foldToCbet). It is value-gated + WSD-
+    dampened + confidence-gated, additive, and bounded, so the mixer α-cap and LAG/RNR firewall still
+    clamp it. Env kill-switch POKERBOT_VALUE_SIZING=0."""
     read = context_read(stats, _mixer_context_key(board, legal_mask, n_prior_aggr))
-    if read is not None:
-        return read.mixer_logits(hand_strength)
-    return exploit_adjustment(stats, hand_strength)
+    base = read.mixer_logits(hand_strength) if read is not None else exploit_adjustment(stats, hand_strength)
+    return base + value_sizing_logits(stats, hand_strength)
 
 USE_BELIEF_BR = True
 
