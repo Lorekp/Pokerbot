@@ -34,3 +34,7 @@ $OUT
 models/
 data/_proftest.json
 data/aof/cfr_base/tensor_row_checkpoints/
+
+# Large downloaded datasets (IRC poker DB etc.) — never commit
+data/datasets/
+*.tgz
