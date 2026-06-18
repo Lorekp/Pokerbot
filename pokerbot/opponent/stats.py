@@ -22,6 +22,11 @@ class OpponentStats:
     aggression_calls: int = 0
     wtsd: int = 0  # went to showdown
     saw_flop: int = 0
+    # Per-format hand split (schema v7). The store is UNIFIED per player (one human, format-stable read),
+    # but each hand is counted by format so reporting / a future ICM-aware model can segment cash vs MTT
+    # without fragmenting the live posterior. ``hands`` stays the grand total (hands_cash+hands_tourney).
+    hands_cash: int = 0
+    hands_tourney: int = 0
     # Per-context Dirichlet sufficient stats: {context_key -> K=4 outcome-bin counts}
     # (see pokerbot.opponent.context). Empty for legacy/cold profiles ⇒ all scalar math below and
     # archetype()/confidence() are unaffected; the contextual Bayesian model uses it when present.

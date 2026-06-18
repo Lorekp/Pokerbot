@@ -31,11 +31,14 @@ DEFAULT_PATH = "data/player_profiles/profiles.json"
 # v1 = scalar-only; v2 adds per-context Dirichlet counts; v3 adds dual-timescale discounted counts
 # (ctx_fast/ctx_slow/ctx_last) for non-stationarity; v4 adds the BOCPD run-length (ctx_runlen);
 # v5 adds the showdown-conditioned bluff-ratio Beta counts (ctx_bluff/ctx_bluff_last); v6 adds the
-# server HUD-stat prior (hud). All reads are back-compatible (older files load with newer fields empty).
-SCHEMA_VERSION = 6
+# server HUD-stat prior (hud); v7 adds the per-format hand split (hands_cash/hands_tourney) so cash and
+# MTT hands share one unified profile yet stay segmentable. All reads are back-compatible (older files
+# load with newer fields empty/zero).
+SCHEMA_VERSION = 7
 _STAT_FIELDS = (
     "hands", "vpip", "pfr", "three_bet", "fold_to_cbet", "cbet_faced",
     "aggression_bets_raises", "aggression_calls", "wtsd", "saw_flop",
+    "hands_cash", "hands_tourney",
 )
 
 _BLIND_TYPES = frozenset({"sb", "bb", "post", "ante", "straddle"})
@@ -188,6 +191,9 @@ def derive_hand_stats(record: dict) -> dict[str, dict]:
             pre_raises_so_far += 1
 
     flop_seen = len(record.get("board") or []) >= 3
+    # Per-format hand split (v7). Legacy records (no table.format) predate the tag and were cash/AoF;
+    # AoF routes to a separate store, so an untagged NLHE record is treated as cash.
+    is_tourney = (record.get("table") or {}).get("format") == "tournament"
     contexts = _derive_contexts(actions, record.get("board"))
     bluffs = _derive_bluffs(actions, record.get("board"), record.get("shown"))
     out: dict[str, dict] = {}
@@ -210,6 +216,8 @@ def derive_hand_stats(record: dict) -> dict[str, dict]:
 
         out[key] = {
             "hands": 1,
+            "hands_cash": int(not is_tourney),
+            "hands_tourney": int(is_tourney),
             "vpip": int(vpip),
             "pfr": int(pfr),
             "three_bet": int(three_bet),
