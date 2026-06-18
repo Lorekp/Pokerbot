@@ -75,6 +75,16 @@ def game_state_to_env(state: GameState, hero_seat: int) -> EnvState:
 
     pot_dead = _bb_to_chips(state.pot_bb - sum(p.committed_street_bb for p in state.players))
 
+    # Per-street "has acted" flags. The jax engine's _street_complete / reopen logic keys on `acted`
+    # (round closes only when every still-actable seat has acted + matched). GameState tracks this in
+    # `_acted_this_street` (reset to {raiser} after a full raise, exactly like the jax engine). Leaving
+    # it all-False — as the original bridge did — makes the solver believe NO opponent has acted yet, so
+    # from any non-first-to-act hero seat it searches a subgame with phantom extra betting rounds (the
+    # already-acted opponents are expected to act again), corrupting the EVs out of position.
+    acted = np.zeros(NUM_PLAYERS, dtype=bool)
+    for s in getattr(state, "_acted_this_street", set()):
+        acted[s] = True
+
     return EnvState(
         holes=jnp.asarray(holes),
         board=jnp.asarray(board),
@@ -89,7 +99,7 @@ def game_state_to_env(state: GameState, hero_seat: int) -> EnvState:
         button=jnp.int32(state.button_seat),
         action_seat=jnp.int32(state.action_seat),
         last_aggressor=jnp.int32(state.last_aggressor if state.last_aggressor is not None else -1),
-        acted=jnp.zeros(NUM_PLAYERS, dtype=bool),
+        acted=jnp.asarray(acted),
         last_raise_full=jnp.bool_(True),
         deck=jnp.arange(52, dtype=jnp.int32),
         deck_ptr=jnp.int32(0),
