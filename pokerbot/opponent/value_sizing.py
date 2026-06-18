@@ -48,9 +48,33 @@ _K_BIG = 1.2                               # boost to the over-bet buckets (>=1x
 _K_MID = 0.35                              # smaller boost to mid bets (keeps total betting up)
 _K_CHECK = 0.5                             # discourage checking back a value hand vs a payoff station
 
+# Bluff-suppression gains: the symmetric (air-hand) overlay — slash our bluff betting vs a non-folder.
+_K_BLUFF = 0.9                             # cut to bet/raise buckets when bluffing a sticky station
+_K_BLUFF_CHECK = 0.5                       # lean toward checking/giving up air vs a non-folder
+
+# River thin-value expansion: bet marginally-ahead hands (2nd pair / weak TP) the base would CHECK BACK,
+# vs a confirmed weak-showdown station on the RIVER (no card to come ⇒ a check-back has no protective
+# value, and the station calls with worse). Fires only in the marginal band BELOW the normal value
+# cutoff; value hands (h>=0.5) are already handled by value_sizing_logits.
+_THIN_LO = 0.40                            # floor: below this we're not ahead of a station's call range
+_THIN_HI = 0.50                            # ceiling: at/above this value_sizing already fires
+_WSD_THIN_MAX = 0.50                       # require a weak showdown range (won-at-sd < this) to bet thin
+_K_THIN = 0.6                              # boost to the small/mid value buckets for a thin value bet
+_K_THIN_CHECK = 0.45                       # discourage checking back a thin-value hand vs a station
+
 
 def _enabled() -> bool:
     return os.environ.get("POKERBOT_VALUE_SIZING", "1") != "0"
+
+
+def _bluff_suppress_enabled() -> bool:
+    return os.environ.get("POKERBOT_BLUFF_SUPPRESS", "1") != "0"
+
+
+def _river_thin_value_enabled() -> bool:
+    # Default OFF: this is the one overlay with genuine value-cut risk (betting into a range that may
+    # beat us), so it ships behind a flag pending CRN-battery validation before any live enablement.
+    return os.environ.get("POKERBOT_RIVER_THIN_VALUE", "0") != "0"
 
 
 def _pct(hud: dict, *keys):
@@ -128,4 +152,65 @@ def value_sizing_logits(stats, hand_strength: float | None) -> np.ndarray:
     adj[_BIG_LO:_ALL_IN] += _K_BIG * mag       # push toward the over-bet (>=1x pot, excl. all-in)
     adj[_BET_LO:_BIG_LO] += _K_MID * mag       # keep mid bets live so total betting still rises
     adj[1] -= _K_CHECK * mag                    # don't check back value vs a station
+    return adj
+
+
+def bluff_suppression_logits(stats, hand_strength: float | None) -> np.ndarray:
+    """Logit overlay that SUPPRESSES our bluff frequency vs a sticky calling station — the symmetric
+    counterpart to ``value_sizing_logits``. The population leak #1 is "a sub-42% folder makes most
+    bluffs −EV" (a bluff needs fold ≥ bet/(bet+pot); a 36% folder fails that for most sizes). So when
+    hero holds AIR (strength < 0.5) and the opponent reads as a non-folding station, push mass OFF the
+    bet/raise buckets and toward checking/giving up. Zero unless hero holds air AND the opponent is a
+    confident sticky station. Negative-risk: betting less air vs a non-folder cannot be punished by the
+    station, and the magnitude auto-damps vs lag/tag (``station_payoff_score`` ×0.3). Bounded + additive,
+    so the mixer α-cap + LAG/RNR firewall still clamp it. Env kill-switch ``POKERBOT_BLUFF_SUPPRESS=0``."""
+    adj = np.zeros(NUM_ACTIONS, dtype=np.float64)
+    if not _bluff_suppress_enabled() or NUM_ACTIONS < 5:
+        return adj
+    h = 0.55 if hand_strength is None else float(np.clip(hand_strength, 0.0, 1.0))
+    air = max(0.0, (0.5 - h) * 2.0)            # only air suppresses (value never suppresses)
+    if air <= 0.0:
+        return adj
+    score, conf = station_payoff_score(stats)
+    mag = score * conf * air                   # in [0,1]
+    if mag <= 0.0:
+        return adj
+    adj[_BET_LO:_ALL_IN] -= _K_BLUFF * mag      # de-prioritize bluff bets across sizes (they call anyway)
+    adj[1] += _K_BLUFF_CHECK * mag              # prefer checking/giving up air vs a non-folder
+    return adj
+
+
+def river_thin_value_logits(stats, hand_strength: float | None, board) -> np.ndarray:
+    """River-only thin-value EXPANSION: bet marginally-ahead hands (hand_strength in [_THIN_LO,_THIN_HI),
+    e.g. 2nd pair / weak top pair) that the GTO base checks back, when the opponent reads as a confirmed
+    weak-showdown station. On the river a check-back forfeits value with no protective upside, and a
+    station calls with worse, so a thin value bet prints. This is a bet-FREQUENCY expansion (small/mid
+    sizes), complementing value_sizing_logits' SIZE escalation for already-value hands.
+
+    Guards (this is the one overlay with real value-cut risk — betting into a range that may beat us):
+      * RIVER only (len(board)==5) — no card to come, so checking has no equity-denial value;
+      * marginal band only (_THIN_LO..._THIN_HI) — air never thin-value-bets, value is value_sizing's job;
+      * weak-showdown gate — require server WSD < _WSD_THIN_MAX (we must be ahead when called);
+      * station_payoff_score stickiness/confidence — never fires vs a reg (lag/tag damped ×0.3).
+    Small/mid sizes only (big bets fold out worse / get raised). Default OFF (POKERBOT_RIVER_THIN_VALUE)."""
+    adj = np.zeros(NUM_ACTIONS, dtype=np.float64)
+    if not _river_thin_value_enabled() or NUM_ACTIONS < 5:
+        return adj
+    if len([c for c in (board or []) if c is not None]) != 5:   # river only
+        return adj
+    h = 0.45 if hand_strength is None else float(np.clip(hand_strength, 0.0, 1.0))
+    if not (_THIN_LO <= h < _THIN_HI):          # only the marginal-ahead band
+        return adj
+    thin = (h - _THIN_LO) / (_THIN_HI - _THIN_LO)   # 0 at floor -> 1 at the value cutoff
+    # Value-cut guard: require a genuinely weak showdown range (we beat their calls). Absent server WSD,
+    # do NOT fire (no blind thin value).
+    wsd = _pct(getattr(stats, "hud", None) or {}, "wsd")
+    if wsd is None or wsd >= _WSD_THIN_MAX:
+        return adj
+    score, conf = station_payoff_score(stats)
+    mag = score * conf * thin
+    if mag <= 0.0:
+        return adj
+    adj[_BET_LO:_BIG_LO] += _K_THIN * mag        # small/mid value sizes only (don't over-bet 2nd pair)
+    adj[1] -= _K_THIN_CHECK * mag                # don't check back a thin value hand vs a station
     return adj
