@@ -47,6 +47,11 @@ class OpponentStats:
     # Empty for v4/legacy profiles ⇒ bluff_read returns None ⇒ frequency-only exploitation (unchanged).
     ctx_bluff: dict[str, list[float]] = field(default_factory=dict)
     ctx_bluff_last: dict[str, int] = field(default_factory=dict)
+    # Server-computed HUD stats (CoinPoker), authoritative over the player's WHOLE history:
+    # {vpip, pfr, wtsd, wsd, threeBet, foldToThreeBet, cbet, foldToCbet, steal, ...} as the site's
+    # values. A high-confidence PRIOR captured live (seed_from_hud) — kept SEPARATE from the
+    # count-based fields above so it never distorts per-hand derivation. Empty ⇒ none captured.
+    hud: dict = field(default_factory=dict)
 
     def add_ctx(self, context_key: str, bin_increments) -> None:
         """Element-wise fold a hand's per-context bin increments into the running counts."""

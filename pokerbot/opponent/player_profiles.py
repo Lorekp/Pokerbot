@@ -30,9 +30,9 @@ from pokerbot.opponent.stats import OpponentStats
 DEFAULT_PATH = "data/player_profiles/profiles.json"
 # v1 = scalar-only; v2 adds per-context Dirichlet counts; v3 adds dual-timescale discounted counts
 # (ctx_fast/ctx_slow/ctx_last) for non-stationarity; v4 adds the BOCPD run-length (ctx_runlen);
-# v5 adds the showdown-conditioned bluff-ratio Beta counts (ctx_bluff/ctx_bluff_last). All reads are
-# back-compatible (older files load with the newer fields empty).
-SCHEMA_VERSION = 5
+# v5 adds the showdown-conditioned bluff-ratio Beta counts (ctx_bluff/ctx_bluff_last); v6 adds the
+# server HUD-stat prior (hud). All reads are back-compatible (older files load with newer fields empty).
+SCHEMA_VERSION = 6
 _STAT_FIELDS = (
     "hands", "vpip", "pfr", "three_bet", "fold_to_cbet", "cbet_faced",
     "aggression_bets_raises", "aggression_calls", "wtsd", "saw_flop",
@@ -319,6 +319,8 @@ class PlayerProfileStore:
             for ck, row in (d.get("ctx_bluff") or {}).items():
                 s.ctx_bluff[ck] = [float(x) for x in (list(row) + [0.0, 0.0])[:2]]
             s.ctx_bluff_last = {ck: int(v) for ck, v in (d.get("ctx_bluff_last") or {}).items()}
+            # v6 server HUD-stat prior (absent in v1–v5 ⇒ empty ⇒ no HUD prior).
+            s.hud = dict(d.get("hud") or {})
             self.profiles[key] = s
             if d.get("name"):
                 self.names[key] = d["name"]
@@ -345,6 +347,7 @@ class PlayerProfileStore:
                     **({"ctx_bluff": {k: [round(x, 4) for x in v] for k, v in s.ctx_bluff.items()}}
                        if s.ctx_bluff else {}),
                     **({"ctx_bluff_last": s.ctx_bluff_last} if s.ctx_bluff_last else {}),
+                    **({"hud": s.hud} if s.hud else {}),
                 }
                 for key, s in self.profiles.items()
             },
@@ -433,6 +436,23 @@ class PlayerProfileStore:
             self._dirty = True
             self._updates_since_save += 1
         return len(increments)
+
+    def seed_from_hud(self, key: str, stats: dict, *, name: str | None = None) -> bool:
+        """Store the server's HUD stats (VPIP/PFR/WTSD/3bet/cbet/...) for a player as a high-confidence
+        prior. Authoritative over the player's whole history — kept verbatim and SEPARATE from the
+        count-based fields, so it never distorts per-hand derivation. Idempotent: only marks dirty when
+        the payload actually changes. Returns True if stored/updated."""
+        if not key or not isinstance(stats, dict) or not stats:
+            return False
+        s = self.get(key)
+        if s.hud == stats:
+            return False
+        s.hud = dict(stats)
+        if name:
+            self.names[key] = name
+        self._dirty = True
+        self._updates_since_save += 1
+        return True
 
     @property
     def dirty(self) -> bool:
