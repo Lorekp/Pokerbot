@@ -157,6 +157,69 @@ def _reconcile(rec: dict, aggs: dict[str, Agg]) -> None:
             aggs[key].net += float(w["amount"])
 
 
+TIMING_HANDS_TARGET = 1000   # timed hands needed before wiring the dt-based timing-tell model
+_MIN_RECON_PER_VILLAIN = 10  # showdown-reconciled samples per villain for a usable per-player tell
+
+
+def compute_timing_readiness(records, *, target_timed: int = TIMING_HANDS_TARGET,
+                             min_per_villain: int = _MIN_RECON_PER_VILLAIN) -> dict:
+    """Scan NLHE hand records for whether we have enough TIMED data to wire the dt-based timing-tell
+    model. The headline gate is ``timed_hands >= target_timed`` (a 'timed hand' has >=1 action carrying
+    a decision time ``dt``). Also reports showdown-reconciled coverage — aggressive dt-actions by a
+    villain whose hole we later learned at showdown — since the tell (dt split by bluff/value) can only
+    be FIT on those; 1000 timed hands with no showdowns still can't train it."""
+    n_hands = n_timed = n_showdown = 0
+    recon: dict[str, int] = defaultdict(int)
+    for rec in records:
+        if (rec.get("table") or {}).get("game_mode") == "aof":
+            continue  # AoF has its own report + push/fold has no postflop timing tell
+        n_hands += 1
+        actions = rec.get("actions") or []
+        if any(a.get("dt") is not None for a in actions):
+            n_timed += 1
+        shown_keys = {_player_key(s.get("user_id"), s.get("name")) for s in (rec.get("shown") or [])}
+        shown_keys.discard(None)
+        if shown_keys:
+            n_showdown += 1
+            for a in actions:
+                if a.get("type") in _AGGR and a.get("dt") is not None:
+                    k = _player_key(a.get("user_id"), a.get("name"))
+                    if k in shown_keys:
+                        recon[k] += 1
+    return {
+        "hands": n_hands,
+        "timed_hands": n_timed,
+        "target_timed": target_timed,
+        "showdown_hands": n_showdown,
+        "reconciled_samples": sum(recon.values()),
+        "villains_reconciled_ge_min": sum(1 for v in recon.values() if v >= min_per_villain),
+        "min_per_villain": min_per_villain,
+        "ready": n_timed >= target_timed,
+    }
+
+
+def print_timing_readiness(rd: dict) -> None:
+    tgt, timed = rd["target_timed"], rd["timed_hands"]
+    pct = (100.0 * timed / tgt) if tgt else 100.0
+    verdict = "READY" if rd["ready"] else "NOT READY"
+    print(f"\nTIMING READINESS (gate to wire dt-based timing tells)  ->  {verdict}")
+    print(f"  timed hands (>=1 dt action): {timed:>6} / {tgt}   [{pct:3.0f}% of target]")
+    print(f"  showdown hands (reveals):    {rd['showdown_hands']:>6}")
+    print(f"  reconciled timing samples:   {rd['reconciled_samples']:>6}   "
+          f"(aggressive dt-actions by a villain we saw show down)")
+    print(f"  villains >= {rd['min_per_villain']} reconciled:        "
+          f"{rd['villains_reconciled_ge_min']:>6}")
+    if rd["ready"]:
+        if rd["reconciled_samples"] == 0:
+            print("  => 1000-timed-hand gate MET, but 0 showdown-reconciled samples — the tell needs "
+                  "reveals to fit. Keep collecting until reconciled samples accrue, THEN wire timing.")
+        else:
+            print("  => gate MET. Wire the dt -> bluff/value timing model and battery/replay-validate it.")
+    else:
+        need = tgt - timed
+        print(f"  => collect {need} more timed hand(s) before wiring timing (target {tgt}).")
+
+
 def _pct(num: int, den: int) -> str:
     return f"{100.0 * num / den:4.0f}" if den else "   -"
 
@@ -169,13 +232,16 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dir", default="runs/live_hands", help="directory of live hand records")
     ap.add_argument("--min-hands", type=int, default=5, help="only print opponents with >= this many hands")
+    ap.add_argument("--timing-target", type=int, default=TIMING_HANDS_TARGET,
+                    help="timed-hand count that flags the timing-tell model as ready to wire")
     args = ap.parse_args()
 
     paths = sorted(glob.glob(str(Path(args.dir) / "**" / "*.jsonl"), recursive=True)
                    + glob.glob(str(Path(args.dir) / "**" / "*.jsonl.gz"), recursive=True))
+    records = list(_read(paths))  # materialize once: feeds both the opponent table and the readiness scan
     aggs: dict[str, Agg] = defaultdict(Agg)
     n_rec = 0
-    for rec in _read(paths):
+    for rec in records:
         if (rec.get("table") or {}).get("game_mode") == "aof":
             continue  # this is the NLHE/cash report; AoF has its own (opponent_report.py)
         _reconcile(rec, aggs)
@@ -200,6 +266,8 @@ def main() -> None:
     print("\ntBluff/tValue = median decision-time (s) on aggressive actions later shown as bluff/value "
           "(the timing tell). 'size' = mean bet/raise as a fraction of pot. 'net' = chips netted vs us.")
     print("HUD = server whole-history stats (blank if not captured this sample).")
+
+    print_timing_readiness(compute_timing_readiness(records, target_timed=args.timing_target))
 
 
 if __name__ == "__main__":
