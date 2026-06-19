@@ -145,6 +145,34 @@ def _bucket(x: float, edges: tuple[float, ...]) -> int:
 _POT_EDGES = (3.0, 6.0, 12.0, 25.0, 50.0, 100.0, 200.0)        # total pot in BB
 _TOCALL_EDGES = (0.01, 0.34, 0.67, 1.01, 2.01)                  # amount-to-call as fraction of pot
 _SPR_EDGES = (1.0, 2.5, 5.0, 10.0, 20.0)                        # effective-stack-to-pot ratio
+# Effective STARTING-stack depth (absolute BB) for the depth-aware PREFLOP key (A2). 4 buckets for
+# CoinPoker cash: short [..,50) (40-50bb buy-ins + lost-down tail), mid [50,90), full [90,140) (the
+# 100bb buy-in cluster), deep [140,..) (run-ups). NOTE: the 100bb MAX buy-in bounds the START depth, NOT
+# the running stack — winners accumulate above 100bb and stay deep until they lose back (no mid-session
+# cash-out), and losers reloading at <=100bb feed that persistent deep tail, so a WINNING bot genuinely
+# plays 130-200bb deep-vs-deep. (Multiway all-ins make a 200-300bb POT, not >100bb DEPTH — pot is keyed
+# separately by _POT_EDGES/SPR.) Absolute (not pot-relative): preflop pot ~1.5bb so SPR is uninformative.
+# Only consulted when POKERBOT_DEPTH_BUCKETS.
+_DEPTH_EDGES = (50.0, 90.0, 140.0)
+
+
+def effective_depth_bb(state: EnvState | Any) -> float:
+    """Effective STARTING stack depth in BB = min over non-folded seats of (stacks + committed_total).
+    Chips only move stack->committed within a hand, so the sum is each seat's depth at hand start and the
+    min (the binding stack) is CONSTANT across the hand — a preflop infoset stays in ONE depth bucket."""
+    stacks = np.asarray(state.stacks, dtype=np.float64)
+    committed_total = np.asarray(state.committed_total, dtype=np.float64)
+    seat_status = np.asarray(state.seat_status)
+    totals = stacks + committed_total
+    live = [totals[s] for s in range(len(totals))
+            if int(seat_status[s]) not in (_SEAT_EMPTY_I, _SEAT_FOLDED_I) and totals[s] > 0]
+    chips = min(live) if live else (float(totals.max()) if totals.size else 100.0 * CHIP_UNIT)
+    return float(chips) / float(CHIP_UNIT)
+
+
+def depth_bucket(state: EnvState | Any) -> int:
+    """Discrete effective-starting-depth bucket in [0, len(_DEPTH_EDGES)] for the depth-aware preflop key."""
+    return _bucket(effective_depth_bb(state), _DEPTH_EDGES)
 
 
 def betting_abstraction_key(state: EnvState | Any, seat: int) -> bytes:
@@ -355,9 +383,10 @@ def encode_nlhe_bundle_fast(
     _ = oop_range, ip_range
     spot_scope = encode_spot_scope_numpy(spot_class)
     policy_position = fuse_position_scope(position, spot_scope)
-    from pokerbot.engine.jax_weva_encode import compute_postflop_bucket
+    from pokerbot.engine.jax_weva_encode import _DEPTH_BUCKETS, compute_postflop_bucket
 
     bucket = compute_postflop_bucket(holes[seat], board)
+    dbucket = depth_bucket(state) if _DEPTH_BUCKETS else -1  # hashed preflop only; -1 => not hashed
     return NLHEEncodeBundle(
         weva_id=weva_id,
         cards=cards,
@@ -368,6 +397,7 @@ def encode_nlhe_bundle_fast(
         postflop_bucket_id=bucket,
         history_key=betting_history_key(state),
         betting_state=betting_abstraction_key(state, seat),
+        depth_bucket=dbucket,
     )
 
 
@@ -386,6 +416,7 @@ def fingerprint_fast(state: EnvState | Any, seat: int, *, weva_table: np.ndarray
     """
     from pokerbot.engine.jax_weva_encode import (
         _BETTING_ABSTRACTION,
+        _DEPTH_BUCKETS,
         NLHEEncodeBundle,
         compute_postflop_bucket,
     )
@@ -409,10 +440,11 @@ def fingerprint_fast(state: EnvState | Any, seat: int, *, weva_table: np.ndarray
         history_key = betting_history_key(state)
     # Minimal bundle: bounded-mode .fingerprint() reads weva_id/postflop_bucket_id + (history_key preflop-
     # lossless | betting_state otherwise) — see NLHEEncodeBundle._digest.
+    dbucket = depth_bucket(state) if _DEPTH_BUCKETS else -1  # serve-side twin of the train encode
     return NLHEEncodeBundle(
         weva_id=weva_id, cards=_FP_FAST_EMPTY, actions=_FP_FAST_EMPTY, position=_FP_FAST_EMPTY,
         spot_scope=_FP_FAST_EMPTY, policy_position=_FP_FAST_EMPTY, postflop_bucket_id=bucket,
-        history_key=history_key, betting_state=betting_state,
+        history_key=history_key, betting_state=betting_state, depth_bucket=dbucket,
     ).fingerprint()
 
 

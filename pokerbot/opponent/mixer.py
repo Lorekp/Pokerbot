@@ -11,7 +11,11 @@ from pokerbot.engine.actions import NUM_ACTIONS
 from pokerbot.opponent.bayes_exploit import context_read
 from pokerbot.opponent.context import context_key as _context_key
 from pokerbot.opponent.stats import OpponentStats
-from pokerbot.opponent.value_sizing import value_sizing_logits
+from pokerbot.opponent.value_sizing import (
+    bluff_suppression_logits,
+    river_thin_value_logits,
+    value_sizing_logits,
+)
 
 # board card count -> street index (preflop/flop/turn/river)
 _BOARD_LEN_TO_STREET = {0: 0, 3: 1, 4: 2, 5: 3}
@@ -44,14 +48,16 @@ def _context_or_archetype_logits(stats, hand_strength, board, legal_mask,
     """OUR exploit logit adjustment, preferring the per-context Bayesian read (bayes_exploit) when
     that context has data, else the discrete-archetype ``exploit_adjustment`` (cold-start fallback).
 
-    On top of the frequency read we add the HUD-driven value-SIZING overlay (``value_sizing_logits``):
-    the per-context/archetype path tilts WHETHER we bet; this tilts HOW BIG, escalating value sizing
-    vs a sticky/weak-showdown station (server HUD wtsd/wsd/foldToCbet). It is value-gated + WSD-
-    dampened + confidence-gated, additive, and bounded, so the mixer α-cap and LAG/RNR firewall still
-    clamp it. Env kill-switch POKERBOT_VALUE_SIZING=0."""
+    On top of the frequency read we add two HUD-driven SIZE/FREQUENCY overlays: ``value_sizing_logits``
+    escalates HOW BIG we bet value vs a sticky/weak-showdown station, and ``bluff_suppression_logits``
+    (the symmetric air-hand term) slashes HOW OFTEN we bluff a non-folder. Both are value/air-gated,
+    confidence-gated, additive, and bounded, so the mixer α-cap and LAG/RNR firewall still clamp them.
+    Env kill-switches POKERBOT_VALUE_SIZING=0 / POKERBOT_BLUFF_SUPPRESS=0."""
     read = context_read(stats, _mixer_context_key(board, legal_mask, n_prior_aggr))
     base = read.mixer_logits(hand_strength) if read is not None else exploit_adjustment(stats, hand_strength)
-    return base + value_sizing_logits(stats, hand_strength)
+    return (base + value_sizing_logits(stats, hand_strength)
+            + bluff_suppression_logits(stats, hand_strength)
+            + river_thin_value_logits(stats, hand_strength, board))
 
 USE_BELIEF_BR = True
 
@@ -160,8 +166,17 @@ def _stats_confidence(stats) -> float:
     exploitation — defeating the "remember every player" goal. Sourcing it from ``stats.hands`` is
     BIT-IDENTICAL for the tracker path (there ``stats = tracker.get(id)``, and
     ``tracker.confidence(id) == min(1, tracker.get(id).hands/50)``) while making the DB profile drive
-    the deviation."""
-    return min(1.0, float(getattr(stats, "hands", 0)) / 50.0)
+    the deviation.
+
+    HUD floor: a server-HUD prior (whole-history vpip/pfr/wtsd/wsd/foldToCbet/...) is high-confidence
+    even with few LOCALLY observed hands. Without this floor a station known only from the CoinPoker HUD
+    (hands < ~5 locally) is alpha-zeroed -> the value-sizing lever silently doesn't fire vs the exact
+    target it was built for (see population-hud-analysis / ev-lever-implementation)."""
+    conf = min(1.0, float(getattr(stats, "hands", 0)) / 50.0)
+    hud = getattr(stats, "hud", None)
+    if isinstance(hud, dict) and len(hud) >= 3:
+        conf = max(conf, 0.6)
+    return conf
 
 
 class HybridPolicy:

@@ -15,11 +15,16 @@ Local dry-run: --local-only writes checkpoints to a local dir (no AWS) for valid
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import threading
 import time
 import urllib.request
 from pathlib import Path
+
+
+def _flag_truthy(val: str | None) -> bool:
+    return (val or "").lower() not in ("", "0", "false", "no")
 
 import numpy as np
 
@@ -159,6 +164,43 @@ def main() -> None:
     p.add_argument("--region", default="eu-central-1")
     p.add_argument("--local-only", default=None, help="local checkpoint dir instead of S3 (dry-run)")
     args = p.parse_args()
+
+    # Depth-retrain startup guard: if the depth KEY is on, the deal randomizer MUST be configured. The
+    # sampler fails SAFE (None -> fixed 100bb) on a missing/malformed range, which is right interactively but
+    # WRONG for an unattended run — it would silently train the whole table at 100bb with the depth byte on
+    # (everything in one bucket), discovered only at the post-run coverage gate. Fail LOUD instead.
+    if _flag_truthy(os.environ.get("POKERBOT_DEPTH_BUCKETS")):
+        raw = os.environ.get("POKERBOT_TRAIN_DEPTH_BB", "").strip()
+        ok = False
+        try:
+            _lo, _hi = (float(x) for x in raw.split(","))
+            ok = _hi > _lo > 0
+        except (ValueError, TypeError):
+            ok = False
+        if not ok:
+            raise SystemExit(
+                "POKERBOT_DEPTH_BUCKETS is set but POKERBOT_TRAIN_DEPTH_BB is unset/malformed "
+                f"({raw!r}); refusing to train a depth-keyed table with fixed-100bb deals. "
+                "Set POKERBOT_TRAIN_DEPTH_BB=lo,hi (e.g. 30,200).")
+        print(f"Depth retrain: POKERBOT_DEPTH_BUCKETS=1, deals log-U over {raw}bb (shared per deal).",
+              flush=True)
+
+    # C1 short-handed coverage guard: a malformed POKERBOT_TRAIN_OCCUPANCY_MIX would silently disable the
+    # occupancy randomization (fixed full ring) on an unattended run — fail LOUD instead.
+    _occ_raw = os.environ.get("POKERBOT_TRAIN_OCCUPANCY_MIX", "").strip()
+    if _occ_raw:
+        _ok = False
+        try:
+            _lo, _hi = (int(x) for x in _occ_raw.split(","))
+            _ok = 2 <= _lo <= _hi <= 6
+        except (ValueError, TypeError):
+            _ok = False
+        if not _ok:
+            raise SystemExit(
+                f"POKERBOT_TRAIN_OCCUPANCY_MIX is malformed ({_occ_raw!r}); expected LO,HI with "
+                "2 <= LO <= HI <= 6 (e.g. 2,6). Refusing to silently train fixed-ring on a short-handed run.")
+        print(f"Short-handed coverage: per-deal live-seat count over {_occ_raw} (weighted toward full).",
+              flush=True)
 
     if args.local_only:
         store = LocalDirObjectStore(args.local_only)

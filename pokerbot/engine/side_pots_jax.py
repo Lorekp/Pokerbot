@@ -37,7 +37,7 @@ def _odd_chip_seat(eligible: Array, button: Array) -> Array:
 
 
 def award_layer(amount: Array, eligible: Array, scores: Array, button: Array) -> Array:
-    best = jnp.max(jnp.where(eligible, scores, jnp.int64(-1)))
+    best = jnp.max(jnp.where(eligible, scores, jnp.int32(-1)))
     winners = eligible & (scores == best) & (best >= 0)
     n_winners = jnp.maximum(jnp.sum(winners.astype(jnp.int32)), 1)
     base = amount // n_winners
@@ -68,7 +68,7 @@ def compute_returns(
     def showdown(_: None) -> Array:
         board_valid = board >= 0
         scores = jax.vmap(lambda s: player_showdown_score(holes[s], board, board_valid))(jnp.arange(NUM_PLAYERS))
-        scores = jnp.where(_eligible_to_win(seat_status), scores, jnp.int64(-1))
+        scores = jnp.where(_eligible_to_win(seat_status), scores, jnp.int32(-1))
 
         capped = _cap_contributions(committed_total)
         excess = committed_total - capped

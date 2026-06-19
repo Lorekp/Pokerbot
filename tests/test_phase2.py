@@ -44,8 +44,11 @@ def test_distill_loss_finite_on_synthetic(tmp_path, monkeypatch) -> None:
         return [
             {
                 "weva_id": np.int64(i),
+                # cards is required by PseudoSiamesePolicy (encoding v2 added board cards); the real
+                # _collect_distill_rows supplies enc["cards"] of SPEC.card_shape = (9, 4, 13).
+                "cards": np.zeros((9, 4, 13), dtype=np.float32),
                 "actions": np.zeros((6, 4, 12), dtype=np.float32),
-                "position": np.zeros(6, dtype=np.float32),
+                "position": np.zeros(8, dtype=np.float32),   # POLICY_POSITION_DIM (position + spot_scope)
                 "legal_mask": np.ones(11, dtype=bool),
                 "teacher_probs": np.ones(11, dtype=np.float32) / 11.0,
             }

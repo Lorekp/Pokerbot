@@ -65,7 +65,23 @@ def _is_value_fish(prof) -> bool:
     aggression. Unknown / aggressive (lag) / tight (nit, reg) all return False so the caller defers."""
     from pokerbot.opponent.bayes_exploit import aggregate_read
 
-    if prof is None or getattr(prof, "hands", 0) < FISH_MIN_HANDS:
+    if prof is None:
+        return False
+    # HUD-driven path: a server-HUD station (whole-history stats: wtsd/wsd/foldToCbet/...) qualifies even
+    # with few LOCALLY observed hands. Keying only on the derived count fields (FISH_MIN_HANDS) left the
+    # captured-HUD lever (the headline value-extraction signal, population-hud-analysis) inert on the live
+    # path. Require a CONFIDENT, clearly-sticky, weak-showdown read and not a (HUD-)aggressor.
+    if getattr(prof, "hud", None):
+        from pokerbot.opponent.value_sizing import _pct, station_payoff_score
+        hud = prof.hud
+        vpip, pfr = _pct(hud, "vpip"), _pct(hud, "pfr")
+        ftc = _pct(hud, "foldToCbet", "foldtocbet")
+        passive = vpip is not None and pfr is not None and (vpip - pfr) >= 0.25  # big limp/flat gap
+        sticky = ftc is not None and ftc <= 0.40                                 # doesn't fold to c-bets
+        score, conf = station_payoff_score(prof)
+        if conf >= 0.8 and (score >= 0.5 or (passive and sticky)):
+            return True
+    if getattr(prof, "hands", 0) < FISH_MIN_HANDS:
         return False
     fr = aggregate_read(prof, facing="facing_bet")
     if fr is None:
@@ -132,13 +148,21 @@ def _table_too_aggressive(profiles: dict | None, k: int = AGG_KILL_COUNT) -> boo
 
 
 def apply_root_exploit_mixer(state, seat: int, probs: np.ndarray, profiles: dict | None,
-                             *, unopened: bool = False) -> np.ndarray:
+                             *, unopened: bool = False, solver_best_responds: bool = False) -> np.ndarray:
     """Tilt the hero's own policy ``probs`` at ``state``/``seat`` by the villain read.
 
     Reads the villain's RESPONSE context (how they react to a bet when we can bet; how often
     they over-bet when we face one), tilts our policy by ``read.mixer_logits(hand_strength)``
     under the bounded-(alpha) safe mix, and renormalizes over legal actions. No read => probs
-    returned unchanged (safe fallback, keeps the GTO base)."""
+    returned unchanged (safe fallback, keeps the GTO base).
+
+    ``solver_best_responds``: set when the BASE policy already best-responds to the profiled opponent
+    (the pluribus SEARCH vehicle, whose ``solver.opponent_model`` makes hero CFR value-bet the fish
+    internally). The UNOPENED value tilt would then stack a SECOND value push on the same read and
+    over-exploit (the measured negative lean on a homogeneous station table) — so under this flag the
+    value branch DEFERS to the solver, mirroring the facing branch's existing defer-to-search-policy.
+    The heuristic / HybridAgent vehicle has NO solver response (solver_best_responds=False) and keeps
+    the full tilt (its battery-validated +EV path is unchanged)."""
     from pokerbot.agent import _hero_hand_strength
     from pokerbot.opponent.bayes_exploit import (DEFAULT_MAX_ALPHA, aggregate_read, bluff_read,
                                                  context_read)
@@ -191,6 +215,12 @@ def apply_root_exploit_mixer(state, seat: int, probs: np.ndarray, profiles: dict
     # station (see _all_live_villains_fish). This is the do-no-harm guarantee that lets the +1.4 bb/100
     # value-extraction run live: a single lag/reg/nit/unknown in the pot -> defer to the search policy.
     if not facing and not _all_live_villains_fish(state, seat, profiles):
+        return probs
+    # DOUBLE-COUNT GUARD: if the base already best-responds to the read (search vehicle's
+    # solver.opponent_model value-bets the fish internally), the unopened VALUE tilt double-counts ->
+    # over-exploits. Defer the value branch to the solver (the facing branch already defers its
+    # bluff-catch). Off for the heuristic/Hybrid vehicle (no solver response) -> full tilt retained.
+    if not facing and solver_best_responds:
         return probs
     villain_ck = context_key(street, board, 0 if facing else 1)
     read = (context_read(prof, villain_ck) or aggregate_read(prof, facing=target))
@@ -337,3 +367,66 @@ def apply_root_exploit_mixer(state, seat: int, probs: np.ndarray, profiles: dict
             out[0] += extra  # nothing to continue with (shouldn't happen) — keep mass on fold
         out = out / out.sum()
     return out
+
+
+def _overlay_hand_strength(state, seat: int) -> float | None:
+    """Board-aware hero strength for the overlays. Delegates to the SHARED
+    ``value_sizing.overlay_hand_strength`` (one source of truth used live + in the sim battery), so the
+    sim measures exactly the live value/air separation rather than the preflop-rank proxy."""
+    from pokerbot.opponent.value_sizing import overlay_hand_strength
+    return overlay_hand_strength(state, seat)
+
+
+def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict | None,
+                            *, max_alpha: float = 0.7) -> np.ndarray:
+    """LIVE-only HUD value-SIZING / bluff-suppression overlay on the SEARCH base.
+
+    The validated value_sizing overlay (value_sizing.py, +11.9 bb/100 vs stations) lived ONLY on the
+    HybridAgent/battery path; the live LiveSearchAdvisor exploited via the root mixer above, so the
+    headline HUD lever never fired live. This wires it on: vs a confirmed STATION table that is NOT
+    loose-aggressive (the SAME firewalls the root mixer uses), tilt the hero's own value bets toward
+    bigger sizes + cut bluffs, bounded by the alpha-cap. Distinct from the proven-dead bluff-CATCH read
+    mixer (this is sizing, not a frequency call-boost). Returns ``probs`` unchanged when it doesn't fire.
+
+    Env kill-switch ``POKERBOT_LIVE_VALUE_SIZING=0``. The component overlays keep their own switches
+    (POKERBOT_VALUE_SIZING / POKERBOT_BLUFF_SUPPRESS / POKERBOT_RIVER_THIN_VALUE)."""
+    import os
+
+    if os.environ.get("POKERBOT_LIVE_VALUE_SIZING", "1").lower() in ("0", "false", "no", "off"):
+        return probs
+    if profiles is None or probs.sum() <= 0:
+        return probs
+    # FIREWALLS (reuse the root-mixer gates): only vs an all-station table, never vs a lag-heavy one.
+    if _table_too_aggressive(profiles) or not _all_live_villains_fish(state, seat, profiles):
+        return probs
+    prof = _select_profile(profiles, getattr(state, "last_aggressor", None))
+    if prof is None:
+        return probs
+
+    from pokerbot.opponent.mixer import _stats_confidence, safe_mix_policies
+    from pokerbot.opponent.value_sizing import (bluff_suppression_logits, river_thin_value_logits,
+                                                station_payoff_score, value_sizing_logits)
+    from pokerbot.training.self_play import _legal_mask
+
+    # BOARD-AWARE strength (not the preflop-rank proxy): so the value-SIZE escalation never fires on air.
+    hs = _overlay_hand_strength(state, seat)
+    board = [str(c) for c in (getattr(state, "board", None) or [])]
+    overlay = (value_sizing_logits(prof, hs)
+               + bluff_suppression_logits(prof, hs)
+               + river_thin_value_logits(prof, hs, board))
+    if not np.any(overlay):
+        return probs
+
+    legal = np.asarray(_legal_mask(state, seat), dtype=bool)
+    base_logits = np.log(np.clip(probs, 1e-9, 1.0))
+    exploit_logits = base_logits + overlay
+    exploit_logits[~legal] = -1e9            # never let the overlay leak prob onto an illegal action
+    # EXTREMITY-gate the blend weight (mirrors the root mixer's tv-scaling): the live overlay previously
+    # blended at a fixed _stats_confidence*max_alpha, which over-deviates against a marginal/neutral read.
+    # Scale alpha by the station score so a borderline station collapses the tilt toward 0.
+    score, _sconf = station_payoff_score(prof)
+    alpha = _stats_confidence(prof) * float(min(1.0, score))
+    mixed = safe_mix_policies(probs, exploit_logits, alpha, max_alpha=max_alpha)
+    mixed = mixed * legal
+    s = float(mixed.sum())
+    return mixed / s if s > 1e-12 else probs

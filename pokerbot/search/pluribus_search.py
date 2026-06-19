@@ -23,6 +23,7 @@ from ``turbo_rebel_search`` (``apply_context_bias`` / ``apply_opponent_bias`` / 
 from __future__ import annotations
 
 import hashlib
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -68,6 +69,13 @@ class PluribusReBeLConfig:
     blueprint_mix: float = 0.5        # opponent node: (1-mix)*regret_match + mix*blueprint
     client_bet_sizing: bool = True    # use the SAME action abstraction as training (blueprint keys hit)
     search_preflop: bool = False      # Pluribus: serve preflop from blueprint, search postflop only
+    # A1 stack-agnostic preflop: the preflop blueprint is keyed on (hole, position) only and trained at
+    # 100bb, so it is the one engine component that is NOT depth-general (the postflop key + rollout leaf
+    # already key on real stacks / SPR). Trust it ONLY when the effective stack is within this band of its
+    # training depth; OFF-band (deep/short tables), fall through to the depth-general search below instead
+    # of serving an off-depth range. None => always trust (legacy fixed-100bb behaviour). Standard 100bb
+    # tables stay on the fast blueprint path bit-for-bit; only genuinely off-depth tables divert to search.
+    preflop_blueprint_band_bb: tuple[float, float] | None = (80.0, 130.0)
     leaf: ContinuationLeafConfig = field(default_factory=ContinuationLeafConfig)
     # Deterministic per-decision RNG: each solve() seeds its Monte-Carlo stream from a hash of the
     # ROOT'S PUBLIC STATE (and each leaf from its canonical leaf key), so a decision is a pure function
@@ -77,6 +85,16 @@ class PluribusReBeLConfig:
     # isolates genuine exploit-induced deviations. False restores the legacy running-stream behavior.
     per_decision_seed: bool = True
     rng_salt: int = 0                 # mixed into the public-state seed (vary for independent replicas)
+    # CFR+ recency-weighted (linear) strategy averaging: accumulate iteration t's strategy with weight
+    # (t+1) instead of a flat 1.0. This is the averaging half of CFR+ (Tammelin 2014); without it the
+    # served average over-weights the noisy early iterates and converges slower. The final extraction
+    # already normalizes by the accumulated sum, so only the RELATIVE per-iteration weight matters.
+    # Default ON (matches the "CFR+" the solver advertises); set False for the legacy uniform average.
+    # Mirrored in the native (Rust) subgame solve so the statistical-equivalence crosscheck stays green.
+    # Env override POKERBOT_LINEAR_AVERAGING=0/1 (read at import) lets an eval A/B both arms without code
+    # changes (the field default IS the env when present); explicit constructor arg still wins.
+    linear_averaging: bool = field(
+        default_factory=lambda: os.environ.get("POKERBOT_LINEAR_AVERAGING", "1") not in ("0", "false", "False", ""))
     # DBR-style frozen-read response. Two measured facts motivate this: (1) opponent regrets are
     # never updated in this solver (only hero nodes update), so the "regret_match" half of the
     # opponent mix is permanently UNIFORM; (2) the tabular blueprint has ~0% serve-time coverage
@@ -94,6 +112,23 @@ class PluribusReBeLConfig:
     # bit-identical drop-in for apply_action/legal_mask/sample_chance/showdown, so the solve output is
     # byte-unchanged either way — it only changes speed. See pokerbot/search/native_solver.py.
     native: bool | None = None
+
+
+# POKERBOT_NATIVE_SUBGAME: when truthy AND the native SubgameSolver is built AND opponent_model is None
+# (GTO base), the whole CFR subgame solve runs in Rust (one call/decision, no per-node marshaling). The
+# result is STATISTICALLY EQUIVALENT (fast native RNG), not bit-identical. Default OFF => the Python
+# `_cfv` loop below runs unchanged. The exploit tail (opponent_model != None) is NEVER native (firewall).
+_NATIVE_SUBGAME = os.environ.get("POKERBOT_NATIVE_SUBGAME", "0") not in ("0", "", "false", "False")
+
+
+def native_subgame_enabled() -> bool:
+    return _NATIVE_SUBGAME
+
+
+def set_native_subgame(on: bool) -> None:
+    """Runtime toggle for the native CFR subgame fast path (used by the validation harness)."""
+    global _NATIVE_SUBGAME
+    _NATIVE_SUBGAME = bool(on)
 
 
 def _abstraction_masks(client_bet_sizing: bool):
@@ -140,6 +175,7 @@ class PluribusReBeLSolver:
         self._leaf_cache_hits = 0
         self._leaf_counter = 0  # per-leaf CRN offset so distinct leaves get distinct board runouts
         self._leaf_cont_weights: dict[int, np.ndarray] | None = None  # model-aware leaf (per solve)
+        self._budget_bound_count = 0  # per-solver count of decisions cut short by time_budget_ms (S2)
 
     # ------------------------------------------------------------------ keys / masks
     def _abstract(self, mask: np.ndarray, street: int) -> np.ndarray:
@@ -151,6 +187,16 @@ class PluribusReBeLSolver:
     def _legal(self, env, seat: int) -> np.ndarray:
         m = legal_action_mask_np(env, seat).astype(bool)
         return self._abstract(m, int(env.street))
+
+    @staticmethod
+    def _effective_stack_bb(env) -> float:
+        """Effective starting stack in BB = min over in-hand (non-folded) seats of (stack + committed_total).
+        Chips only move from stack to committed within a hand, so the sum is each seat's depth at hand
+        start; the min is the effective depth that caps the action. Used by the A1 preflop-blueprint band."""
+        totals = np.asarray(env.stacks, dtype=np.float64) + np.asarray(env.committed_total, dtype=np.float64)
+        live = (np.asarray(env.seat_status) != SEAT_FOLDED) & (totals > 0)
+        chips = totals[live].min() if live.any() else (totals.max() if totals.size else 100.0 * CHIP_UNIT)
+        return float(chips) / float(CHIP_UNIT)
 
     def _infoset_key(self, env, seat: int) -> str:
         hist_len = int(np.asarray(env.hist_len))
@@ -324,7 +370,9 @@ class PluribusReBeLSolver:
         return out or None
 
     # ------------------------------------------------------------------ CFR recursion
-    def _cfv(self, env, hero: int, depth: int) -> float:
+    def _cfv(self, env, hero: int, depth: int, t: int = 0) -> float:
+        # ``t`` = the (0-based) CFR iteration index, threaded down only to weight the strategy-sum
+        # accumulation (CFR+ linear averaging); it does not affect regrets or the traversal.
         if bool(env.done):
             return float(env.rewards[hero]) / CHIP_UNIT
         # Depth limit = end of current betting round: the next chance node (street deal) is the leaf.
@@ -351,17 +399,20 @@ class PluribusReBeLSolver:
                 a = int(np.flatnonzero(legal)[0])
             else:
                 a = int(self.rng.choice(np.flatnonzero(legal), p=lp / tot))
-            return self._cfv(apply_action_np(env, a), hero, depth + 1)
+            return self._cfv(apply_action_np(env, a), hero, depth + 1, t)
 
         # Hero node: branch all (abstracted-)legal actions, CFR+ regret update.
         strategy = _regret_match(regrets, legal.astype(np.float64))
         action_values = np.zeros(NUM_ACTIONS, dtype=np.float64)
         for a in np.flatnonzero(legal):
-            action_values[a] = self._cfv(apply_action_np(env, int(a)), hero, depth + 1)
+            action_values[a] = self._cfv(apply_action_np(env, int(a)), hero, depth + 1, t)
         ev = float(np.dot(strategy, action_values))
         for a in np.flatnonzero(legal):
             regrets[a] = max(regrets[a] + action_values[a] - ev, 0.0)
-        self._strategy_sum[key] += strategy
+        # CFR+ linear averaging: weight by (t+1) so later (better-converged) iterates dominate the
+        # served average. Flat weight 1.0 = legacy uniform average (extraction normalizes by the sum).
+        weight = float(t + 1) if self.config.linear_averaging else 1.0
+        self._strategy_sum[key] += weight * strategy
         return ev
 
     # ------------------------------------------------------------------ public surface
@@ -378,7 +429,10 @@ class PluribusReBeLSolver:
         s = bp.sum()
         return bp / s if s > 1e-12 else legal.astype(np.float64) / max(legal.sum(), 1)
 
-    def solve(self, root: SubgameRoot, pbs: PBSTracker) -> SolveResult:
+    def solve(self, root: SubgameRoot, pbs: PBSTracker, cancel_event=None) -> SolveResult:
+        # ``cancel_event`` (optional threading.Event): if set mid-solve (e.g. by a live watchdog or the
+        # multitable manager when the table moves on), the iteration loop breaks early and serves the
+        # best average so far. None => only the internal time_budget_ms bounds the solve.
         t0 = time.perf_counter()
         cfg = self.config
         hero = int(root.hero_seat)
@@ -399,22 +453,71 @@ class PluribusReBeLSolver:
             probs = np.zeros(NUM_ACTIONS, dtype=np.float32)
             return SolveResult(action_probs=probs, ev=0.0, iterations=0, metadata={})
 
-        # Pluribus: preflop served directly from the blueprint (no search).
+        # Pluribus: preflop served directly from the blueprint (no search) — but ONLY when the table is
+        # within the blueprint's trained depth band (A1). Off-band (deep/short), fall through to the
+        # depth-general search so we never serve an off-depth 100bb preflop range.
         if int(base_state.street) == 0 and not cfg.search_preflop:
-            probs = self._root_blueprint(base_state, hero, legal).astype(np.float32)
-            return SolveResult(
-                action_probs=probs, ev=0.0, iterations=0,
-                metadata={"served": "blueprint_preflop"},
+            band = cfg.preflop_blueprint_band_bb
+            eff_bb = self._effective_stack_bb(base_state)
+            if band is None or band[0] <= eff_bb <= band[1]:
+                probs = self._root_blueprint(base_state, hero, legal).astype(np.float32)
+                return SolveResult(
+                    action_probs=probs, ev=0.0, iterations=0,
+                    metadata={"served": "blueprint_preflop", "eff_stack_bb": round(eff_bb, 1)},
+                )
+            # else: off-depth preflop -> depth-general search (pot-relative buckets + real-stack leaf).
+
+        # NATIVE FAST PATH (opt-in): run the entire CFR subgame solve in Rust (one call, no per-node
+        # EnvState marshaling). Gated on opponent_model is None (firewall: the exploit tail stays in
+        # Python) and the model-aware leaf being off; the native solve samples opponent holes under a
+        # UNIFORM belief (the eval base arm). Statistically equivalent to the Python loop below.
+        if (self.opponent_model is None and self._leaf_cont_weights is None
+                and native_subgame_enabled()):
+            from pokerbot.engine.jax_weva_encode import _POSTFLOP_NUM_BUCKETS
+            from pokerbot.search import native_solver as _ns
+
+            probs_n = _ns.native_subgame_solve(
+                base_state, hero, self.adapter,
+                public_seed=self._public_seed(base_state, hero),
+                max_iterations=cfg.max_iterations, max_depth=cfg.max_depth,
+                blueprint_mix=cfg.blueprint_mix,
+                rollout_samples=cfg.leaf.rollout_samples,
+                resample_board=cfg.leaf.resample_board,
+                max_playout_depth=cfg.leaf.max_playout_depth,
+                num_buckets=int(_POSTFLOP_NUM_BUCKETS),
+                linear_averaging=bool(cfg.linear_averaging),
             )
+            if probs_n is not None:
+                probs = probs_n * legal
+                probs = probs / max(probs.sum(), 1e-12)
+                return SolveResult(
+                    action_probs=probs.astype(np.float32), ev=0.0,
+                    iterations=int(cfg.max_iterations),
+                    metadata={"served": "search_native"},
+                )
 
         root_key = self._infoset_key(base_state, hero)
         iterations = 0
+        budget_bound = False
         while iterations < cfg.max_iterations:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             if (time.perf_counter() - t0) * 1000.0 >= cfg.time_budget_ms:
+                # Wall-clock budget bound before max_iterations -> the realized average strategy is
+                # machine-speed dependent, breaking the "pure function of public state" determinism/CRN
+                # contract. Count it PER SOLVER (not a one-shot process flag) and surface the count in
+                # metadata so the live decision log sees how often decisions are non-reproducible under
+                # load (set a high time_budget_ms / drive purely by max_iterations for a deterministic serve).
+                budget_bound = True
+                self._budget_bound_count += 1
+                if self._budget_bound_count == 1:
+                    print(f"[search] time_budget_ms={cfg.time_budget_ms} bound at {iterations}/"
+                          f"{cfg.max_iterations} iters — decisions non-reproducible under load "
+                          f"(per-solver count tracked in SolveResult.metadata)", flush=True)
                 break
             sampled_holes = pbs.sample_opponent_holes(self.rng)
             world = self._set_world(base_state, sampled_holes)
-            self._cfv(world, hero, 0)
+            self._cfv(world, hero, 0, iterations)
             iterations += 1
 
         ss = self._strategy_sum.get(root_key)
@@ -435,6 +538,8 @@ class PluribusReBeLSolver:
                 "leaf_eval_count": float(self._leaf_eval_count),
                 "leaf_cache_hits": float(self._leaf_cache_hits),
                 "budget_used_ms": budget_ms,
+                "budget_bound": budget_bound,
+                "budget_bound_count": float(self._budget_bound_count),
                 "served": "search",
             },
         )

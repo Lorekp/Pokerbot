@@ -547,26 +547,138 @@ class CounterExploiterBot(_HSBotBase):
         return self._take(legal, ActionType.CHECK, ActionType.FOLD)
 
 
+def _street_giveup(state: GameState) -> float:
+    """Bluff-frequency multiplier emulating PRO give-up discipline: bluff more on early streets,
+    barrel-give-up later. The caricature/HS bots bluff at a street-flat rate (over-bluffs rivers,
+    which a competent reg never does); a pro tapers."""
+    return {"PREFLOP": 1.0, "FLOP": 1.0, "TURN": 0.7, "RIVER": 0.45}.get(state.street.name, 1.0)
+
+
+class HSProBalancedBot(_HSBotBase):
+    """PROFESSIONAL balanced reg (G5 strong reference): polarized, range-aware, and HARD to exploit.
+
+    Unlike the HS archetypes (which leak a one-sided tilt the engine feasts on), this bot is balanced
+    in the GTO sense:
+      * value-bets a strong range AND a CALIBRATED bluff fraction drawn ONLY from the very bottom
+        (air with no showdown) -- never the medium hands, which it check-calls as bluff-catchers;
+      * defends vs bets at an MDF-like threshold (folds the bottom, continues enough to deny a pure
+        steal), so over-folding it does not work;
+      * tapers its bluffs by street (give-up discipline) so barreling thin air does not auto-profit.
+
+    The exploit engine should extract ~0 here without leaking (do-no-harm), and the RNR cap must keep
+    it from over-adjusting -- this is the balanced counterpart to CounterExploiterBot's adversary."""
+
+    pre_fold_hs = 0.46
+    value_bet_hs = 0.62
+    value_bet_freq = 0.72
+    bluff_top_hs = 0.22          # only the BOTTOM (hs below this) is ever turned into a bluff
+    bluff_bet_freq = 0.28
+    call_defend_hs = 0.40        # MDF-ish bluff-catch floor vs a bet
+    raise_value_hs = 0.80
+    raise_value_freq = 0.45
+    checkraise_bluff_freq = 0.08  # rare, polarized check-raise bluff from the bottom
+
+    def __call__(self, state: GameState) -> Action:
+        seat = state.action_seat
+        hs = _hand_strength(state, seat)
+        legal = state.legal_actions()
+        types = {a.action_type for a in legal}
+        gv = _street_giveup(state)
+        if state.street.name == "PREFLOP" and hs < self.pre_fold_hs and ActionType.CALL in types:
+            return self._take(legal, ActionType.FOLD)
+        if ActionType.CALL in types:                       # facing a bet/raise
+            if hs > self.raise_value_hs and self.rng.random() < self.raise_value_freq:
+                return _pick_bet(state, aggressive=False)   # value raise
+            if hs > self.call_defend_hs:
+                return self._take(legal, ActionType.CALL)   # bluff-catch / continue (denies the steal)
+            if hs < self.bluff_top_hs and self.rng.random() < self.checkraise_bluff_freq * gv:
+                return _pick_bet(state, aggressive=True)     # balanced polarized bluff-raise
+            return self._take(legal, ActionType.FOLD)
+        # unopened: polarized value + a calibrated bottom-range bluff, check the medium
+        if hs > self.value_bet_hs and self.rng.random() < self.value_bet_freq:
+            return _pick_bet(state, aggressive=False)
+        if hs < self.bluff_top_hs and self.rng.random() < self.bluff_bet_freq * gv:
+            return _pick_bet(state, aggressive=False)
+        return self._take(legal, ActionType.CHECK, ActionType.FOLD)
+
+
+class HSProAggroBot(_HSBotBase):
+    """PROFESSIONAL aggressive reg (G5 strong reference): disciplined LAG with a BALANCED 3bet/barrel
+    range. It punishes passivity and over-folding -- but with a REAL polarized range, not random air:
+      * 3bets/raises for value AND a controlled fraction of pure bottom-range air (light 3bets),
+        while FOLDING the capped middle (range discipline a maniac lacks);
+      * barrels with balance and tapers bluffs by street;
+      * still defends correctly vs aggression.
+
+    Versus hs_lag (loose, undisciplined) this is the version a winning reg actually plays. It is the
+    honest test of the RNR counter-exploitation cap: reacting to its pressure by over-folding loses,
+    and over-bluff-catching also loses, because its aggression is balanced."""
+
+    pre_fold_hs = 0.40
+    raise_value_hs = 0.66
+    raise_value_freq = 0.60
+    bluff_top_hs = 0.26          # light-3bet/bluff only from the bottom
+    bluff_raise_freq = 0.22
+    call_defend_hs = 0.38
+    bet_value_hs = 0.50
+    bet_value_freq = 0.78
+    barrel_bluff_freq = 0.34
+
+    def __call__(self, state: GameState) -> Action:
+        seat = state.action_seat
+        hs = _hand_strength(state, seat)
+        legal = state.legal_actions()
+        types = {a.action_type for a in legal}
+        gv = _street_giveup(state)
+        if state.street.name == "PREFLOP" and hs < self.pre_fold_hs and ActionType.CALL in types:
+            # capped-middle discipline: fold the weak-but-not-bluff hands rather than spew
+            if not (hs < self.bluff_top_hs and self.rng.random() < self.bluff_raise_freq):
+                return self._take(legal, ActionType.FOLD)
+        if ActionType.CALL in types:                       # facing
+            if hs > self.raise_value_hs and self.rng.random() < self.raise_value_freq:
+                return _pick_bet(state, aggressive=True)    # value 3bet/raise
+            if hs < self.bluff_top_hs and self.rng.random() < self.bluff_raise_freq * gv:
+                return _pick_bet(state, aggressive=True)    # balanced light 3bet/bluff-raise
+            if hs > self.call_defend_hs:
+                return self._take(legal, ActionType.CALL)
+            return self._take(legal, ActionType.FOLD)
+        if hs > self.bet_value_hs and self.rng.random() < self.bet_value_freq:
+            return _pick_bet(state, aggressive=True)        # wide-but-real value barrel
+        if hs < self.bluff_top_hs and self.rng.random() < self.barrel_bluff_freq * gv:
+            return _pick_bet(state, aggressive=True)        # tapered bluff barrel
+        return self._take(legal, ActionType.CHECK, ActionType.FOLD)
+
+
 _BLUEPRINT_SNAPSHOT_CACHE: dict = {}
 
 
 def _load_blueprint_snapshot():
-    """Lazy module-level snapshot for BlueprintBot (env POKERBOT_BLUEPRINT_SNAPSHOT or the v2
-    default). Loaded once per process; per-hand bot construction stays cheap."""
+    """Lazy module-level snapshot for BlueprintBot (env POKERBOT_BLUEPRINT_SNAPSHOT or the default).
+    Loaded once per process; per-hand bot construction stays cheap.
+
+    DEFAULT = the lossless-preflop ship candidate ``bp6max_lossless2_iter200.pkl``. Certified by the
+    25k-hand AWS LBR6 suite ``run_lbr6_oldnew1`` (cell3): fc-floor best-responder = -13.2 bb/100
+    [-43, +16] vs blueprint+search WITH ``search_preflop=ON`` — a robust ~55 bb/100 improvement on the
+    old weva ``bp6max_v2`` (-68.6). CRITICAL: this blueprint is BEATABLE served WITHOUT preflop search
+    (cell2 fc pf=OFF = +95.9, cell4 fcpa pf=OFF = +103.7), so the serve MUST keep ``search_preflop=ON``
+    (the deployed default) AND ``POKERBOT_PREFLOP_LOSSLESS=1`` set before importing pokerbot."""
     import os
     import pickle
 
     path = os.environ.get("POKERBOT_BLUEPRINT_SNAPSHOT",
-                          r"checkpoints/bp6max_v2_iter200.pkl")
+                          r"checkpoints/bp6max_lossless2_iter200.pkl")
     if path not in _BLUEPRINT_SNAPSHOT_CACHE:
         with open(path, "rb") as f:
             snap = pickle.load(f)
         if isinstance(snap, dict) and "strat_sum" in snap:
-            # Cross-check the serve abstraction against the stamp the trainer wrote (catch flag skew
-            # loudly — a mismatch silently misses every key). No stamp ⇒ legacy snapshot, env-only check.
+            # Cross-check the serve abstraction against the stamp the trainer wrote. A STAMPED snapshot
+            # (the lossless era) is checked STRICTLY — serving it under the wrong encoder flags silently
+            # misses every affected node and plays a beatable strategy, so we raise rather than warn.
+            # An unstamped (legacy weva) snapshot keeps the lenient env-only warn for back-compat.
             from pokerbot.eval.lbr import check_blueprint_serve_env
 
-            check_blueprint_serve_env(expected=snap.get("abstraction"))
+            stamp = snap.get("abstraction")
+            check_blueprint_serve_env(expected=stamp, strict=stamp is not None)
             snap = snap["strat_sum"]
         _BLUEPRINT_SNAPSHOT_CACHE[path] = snap
     return _BLUEPRINT_SNAPSHOT_CACHE[path]
@@ -636,6 +748,10 @@ def build_bot(name: str, rng: random.Random | None = None, model=None, device: s
         return AdaptiveBRBot(rng)
     if name == "counter_exploiter":
         return CounterExploiterBot(rng)
+    if name == "pro_balanced":
+        return HSProBalancedBot(rng, **(params or {}))
+    if name == "pro_aggro":
+        return HSProAggroBot(rng, **(params or {}))
     if name == "blueprint":
         return BlueprintBot(rng)
     if name == "alpha_hu":

@@ -9,6 +9,10 @@
 //! is native.
 
 pub mod core;
+pub mod fingerprint;
+pub mod phe_tables;
+pub mod playout;
+pub mod subgame;
 
 #[cfg(test)]
 mod tests;
@@ -154,10 +158,14 @@ pub mod flat {
 
 #[cfg(feature = "python")]
 mod py {
-    use crate::core::{self, MAX_BOARD, NUM_PLAYERS};
+    use crate::core::{self, MAX_BOARD, NUM_ACTIONS, NUM_PLAYERS};
+    use crate::fingerprint;
     use crate::flat;
+    use crate::playout::{self, Blueprint, PlayoutConfig};
+    use crate::subgame::{self, SubgameConfig};
     use pyo3::prelude::*;
-    use pyo3::types::PyBytes;
+    use pyo3::types::{PyBytes, PyDict};
+    use std::collections::HashMap;
 
     // The state buffer is marshaled as raw little-endian i64 bytes (numpy `arr.tobytes()` -> here,
     // and a returned `bytes` -> `np.frombuffer(..., np.int64)` on the Python side). This is a single
@@ -243,6 +251,207 @@ mod py {
         core::compute_returns(&h, &b, &ss, &ct, button, n_showdown).to_vec()
     }
 
+    /// `fingerprint_fast(state_bytes, seat, num_buckets)` -> 16-byte digest. Byte-identical to the
+    /// Python `pokerbot.engine.jax_weva_fast.fingerprint_fast` for the bounded eval config.
+    #[pyfunction]
+    fn fingerprint_fast<'py>(
+        py: Python<'py>,
+        state: &[u8],
+        seat: usize,
+        num_buckets: i32,
+    ) -> Bound<'py, PyBytes> {
+        let s = flat::from_flat(&bytes_to_flat(state));
+        let d = fingerprint::fingerprint_fast(&s, seat, num_buckets);
+        PyBytes::new(py, &d)
+    }
+
+    /// `eval_seven_phe(cards)` -> phevaluator 1..7462 rank for 5..7 card ids (cross-check helper).
+    #[pyfunction]
+    fn eval_seven_phe(cards: Vec<i32>) -> i32 {
+        fingerprint::evaluate_cards(&cards)
+    }
+
+    /// Native uniform-mode continuation leaf engine. Holds the blueprint + config ONCE per worker;
+    /// `leaf_value` runs the rollout for a depth-limit state with no per-step Python marshaling.
+    #[pyclass]
+    struct PlayoutEngine {
+        bp: Blueprint,
+        cfg: PlayoutConfig,
+    }
+
+    #[pymethods]
+    impl PlayoutEngine {
+        /// blueprint: dict[bytes(16) -> sequence[float] len 11]; abstraction masks len 11.
+        #[new]
+        fn new(
+            blueprint: &Bound<'_, PyDict>,
+            allowed_pre: Vec<bool>,
+            allowed_post: Vec<bool>,
+            bias_mult: f64,
+            bias_floor: f64,
+            max_depth: i32,
+            num_buckets: i32,
+        ) -> PyResult<Self> {
+            let mut bp: Blueprint = HashMap::with_capacity(blueprint.len());
+            for (k, v) in blueprint.iter() {
+                let kb: &[u8] = k.extract()?;
+                if kb.len() != 16 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "blueprint key must be 16 bytes",
+                    ));
+                }
+                let mut key = [0u8; 16];
+                key.copy_from_slice(kb);
+                let row: Vec<f64> = v.extract()?;
+                if row.len() != NUM_ACTIONS {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "blueprint row must have 11 entries",
+                    ));
+                }
+                let mut r = [0.0f64; NUM_ACTIONS];
+                r.copy_from_slice(&row[..NUM_ACTIONS]);
+                bp.insert(key, r);
+            }
+            let mut ap = [false; NUM_ACTIONS];
+            let mut po = [false; NUM_ACTIONS];
+            for a in 0..NUM_ACTIONS {
+                ap[a] = *allowed_pre.get(a).unwrap_or(&false);
+                po[a] = *allowed_post.get(a).unwrap_or(&false);
+            }
+            Ok(PlayoutEngine {
+                bp,
+                cfg: PlayoutConfig {
+                    allowed_pre: ap,
+                    allowed_post: po,
+                    bias_mult,
+                    bias_floor,
+                    max_depth,
+                    num_buckets,
+                },
+            })
+        }
+
+        fn n_keys(&self) -> usize {
+            self.bp.len()
+        }
+
+        /// Uniform-mode continuation leaf value (hero bb) for a depth-limit state.
+        fn leaf_value(
+            &self,
+            state: &[u8],
+            hero: usize,
+            base_seed: u64,
+            rollout_samples: i32,
+            resample_board: bool,
+        ) -> f64 {
+            let s = flat::from_flat(&bytes_to_flat(state));
+            playout::uniform_leaf_value(
+                &s,
+                hero,
+                &self.bp,
+                &self.cfg,
+                base_seed,
+                rollout_samples,
+                resample_board,
+            )
+        }
+    }
+
+    /// Native depth-limited CFR subgame solver (GTO-base / opponent_model=None path). Holds the
+    /// blueprint + abstraction config ONCE; `solve` runs the whole CFR loop (hole sampling, recursion,
+    /// regret-matching, blueprint mix, continuation-gadget leaf) natively and returns the root action
+    /// probabilities — no per-node Python marshaling. See `subgame.rs`.
+    #[pyclass]
+    struct SubgameSolver {
+        bp: Blueprint,
+        cfg: PlayoutConfig,
+    }
+
+    #[pymethods]
+    impl SubgameSolver {
+        /// Same construction as `PlayoutEngine`: blueprint dict + abstraction masks + leaf knobs.
+        /// `leaf_max_depth` bounds the per-leaf rollout (PlayoutConfig.max_depth); the CFR
+        /// betting-recursion depth is passed per-call to `solve`.
+        #[new]
+        fn new(
+            blueprint: &Bound<'_, PyDict>,
+            allowed_pre: Vec<bool>,
+            allowed_post: Vec<bool>,
+            bias_mult: f64,
+            bias_floor: f64,
+            leaf_max_depth: i32,
+            num_buckets: i32,
+        ) -> PyResult<Self> {
+            let mut bp: Blueprint = HashMap::with_capacity(blueprint.len());
+            for (k, v) in blueprint.iter() {
+                let kb: &[u8] = k.extract()?;
+                if kb.len() != 16 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "blueprint key must be 16 bytes",
+                    ));
+                }
+                let mut key = [0u8; 16];
+                key.copy_from_slice(kb);
+                let row: Vec<f64> = v.extract()?;
+                if row.len() != NUM_ACTIONS {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "blueprint row must have 11 entries",
+                    ));
+                }
+                let mut r = [0.0f64; NUM_ACTIONS];
+                r.copy_from_slice(&row[..NUM_ACTIONS]);
+                bp.insert(key, r);
+            }
+            let mut ap = [false; NUM_ACTIONS];
+            let mut po = [false; NUM_ACTIONS];
+            for a in 0..NUM_ACTIONS {
+                ap[a] = *allowed_pre.get(a).unwrap_or(&false);
+                po[a] = *allowed_post.get(a).unwrap_or(&false);
+            }
+            Ok(SubgameSolver {
+                bp,
+                cfg: PlayoutConfig {
+                    allowed_pre: ap,
+                    allowed_post: po,
+                    bias_mult,
+                    bias_floor,
+                    max_depth: leaf_max_depth,
+                    num_buckets,
+                },
+            })
+        }
+
+        fn n_keys(&self) -> usize {
+            self.bp.len()
+        }
+
+        /// Solve the depth-limited subgame rooted at `state` for `hero`; returns 11 root action probs.
+        #[allow(clippy::too_many_arguments)]
+        fn solve(
+            &self,
+            state: &[u8],
+            hero: usize,
+            public_seed: u64,
+            max_iterations: i32,
+            max_depth: i32,
+            blueprint_mix: f64,
+            rollout_samples: i32,
+            resample_board: bool,
+            linear_averaging: bool,
+        ) -> Vec<f64> {
+            let s = flat::from_flat(&bytes_to_flat(state));
+            let scfg = SubgameConfig {
+                max_iterations,
+                max_depth,
+                blueprint_mix,
+                rollout_samples,
+                resample_board,
+                linear_averaging,
+            };
+            subgame::solve(&s, hero, &self.bp, &self.cfg, &scfg, public_seed).to_vec()
+        }
+    }
+
     /// Flat buffer length + engine dims, for the wrapper's startup self-check.
     #[pyfunction]
     fn engine_dims() -> (usize, usize, usize, usize, usize) {
@@ -264,6 +473,10 @@ mod py {
         m.add_function(wrap_pyfunction!(evaluate_seven, m)?)?;
         m.add_function(wrap_pyfunction!(compute_returns, m)?)?;
         m.add_function(wrap_pyfunction!(engine_dims, m)?)?;
+        m.add_function(wrap_pyfunction!(fingerprint_fast, m)?)?;
+        m.add_function(wrap_pyfunction!(eval_seven_phe, m)?)?;
+        m.add_class::<PlayoutEngine>()?;
+        m.add_class::<SubgameSolver>()?;
         Ok(())
     }
 }

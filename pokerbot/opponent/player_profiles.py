@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 
 from pokerbot.opponent.context import (
@@ -159,60 +160,98 @@ def _derive_bluffs(actions: list, board: list | None, shown: list | None) -> dic
     return out
 
 
+def _aggressive_idxs(actions: list[dict]) -> set[int]:
+    """Indices of actions that are GENUINE aggression (a bet, or a raise/all-in that INCREASES the
+    wager). An all-in is aggressive only when it exceeds the current street bet — a short-stack all-in
+    CALL just matches the bet and must NOT inflate PFR / 3-bet / aggression-factor for a passive player.
+    Blinds/antes/calls advance the running street bet but are not aggression."""
+    out: set[int] = set()
+    street_max: dict[str, float] = {}
+    for i, a in enumerate(actions):
+        t, s = a.get("type"), a.get("street")
+        amt = float(a.get("amount") or 0.0)
+        prev = street_max.get(s, 0.0)
+        if t in ("bet", "raise"):
+            out.add(i)
+            street_max[s] = max(prev, amt)
+        elif t == "all_in":
+            if amt > prev + 1e-9:      # all-in RAISE (exceeds the standing bet) -> aggression
+                out.add(i)
+                street_max[s] = amt
+            # else: all-in CALL -> matches the bet, not aggression
+        elif t in ("call", "sb", "bb", "ante", "post"):
+            street_max[s] = max(prev, amt)
+    return out
+
+
 def derive_hand_stats(record: dict) -> dict[str, dict]:
     """Per-player per-hand stat increments from a recorded hand (hand_recorder schema).
 
     Returns ``{player_key: {field: increment}}`` matching OpponentStats fields. player_key
     is the str(user_id) when present, else ``name:<username>`` so anonymous tables still
-    aggregate per seat-name. Hero is included too (harmless; lets us self-track).
+    aggregate per seat-name. Hero is included too (harmless; the mixer only reads opponent-seat keys).
     """
     actions = record.get("actions") or []
-    # group actions by player key, preserving order
-    by_player: dict[str, list[dict]] = {}
+    aggr = _aggressive_idxs(actions)     # genuine-aggression action indices (all-in CALL excluded)
+    # group actions (with their global index) by player key, preserving order
+    by_player: dict[str, list[tuple[int, dict]]] = {}
     keys_seen: dict[str, str] = {}  # player_key -> display name
-    for a in actions:
+    for i, a in enumerate(actions):
         key = _player_key(a.get("user_id"), a.get("name"))
         if key is None:
             continue
-        by_player.setdefault(key, []).append(a)
+        by_player.setdefault(key, []).append((i, a))
         keys_seen[key] = a.get("name") or keys_seen.get(key)
 
-    # 3-bet per player: their first preflop raise happened after >=1 prior (re)raise.
-    # Walk the global preflop sequence once, counting voluntary raises before each.
+    # 3-bet per player: their first preflop AGGRESSION happened after >=1 prior (re)raise.
     three_bettors: set[str] = set()
     pre_raises_so_far = 0
-    for a in actions:
+    for i, a in enumerate(actions):
         if a.get("street") != "preflop":
             continue
         key = _player_key(a.get("user_id"), a.get("name"))
-        if a.get("type") in ("raise", "all_in"):
+        if i in aggr:                    # genuine raise (not an all-in call)
             if pre_raises_so_far >= 1 and key is not None:
                 three_bettors.add(key)
             pre_raises_so_far += 1
 
     flop_seen = len(record.get("board") or []) >= 3
+    # First flop AGGRESSION = the c-bet, for fold-to-cbet attribution (who bet, who folded to it).
+    flop_cbet = next(((i, actions[i]) for i in sorted(aggr) if actions[i].get("street") == "flop"), None)
+    cbet_idx = flop_cbet[0] if flop_cbet else None
+    cbet_key = _player_key(flop_cbet[1].get("user_id"), flop_cbet[1].get("name")) if flop_cbet else None
     # Per-format hand split (v7). Legacy records (no table.format) predate the tag and were cash/AoF;
     # AoF routes to a separate store, so an untagged NLHE record is treated as cash.
     is_tourney = (record.get("table") or {}).get("format") == "tournament"
     contexts = _derive_contexts(actions, record.get("board"))
     bluffs = _derive_bluffs(actions, record.get("board"), record.get("shown"))
     out: dict[str, dict] = {}
-    for key, acts in by_player.items():
-        pre = [a for a in acts if a.get("street") == "preflop"]
-        postflop = [a for a in acts if a.get("street") in ("flop", "turn", "river")]
+    for key, iacts in by_player.items():
+        acts = [a for _, a in iacts]
+        idxs = {i for i, _ in iacts}
+        pre = [a for _, a in iacts if a.get("street") == "preflop"]
+        postflop = [a for _, a in iacts if a.get("street") in ("flop", "turn", "river")]
         atypes = [a.get("type") for a in acts]
+        pre_idxs = [i for i, a in iacts if a.get("street") == "preflop"]
 
         vpip = any(t in ("call", "bet", "raise", "all_in") for t in (a.get("type") for a in pre))
-        pfr = any(t in ("raise", "bet", "all_in") for t in (a.get("type") for a in pre))
+        pfr = any(i in aggr for i in pre_idxs)                  # genuine preflop aggression (not all-in call)
         three_bet = key in three_bettors
         saw_flop = bool(postflop) or (flop_seen and not _folded_preflop(pre))
-        wtsd = bool(record.get("winners")) and not _folded(atypes) and len(record.get("board") or []) >= 5
-        bet_or_raise = sum(1 for t in atypes if t in ("bet", "raise", "all_in"))
+        # WTSD: of hands where the player saw the flop, did they reach showdown (board complete, not
+        # folded)? Keyed on saw_flop (the standard denominator), NOT on the winners-capture succeeding.
+        wtsd = saw_flop and len(record.get("board") or []) >= 5 and not _folded(atypes)
+        bet_or_raise = sum(1 for i in idxs if i in aggr)        # aggression-factor numerator (true raises)
         calls = sum(1 for t in atypes if t == "call")
-        # fold-to-cbet: folded on the flop (proxy; true cbet attribution needs aggressor tracking)
-        flop_acts = [a for a in acts if a.get("street") == "flop"]
-        cbet_faced = bool(flop_acts)
-        fold_to_cbet = any(a.get("type") == "fold" for a in flop_acts)
+        # fold-to-cbet, aggressor-attributed: did this player face the flop c-bet (a flop aggression by
+        # SOMEONE ELSE, before their flop action) and fold to it? Excludes the c-bettor and check-throughs.
+        cbet_faced = False
+        fold_to_cbet = False
+        if cbet_idx is not None and cbet_key != key:
+            post_cbet = [a for i, a in iacts if a.get("street") == "flop" and i > cbet_idx]
+            if post_cbet:
+                cbet_faced = True
+                fold_to_cbet = any(a.get("type") == "fold" for a in post_cbet)
 
         out[key] = {
             "hands": 1,
@@ -258,13 +297,29 @@ class PlayerProfileStore:
         self.path = Path(path)
         self.profiles: dict[str, OpponentStats] = {}
         self.names: dict[str, str] = {}  # key -> last seen display name
-        self.seen_hands: set[str] = set()  # hand_ids already folded in (idempotency)
+        # O4 name<->uid reconciliation: name:<name> -> canonical str(user_id), learned whenever a seat
+        # shows BOTH a uid and a name in one hand. A later hand that carries only the name (the feed
+        # sometimes drops the uid) then folds into the SAME profile instead of a split-brain `name:` twin.
+        self.alias: dict[str, str] = {}
+        # Idempotency ledger as an INSERTION-ORDERED set (dict keys): the cap prune keeps the most
+        # RECENTLY folded-in ids, not the lexicographically-largest (which, with per-room-namespaced
+        # `room:hid` keys, would drop a whole room's ids regardless of recency and re-count them).
+        self.seen_hands: dict[str, None] = {}
+        # Reentrant lock: in live MULTITABLING each table runs on its own Frida message thread and they
+        # all share ONE store. Without this, a get()/update_from_hand() mutating self.profiles while
+        # save() iterates it raises "dict changed size during iteration" / writes a torn snapshot. RLock
+        # (not Lock) because the mutators nest — update_from_hand -> get/seed_from_hud, save_throttled ->
+        # save. Single-thread callers pay an uncontended lock (negligible).
+        self._lock = threading.RLock()
         self._dirty = False
         # G6 crash journal: every update_from_hand APPENDS the raw record to <path>.wal.jsonl
         # (cheap, immediate); load() replays anything newer than the snapshot (idempotent by
         # hand_id); save() truncates it. A kill between saves loses nothing.
         self._wal_enabled = wal
         self._wal_replaying = False
+        # WAL appends use their OWN lock (not the main RLock) so a disk append/flush never blocks a
+        # decision-thread read of self.profiles under self._lock.
+        self._wal_lock = threading.Lock()
         self._updates_since_save = 0
         self._last_save_ts = 0.0
         self.load()
@@ -332,12 +387,17 @@ class PlayerProfileStore:
             self.profiles[key] = s
             if d.get("name"):
                 self.names[key] = d["name"]
-        self.seen_hands = set(raw.get("seen_hands") or [])
+        self.seen_hands = dict.fromkeys(raw.get("seen_hands") or [])  # insertion-ordered set
+        self.alias = dict(raw.get("alias") or {})  # name:<name> -> canonical uid key (O4; absent => empty)
 
     def save(self) -> None:
+        with self._lock:
+            self._save_impl()
+
+    def _save_impl(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if len(self.seen_hands) > SEEN_HANDS_CAP:  # cap the ledger; keep the newest ids
-            self.seen_hands = set(sorted(self.seen_hands)[-SEEN_HANDS_CAP:])
+        if len(self.seen_hands) > SEEN_HANDS_CAP:  # cap the ledger; keep the most-recently-added ids
+            self.seen_hands = dict.fromkeys(list(self.seen_hands)[-SEEN_HANDS_CAP:])
         payload = {
             "schema_version": SCHEMA_VERSION,
             "profiles": {
@@ -359,8 +419,12 @@ class PlayerProfileStore:
                 }
                 for key, s in self.profiles.items()
             },
-            # idempotency ledger; grows with hands — prune or migrate to sqlite at large scale
-            "seen_hands": sorted(self.seen_hands),
+            # idempotency ledger in INSERTION order (recency) so the cap prune across restarts is
+            # chronological, not lexicographic; grows with hands -> migrate to sqlite at large scale
+            "seen_hands": list(self.seen_hands),
+            # O4 name->uid alias map so reconciliation survives a restart (a later name-only hand keeps
+            # resolving to the uid profile); only emitted when non-empty to keep cold files compact.
+            **({"alias": self.alias} if self.alias else {}),
         }
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=0), encoding="utf-8")
@@ -388,39 +452,122 @@ class PlayerProfileStore:
         to one WAL append (the journal makes the throttle lossless). Returns True if it saved."""
         import time
 
-        if not self._dirty:
+        with self._lock:
+            if not self._dirty:
+                return False
+            if (self._updates_since_save >= min_hands
+                    or time.monotonic() - self._last_save_ts >= min_seconds):
+                self.save()
+                return True
             return False
-        if (self._updates_since_save >= min_hands
-                or time.monotonic() - self._last_save_ts >= min_seconds):
-            self.save()
-            return True
-        return False
 
     def get(self, key: str) -> OpponentStats:
-        if key not in self.profiles:
-            self.profiles[key] = OpponentStats()
-        return self.profiles[key]
+        with self._lock:
+            if key not in self.profiles:
+                self.profiles[key] = OpponentStats()
+            return self.profiles[key]
+
+    def snapshot(self, key: str) -> OpponentStats:
+        """A DEEP copy of a player's stats taken UNDER the lock, for cross-thread readers. The live mixer
+        reads a villain's profile on a decision thread while another table's recorder thread may be
+        mutating that same object's ctx_*/hud dicts in place; a shallow ``copy.copy(get(...))`` outside the
+        lock both races the mutation (can raise 'dict changed size') and aliases the still-mutating dicts.
+        ``deepcopy`` under the lock is the safe, self-contained snapshot."""
+        import copy as _copy
+        with self._lock:
+            if key not in self.profiles:
+                self.profiles[key] = OpponentStats()
+            return _copy.deepcopy(self.profiles[key])
+
+    def _canonical_key(self, key: str) -> str:
+        """Resolve a name-only key to its canonical uid key when an alias is known (O4)."""
+        return self.alias.get(key, key) if key.startswith("name:") else key
+
+    def _learn_aliases(self, record: dict) -> None:
+        """O4: remember name:<name> -> str(user_id) for every seat that shows BOTH this hand, and fold
+        any name-only profile that accreted BEFORE the uid was first seen into the uid profile once."""
+        for a in record.get("actions") or []:
+            uid, nm = a.get("user_id"), a.get("name")
+            if not (uid and nm):
+                continue
+            ukey, nkey = str(uid), f"name:{nm}"
+            if self.alias.get(nkey) == ukey:
+                continue
+            self.alias[nkey] = ukey
+            self.names.setdefault(ukey, nm)
+            orphan = self.profiles.pop(nkey, None)  # pre-uid name-only history -> merge into the uid
+            if orphan is not None:
+                self._merge_stats(self.get(ukey), orphan)
+                self.names.pop(nkey, None)
+
+    @staticmethod
+    def _merge_stats(dst: OpponentStats, src: OpponentStats) -> None:
+        """Fold one profile's aggregates into another (O4 orphan reconciliation). Cumulative counts add;
+        discounted/last-hand markers take the max (they self-heal over subsequent hands); the HUD prior
+        fills only if the destination has none. A rare, one-shot event, so approximate discounting is fine."""
+        for f in _STAT_FIELDS:
+            setattr(dst, f, int(getattr(dst, f, 0)) + int(getattr(src, f, 0)))
+        for ck, row in src.ctx_counts.items():
+            dst.add_ctx(ck, row)
+        for attr in ("ctx_fast", "ctx_slow", "ctx_bluff"):
+            d, sm = getattr(dst, attr), getattr(src, attr)
+            for ck, row in sm.items():
+                cur = d.get(ck)
+                if cur is None:
+                    d[ck] = list(row)
+                else:
+                    for i in range(min(len(cur), len(row))):
+                        cur[i] += row[i]
+        for attr in ("ctx_last", "ctx_runlen", "ctx_bluff_last"):
+            d, sm = getattr(dst, attr), getattr(src, attr)
+            for ck, v in sm.items():
+                d[ck] = max(d.get(ck, 0), v)
+        if not dst.hud and src.hud:
+            dst.hud = dict(src.hud)
 
     def confidence(self, key: str) -> float:
-        return min(1.0, self.get(key).hands / 50.0)
+        s = self.get(key)
+        base = min(1.0, s.hands / 50.0)
+        # A server-HUD station (whole-history stats) is high-confidence even with few locally observed
+        # hands -> floor it (matches mixer._stats_confidence) so the captured HUD lever isn't zeroed.
+        if getattr(s, "hud", None) and len(s.hud) >= 3:
+            return max(base, 0.6)
+        return base
 
     def update_from_hand(self, record: dict) -> int:
+        # Crash-journal the raw record FIRST, under a DEDICATED lock (not the main RLock) so the disk
+        # append/flush never stalls a decision-thread read of self.profiles. A duplicate that slips
+        # through is harmless — WAL replay dedups by hand_id. Skipped during replay (reading, not extending).
+        if self._wal_enabled and not self._wal_replaying:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                line = json.dumps(record, ensure_ascii=False) + "\n"
+                with self._wal_lock, open(self.wal_path, "a", encoding="utf-8") as wf:
+                    wf.write(line)
+            except (OSError, TypeError):
+                pass
+        with self._lock:
+            return self._update_from_hand_impl(record)
+
+    def _update_from_hand_impl(self, record: dict) -> int:
         """Fold one recorded hand into the per-player aggregates. Idempotent by hand_id —
         re-folding the same hand (restart, log reprocessing) is a no-op. Returns players updated."""
         hid = record.get("hand_id")
         if hid:
-            if hid in self.seen_hands:
+            # Per-table dedup key: in live multitabling two tables can share a server hand id, so
+            # namespace by the stable room key when the record carries one (live recorder stamps it) so
+            # table B's hand isn't dropped as a dup of table A's. Records with NO room_key (legacy /
+            # pre-upgrade WAL) keep the raw id -> idempotent across the upgrade and on WAL replay (the
+            # room_key is persisted in the record, so a replayed hand recomputes the same key).
+            room_key = (record.get("table") or {}).get("room_key")
+            dkey = f"{room_key}:{hid}" if room_key else str(hid)
+            if dkey in self.seen_hands:
                 return 0
-            self.seen_hands.add(hid)
-        if self._wal_enabled and not self._wal_replaying:
-            try:  # crash journal first — the cheap append makes the throttled snapshot lossless
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                with open(self.wal_path, "a", encoding="utf-8") as wf:
-                    wf.write(json.dumps(record, ensure_ascii=False) + "\n")
-            except (OSError, TypeError):
-                pass
+            self.seen_hands[dkey] = None     # insertion-ordered set add
+        self._learn_aliases(record)  # O4: map name:<name> -> uid (+ merge any pre-uid orphan) first
         increments = derive_hand_stats(record)
         for key, inc in increments.items():
+            key = self._canonical_key(key)  # fold a name-only seat into its uid profile when known
             s = self.get(key)
             for f in _STAT_FIELDS:
                 setattr(s, f, getattr(s, f) + int(inc.get(f, 0)))
@@ -440,27 +587,44 @@ class PlayerProfileStore:
                     s.bluff_decay_and_add(ck, False, s.hands, weight=float(nv) * wconf)
             if inc.get("_name"):
                 self.names[key] = inc["_name"]
+        # Server HUD snapshot (whole-history VPIP/PFR/WTSD/WSD/foldToCbet/...) carried on the record by
+        # the live recorder (hand_recorder `hud`, keyed by str(user_id) == our player_key). Fold it into
+        # the SAME high-confidence prior the live RPC uses (seed_from_hud) so the value-sizing / exploit
+        # path keys on it for EVERY opponent we have history on — not only those seeded live this session.
+        # Idempotent (seed_from_hud no-ops when unchanged) ⇒ WAL replay / log reprocessing is safe.
+        hud_block = record.get("hud")
+        if isinstance(hud_block, dict):
+            for uid, hud_stats in hud_block.items():
+                if isinstance(hud_stats, dict) and hud_stats:
+                    key = str(uid)
+                    # _count=False: the per-HAND increment below drives the save throttle; without this
+                    # a 6-HUD hand bumped _updates_since_save by 7, snapshotting ~7x too often (inline I/O).
+                    self.seed_from_hud(key, hud_stats, name=self.names.get(key), _count=False)
         if increments:
             self._dirty = True
             self._updates_since_save += 1
         return len(increments)
 
-    def seed_from_hud(self, key: str, stats: dict, *, name: str | None = None) -> bool:
+    def seed_from_hud(self, key: str, stats: dict, *, name: str | None = None, _count: bool = True) -> bool:
         """Store the server's HUD stats (VPIP/PFR/WTSD/3bet/cbet/...) for a player as a high-confidence
         prior. Authoritative over the player's whole history — kept verbatim and SEPARATE from the
         count-based fields, so it never distorts per-hand derivation. Idempotent: only marks dirty when
-        the payload actually changes. Returns True if stored/updated."""
+        the payload actually changes. ``_count`` advances the save-throttle counter (default True for the
+        standalone live-RPC seed path; the in-hand fold-in passes False so a multi-HUD hand counts once).
+        Returns True if stored/updated."""
         if not key or not isinstance(stats, dict) or not stats:
             return False
-        s = self.get(key)
-        if s.hud == stats:
-            return False
-        s.hud = dict(stats)
-        if name:
-            self.names[key] = name
-        self._dirty = True
-        self._updates_since_save += 1
-        return True
+        with self._lock:
+            s = self.get(key)
+            if s.hud == stats:
+                return False
+            s.hud = dict(stats)
+            if name:
+                self.names[key] = name
+            self._dirty = True
+            if _count:
+                self._updates_since_save += 1
+            return True
 
     @property
     def dirty(self) -> bool:

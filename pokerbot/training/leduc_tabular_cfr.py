@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import functools
+import hashlib
+import inspect
+import json
+import os
 from collections import defaultdict
 from itertools import permutations
 
@@ -15,6 +20,7 @@ from pokerbot.engine.leduc_bridge import (
     init_py_from_key,
     jax_from_py,
     py_fingerprint,
+    py_from_jax,
     py_info_key,
     py_legal,
     py_state_from_deal,
@@ -427,6 +433,43 @@ def _profile_value_from_policy(
     return val
 
 
+def _build_policy_table(policy_fn, roots: list[PyLeducState]) -> dict[tuple, np.ndarray]:
+    """Precompute ``policy_fn`` raw output once per reachable (infoset, seat).
+
+    The trained strategy is FIXED during a BR, and the Leduc infoset key
+    (``py_info_key``) is injective over the suit-isomorphic encoding, so every state
+    sharing an infoset key produces the same ``policy_fn`` output. Calling ``policy_fn``
+    once per unique key (instead of once per node, per recursion, per deal) collapses
+    ~17k tiny JAX dispatches to ~140 while returning bit-identical raw probabilities.
+
+    A representative JAX state is collected per key and the calls are issued in a single
+    pass; this is the table the BR + profile traversals then read from.
+    """
+    reps: dict[tuple, tuple[PyLeducState, int]] = {}
+    stack = list(roots)
+    seen: set[tuple] = set()
+    while stack:
+        state = stack.pop()
+        fp = (state.deal_public, py_fingerprint(state))
+        if fp in seen:
+            continue
+        seen.add(fp)
+        if state.done:
+            continue
+        seat = state.acting
+        ikey = py_info_key(state, seat)
+        if ikey not in reps:
+            reps[ikey] = (state, seat)
+        mask = py_legal(state)
+        for a in range(NUM_ACTIONS):
+            if mask[a]:
+                stack.append(apply_action_py(state, a))
+    table: dict[tuple, np.ndarray] = {}
+    for ikey, (state, seat) in reps.items():
+        table[ikey] = np.asarray(policy_fn(jax_from_py(state), seat), dtype=np.float64)
+    return table
+
+
 def infoset_exploitability_mbb_from_policy(
     policy_fn,
     samples: int = 90,
@@ -434,20 +477,40 @@ def infoset_exploitability_mbb_from_policy(
     """Information-set BR exploitability for a JAX-state policy callable.
 
     Returns (expl_mbb, u0, u1, br0, br1).
+
+    The strategy is fixed during the BR, so ``policy_fn`` is evaluated ONCE per reachable
+    infoset (a single batched-ish pass over ~140 keys) and every downstream lookup is served
+    from that precomputed table. This eliminates the ~17k redundant per-node JAX dispatches
+    (host<->device sync + ``np.asarray``) that dominated the original implementation, while
+    returning identical numbers (same deterministic policy per infoset).
     """
+    deals = _all_leduc_deals()
+    eval_deals = list(deals) if samples >= len(deals) else [deals[int(i)] for i in range(samples)]
+    roots = [py_state_from_deal(c, p) for c, p in eval_deals]
+
+    table = _build_policy_table(policy_fn, roots)
+
+    def cached_policy_fn(jax_state, seat: int) -> np.ndarray:
+        # Recover the python view to key the precomputed table; falls back to a live
+        # dispatch for any (unexpected) key not seen during enumeration.
+        py = py_from_jax(jax_state)
+        ikey = py_info_key(py, int(seat))
+        raw = table.get(ikey)
+        if raw is None:
+            raw = np.asarray(policy_fn(jax_state, seat), dtype=np.float64)
+            table[ikey] = raw
+        return raw
 
     def policy_sigma(state: PyLeducState, seat: int) -> np.ndarray:
         mask = py_legal(state)
-        sigma = np.asarray(policy_fn(jax_from_py(state), seat), dtype=np.float64)
-        sigma = sigma * mask
+        raw = table.get(py_info_key(state, seat))
+        if raw is None:
+            raw = np.asarray(policy_fn(jax_from_py(state), seat), dtype=np.float64)
+        sigma = raw * mask
         total = sigma.sum()
         if total > 0:
             return sigma / total
         return mask.astype(np.float64) / max(mask.sum(), 1)
-
-    deals = _all_leduc_deals()
-    eval_deals = list(deals) if samples >= len(deals) else [deals[int(i)] for i in range(samples)]
-    roots = [py_state_from_deal(c, p) for c, p in eval_deals]
 
     br0_calc = _InfosetBestResponse(0, policy_sigma)
     br1_calc = _InfosetBestResponse(1, policy_sigma)
@@ -458,8 +521,8 @@ def infoset_exploitability_mbb_from_policy(
     for root in roots:
         br0 += br0_calc.root_value(root)
         br1 += br1_calc.root_value(root)
-        u0 += _profile_value_from_policy(root, 0, policy_fn)
-        u1 += _profile_value_from_policy(root, 1, policy_fn)
+        u0 += _profile_value_from_policy(root, 0, cached_policy_fn)
+        u1 += _profile_value_from_policy(root, 1, cached_policy_fn)
     n = float(len(roots))
     br0 /= n
     br1 /= n
@@ -469,18 +532,114 @@ def infoset_exploitability_mbb_from_policy(
         u0,
         u1,
         roots,
-        lambda r: _profile_value_from_policy(r, 0, policy_fn),
-        lambda r: _profile_value_from_policy(r, 1, policy_fn),
+        lambda r: _profile_value_from_policy(r, 0, cached_policy_fn),
+        lambda r: _profile_value_from_policy(r, 1, cached_policy_fn),
     )
     expl = float(max(0.0, br0 - u0) + max(0.0, br1 - u1)) * 1000.0
     return expl, u0, u1, br0, br1
 
 
-def equilibrium_reference_exploitability_mbb(iterations: int = 2000) -> float:
-    """Tabular CFR infoset-BR exploitability — primary Leduc ruler."""
+def _floor_cache_dir() -> str:
+    """Directory for the on-disk tabular-floor cache (override via env for tests)."""
+    override = os.environ.get("LEDUC_FLOOR_CACHE_DIR")
+    if override:
+        return override
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.abspath(os.path.join(here, "..", ".."))
+    return os.path.join(root, "runs", "leduc_floor_cache")
+
+
+def _floor_cache_key(iterations: int) -> str:
+    """Correctness-preserving cache key.
+
+    The tabular floor is fully determined by:
+      * ``iterations`` (CFR sweep count) and the fixed seed 0,
+      * the EXACT source of the functions that produce it (``tabular_cfr`` +
+        ``infoset_exploitability_mbb`` and the BR/profile helpers it calls), and
+      * the Leduc game parameters (deal enumeration + payoff/structure constants).
+
+    Hashing the source of those functions means any rule/algorithm change to the
+    ruler invalidates the cache automatically (a stale key can never return a value
+    computed under different code). Numeric constants are folded in for belt-and-braces.
+    """
+    h = hashlib.blake2b(digest_size=16)
+    h.update(f"iters={int(iterations)};seed=0;samples=90\n".encode())
+    # Source of every function whose change would alter the floor value.
+    for fn in (
+        tabular_cfr,
+        infoset_exploitability_mbb,
+        _profile_value,
+        _policy_for_key,
+        assert_leduc_profile_ev_in_range,
+        _terminal_reward_bounds,
+        all_leduc_deals,
+    ):
+        try:
+            src = inspect.getsource(fn)
+        except (OSError, TypeError):
+            src = repr(fn)
+        h.update(src.encode("utf-8", "replace"))
+    h.update(b"_InfosetBestResponse\n")
+    h.update(inspect.getsource(_InfosetBestResponse).encode("utf-8", "replace"))
+    # Game constants + the exact deal set (so a game-rule change invalidates).
+    from pokerbot.engine import leduc_jax as _lj
+
+    consts = (
+        _lj.NUM_PLAYERS, _lj.NUM_ACTIONS, _lj.NUM_CARD_RANKS, _lj.ANTE,
+        _lj.RAISE_SIZE, _lj.MAX_RAISES, _lj.MAX_HISTORY,
+        LEDUC_PROFILE_EV_SANITY_MAX,
+    )
+    h.update(repr(consts).encode())
+    h.update(repr(all_leduc_deals()).encode())
+    return h.hexdigest()
+
+
+def _compute_floor(iterations: int) -> float:
     avg, _ = tabular_cfr(iterations=iterations, seed=0)
     expl, _, _, _, _ = infoset_exploitability_mbb(avg, samples=90)
-    return expl
+    return float(expl)
+
+
+@functools.lru_cache(maxsize=8)
+def _equilibrium_floor_cached(iterations: int) -> float:
+    """In-process + on-disk memoized tabular floor. Returns the same constant per key."""
+    key = _floor_cache_key(iterations)
+    cache_dir = _floor_cache_dir()
+    path = os.path.join(cache_dir, f"floor_{key}.json")
+    if os.environ.get("LEDUC_FLOOR_CACHE", "1") != "0":
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            val = float(payload["expl_mbb"])
+            if payload.get("key") == key and int(payload.get("iterations", -1)) == int(iterations):
+                return val
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    val = _compute_floor(iterations)
+    if os.environ.get("LEDUC_FLOOR_CACHE", "1") != "0":
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"expl_mbb": val, "iterations": int(iterations), "key": key},
+                    fh,
+                )
+            os.replace(tmp, path)
+        except OSError:
+            pass
+    return val
+
+
+def equilibrium_reference_exploitability_mbb(iterations: int = 2000) -> float:
+    """Tabular CFR infoset-BR exploitability — primary Leduc ruler.
+
+    Strategy-INDEPENDENT constant for a given ``iterations`` (and fixed seed 0), so it is
+    memoized in-process (lru_cache) and on disk. The cache key hashes the ruler's source +
+    game constants, so any algorithm/rule change invalidates it. Set env ``LEDUC_FLOOR_CACHE=0``
+    to force recomputation.
+    """
+    return _equilibrium_floor_cached(int(iterations))
 
 
 def openspiel_nash_conv_uniform_mbb() -> float:

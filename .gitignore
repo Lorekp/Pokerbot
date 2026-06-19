@@ -38,3 +38,6 @@ data/aof/cfr_base/tensor_row_checkpoints/
 # Large downloaded datasets (IRC poker DB etc.) — never commit
 data/datasets/
 *.tgz
+
+# CoinPoker client binary snapshots (proprietary, ~41MB each) - kept on disk for post-update diffing, never committed
+artifacts/client_snapshot/

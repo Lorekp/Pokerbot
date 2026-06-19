@@ -40,9 +40,19 @@ def _bb_to_chips(x: float) -> int:
 
 def game_state_to_env(state: GameState, hero_seat: int) -> EnvState:
     """Convert production GameState to JAX EnvState for search stepping."""
+    # ALWAYS emit NUM_PLAYERS-wide per-seat arrays, padding absent seats (a short-handed live table that
+    # lists fewer than 6 players) as SEAT_EMPTY with 0 chips. The EnvState fields must be uniformly 6-wide:
+    # the strict native engine (_to_flat) requires it, and a ragged (len(players),) array silently corrupts
+    # downstream indexing even on the pure-Python path. This is also the short-handed (5/4/3-handed, HU)
+    # live path — empty seats beyond the seated count.
     holes = np.full((NUM_PLAYERS, 2), -1, dtype=np.int32)
     seat_status = np.full(NUM_PLAYERS, SEAT_EMPTY, dtype=np.int8)
+    stacks = np.zeros(NUM_PLAYERS, dtype=np.int32)
+    committed_street = np.zeros(NUM_PLAYERS, dtype=np.int32)
+    committed_total = np.zeros(NUM_PLAYERS, dtype=np.int32)
     for i, p in enumerate(state.players):
+        if i >= NUM_PLAYERS:
+            break
         if p.hole:
             holes[i, 0] = _card_to_idx(p.hole[0])
             holes[i, 1] = _card_to_idx(p.hole[1])
@@ -52,14 +62,13 @@ def game_state_to_env(state: GameState, hero_seat: int) -> EnvState:
             seat_status[i] = SEAT_ALLIN
         else:
             seat_status[i] = SEAT_LIVE
+        stacks[i] = _bb_to_chips(p.stack_bb)
+        committed_street[i] = _bb_to_chips(p.committed_street_bb)
+        committed_total[i] = _bb_to_chips(p.committed_total_bb)
 
     board = np.full(5, -1, dtype=np.int32)
     for i, c in enumerate(state.board[:5]):
         board[i] = _card_to_idx(c)
-
-    stacks = np.array([_bb_to_chips(p.stack_bb) for p in state.players], dtype=np.int32)
-    committed_street = np.array([_bb_to_chips(p.committed_street_bb) for p in state.players], dtype=np.int32)
-    committed_total = np.array([_bb_to_chips(p.committed_total_bb) for p in state.players], dtype=np.int32)
 
     hist_seat = np.full(MAX_HISTORY, -1, dtype=np.int32)
     hist_action = np.full(MAX_HISTORY, -1, dtype=np.int32)
@@ -85,6 +94,14 @@ def game_state_to_env(state: GameState, hero_seat: int) -> EnvState:
     for s in getattr(state, "_acted_this_street", set()):
         acted[s] = True
 
+    # Reopen/min-raise context. These were hard-coded (min_raise=1bb, last_raise_full=True), which let the
+    # engine grant already-acted seats phantom re-raise rights after a short all-in under-raise. Read the
+    # real values from the GameState when present (the live reconstruction supplies them); engine-built
+    # GameStates lack the attrs and fall back to the prior constants (unchanged behavior).
+    _mrb = getattr(state, "min_raise_bb", None)
+    min_raise_chips = _bb_to_chips(_mrb) if (_mrb and _mrb > 0) else BB_CHIPS
+    last_raise_full = bool(getattr(state, "last_raise_full", True))
+
     return EnvState(
         holes=jnp.asarray(holes),
         board=jnp.asarray(board),
@@ -95,12 +112,12 @@ def game_state_to_env(state: GameState, hero_seat: int) -> EnvState:
         street=jnp.int32(STREET_MAP.get(state.street, 4)),
         pot_dead=jnp.int32(max(pot_dead, 0)),
         current_bet=jnp.int32(_bb_to_chips(state.current_bet_bb)),
-        min_raise=jnp.int32(BB_CHIPS),
+        min_raise=jnp.int32(min_raise_chips),
         button=jnp.int32(state.button_seat),
         action_seat=jnp.int32(state.action_seat),
         last_aggressor=jnp.int32(state.last_aggressor if state.last_aggressor is not None else -1),
         acted=jnp.asarray(acted),
-        last_raise_full=jnp.bool_(True),
+        last_raise_full=jnp.bool_(last_raise_full),
         deck=jnp.arange(52, dtype=jnp.int32),
         deck_ptr=jnp.int32(0),
         rng_key=jnp.zeros(2, dtype=jnp.uint32),

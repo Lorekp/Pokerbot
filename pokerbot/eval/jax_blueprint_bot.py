@@ -22,6 +22,17 @@ class JAXBlueprintBot:
         self.hidden_dim = int(hidden_dim or payload.get("hidden_dim", 256))
         self.params = payload["average_strategy_params"]
         self.module = AverageStrategyNet(self.hidden_dim)
+        # Skew guard: the served encode_info_state layout must match what the net was trained on.
+        trained_suits = payload.get("info_suits")
+        if trained_suits is not None:
+            import pokerbot.engine.jax_engine as _je
+
+            if bool(trained_suits) != bool(_je._INFO_SUITS):
+                raise RuntimeError(
+                    f"info-state encoding skew: checkpoint trained with POKERBOT_INFO_SUITS="
+                    f"{int(bool(trained_suits))} but serving with {int(bool(_je._INFO_SUITS))}. "
+                    f"Set POKERBOT_INFO_SUITS to match BEFORE importing pokerbot."
+                )
 
     def action_probs(self, state: GameState, seat: int | None = None) -> jnp.ndarray:
         seat = state.action_seat if seat is None else seat

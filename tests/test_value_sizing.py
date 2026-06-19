@@ -15,9 +15,14 @@ from pokerbot.opponent.value_sizing import (
     _BET_LO,
     _BIG_LO,
     _ALL_IN,
+    bluff_suppression_logits,
+    river_thin_value_logits,
     station_payoff_score,
     value_sizing_logits,
 )
+
+_RIVER = ["Ah", "Kd", "7s", "2c", "9h"]      # 5-card board
+_FLOP = ["Ah", "Kd", "7s"]
 
 
 def _station(**hud) -> OpponentStats:
@@ -108,3 +113,76 @@ def test_overlay_is_additive_and_bounded():
     assert np.isfinite(adj).all()
     assert adj.shape == (NUM_ACTIONS,)
     assert adj.max() <= 2.0 and adj.min() >= -2.0
+
+
+# ---- bluff-frequency suppression overlay (symmetric, air-only) ----
+
+def test_bluff_suppression_cuts_bets_with_air_vs_station():
+    s = _station(wtsd=41, wsd=44, foldToCbet=28, fta=30)
+    adj = bluff_suppression_logits(s, hand_strength=0.25)   # air vs a sticky non-folder
+    assert adj[_BET_LO:_ALL_IN].max() < 0          # all bet/raise sizes de-prioritized
+    assert adj[1] > 0                               # checking/giving up preferred
+    assert adj[0] == 0 and adj[_ALL_IN] == 0        # fold + all-in untouched
+
+
+def test_bluff_suppression_value_hand_is_zero():
+    # Value hands never suppress (that's value_sizing's job) — only air.
+    s = _station(wsd=42, foldToCbet=28)
+    assert np.allclose(bluff_suppression_logits(s, hand_strength=0.80), 0.0)
+
+
+def test_bluff_suppression_no_data_is_zero():
+    assert np.allclose(bluff_suppression_logits(OpponentStats(hands=0), 0.2), 0.0)
+
+
+def test_bluff_suppression_damped_vs_lag():
+    lag = OpponentStats(hands=50, vpip=20, pfr=18, aggression_bets_raises=30, aggression_calls=5,
+                        cbet_faced=30, fold_to_cbet=6)
+    station = OpponentStats(hands=50, vpip=30, pfr=4, aggression_bets_raises=5, aggression_calls=20,
+                            cbet_faced=30, fold_to_cbet=6)
+    # A LAG (who folds to bluffs) should be suppressed far less than a station.
+    assert abs(bluff_suppression_logits(lag, 0.2)[_BET_LO]) < abs(bluff_suppression_logits(station, 0.2)[_BET_LO])
+
+
+def test_bluff_suppression_env_killswitch(monkeypatch):
+    monkeypatch.setenv("POKERBOT_BLUFF_SUPPRESS", "0")
+    s = _station(wsd=42, foldToCbet=28)
+    assert np.allclose(bluff_suppression_logits(s, 0.2), 0.0)
+
+
+# ---- river thin-value expansion (river-only, marginal-band, weak-WSD gated, default OFF) ----
+
+def test_river_thin_value_default_off():
+    s = _station(wsd=42, foldToCbet=28)
+    assert np.allclose(river_thin_value_logits(s, 0.45, _RIVER), 0.0)  # default OFF
+
+
+def test_river_thin_value_fires_on_river(monkeypatch):
+    monkeypatch.setenv("POKERBOT_RIVER_THIN_VALUE", "1")
+    s = _station(wsd=42, foldToCbet=28)          # weak showdown range (wsd<0.50)
+    adj = river_thin_value_logits(s, 0.45, _RIVER)  # marginal hand in [0.40, 0.50)
+    assert adj[_BET_LO:_BIG_LO].max() > 0          # small/mid value bet boosted
+    assert np.allclose(adj[_BIG_LO:_ALL_IN], 0.0)  # NOT the over-bet buckets (don't over-bet 2nd pair)
+    assert adj[1] < 0                              # don't check back the thin value hand
+
+
+def test_river_thin_value_only_on_river(monkeypatch):
+    monkeypatch.setenv("POKERBOT_RIVER_THIN_VALUE", "1")
+    s = _station(wsd=42, foldToCbet=28)
+    assert np.allclose(river_thin_value_logits(s, 0.45, _FLOP), 0.0)   # flop -> no thin value
+    assert np.allclose(river_thin_value_logits(s, 0.45, []), 0.0)      # preflop -> no thin value
+
+
+def test_river_thin_value_band_only(monkeypatch):
+    monkeypatch.setenv("POKERBOT_RIVER_THIN_VALUE", "1")
+    s = _station(wsd=42, foldToCbet=28)
+    assert np.allclose(river_thin_value_logits(s, 0.30, _RIVER), 0.0)  # air below band -> nothing
+    assert np.allclose(river_thin_value_logits(s, 0.70, _RIVER), 0.0)  # value above band -> value_sizing's job
+
+
+def test_river_thin_value_needs_weak_showdown(monkeypatch):
+    monkeypatch.setenv("POKERBOT_RIVER_THIN_VALUE", "1")
+    # strong showdown range (wsd>=0.50) -> value-cut guard blocks the thin bet
+    assert np.allclose(river_thin_value_logits(_station(wsd=58, foldToCbet=28), 0.45, _RIVER), 0.0)
+    # no server WSD at all -> no blind thin value
+    assert np.allclose(river_thin_value_logits(_station(foldToCbet=28), 0.45, _RIVER), 0.0)

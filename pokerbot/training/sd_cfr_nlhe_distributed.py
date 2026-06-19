@@ -25,6 +25,68 @@ HU_CLOUD_TARGET_VISITS_PER_ITER = (
 )
 
 from pokerbot.engine.jax_engine import init_hand
+
+
+def _sample_depth_stacks(deal_key):
+    """A3 depth-randomized retrain (pool/distributed trainer = the production-blueprint path): ONE per-deal
+    effective starting depth ~ log-U(lo,hi)bb, broadcast to every seat, from a SUB-key of the deal key
+    (deterministic/CRN, independent of the deck). None when POKERBOT_TRAIN_DEPTH_BB unset -> init_hand keeps
+    100bb (legacy). SHARED (symmetric) depth, not independent per-seat: the abstraction key buckets on the
+    effective (min-over-seats) depth, and the min of 6 independent log-U draws collapses short (~0% deep),
+    starving the deep buckets; broadcasting one depth makes min == the drawn depth so the keyed variable
+    sweeps the full range. KEEP IN SYNC with sd_cfr_nlhe_hogwild._sample_depth_stacks (same env var +
+    sub-key salt + shared-depth draw); a parity test asserts byte-identical output for the same deal key."""
+    import os
+
+    raw = os.environ.get("POKERBOT_TRAIN_DEPTH_BB", "").strip()
+    if not raw:
+        return None
+    try:
+        lo, hi = (float(x) for x in raw.split(","))
+    except (ValueError, TypeError):
+        return None
+    if not (hi > lo > 0):
+        return None
+    import math
+
+    import jax.numpy as jnp
+
+    from pokerbot.engine.jax_engine import CHIP_UNIT, NUM_PLAYERS
+
+    k = jax.random.fold_in(deal_key, 0x5747ACC)
+    u = jax.random.uniform(k, (), minval=math.log(lo), maxval=math.log(hi))  # ONE depth per deal
+    chips = jnp.round(jnp.exp(u) * CHIP_UNIT).astype(jnp.int32)
+    return jnp.full((NUM_PLAYERS,), chips, dtype=jnp.int32)
+
+
+def _sample_occupancy(deal_key):
+    """C1 short-handed coverage (pool/distributed trainer): per-deal live-seat occupancy
+    (bool[NUM_PLAYERS]) — draw a live-seat COUNT n in [lo,hi] weighted toward fuller tables, then a random
+    size-n subset of the 6 seats, from a SUB-key of the deal key (deterministic/CRN, distinct stream from
+    deck + depth). None when POKERBOT_TRAIN_OCCUPANCY_MIX unset -> fixed --occupancy. KEEP IN SYNC with
+    sd_cfr_nlhe_hogwild._sample_occupancy (a parity test asserts byte-identical output for the same key)."""
+    import os
+
+    raw = os.environ.get("POKERBOT_TRAIN_OCCUPANCY_MIX", "").strip()
+    if not raw:
+        return None
+    try:
+        lo, hi = (int(x) for x in raw.split(","))
+    except (ValueError, TypeError):
+        return None
+    from pokerbot.engine.jax_engine import NUM_PLAYERS
+
+    if not (2 <= lo <= hi <= NUM_PLAYERS):
+        return None
+    k = jax.random.fold_in(deal_key, 0x0CC0)  # distinct stream from deck + depth sampler
+    kc, ks = jax.random.split(k)
+    counts = jnp.arange(lo, hi + 1)
+    weights = counts.astype(jnp.float32)  # w(n) proportional to n: fuller tables more likely (live mode)
+    n = int(jax.random.choice(kc, counts, p=weights / weights.sum()))
+    live = np.asarray(jax.random.choice(ks, NUM_PLAYERS, shape=(n,), replace=False))
+    occ = np.zeros(NUM_PLAYERS, dtype=bool)
+    occ[live] = True
+    return occ
 from pokerbot.training.sd_cfr_nlhe import (
     NLHE_NUM_ACTIONS,
     SDCFRNLHEConfig,
@@ -143,14 +205,20 @@ def run_traversal_unit(
     before_pending = {k: len(v) for k, v in trainer._pending_regret.items()}
     coll_before = _sdm._collision_count
     trainer._iter_weight = plan.iteration_weight
-    occ = jnp.asarray(trainer.occupancy, dtype=bool)
     k1, k2 = traversal_prng_keys(trainer, iteration_num, sweep_i, trav_i)
+    # C1: per-deal occupancy (short-handed coverage) when POKERBOT_TRAIN_OCCUPANCY_MIX is set; else the
+    # fixed --occupancy. A fixed button landing on a sampled-empty seat is a valid dead button (init_hand
+    # walks SB/BB/action to live seats via _nth_live_after). The traversal set follows the per-deal occupancy.
+    occ_k = _sample_occupancy(k1)
+    occ = jnp.asarray(occ_k if occ_k is not None else trainer.occupancy, dtype=bool)
+    trav_seats = [i for i, s in enumerate(occ_k) if s] if occ_k is not None else trainer._live_seats
     state = init_hand(
         k1,
         button=jnp.int32(trainer.config.button_seat),
         occupancy=occ,
+        stacks=_sample_depth_stacks(k1),  # A3: depth-randomized (None => 100bb)
     )
-    for seat in trainer._live_seats:
+    for seat in trav_seats:
         trainer.traverse(state, seat, k2)
     cum_d, strat_d = _delta_regret_tables(before_cum, before_strat, trainer)
     pending = _pending_fragment(trainer, before_pending)
@@ -252,13 +320,18 @@ def run_traversal_phase_single_threaded(
         )
     for idx, (sweep_i, trav_i) in enumerate(plan.pairs):
         k1, k2 = traversal_prng_keys(trainer, iteration_num, sweep_i, trav_i)
-        occ = jnp.asarray(trainer.occupancy, dtype=bool)
+        # C1: per-deal occupancy (short-handed coverage) when POKERBOT_TRAIN_OCCUPANCY_MIX is set; else the
+        # fixed --occupancy (dead button on a sampled-empty seat is valid — blinds walk to live seats).
+        occ_k = _sample_occupancy(k1)
+        occ = jnp.asarray(occ_k if occ_k is not None else trainer.occupancy, dtype=bool)
+        trav_seats = [i for i, s in enumerate(occ_k) if s] if occ_k is not None else trainer._live_seats
         state = init_hand(
             k1,
             button=jnp.int32(trainer.config.button_seat),
             occupancy=occ,
+            stacks=_sample_depth_stacks(k1),  # A3: depth-randomized (None => 100bb)
         )
-        for seat in trainer._live_seats:
+        for seat in trav_seats:
             trainer.traverse(state, seat, k2)
         done = idx + 1
         if done == total or done % max(1, log_every_units) == 0:

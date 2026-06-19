@@ -237,7 +237,7 @@ def test_firewall_invariants_unchanged():
     # v5 = ADDITIVE bluff-ratio Beta counts (ctx_bluff/ctx_bluff_last); the locked context spec,
     # bin ladder, and back-compat loading (v1–v4 files open with new fields empty — pinned by
     # tests/test_bluff_model.py) are all unchanged.
-    assert player_profiles.SCHEMA_VERSION == 5
+    assert player_profiles.SCHEMA_VERSION == 7   # unified cash+MTT store (v7); bump in lockstep with the schema
 
 
 def test_solver_does_not_load_neural_stack():
@@ -476,6 +476,30 @@ def test_solver_builds_leaf_weights_only_with_reads():
     for s, ws in w.items():
         assert abs(ws.sum() - 1.0) < 1e-9
         assert ws[2] == max(ws)        # station read => call-continuation dominates
+
+
+def test_leaf_memo_bit_identical_and_deterministic():
+    """The per-leaf continuation-set memo (fast path, env POKERBOT_LEAF_MEMO) is a PURE cache: the leaf
+    value with the memo ON is byte-identical to the legacy (memo OFF) path for BOTH leaf modes, and is
+    deterministic given the seed (the CRN contract the exploitation battery relies on)."""
+    from pokerbot.search import pluribus_rollout as R
+
+    ad = TabularBlueprintAdapter(snapshot={}, client_bet_sizing=True)
+    try:
+        for mode in ("uniform", "gadget"):
+            cfg = ContinuationLeafConfig(select=mode, rollout_samples=3, base_seed=4242)
+            for seed in (7, 11, 13):
+                env = _postflop_env(seed=seed)
+                hero = int(env.action_seat) if int(env.action_seat) >= 0 else 0
+                R.set_leaf_memo(False)
+                v_off = continuation_leaf_value(env, hero, ad, cfg)
+                R.set_leaf_memo(True)
+                v_on1 = continuation_leaf_value(env, hero, ad, cfg)
+                v_on2 = continuation_leaf_value(env, hero, ad, cfg)  # same seed => identical
+                assert v_on1 == v_off, f"{mode}/{seed}: memo changed leaf value {v_on1} != {v_off}"
+                assert v_on1 == v_on2, f"{mode}/{seed}: memo non-deterministic given seed"
+    finally:
+        R.set_leaf_memo(True)
 
 
 def test_model_aware_leaf_direction_and_zero_deviation():

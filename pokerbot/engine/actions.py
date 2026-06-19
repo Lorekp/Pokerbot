@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 
 
@@ -22,7 +22,15 @@ BET_SIZE_BUCKETS = (0.33, 0.50, 0.66, 0.75, 1.0, 1.5, 2.0)
 @dataclass(frozen=True, slots=True)
 class Action:
     action_type: ActionType
-    amount_bb: float = 0.0  # total chips committed this action, in BB units
+    amount_bb: float = 0.0  # raise increment above the call, in BB units (NOT a pot fraction)
+    # Resolved abstraction bucket index (into ACTION_VOCAB), set by the PRODUCER when the originating
+    # pot-fraction / menu position is known (engine ``legal_actions`` knows it exactly; the live replay
+    # computes it from the pot AT ACTION TIME). -1 = not set. ``action_to_index`` returns this directly
+    # when >= 0, which is the FIX for the serve-path convention clash: ``amount_bb`` is an absolute BB
+    # increment, but ``action_to_index``/``BET_SIZE_BUCKETS`` bucket a POT FRACTION, so bucketing a raw
+    # ``amount_bb`` collapses every raise to the top bucket. The training/PokerBench path never sets this
+    # (stays -1), so that path is byte-identical. Excluded from eq/hash so equality semantics are unchanged.
+    bucket: int = field(default=-1, compare=False)
 
     def label(self) -> str:
         if self.action_type == ActionType.FOLD:
@@ -57,6 +65,12 @@ NUM_ACTIONS = len(ACTION_VOCAB)
 
 
 def action_to_index(action: Action) -> int:
+    # FIX (serve path): when the producer resolved the abstraction bucket (engine legal_actions, or the
+    # live replay using pot-at-action), trust it — bucketing the raw absolute-BB ``amount_bb`` against the
+    # pot-fraction BET_SIZE_BUCKETS would collapse every raise to the top bucket. Training Actions never
+    # set ``bucket`` (stays -1), so the pot-fraction path below is byte-identical for training/encoding.
+    if action.bucket >= 0:
+        return int(action.bucket)
     if action.action_type == ActionType.FOLD:
         return 0
     if action.action_type == ActionType.CHECK:
@@ -80,6 +94,65 @@ def index_to_bucket(index: int) -> float | None:
     if index < 3 or index >= NUM_ACTIONS - 1:
         return None
     return BET_SIZE_BUCKETS[index - 3]
+
+
+def pseudo_harmonic_bucket(x: float, buckets=BET_SIZE_BUCKETS) -> int:
+    """Map an off-tree size ``x`` to a bucket index (0-based into ``buckets``) by the *pseudo-harmonic*
+    mapping (Ganzfried & Sandholm 2013), not nearest-by-absolute-distance.
+
+    Nearest-by-distance is the specifically exploitable translation the literature warns against: an
+    opponent bets just inside a bucket boundary to swing our response a full bucket for a negligible
+    size change. Pseudo-harmonic is the lowest-exploitability *deterministic* no-compute mapping: for a
+    size ``x`` bracketed by abstraction sizes ``A < x < B`` it maps to the SMALLER size ``A`` with
+    probability ``f = (B - x)(1 + A) / ((B - A)(1 + x))`` (and to ``B`` with ``1 - f``). We take the
+    deterministic argmax (``A`` iff ``f >= 0.5``), which biases toward the smaller bet — exactly the
+    anti-exploitation property (the attacker can't cheaply buy the bigger-bucket response).
+
+    Out-of-range clamps to the end buckets. Pure + side-effect free; ``buckets`` must be ascending."""
+    n = len(buckets)
+    if n == 0:
+        return 0
+    if x <= buckets[0]:
+        return 0
+    if x >= buckets[-1]:
+        return n - 1
+    for i in range(n - 1):
+        a, b = buckets[i], buckets[i + 1]
+        if a <= x <= b:
+            # probability mass the pseudo-harmonic mapping assigns to the SMALLER size A
+            denom = (b - a) * (1.0 + x)
+            f_a = ((b - x) * (1.0 + a) / denom) if denom > 0 else 1.0
+            return i if f_a >= 0.5 else i + 1
+    return n - 1  # unreachable for ascending buckets, but keep total
+
+
+def action_to_index_pseudo_harmonic(action: Action) -> int:
+    """Serve-time variant of ``action_to_index`` that translates an opponent's off-tree bet/raise size
+    via ``pseudo_harmonic_bucket`` instead of nearest-by-absolute-distance. Fold/check/call/all-in are
+    identical to ``action_to_index``. Use ONLY on the live serve path (opponent-action → belief/policy
+    query); training/encoding paths MUST keep calling the raw ``action_to_index`` so the trained policy
+    head's bucket fingerprint stays byte-identical."""
+    if action.bucket >= 0:
+        return int(action.bucket)  # producer already resolved the bucket (pot-at-action) — trust it
+    if action.action_type == ActionType.FOLD:
+        return 0
+    if action.action_type == ActionType.CHECK:
+        return 1
+    if action.action_type == ActionType.CALL:
+        return 2
+    if action.action_type == ActionType.ALL_IN:
+        return NUM_ACTIONS - 1
+    return 3 + pseudo_harmonic_bucket(action.amount_bb, BET_SIZE_BUCKETS)
+
+
+def bucket_index_for_bet(bet_to_bb: float, pot_before_bb: float) -> int:
+    """Abstraction action index (3..NUM_ACTIONS-2) for a bet/raise whose STREET bet-TO total is
+    ``bet_to_bb`` made into ``pot_before_bb`` (the whole-hand pot BEFORE this action) — matching the
+    training menu ``target = max(current_bet, pot * frac)`` ⇒ ``frac = bet_to / pot_before``. Uses the
+    pseudo-harmonic mapping (anti-exploitation). This is how the live replay resolves an observed
+    off-tree opponent/hero size to the trained abstraction bucket (the value to put in ``Action.bucket``)."""
+    frac = float(bet_to_bb) / max(float(pot_before_bb), 1e-9)
+    return 3 + pseudo_harmonic_bucket(frac, BET_SIZE_BUCKETS)
 
 
 def parse_pokerbench_output(text: str) -> Action:

@@ -51,6 +51,27 @@ _SELFCHECK_OK = False
 # when ENABLED. The solver / battery flip this via enable()/disable() so the flag-gated drop-in is
 # opt-out-able at runtime without re-import. Default: ON iff available (set in _init after selfcheck).
 _ENABLED = False
+# SE8: the enable flag is PROCESS-GLOBAL (the hot modules dispatch through this module, not per-solver),
+# so two solvers built with conflicting ``native=`` policies clobber each other — last writer wins. That
+# is output-safe (the native core is byte/stat-equivalent to np_engine either way) but surprising in a
+# mixed live process; track the last EXPLICIT policy and warn ONCE when it gets flipped, so the
+# shared-policy behaviour is visible rather than silent.
+_LAST_EXPLICIT_POLICY: bool | None = None
+_POLICY_CLASH_WARNED = False
+
+
+def _note_explicit_policy(on: bool) -> None:
+    global _LAST_EXPLICIT_POLICY, _POLICY_CLASH_WARNED
+    if (_LAST_EXPLICIT_POLICY is not None and _LAST_EXPLICIT_POLICY != on
+            and not _POLICY_CLASH_WARNED):
+        _POLICY_CLASH_WARNED = True
+        warnings.warn(
+            f"native engine policy flipped to {'ON' if on else 'OFF'} after being explicitly set to "
+            f"{'ON' if _LAST_EXPLICIT_POLICY else 'OFF'}: the flag is PROCESS-GLOBAL, so all live "
+            "solvers now share this policy (output is byte/stat-equivalent either way).",
+            RuntimeWarning, stacklevel=3,
+        )
+    _LAST_EXPLICIT_POLICY = on
 
 
 def enable() -> bool:
@@ -58,6 +79,7 @@ def enable() -> bool:
     global _ENABLED
     if _AVAILABLE:
         _ENABLED = True
+    _note_explicit_policy(True)
     return _ENABLED
 
 
@@ -65,6 +87,7 @@ def disable() -> None:
     """Force the pure-Python np_engine path (used by the battery's --no-native and tests)."""
     global _ENABLED
     _ENABLED = False
+    _note_explicit_policy(False)
 
 
 def is_enabled() -> bool:
@@ -86,14 +109,20 @@ def _try_load():
     dll = os.path.join(rel, "battery_native.dll")
     so = os.path.join(rel, "battery_native.so")
     try:
-        if not os.path.exists(pyd):
-            if os.path.exists(dll):
+        # Refresh the .pyd from the freshly built .dll when the dll is newer (or the pyd is missing).
+        # Without the mtime check a stale .pyd silently shadows a rebuilt .dll (e.g. after adding the
+        # SubgameSolver class), so the new symbols never load. cdylib output is .dll; CPython imports .pyd.
+        if os.path.exists(dll):
+            need_copy = (not os.path.exists(pyd)
+                         or os.path.getmtime(dll) > os.path.getmtime(pyd))
+            if need_copy:
                 import shutil
-                shutil.copyfile(dll, pyd)
-            elif os.path.exists(so):
-                pyd_target = so
-            else:
-                return None
+                try:
+                    shutil.copyfile(dll, pyd)
+                except OSError:
+                    pass  # pyd locked by another process already importing it; use the existing one
+        elif not os.path.exists(pyd) and not os.path.exists(so):
+            return None
         target = pyd if os.path.exists(pyd) else so
         import importlib.util
         spec = importlib.util.spec_from_file_location("battery_native", target)
@@ -265,6 +294,145 @@ def evaluate_seven(cards: np.ndarray):
 
 def available() -> bool:
     return _AVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# Native uniform-mode continuation-leaf playout (POKERBOT_NATIVE_ROLLOUT).
+#
+# Moves the ENTIRE pluribus_rollout._playout loop (uniform path) into the Rust core as one call,
+# eliminating the per-step EnvState marshaling (_to_flat/_from_flat) that otherwise dominates. The
+# fingerprint (blueprint lookup key) is computed natively, byte-identical to fingerprint_fast (gated
+# + fuzz-verified). RNG is a fast native xoshiro seeded from base_seed — statistical equivalence,
+# NOT a replay of numpy's PCG64 (the leaf value estimates the SAME expectation).
+# Default OFF; the Python loop in pluribus_rollout is unchanged when this is not engaged.
+# ---------------------------------------------------------------------------
+def native_rollout_available() -> bool:
+    """True iff the native extension exposes the PlayoutEngine (built) AND is enabled."""
+    return bool(_AVAILABLE and _ENABLED and _EXT is not None and hasattr(_EXT, "PlayoutEngine"))
+
+
+# Per-adapter PlayoutEngine cache (built once per blueprint snapshot identity; the blueprint is large
+# and the HashMap build is the only non-trivial setup cost). Keyed by id(adapter) with a weak hold.
+_PLAYOUT_ENGINE_CACHE: dict[int, object] = {}
+
+
+def _build_playout_engine(adapter, num_buckets: int, max_playout_depth: int):
+    import numpy as _np
+
+    allowed_pre = adapter._allowed_pre
+    allowed_post = adapter._allowed_post
+    if allowed_pre is None or allowed_post is None:
+        return None  # native path requires client_bet_sizing (the eval config)
+    bp = {
+        bytes(k): [float(x) for x in _np.asarray(v, dtype=_np.float64).reshape(-1)[:11]]
+        for k, v in adapter.snapshot.items()
+    }
+    return _EXT.PlayoutEngine(
+        bp,
+        [bool(x) for x in allowed_pre],
+        [bool(x) for x in allowed_post],
+        float(adapter.bias_mult),
+        float(adapter.bias_floor),
+        int(max_playout_depth),
+        int(num_buckets),
+    )
+
+
+def native_uniform_leaf_value(
+    env, hero: int, adapter, base_seed: int, rollout_samples: int,
+    resample_board: bool, max_playout_depth: int, num_buckets: int,
+) -> float:
+    """Native uniform continuation-leaf value (hero bb). Builds/caches a PlayoutEngine per adapter.
+
+    Returns None if the native path is unavailable or the adapter is not in the supported (bounded,
+    client_bet_sizing) config, so the caller falls back to the Python loop."""
+    if not native_rollout_available():
+        return None
+    ckey = (id(adapter), int(max_playout_depth), int(num_buckets))
+    eng = _PLAYOUT_ENGINE_CACHE.get(ckey)
+    if eng is None:
+        eng = _build_playout_engine(adapter, num_buckets, max_playout_depth)
+        if eng is None:
+            return None
+        _PLAYOUT_ENGINE_CACHE[ckey] = eng
+    sb = _to_flat(env).tobytes()
+    return float(eng.leaf_value(sb, int(hero), int(base_seed) & 0xFFFFFFFFFFFFFFFF,
+                                int(rollout_samples), bool(resample_board)))
+
+
+# ---------------------------------------------------------------------------
+# Native depth-limited CFR subgame solve (POKERBOT_NATIVE_SUBGAME).
+#
+# Runs the ENTIRE pluribus_search._cfv loop (opponent-hole sampling + CFR+ recursion + blueprint-mixed
+# opponent prior + continuation-gadget leaf) in Rust as one call per hero decision, eliminating the
+# per-node _to_flat/_from_flat marshaling (~20% of a run) AND the interpreted CFR orchestration. Only
+# the GTO-base path (opponent_model is None, uniform belief) is native; the exploit tail stays in
+# Python (firewall). Statistically equivalent, not bit-identical (fast native RNG). Default OFF.
+# ---------------------------------------------------------------------------
+def native_subgame_available() -> bool:
+    """True iff the native extension exposes SubgameSolver (built) AND the native path is enabled."""
+    return bool(_AVAILABLE and _ENABLED and _EXT is not None and hasattr(_EXT, "SubgameSolver"))
+
+
+_SUBGAME_ENGINE_CACHE: dict[tuple, object] = {}
+
+
+def _build_subgame_engine(adapter, num_buckets: int, leaf_max_depth: int):
+    import numpy as _np
+
+    allowed_pre = adapter._allowed_pre
+    allowed_post = adapter._allowed_post
+    if allowed_pre is None or allowed_post is None:
+        return None  # native path requires client_bet_sizing (the eval config)
+    bp = {
+        bytes(k): [float(x) for x in _np.asarray(v, dtype=_np.float64).reshape(-1)[:11]]
+        for k, v in adapter.snapshot.items()
+    }
+    return _EXT.SubgameSolver(
+        bp,
+        [bool(x) for x in allowed_pre],
+        [bool(x) for x in allowed_post],
+        float(adapter.bias_mult),
+        float(adapter.bias_floor),
+        int(leaf_max_depth),
+        int(num_buckets),
+    )
+
+
+def native_subgame_solve(
+    base_state, hero: int, adapter, *, public_seed: int, max_iterations: int, max_depth: int,
+    blueprint_mix: float, rollout_samples: int, resample_board: bool, max_playout_depth: int,
+    num_buckets: int, linear_averaging: bool = True,
+):
+    """Native root action-probability vector (length 11) for a depth-limited subgame solve, or None
+    if the native path is unavailable / the adapter is not in the supported (bounded, client_bet_sizing)
+    config — in which case the caller runs the Python CFR loop.
+
+    ``linear_averaging`` mirrors PluribusReBeLConfig.linear_averaging (CFR+ recency-weighted strategy
+    average); the native core must apply the SAME weighting or the python/native crosscheck diverges."""
+    if not native_subgame_available():
+        return None
+    ckey = (id(adapter), int(max_playout_depth), int(num_buckets))
+    eng = _SUBGAME_ENGINE_CACHE.get(ckey)
+    if eng is None:
+        eng = _build_subgame_engine(adapter, num_buckets, max_playout_depth)
+        if eng is None:
+            return None
+        _SUBGAME_ENGINE_CACHE[ckey] = eng
+    sb = _to_flat(base_state).tobytes()
+    try:
+        probs = eng.solve(
+            sb, int(hero), int(public_seed) & 0xFFFFFFFFFFFFFFFF,
+            int(max_iterations), int(max_depth), float(blueprint_mix),
+            int(rollout_samples), bool(resample_board), bool(linear_averaging),
+        )
+    except TypeError:
+        # Stale native binary built before the linear_averaging arg — fall back to Python so a
+        # not-yet-rebuilt crate doesn't crash the solve (the Python path applies the weighting).
+        return None
+    import numpy as _np
+
+    return _np.asarray(probs, dtype=_np.float64)
 
 
 # ---------------------------------------------------------------------------

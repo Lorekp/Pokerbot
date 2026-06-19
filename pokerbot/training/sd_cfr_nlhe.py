@@ -586,6 +586,10 @@ class SDCFRNLHETrainer:
         start_iter: int = 0,
     ) -> list[float]:
         losses: list[float] = []
+        # Guard: never SILENTLY ship a new blueprint on the made-hand-only postflop abstraction (it
+        # ignores draw equity). Warns loudly unless POKERBOT_ALLOW_MADE_HAND_BUCKETS=1 (smoke runs).
+        from pokerbot.engine.jax_weva_encode import warn_if_made_hand_only
+        warn_if_made_hand_only(context="SD-CFR NLHE blueprint training")
         t0 = time.perf_counter()
         for i in range(start_iter, self.config.iterations):
             iter_num = i + 1

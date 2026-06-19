@@ -25,6 +25,17 @@ _BETTING_ABSTRACTION = os.environ.get("POKERBOT_BETTING_ABSTRACTION", "0").lower
     "false",
     "no",
 )
+# Depth-aware blueprint (A2): fold an effective-STARTING-stack-depth bucket into the PREFLOP tabular key
+# so a depth-randomized retrain can serve depth-specific preflop ranges (40-200bb), not just 100bb. Off
+# (default) => the digest is BYTE-IDENTICAL to the non-depth blueprint (the byte is only hashed when ON and
+# only preflop; postflop the existing SPR bucket already carries depth-relative-to-pot). Edges live in
+# jax_weva_fast._DEPTH_EDGES. Train and serve MUST agree (stamped in active_abstraction_config + guarded).
+_DEPTH_BUCKETS = os.environ.get("POKERBOT_DEPTH_BUCKETS", "0").lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+)
 _GLOBAL_BUCKETER: Any = None
 # Inline card-abstraction mode: "fast" (one made-hand eval/node, ~2us — the per-node-affordable
 # default) vs "ehs" (Monte-Carlo EHS, accurate but ~ms/cold-key — only for offline precompute).
@@ -40,6 +51,45 @@ def _get_bucketer() -> Any:
         iters = int(os.environ.get("POKERBOT_POSTFLOP_EHS_ITERS", "500"))
         _GLOBAL_BUCKETER = PostflopBucketer(num_buckets=_POSTFLOP_NUM_BUCKETS, n_iter=iters)
     return _GLOBAL_BUCKETER
+
+
+_GLOBAL_EMD_BUCKETER: Any = None
+
+
+def _get_emd_bucketer() -> Any:
+    """Load the fitted potential-aware EMD centroids (POKERBOT_POSTFLOP_EMD_TABLE) for mode 'emd'.
+    The centroids are fit offline by scripts/precompute_emd_buckets.py and serialized; serving and
+    training MUST point at the same table (it's stamped, so the serve guard catches a mismatch)."""
+    global _GLOBAL_EMD_BUCKETER
+    if _GLOBAL_EMD_BUCKETER is None:
+        from pokerbot.encoding.postflop_bucketer import EMDBucketer
+
+        path = os.environ.get("POKERBOT_POSTFLOP_EMD_TABLE")
+        if not path:
+            raise RuntimeError(
+                "POKERBOT_POSTFLOP_MODE=emd requires POKERBOT_POSTFLOP_EMD_TABLE=<centroids.json> "
+                "(fit it offline with scripts/precompute_emd_buckets.py)")
+        _GLOBAL_EMD_BUCKETER = EMDBucketer.load(path)
+    return _GLOBAL_EMD_BUCKETER
+
+
+def warn_if_made_hand_only(context: str = "training") -> bool:
+    """Loudly flag the made-hand-only ('fast') postflop abstraction, which IGNORES DRAW EQUITY — a
+    known strategic leak (a flush draw is bucketed by its weak current rank, so the blueprint can't
+    size/continue it correctly). Call at the start of any production training run so a new blueprint is
+    never SILENTLY shipped on the made-hand bucketer. Returns True iff the made-hand path is active.
+    Set POKERBOT_ALLOW_MADE_HAND_BUCKETS=1 to acknowledge (e.g. a fast smoke run)."""
+    mode = active_abstraction_config().get("postflop_mode", _POSTFLOP_MODE)  # single source of truth
+    if mode != "fast":
+        return False
+    msg = (f"[postflop-abstraction] {context}: POKERBOT_POSTFLOP_MODE=fast = MADE-HAND-ONLY buckets "
+           "(ignores draw equity). For a production blueprint use POKERBOT_POSTFLOP_MODE=emd (potential-"
+           "aware) with POKERBOT_POSTFLOP_EMD_TABLE, or 'ehs'. Set POKERBOT_ALLOW_MADE_HAND_BUCKETS=1 to "
+           "silence for a deliberate smoke run.")
+    if os.environ.get("POKERBOT_ALLOW_MADE_HAND_BUCKETS", "0").lower() in ("0", "", "false", "no", "off"):
+        import warnings
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+    return True
 
 
 def compute_postflop_bucket(hole_ids: Any, board_ids: Any) -> int:
@@ -60,6 +110,8 @@ def compute_postflop_bucket(hole_ids: Any, board_ids: Any) -> int:
         from pokerbot.encoding.postflop_bucketer import fast_made_hand_bucket
 
         return fast_made_hand_bucket((h[0], h[1]), tuple(board), _POSTFLOP_NUM_BUCKETS)
+    if _POSTFLOP_MODE == "emd":
+        return _get_emd_bucketer().bucket((h[0], h[1]), tuple(board))
     return _get_bucketer().bucket((h[0], h[1]), tuple(board))
 
 from pokerbot.engine.jax_engine import EnvState
@@ -75,7 +127,7 @@ def active_abstraction_config() -> dict:
     (provenance) and cross-check at serve via ``lbr.check_blueprint_serve_env`` — a mismatch silently
     breaks blueprint coverage (every lookup misses → uniform fallback), the train/serve skew that has
     bitten this pipeline before (postflop 0%-coverage)."""
-    return {
+    cfg = {
         "betting_abstraction": bool(_BETTING_ABSTRACTION),
         "postflop_buckets": bool(_POSTFLOP_BUCKETS_ENABLED),
         "postflop_mode": _POSTFLOP_MODE,
@@ -83,6 +135,14 @@ def active_abstraction_config() -> dict:
         "preflop_lossless": bool(weva_encoder._PREFLOP_LOSSLESS),
         "preflop_lossless_betting": bool(weva_encoder._PREFLOP_LOSSLESS_BETTING),
     }
+    # Depth-aware blueprint (A2): emit the stamp fields ONLY when enabled, so the default (off) stamp stays
+    # byte-identical to legacy non-depth checkpoints (and the golden config). The serve guard
+    # (check_blueprint_serve_env) compares these with a `.get(default=False)` so a missing key reads as off.
+    if _DEPTH_BUCKETS:
+        from pokerbot.engine.jax_weva_fast import _DEPTH_EDGES  # lazy: avoids an import cycle
+        cfg["depth_bucketed"] = True
+        cfg["depth_edges"] = list(_DEPTH_EDGES)
+    return cfg
 
 
 @dataclass(frozen=True)
@@ -107,6 +167,9 @@ class NLHEEncodeBundle:
     # Used as the betting dimension of the key ONLY in betting-abstraction mode (the lossless
     # history_key is unbounded → never converges). See ``betting_abstraction_key`` in jax_weva_fast.
     betting_state: bytes = b""
+    # Effective-STARTING-stack-depth bucket (A2), hashed into the PREFLOP key ONLY when POKERBOT_DEPTH_BUCKETS
+    # is set. -1 => not computed / depth-buckets off ⇒ not hashed (digest byte-identical). See depth_bucket().
+    depth_bucket: int = -1
 
     def _digest(self, person: bytes) -> bytes:
         h = hashlib.blake2b(digest_size=16, person=person)
@@ -129,6 +192,11 @@ class NLHEEncodeBundle:
                 # combinatorics explode the table); otherwise the bounded betting_state (tractable default).
                 h.update(b"w")
                 h.update(int(self.weva_id).to_bytes(4, "little", signed=True))
+                # Depth-aware preflop key (A2): hash the effective-starting-depth bucket ONLY when enabled
+                # and computed (>=0). Gated so a non-depth blueprint's preflop digest is byte-unchanged.
+                if _DEPTH_BUCKETS and self.depth_bucket >= 0:
+                    h.update(b"D")
+                    h.update(int(self.depth_bucket).to_bytes(1, "little"))
                 if weva_encoder._PREFLOP_LOSSLESS and weva_encoder._PREFLOP_LOSSLESS_BETTING:
                     h.update(b"H")
                     h.update(self.history_key)
@@ -219,8 +287,9 @@ def encode_nlhe_weva_bundle(
     policy_position = fuse_position_scope(enc["position"], enc["spot_scope"])
     holes = np.asarray(state.holes)
     bucket = compute_postflop_bucket(holes[seat], np.asarray(state.board))
-    from pokerbot.engine.jax_weva_fast import betting_abstraction_key, betting_history_key
+    from pokerbot.engine.jax_weva_fast import betting_abstraction_key, betting_history_key, depth_bucket
 
+    dbucket = depth_bucket(state) if _DEPTH_BUCKETS else -1
     return NLHEEncodeBundle(
         weva_id=int(enc["weva_id"]),
         cards=np.asarray(enc["cards"], dtype=np.float32),
@@ -231,6 +300,7 @@ def encode_nlhe_weva_bundle(
         postflop_bucket_id=bucket,
         history_key=betting_history_key(state),
         betting_state=betting_abstraction_key(state, seat),
+        depth_bucket=dbucket,
     )
 
 

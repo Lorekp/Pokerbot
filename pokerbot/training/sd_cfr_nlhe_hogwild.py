@@ -46,6 +46,81 @@ from pokerbot.engine.np_engine import (
 from pokerbot.training.hogwild_cfr import regret_match
 from pokerbot.training.shared_hogwild_table import SharedHogwildTable
 
+
+def _sample_depth_stacks(deal_key):
+    """A3 depth-randomized retrain: ONE per-deal effective starting depth ~ log-U(lo,hi)bb, broadcast to
+    every seat, drawn from a SUB-key of the deal key so it is deterministic/CRN-reproducible and INDEPENDENT
+    of the deck shuffle (which uses ``deal_key`` directly). Returns None when ``POKERBOT_TRAIN_DEPTH_BB`` is
+    unset → ``init_hand`` keeps the fixed 100bb default (legacy). Set e.g. ``POKERBOT_TRAIN_DEPTH_BB=40,200``
+    (+ POKERBOT_DEPTH_BUCKETS=1 so the depth bucket is keyed). Log-uniform over-weights SHORT stacks, where
+    strategy is most depth-sensitive.
+
+    SHARED (symmetric) depth, NOT independent per-seat: the abstraction key buckets on the EFFECTIVE depth
+    (min over live seats of (stack+committed)/CHIP_UNIT). The min of 6 INDEPENDENT log-U draws collapses to
+    the short end (binding-min ~85% short / ~0% deep), which would starve the deep buckets the retrain
+    exists to fill. Broadcasting one depth makes min == the drawn depth, so the keyed variable sweeps the
+    full range with clean log-U mass and the table trains genuine deep-vs-deep. The key cannot distinguish
+    asymmetric stacks anyway (it only sees the min) and side pots cap each confrontation at the binding
+    depth, so symmetric is a faithful, low-risk representation (it is also the legacy equal-stack case)."""
+    import os
+
+    raw = os.environ.get("POKERBOT_TRAIN_DEPTH_BB", "").strip()
+    if not raw:
+        return None
+    try:
+        lo, hi = (float(x) for x in raw.split(","))
+    except (ValueError, TypeError):
+        return None
+    if not (hi > lo > 0):
+        return None
+    import math
+
+    import jax
+    import jax.numpy as jnp
+
+    from pokerbot.engine.jax_engine import NUM_PLAYERS
+
+    k = jax.random.fold_in(deal_key, 0x5747ACC)  # distinct RNG stream from the deck
+    u = jax.random.uniform(k, (), minval=math.log(lo), maxval=math.log(hi))  # ONE depth per deal
+    chips = jnp.round(jnp.exp(u) * CHIP_UNIT).astype(jnp.int32)
+    return jnp.full((NUM_PLAYERS,), chips, dtype=jnp.int32)
+
+
+def _sample_occupancy(deal_key):
+    """C1 short-handed coverage: per-deal live-seat occupancy (bool[NUM_PLAYERS]) — draw a live-seat COUNT
+    n in [lo,hi] weighted toward FULLER tables (the live mode), then a random size-n subset of the 6 seats,
+    from a SUB-key of the deal key (deterministic/CRN, a DISTINCT stream from the deck AND the depth
+    sampler). Returns None when POKERBOT_TRAIN_OCCUPANCY_MIX is unset -> the trainer keeps the fixed
+    --occupancy (byte-identical to today). Set e.g. POKERBOT_TRAIN_OCCUPANCY_MIX=2,6 to also train short
+    tables so the blueprint prior covers 5/4/3-handed + heads-up (the engine + search already play any
+    count; this only adds the trained warm-start). KEEP IN SYNC with sd_cfr_nlhe_distributed._sample_occupancy."""
+    import os
+
+    raw = os.environ.get("POKERBOT_TRAIN_OCCUPANCY_MIX", "").strip()
+    if not raw:
+        return None
+    try:
+        lo, hi = (int(x) for x in raw.split(","))
+    except (ValueError, TypeError):
+        return None
+    from pokerbot.engine.jax_engine import NUM_PLAYERS
+
+    if not (2 <= lo <= hi <= NUM_PLAYERS):
+        return None
+    import jax
+    import jax.numpy as jnp
+
+    k = jax.random.fold_in(deal_key, 0x0CC0)  # distinct stream from deck + depth sampler
+    kc, ks = jax.random.split(k)
+    counts = jnp.arange(lo, hi + 1)
+    weights = counts.astype(jnp.float32)  # w(n) proportional to n: fuller tables more likely (live mode)
+    n = int(jax.random.choice(kc, counts, p=weights / weights.sum()))
+    live = np.asarray(jax.random.choice(ks, NUM_PLAYERS, shape=(n,), replace=False))
+    occ = np.zeros(NUM_PLAYERS, dtype=bool)
+    occ[live] = True
+    return occ
+
+
 # Default HU solver layout (BTN/BB at seats 3/5 — same as SDCFRNLHEConfig.occupancy).
 _DEFAULT_OCCUPANCY: tuple[bool, ...] = (False, False, False, True, False, True)
 
@@ -280,8 +355,13 @@ def _nlhe_worker(
             if warm_event is not None and worker_index != 0 and i == 0:
                 warm_event.wait(timeout=1800)
             k = jax.random.fold_in(base_key, i)
-            root = to_numpy_state(init_hand(k, occupancy=occ))  # JAX init (1/deal), then numpy hot path
-            for trav in seats:
+            # C1: per-deal occupancy (short-handed coverage) when POKERBOT_TRAIN_OCCUPANCY_MIX is set; else
+            # the fixed --occupancy. The live-seat traversal set must follow the per-deal occupancy.
+            occ_k = _sample_occupancy(k)
+            occ_i = occ_k if occ_k is not None else occ
+            trav_seats = _live_seats(occ_i) if occ_k is not None else seats
+            root = to_numpy_state(init_hand(k, occupancy=occ_i, stacks=_sample_depth_stacks(k)))  # JAX init (1/deal), then numpy hot path
+            for trav in trav_seats:
                 _es_nlhe(
                     table, root, trav, rng,
                     allowed_pre=allowed_pre, allowed_post=allowed_post,
@@ -435,8 +515,13 @@ def _persistent_worker(
             if warm_event is not None and worker_index != 0 and i == 0:
                 warm_event.wait(timeout=1800)
             k = jax.random.fold_in(base_key, i)
-            root = to_numpy_state(init_hand(k, occupancy=occ))  # JAX init (1/deal), then numpy hot path
-            for trav in seats:
+            # C1: per-deal occupancy (short-handed coverage) when POKERBOT_TRAIN_OCCUPANCY_MIX is set; else
+            # the fixed --occupancy. The live-seat traversal set must follow the per-deal occupancy.
+            occ_k = _sample_occupancy(k)
+            occ_i = occ_k if occ_k is not None else occ
+            trav_seats = _live_seats(occ_i) if occ_k is not None else seats
+            root = to_numpy_state(init_hand(k, occupancy=occ_i, stacks=_sample_depth_stacks(k)))  # JAX init (1/deal), then numpy hot path
+            for trav in trav_seats:
                 _es_nlhe(
                     table, root, trav, rng,
                     allowed_pre=allowed_pre, allowed_post=allowed_post,

@@ -160,6 +160,15 @@ def check_blueprint_serve_env(*, strict: bool = False, expected: dict | None = N
             problems.append(
                 f"serve abstraction != trained-snapshot stamp (expected,active): {mism} — every "
                 "affected node misses; set the matching POKERBOT_* flags before import")
+        # Depth-bucket guard: a PRE-depth stamp has no "depth_bucketed" key, so the field-by-field loop
+        # above can't catch an OLD blueprint served under POKERBOT_DEPTH_BUCKETS=1 (every preflop key would
+        # then hash a depth byte the table never saw -> 0% preflop coverage). Check it explicitly with a
+        # default so a missing key is treated as False on both sides.
+        if bool(expected.get("depth_bucketed", False)) != bool(cfg.get("depth_bucketed", False)):
+            problems.append(
+                f"depth_bucketed mismatch (trained={expected.get('depth_bucketed', False)}, "
+                f"serve={cfg.get('depth_bucketed', False)}) — set POKERBOT_DEPTH_BUCKETS to match the "
+                "snapshot, else every preflop node misses")
     if problems:
         msg = f"blueprint serve MISCONFIGURED: {'; '.join(problems)}. active={cfg}"
         if strict:
@@ -176,7 +185,12 @@ def make_blueprint_policy(snapshot: dict[bytes, np.ndarray], *, client_bet_sizin
     Replicates ``TabularBlueprintBot._probs_for_env`` but with the numpy engine and
     ``fingerprint_fast`` (the exact key used during training), so lookups hit.
     """
-    from pokerbot.engine.jax_weva_fast import default_weva_bucket_table, fingerprint_fast
+    from pokerbot.engine.jax_weva_fast import default_weva_bucket_table
+    # Gated native fingerprint: ``fingerprint_native.fingerprint_fast`` dispatches to the Rust core
+    # ONLY when POKERBOT_FINGERPRINT_NATIVE is truthy AND the .pyd is built (byte-identical, validated
+    # by tools/fingerprint_native/verify_parity.py); otherwise it delegates to the Python oracle, so
+    # default serve behavior is unchanged. Same dict-key bytes either way -> no coverage skew.
+    from pokerbot.encoding.fingerprint_native import fingerprint_fast
     from pokerbot.training.sd_cfr_nlhe_hogwild import _apply_abstraction
     from pokerbot.training.sd_cfr_nlhe import build_allowed_action_mask
 
@@ -390,7 +404,15 @@ def lbr_exploitability(policy_fn, cfg: LBRConfig | None = None) -> LBRResult:
 
     for h in range(cfg.hands):
         key, k = jax.random.split(key)
-        env = to_numpy_state(init_hand(k, occupancy=occ))
+        # Button MUST land on a LIVE seat (3 or 5). With button=None, init_hand draws a random seat
+        # over all 6, so ~2/3 of hands put the button on a DEAD seat -- and encode_info_state one-hots
+        # state.button over 6 seats (jax_engine.py:585), so a dead-seat button lights an input position
+        # the target never saw in training (HU training deals button in {3,5} only). That off-distribution
+        # serve makes a position-aware target misplay catastrophically and inflates the LBR bound. Deal
+        # the button on a live seat, rotated DECOUPLED from the LBR/target assignment (h//2 vs h%2) so all
+        # four (who-is-LBR) x (who-has-button) combinations are sampled equally -> unbiased position.
+        button = jnp.int32(_HU_LIVE[(h // 2) % 2])
+        env = to_numpy_state(init_hand(k, button=button, occupancy=occ))
         lbr_seat = _HU_LIVE[h % 2]
         bp_seat = _HU_LIVE[1 - (h % 2)]
 

@@ -114,6 +114,118 @@ def fast_made_hand_bucket(hole_ids, board_ids, num_buckets: int = DEFAULT_NUM_BU
     return bucket
 
 
+def strength_histogram(hole_ids, board_ids, *, n_bins: int = 20, n_runouts: int = 200,
+                       seed: int = 0) -> np.ndarray:
+    """Potential-aware HAND-STRENGTH DISTRIBUTION of (hole, board): a normalized histogram (length
+    ``n_bins``) of the hero's made-hand-strength percentile over sampled board completions to the river.
+
+    This is the signal a made-hand-rank bucket THROWS AWAY: a flush/straight DRAW is bimodal (high
+    percentile when it completes, low when it bricks), while a made top pair is unimodal and high. Two
+    hands of identical CURRENT rank but different draw potential get different histograms => different
+    EMD buckets. At the river (5-card board) there are no runouts, so the histogram is a single spike at
+    the made-hand percentile (correctly collapsing to made-hand bucketing — no potential left).
+    Percentile uses the 7462-class rank (1 best .. 7462 worst): pct = 1 - (rank-1)/7461."""
+    from phevaluator import evaluate_cards
+
+    h = tuple(sorted(int(c) for c in hole_ids))
+    b = tuple(sorted(int(c) for c in board_ids if int(c) >= 0))
+    hist = np.zeros(int(n_bins), dtype=np.float64)
+    if len(b) < 3 or len(h) != 2:
+        return hist
+    hole = [card_id_to_str(c) for c in h]
+    board = [card_id_to_str(c) for c in b]
+    need = 5 - len(board)
+    if need <= 0:  # river: single deterministic strength -> one spike
+        rank = evaluate_cards(*(hole + board))
+        pct = 1.0 - (rank - 1) / 7461.0
+        hist[min(int(n_bins) - 1, int(pct * n_bins))] += 1.0
+        return hist
+    known = set(hole) | set(board)
+    deck = [r + s for r in _RANKS for s in _SUITS if (r + s) not in known]
+    rng = np.random.default_rng(seed)
+    deck_arr = np.array(deck, dtype=object)
+    for _ in range(int(n_runouts)):
+        pick = deck_arr[rng.choice(len(deck), size=need, replace=False)]
+        rank = evaluate_cards(*(hole + board + list(pick)))
+        pct = 1.0 - (rank - 1) / 7461.0
+        hist[min(int(n_bins) - 1, int(pct * n_bins))] += 1.0
+    s = hist.sum()
+    return hist / s if s > 0 else hist
+
+
+def _emd_1d(a: np.ndarray, b: np.ndarray) -> float:
+    """1-D Earth Mover's Distance between two normalized histograms = L1 of their CDFs."""
+    return float(np.abs(np.cumsum(a) - np.cumsum(b)).sum())
+
+
+class EMDBucketer:
+    """Potential-aware postflop abstraction (the Pluribus refinement): clusters hands by their
+    hand-strength DISTRIBUTION under Earth Mover's Distance, so draws and made hands of equal current
+    rank land in different buckets. Centroids are fit offline over a sample of (hole, board) histograms
+    (k-means under EMD) and serialized; ``bucket()`` is then an O(K) nearest-centroid lookup. Intended
+    as the ``POKERBOT_POSTFLOP_MODE=emd`` table for the next blueprint retrain."""
+
+    def __init__(self, num_buckets: int = DEFAULT_NUM_BUCKETS, *, n_bins: int = 20,
+                 n_runouts: int = 200, centroids: np.ndarray | None = None) -> None:
+        self.num_buckets = int(num_buckets)
+        self.n_bins = int(n_bins)
+        self.n_runouts = int(n_runouts)
+        self.centroids = None if centroids is None else np.asarray(centroids, dtype=np.float64)
+        self._cache: dict[tuple, int] = {}
+
+    def fit(self, histograms, *, iters: int = 12, seed: int = 0) -> "EMDBucketer":
+        """k-means under EMD over a (N, n_bins) array of pre-computed strength histograms. Centroid
+        update uses the mean histogram of each cluster (a standard, stable EMD-barycenter surrogate)."""
+        X = np.asarray(histograms, dtype=np.float64)
+        if X.ndim != 2 or X.shape[0] < self.num_buckets:
+            raise ValueError(f"need >= num_buckets ({self.num_buckets}) sample histograms, got {X.shape}")
+        rng = np.random.default_rng(seed)
+        cent = X[rng.choice(X.shape[0], size=self.num_buckets, replace=False)].copy()
+        Xc = np.cumsum(X, axis=1)
+        for _ in range(int(iters)):
+            Cc = np.cumsum(cent, axis=1)
+            # EMD(x, c) = L1(CDF_x - CDF_c); assign each x to nearest centroid
+            d = np.abs(Xc[:, None, :] - Cc[None, :, :]).sum(axis=2)
+            assign = d.argmin(axis=1)
+            for k in range(self.num_buckets):
+                members = X[assign == k]
+                if len(members):
+                    cent[k] = members.mean(axis=0)
+        self.centroids = cent
+        return self
+
+    def bucket(self, hole_ids, board_ids) -> int:
+        if self.centroids is None:
+            raise RuntimeError("EMDBucketer not fitted/loaded — call fit() or load() first")
+        key = _canonical_key(hole_ids, board_ids)
+        hit = self._cache.get(key)
+        if hit is not None:
+            return hit
+        hist = strength_histogram(key[0], key[1], n_bins=self.n_bins, n_runouts=self.n_runouts)
+        cc = np.cumsum(self.centroids, axis=1)
+        d = np.abs(np.cumsum(hist)[None, :] - cc).sum(axis=1)
+        b = int(d.argmin())
+        self._cache[key] = b
+        return b
+
+    def save(self, path: str | Path) -> None:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "kind": "emd", "num_buckets": self.num_buckets, "n_bins": self.n_bins,
+            "n_runouts": self.n_runouts,
+            "centroids": (self.centroids.tolist() if self.centroids is not None else None),
+        }), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: str | Path) -> "EMDBucketer":
+        d = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls(num_buckets=int(d["num_buckets"]), n_bins=int(d.get("n_bins", 20)),
+                   n_runouts=int(d.get("n_runouts", 200)),
+                   centroids=(np.asarray(d["centroids"], dtype=np.float64)
+                              if d.get("centroids") is not None else None))
+
+
 class PostflopBucketer:
     """Maps (hole, board) -> bounded bucket id by EHS. Cache + precompute-to-disk."""
 

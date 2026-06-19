@@ -30,6 +30,14 @@ import numpy as np
 from pokerbot.engine.game import NUM_PLAYERS, play_hand, GameState
 from pokerbot.eval.bots import BOT_REGISTRY
 from pokerbot.economics import rake as rk
+# The aggregate floor curve + recommendations now live in the package (pokerbot/economics/rake_floor.py)
+# so live code can import them without reaching into scripts/. Re-exported here for the CLI + tests.
+from pokerbot.economics.rake_floor import (  # noqa: F401
+    analytic_rake_curve,
+    stake_recommendations,
+    total_floor,
+    total_floor_modeled,
+)
 
 
 def _ci95(series: np.ndarray) -> tuple[float, float]:
@@ -69,44 +77,23 @@ def simulate(hero_name: str, field_names: list[str], hands: int, seed: int):
     )
 
 
-def _lognormal_pots(mean_bb: float, cv: float, n: int, rng: np.random.Generator) -> np.ndarray:
-    """Sample n flopped-pot sizes (bb) from a lognormal with the given mean and coefficient of variation."""
-    sigma2 = math.log(1.0 + cv * cv)
-    mu = math.log(mean_bb) - 0.5 * sigma2
-    return rng.lognormal(mean=mu, sigma=math.sqrt(sigma2), size=n)
-
-
-def analytic_rake_curve(flop_per_100: float, mean_pot_bb: float, hero_share: float,
-                        cv: float, n_samples: int, seed: int,
-                        splash_share: float = 1.0 / NUM_PLAYERS):
-    """Per-stake rake+splash bb/100 from a realistic flopped-pot-size model (cap nonlinearity by sampling).
-
-    The rake floor = (pots/100 hero contributes to that see a flop) x E[ min(5%*pot, cap_5+) * hero_share ].
-    The splash floor = 0.1bb on EVERY dealt hand (100/100) x hero's symmetric contribution share, at the
-    eligible low stakes only (0 elsewhere); it is flop-frequency-independent (charged even on preflop folds).
-    Full ring => 5+ tier. Returns {stake: (gross_drag, net_floor, net_modeled, splash)} in bb/100.
-    """
-    rng = np.random.default_rng(seed)
-    pots = _lognormal_pots(mean_pot_bb, cv, n_samples, rng)
-    five_pct = rk.RAKE_PCT * pots
-    out = {}
-    for sk in rk.STAKE_ORDER:
-        cap = rk.STAKES[sk].cap_bb[5]
-        per_pot_hero = float(np.minimum(five_pct, cap).mean()) * hero_share
-        gross = flop_per_100 * per_pot_hero
-        splash = 100.0 * rk.SPLASH_FEE_BB * splash_share if rk.splash_eligible(sk) else 0.0
-        out[sk] = (
-            gross,
-            gross * (1.0 - rk.rakeback_fraction(sk, "floor")),
-            gross * (1.0 - rk.rakeback_fraction(sk, "modeled")),
-            splash,
-        )
-    return out
-
-
-def total_floor_modeled(curve: dict, sk: str) -> float:
-    """The full bb/100 a winning reg must beat at a stake: net rake (modeled rakeback) + splash fee."""
-    return curve[sk][2] + curve[sk][3]
+def print_stake_recommendations(curve: dict, gross_edge_bb: float, *, mode: str = "floor") -> None:
+    rows = stake_recommendations(curve, gross_edge_bb, mode=mode)
+    playable = [r["stake"] for r in rows if r["ok"]]
+    print(f"\n==================  STAKE RECOMMENDATION (gross edge {gross_edge_bb:+.2f} bb/100, "
+          f"{mode} rakeback)  ==================")
+    hdr = f"{'stake':<11}{'band':>6}{'floor':>9}{'net':>9}  verdict"
+    print(hdr)
+    print("-" * (len(hdr) + 4))
+    for r in rows:
+        print(f"{r['stake']:<11}{r['band']:>6}{r['floor']:>9.2f}{r['net']:>+9.2f}  "
+              f"{'PLAY' if r['ok'] else 'avoid'}")
+    if playable:
+        print(f"\n=> net-positive at: {', '.join(playable)}  (best: {rows[0]['stake']} "
+              f"{rows[0]['net']:+.2f} bb/100)")
+    else:
+        print(f"\n=> NO stake clears the floor at this edge — the field is too tough; reselect the field "
+              f"(closest: {rows[0]['stake']} {rows[0]['net']:+.2f}).")
 
 
 def _print_analytic(label: str, curve: dict) -> None:
@@ -178,6 +165,9 @@ def main() -> None:
     ap.add_argument("--gross-bb", default="",
                     help="compose a stake x field NET matrix from MEASURED real-bot gross edges, e.g. "
                          "'soft=8.5,realistic=2.1,tough=-1.0,pro=-3.0' (bb/100 per field)")
+    ap.add_argument("--recommend-edge", type=float, default=None,
+                    help="given a single measured gross edge (bb/100) vs the current field, print the "
+                         "conservative (floor-rakeback) per-stake PLAY/avoid recommendation")
     args = ap.parse_args()
 
     # ---- Analytic rake floor (headline): credible magnitudes from a realistic pot-size model ----
@@ -204,6 +194,10 @@ def main() -> None:
     print("Read: to net-profit at a stake the bot's TRUE gross edge vs the field must exceed floor.m there.")
     print("Caveat: the splash FEE is partly returned as Infused Splash Pots (already credited in the low band),")
     print("        so for a high-volume reg floor.m at the low stakes is a slightly CONSERVATIVE upper bound.")
+
+    # ---- Optional: conservative (floor-rakeback) per-stake PLAY/avoid for one measured gross edge ----
+    if args.recommend_edge is not None:
+        print_stake_recommendations(base, args.recommend_edge, mode="floor")
 
     # ---- Optional: compose a real-bot gross edge per field into a stake x field NET matrix ----
     gross_by_field = parse_gross_bb(args.gross_bb)

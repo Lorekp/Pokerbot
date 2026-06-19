@@ -381,7 +381,9 @@ class Suite:
     def lbr6_jobs(self) -> list[tuple[str, list[str], dict | None]]:
         a, jobs = self.a, []
         extra = (["--rollout"] if getattr(a, "lbr6_passive", False) else [])  # legacy escape hatch only
-        menus = self._LBR6_MENUS if getattr(a, "lbr6_graded", True) else (getattr(a, "lbr6_menu", "fcpa"),)
+        menus = ((getattr(a, "lbr6_menu", "fcpa"),) if getattr(a, "lbr6_single_menu", False)
+                 else self._LBR6_MENUS if getattr(a, "lbr6_graded", True)
+                 else (getattr(a, "lbr6_menu", "fcpa"),))
         # Target: the RAW blueprint (fast lookup) or the DEPLOYED blueprint+SEARCH base (what the bot really
         # plays). For search the seats run Pluribus per decision (~30x slower) while the LBR range-tracks
         # against the cheap blueprint -- so the same 3-menu sweep costs the same wall-clock as 1 menu (the
@@ -389,6 +391,7 @@ class Suite:
         target = getattr(a, "lbr6_target", "blueprint")
         search = (["--search-leaf", getattr(a, "lbr6_search_leaf", "uniform"),
                    "--search-iters", str(getattr(a, "lbr6_search_iters", 10))]
+                  + (["--search-preflop"] if getattr(a, "lbr6_search_preflop", False) else [])
                   if target == "blueprint-search" else [])
         for tgt in ("foldbot", "station"):
             n = f"lbr6_cal_{tgt}_s0"
@@ -723,6 +726,13 @@ def main() -> None:
     ap.add_argument("--lbr6-search-iters", type=int, default=10,
                     help="lbr6 blueprint-search: FIXED CFR+ iters per opponent solve (box-independent). "
                          "10 = the config the +9.1 basestrength base was measured at.")
+    ap.add_argument("--lbr6-search-preflop", action="store_true",
+                    help="lbr6 blueprint-search: ALSO search preflop (default: preflop served from the "
+                         "blueprint table). Passes --search-preflop to lbr6_audit.py. Use the matching "
+                         "POKERBOT_PREFLOP_LOSSLESS env for the snapshot being served.")
+    ap.add_argument("--lbr6-single-menu", action="store_true",
+                    help="lbr6: run ONLY --lbr6-menu instead of the graded fc/fcpa/full sweep (the "
+                         "fc-first OLD-vs-NEW matrix runs a single menu per cell).")
     ap.add_argument("--job-timeout", type=int, default=4 * 3600)
     args = ap.parse_args()
     Suite(args).run()

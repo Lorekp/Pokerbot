@@ -33,10 +33,14 @@ from pokerbot.training.replay_buffers import (
     init_advantage_buffers,
     init_buffer,
     init_history_value_buffer,
+    init_linear_buffer,
     init_strategy_buffer,
     insert_advantage_sample,
     insert_strategy_sample,
+    linear_write,
+    linear_write_batch,
     reservoir_insert,
+    reservoir_insert_batch,
     STRATEGY_BUFFER_SPEC,
 )
 
@@ -134,6 +138,113 @@ def test_advantage_linear_buffer() -> None:
         jnp.int32(1),
     )
     assert int(buf.size) == 1
+
+
+def test_linear_write_batch_matches_sequential() -> None:
+    """Vectorized masked batch append == repeated per-sample linear_write."""
+
+    spec = BufferSpec(capacity=64, fields=STRATEGY_BUFFER_SPEC.fields)
+    m = 10
+    key = jax.random.PRNGKey(7)
+    info = jax.random.normal(key, (m, 256))
+    strat = jnp.ones((m, NUM_ACTIONS)) / NUM_ACTIONS
+    mask = jnp.ones((m, NUM_ACTIONS), dtype=bool)
+    iters = jnp.arange(m, dtype=jnp.int32)
+    valid = jnp.array([1, 0, 1, 1, 0, 1, 1, 1, 0, 1], dtype=bool)
+
+    # Sequential reference.
+    ref = init_linear_buffer(spec)
+    for i in range(m):
+        if bool(valid[i]):
+            ref = linear_write(
+                ref,
+                {"info_state": info[i], "strategy": strat[i], "legal_mask": mask[i], "iteration": iters[i]},
+            )
+
+    # Batched.
+    bat = init_linear_buffer(spec)
+    bat = linear_write_batch(
+        bat,
+        {"info_state": info, "strategy": strat, "legal_mask": mask, "iteration": iters},
+        valid,
+    )
+
+    assert int(bat.size) == int(ref.size) == int(jnp.sum(valid))
+    n = int(bat.size)
+    assert jnp.allclose(bat.data["info_state"][:n], ref.data["info_state"][:n])
+    assert jnp.array_equal(bat.data["iteration"][:n], ref.data["iteration"][:n])
+
+
+def test_reservoir_insert_batch_fill_phase_exact() -> None:
+    """While the reservoir is still filling, batched insert keeps every active row."""
+
+    spec = BufferSpec(capacity=64, fields=STRATEGY_BUFFER_SPEC.fields)
+    m = 8
+    key = jax.random.PRNGKey(3)
+    info = jax.random.normal(key, (m, 256))
+    strat = jnp.ones((m, NUM_ACTIONS)) / NUM_ACTIONS
+    mask = jnp.ones((m, NUM_ACTIONS), dtype=bool)
+    iters = jnp.arange(m, dtype=jnp.int32)
+    valid = jnp.array([1, 1, 0, 1, 1, 1, 0, 1], dtype=bool)
+    n_active = int(jnp.sum(valid))
+
+    buf = init_buffer(spec)
+    buf = reservoir_insert_batch(
+        buf,
+        jax.random.PRNGKey(99),
+        {"info_state": info, "strategy": strat, "legal_mask": mask, "iteration": iters},
+        valid,
+    )
+    assert int(buf.size) == n_active
+    assert int(buf.count) == n_active
+    # Every populated slot must be one of the active inserted iterations.
+    active_iters = set(int(x) for x, v in zip(iters, valid) if bool(v))
+    stored = set(int(x) for x in jax.device_get(buf.data["iteration"][:n_active]))
+    assert stored == active_iters
+
+
+def test_reservoir_insert_batch_caps_and_stays_valid() -> None:
+    """Over-capacity batched inserts keep size==capacity and only stored data."""
+
+    spec = BufferSpec(capacity=10, fields=STRATEGY_BUFFER_SPEC.fields)
+    m = 40
+    key = jax.random.PRNGKey(5)
+    info = jax.random.normal(key, (m, 256))
+    strat = jnp.ones((m, NUM_ACTIONS)) / NUM_ACTIONS
+    mask = jnp.ones((m, NUM_ACTIONS), dtype=bool)
+    iters = jnp.arange(1, m + 1, dtype=jnp.int32)
+    valid = jnp.ones((m,), dtype=bool)
+
+    buf = init_buffer(spec)
+    buf = reservoir_insert_batch(
+        buf, jax.random.PRNGKey(1),
+        {"info_state": info, "strategy": strat, "legal_mask": mask, "iteration": iters}, valid,
+    )
+    assert int(buf.size) == 10
+    assert int(buf.count) == m
+    # All stored iterations must come from the inserted set (no stale zeros).
+    stored = jax.device_get(buf.data["iteration"][:10])
+    assert bool(jnp.all(stored >= 1)) and bool(jnp.all(stored <= m))
+
+
+def test_reservoir_insert_batch_no_active_rows() -> None:
+    """An all-invalid batch is a no-op on size/count."""
+
+    spec = BufferSpec(capacity=16, fields=STRATEGY_BUFFER_SPEC.fields)
+    m = 5
+    buf = init_buffer(spec)
+    buf = reservoir_insert_batch(
+        buf, jax.random.PRNGKey(0),
+        {
+            "info_state": jnp.zeros((m, 256)),
+            "strategy": jnp.ones((m, NUM_ACTIONS)) / NUM_ACTIONS,
+            "legal_mask": jnp.ones((m, NUM_ACTIONS), dtype=bool),
+            "iteration": jnp.arange(m, dtype=jnp.int32),
+        },
+        jnp.zeros((m,), dtype=bool),
+    )
+    assert int(buf.size) == 0
+    assert int(buf.count) == 0
 
 
 def test_loss_functions_finite() -> None:

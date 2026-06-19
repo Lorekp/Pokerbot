@@ -72,8 +72,11 @@ def build_and_upload_code(s3, bucket: str, prefix: str) -> str:
 
 
 def upload_blueprint(s3, bucket: str, prefix: str, local_bp: Path | None = None) -> str:
+    # Key is scoped by the pkl's own filename stem so distinct blueprints (e.g. the OLD WEVA snapshot vs
+    # the NEW lossless snapshot in the same matrix) never collide on one S3 key — the size-skip then acts
+    # as a true per-content cache. The default LOCAL_BP keeps the historical bp6max_v2_iter200 key.
     local_bp = local_bp or LOCAL_BP
-    key = f"{prefix}/blueprint/bp6max_v2_iter200.pkl"
+    key = f"{prefix}/blueprint/{local_bp.stem}.pkl"
     size = local_bp.stat().st_size
     try:
         head = s3.head_object(Bucket=bucket, Key=key)
@@ -92,6 +95,7 @@ def user_data(*, bucket, prefix, region, code_key, bp_key, run_subdir, workers, 
               bs_pooled_profiles=False, ve_config="10:uniform",
               lbr6_rollouts=14, lbr6_no_allin=False, lbr6_passive=False, lbr6_menu="fcpa",
               lbr6_target="blueprint", lbr6_search_leaf="uniform", lbr6_search_iters=10,
+              lbr6_search_preflop=False, lbr6_single_menu=False,
               preflop_lossless=False, preflop_lossless_betting=False) -> str:
     run_prefix = f"{prefix}/{run_subdir}"
     final = "echo BOOTSTRAP_DONE_KEEP_ALIVE" if keep_alive else "shutdown -h now"
@@ -116,7 +120,9 @@ def user_data(*, bucket, prefix, region, code_key, bp_key, run_subdir, workers, 
             bs_flags = (f"--lbr6-menu {lbr6_menu} --lbr6-target {lbr6_target} "
                         + (f"--lbr6-search-leaf {lbr6_search_leaf} "
                            f"--lbr6-search-iters {lbr6_search_iters} "
+                           + ("--lbr6-search-preflop " if lbr6_search_preflop else "")
                            if lbr6_target == "blueprint-search" else "")
+                        + ("--lbr6-single-menu " if lbr6_single_menu else "")
                         + ("--lbr6-passive " if lbr6_passive else ""))
         main_cmd = (
             f"python3 scripts/run_cloud_eval_suite.py --bucket {bucket} --prefix {run_prefix} "
@@ -219,6 +225,12 @@ def main() -> None:
                    help="--mode lbr6 blueprint-search: Pluribus continuation leaf (uniform = deployed).")
     p.add_argument("--lbr6-search-iters", type=int, default=10,
                    help="--mode lbr6 blueprint-search: fixed CFR+ iters per opponent solve (10 = deployed).")
+    p.add_argument("--lbr6-search-preflop", action="store_true",
+                   help="--mode lbr6 blueprint-search: ALSO search preflop (default: preflop served from "
+                        "the blueprint). Set POKERBOT_PREFLOP_LOSSLESS to match the served snapshot.")
+    p.add_argument("--lbr6-single-menu", action="store_true",
+                   help="--mode lbr6: run ONLY --lbr6-menu (default fcpa) instead of the graded "
+                        "fc/fcpa/full sweep (the OLD-vs-NEW fc matrix runs one menu per cell).")
     p.add_argument("--preflop-lossless", action="store_true",
                    help="serve a LOSSLESS-PREFLOP-CARDS blueprint (POKERBOT_PREFLOP_LOSSLESS=1) — use when "
                         "the snapshot (--local-bp) was trained with --preflop-lossless.")
@@ -246,7 +258,9 @@ def main() -> None:
                    lbr6_rollouts=args.lbr6_rollouts, lbr6_no_allin=args.lbr6_no_allin,
                    lbr6_passive=args.lbr6_passive, lbr6_menu=args.lbr6_menu,
                    lbr6_target=args.lbr6_target, lbr6_search_leaf=args.lbr6_search_leaf,
-                   lbr6_search_iters=args.lbr6_search_iters, preflop_lossless=args.preflop_lossless,
+                   lbr6_search_iters=args.lbr6_search_iters,
+                   lbr6_search_preflop=args.lbr6_search_preflop,
+                   lbr6_single_menu=args.lbr6_single_menu, preflop_lossless=args.preflop_lossless,
                    preflop_lossless_betting=args.preflop_lossless_betting)
     run_kwargs = dict(
         ImageId=ami,

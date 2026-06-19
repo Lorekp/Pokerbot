@@ -63,6 +63,30 @@ _K_THIN = 0.6                              # boost to the small/mid value bucket
 _K_THIN_CHECK = 0.45                       # discourage checking back a thin-value hand vs a station
 
 
+def overlay_hand_strength(state, seat, *, n_iter: int = 300) -> float | None:
+    """BOARD-AWARE hero strength for the value-sizing / bluff-suppression overlays — equity vs a random
+    hand, so a genuinely MADE hand (top pair, two pair, a straight) reads as value and unimproved high
+    cards (ace-high air) read as air. This is the SINGLE source of truth used by BOTH the live overlay
+    (root_mixer.apply_live_value_sizing) and the sim battery, so the sim measures exactly the live value/
+    air separation rather than the preflop-rank proxy (which scored AKo on a missed board ~0.90 = top
+    pair). Preflop (no board) falls back to the preflop strength proxy; deterministic (fixed MC seed) so
+    it is CRN-safe; any failure -> None so the overlay defers."""
+    try:
+        player = state.players[seat]
+        if player.hole is None:
+            return None
+        board = [c for c in (getattr(state, "board", None) or []) if c is not None]
+        if len(board) < 3:
+            from pokerbot.encoding.weva_encoder import _preflop_strength
+            return float(_preflop_strength(player.hole))
+        from pokerbot.encoding.postflop_bucketer import expected_hand_strength
+        hole_ids = (int(player.hole[0].index), int(player.hole[1].index))
+        board_ids = tuple(int(c.index) for c in board[:5])
+        return float(expected_hand_strength(hole_ids, board_ids, n_iter=n_iter))
+    except Exception:  # noqa: BLE001 — strength is best-effort; the overlay defers on None
+        return None
+
+
 def _enabled() -> bool:
     return os.environ.get("POKERBOT_VALUE_SIZING", "1") != "0"
 
@@ -116,7 +140,11 @@ def station_payoff_score(stats) -> tuple[float, float]:
 
     folds = [v for v in (ftc, fta) if v is not None]
     sticky = max(0.0, min(1.0, (_FOLD_REF - min(folds)) / _FOLD_REF)) if folds else 0.0
-    weak = max(0.0, min(1.0, (_WSD_REF - wsd) / _WSD_SPAN)) if wsd is not None else 0.5  # neutral
+    # Value-cut guard fails CLOSED: when the showdown-strength stat is absent we cannot confirm the
+    # opponent shows up weak, so the weakness term is 0 (was a 0.5 "neutral" that let the overlay
+    # over-escalate value into an unknown — possibly strong — showdown range). The calling_station
+    # archetype floor below still recognizes a count-confirmed station.
+    weak = max(0.0, min(1.0, (_WSD_REF - wsd) / _WSD_SPAN)) if wsd is not None else 0.0
 
     score = 0.6 * sticky + 0.4 * weak
     arch = stats.archetype() if hasattr(stats, "archetype") else "unknown"
@@ -198,7 +226,9 @@ def river_thin_value_logits(stats, hand_strength: float | None, board) -> np.nda
         return adj
     if len([c for c in (board or []) if c is not None]) != 5:   # river only
         return adj
-    h = 0.45 if hand_strength is None else float(np.clip(hand_strength, 0.0, 1.0))
+    if hand_strength is None:                   # fail closed: never thin-value-bet an UNKNOWN hand
+        return adj
+    h = float(np.clip(hand_strength, 0.0, 1.0))
     if not (_THIN_LO <= h < _THIN_HI):          # only the marginal-ahead band
         return adj
     thin = (h - _THIN_LO) / (_THIN_HI - _THIN_LO)   # 0 at floor -> 1 at the value cutoff

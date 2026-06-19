@@ -6,13 +6,14 @@ Pure-functional transitions, fixed-shape int32 chip math (1 BB = 100 chips),
 
 from __future__ import annotations
 
+import os
 from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
 from jax import Array
 
-from pokerbot.engine.hand_eval_jax import card_rank
+from pokerbot.engine.hand_eval_jax import card_rank, card_suit
 from pokerbot.engine.side_pots_jax import SEAT_ALLIN, SEAT_FOLDED, SEAT_LIVE, compute_returns
 
 SEAT_EMPTY = jnp.int8(0)
@@ -35,6 +36,15 @@ BB_CHIPS: int = CHIP_UNIT
 BET_SIZE_BUCKETS: tuple[float, ...] = (1.0 / 3, 0.50, 0.66, 0.75, 1.0, 1.5, 2.0)
 INFO_FEATURE_DIM: int = 256
 HISTORY_FEATURE_DIM: int = 128
+
+# Suit-aware abstraction-free info encoding (opt-in for the neural-CFR path): appends suit-ISOMORPHIC
+# features (hole suitedness + board/combined suit texture) so the net distinguishes AKs from AKo and
+# sees flush texture. Rank-only encoding collapses 169 preflop classes -> 91 (coarser than the
+# 169-class tabular blueprint), so this is the prerequisite for a neural preflop component. The block
+# is appended at the TAIL of the feature vector -> the output is BYTE-IDENTICAL when the flag is off,
+# so the deployed search path (turbo_rebel_search/belief_likelihood) is unaffected. Train and serve
+# must set this identically (train/serve skew guard).
+_INFO_SUITS: bool = os.environ.get("POKERBOT_INFO_SUITS", "0").lower() not in ("", "0", "false", "no")
 
 FOLD = 0
 CHECK = 1
@@ -547,6 +557,25 @@ def _all_in_mask(seat_status: Array) -> Array:
 
 
 @jax.jit
+def _suit_features(state: EnvState, seat: Array) -> Array:
+    """Suit-ISOMORPHIC features (canonical, invariant to relabeling the 4 suits): hole suitedness +
+    board suit texture + combined (hole+board) flush proximity. Lossless preflop -- recovers the 169
+    starting-hand classes that the rank-only encoding collapses to 91 -- and flush-aware postflop,
+    without leaking suit IDENTITY (so it stays a valid abstraction-free feature, not 1326 raw combos)."""
+    holes = state.holes[seat]                                   # (2,)
+    board = state.board                                         # (5,)
+    h_present = (holes >= 0).astype(jnp.float32)
+    b_present = (board >= 0).astype(jnp.float32)
+    h_suit = card_suit(jnp.maximum(holes, 0))
+    b_suit = card_suit(jnp.maximum(board, 0))
+    suited = h_present[0] * h_present[1] * (h_suit[0] == h_suit[1]).astype(jnp.float32)
+    h_counts = (jax.nn.one_hot(h_suit, 4) * h_present[:, None]).sum(axis=0)   # (4,) per-suit hole
+    b_counts = (jax.nn.one_hot(b_suit, 4) * b_present[:, None]).sum(axis=0)   # (4,) per-suit board
+    board_sorted = jnp.sort(b_counts)[::-1] / 5.0                             # suit-isomorphic texture
+    combined_sorted = jnp.sort(h_counts + b_counts)[::-1] / 7.0               # flush proximity incl. hole
+    return jnp.concatenate([jnp.array([suited], dtype=jnp.float32), board_sorted, combined_sorted])
+
+
 def encode_info_state(state: EnvState, seat: Array) -> Array:
     scale = float(STARTING_STACK_CHIPS)
     pot_live = _pot_for_sizing(state)
@@ -564,6 +593,8 @@ def encode_info_state(state: EnvState, seat: Array) -> Array:
         (state.board >= 0).astype(jnp.float32) * (card_rank(state.board) / 14.0),
     ]
     feat = jnp.concatenate([p.flatten() for p in parts])
+    if _INFO_SUITS:                                            # opt-in suit-isomorphic tail (gated)
+        feat = jnp.concatenate([feat, _suit_features(state, seat)])
     pad = jnp.zeros(INFO_FEATURE_DIM, dtype=jnp.float32)
     return jax.lax.dynamic_update_slice(pad, feat, (0,))
 

@@ -25,6 +25,7 @@ Everything runs on ``np_engine`` (``apply_action_np`` / ``sample_chance_np``); t
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -36,12 +37,87 @@ from pokerbot.search.native_solver import (
     apply_action_np,
     is_chance_node_np,
     legal_action_mask_np,
+    native_uniform_leaf_value,
     sample_chance_np,
 )
+
+# POKERBOT_NATIVE_ROLLOUT: when truthy AND the native PlayoutEngine is built, the UNIFORM continuation
+# leaf runs entirely in Rust (one call/leaf, no per-step EnvState marshaling). Default OFF => the
+# Python loop below runs UNCHANGED (byte-identical default behavior). The native value is statistically
+# equivalent (same expectation), NOT bit-identical (a fast native RNG replaces numpy's PCG64).
+_NATIVE_ROLLOUT = os.environ.get("POKERBOT_NATIVE_ROLLOUT", "0") not in ("0", "", "false", "False")
+
+
+def _native_rollout_enabled() -> bool:
+    return _NATIVE_ROLLOUT
 from pokerbot.search.tabular_blueprint_adapter import (
     NUM_CONTINUATIONS,
     TabularBlueprintAdapter,
 )
+
+
+# --------------------------------------------------------------------------------------------------
+# Leaf-local memoization (FAST PATH, default ON, env-gated revertible).
+#
+# Inside a single leaf evaluation the dominant Python cost is the per-step continuation-set derivation
+# (blueprint fingerprint_fast + WEVA postflop bucket + legal-mask + the four bias rows). Across the
+# CRN playouts that share the SAME board per runout, the SAME (seat, holes, public-history) infoset
+# recurs, so we memoize the continuation-set + legal mask per infoset for the lifetime of ONE leaf
+# evaluation. PURE memoization: ``continuation_set(env, seat)`` is a deterministic function of
+# (seat, hole, street, board, betting history), so a cache hit returns the byte-identical array a fresh
+# call would. Speed only; the leaf value is bit-identical to the un-memoized path. Gated OFF restores
+# the exact legacy calls.
+# --------------------------------------------------------------------------------------------------
+_LEAF_MEMO = os.environ.get("POKERBOT_LEAF_MEMO", "1") not in ("0", "false", "False", "")
+
+
+def leaf_memo_enabled() -> bool:
+    return bool(_LEAF_MEMO)
+
+
+def set_leaf_memo(on: bool) -> None:
+    """Runtime toggle for the per-leaf continuation-set memo (the fast path). ON by default."""
+    global _LEAF_MEMO
+    _LEAF_MEMO = bool(on)
+
+
+def _infoset_sig(env, seat: int):
+    """Hashable signature identifying the continuation-set inputs at (env, seat) WITHIN one leaf eval.
+
+    ``continuation_set`` reads: the legal mask (a function of street + the acting seat's betting state)
+    and the blueprint fingerprint (seat, its hole cards, street, board, betting history). Inside a leaf
+    eval the hole cards are fixed and the betting state is fully determined by the action history from
+    the leaf root, so this tuple uniquely keys a byte-identical continuation-set result."""
+    hist_len = int(env.hist_len)
+    hole = env.holes[seat]
+    return (
+        int(seat),
+        int(hole[0]), int(hole[1]),
+        int(env.street),
+        np.asarray(env.board).tobytes(),
+        np.asarray(env.hist_seat[:hist_len]).tobytes(),
+        np.asarray(env.hist_action[:hist_len]).tobytes(),
+    )
+
+
+def _cont_and_mask(env, seat: int, adapter: "TabularBlueprintAdapter", memo):
+    """Return (continuation_rows, full_legal_mask) for (env, seat), using the per-leaf ``memo`` dict
+    when enabled. ``continuation_rows`` is the (NUM_CONTINUATIONS, NUM_ACTIONS) abstraction-masked
+    strategy stack; ``full_legal_mask`` is the UN-abstracted legal bool mask — exactly what the legacy
+    ``_playout`` passed to ``_sample_action`` (it samples the abstraction-masked row restricted to the
+    full legal index set; the two agree because the row is zero outside the abstraction support)."""
+    if memo is not None:
+        key = _infoset_sig(env, seat)
+        hit = memo.get(key)
+        if hit is not None:
+            return hit
+        mask = legal_action_mask_np(env, seat).astype(bool)
+        cont = adapter.continuation_set(env, seat)
+        memo[key] = (cont, mask)
+        return cont, mask
+    mask = legal_action_mask_np(env, seat).astype(bool)
+    cont = adapter.continuation_set(env, seat)
+    return cont, mask
 
 
 @dataclass
@@ -92,12 +168,14 @@ def _playout(
     choice_fn,
     rng: np.random.Generator,
     max_depth: int,
+    memo=None,
 ) -> float:
     """Play ``env`` to showdown; at each acting seat use the continuation selected by ``choice_fn(seat)``.
 
     ``choice_fn(seat) -> int`` returns the continuation index (0..3) that seat commits to (constant across
-    the playout — matching the gadget's "same choice across indistinguishable infosets"). Returns the hero
-    terminal value in bb (``rewards[hero]/CHIP_UNIT``).
+    the playout — matching the gadget's "same choice across indistinguishable infosets"). ``memo`` is the
+    per-leaf continuation-set cache (None disables it). Returns the hero terminal value in bb
+    (``rewards[hero]/CHIP_UNIT``).
     """
     depth = 0
     while depth < max_depth and not bool(env.done):
@@ -107,8 +185,7 @@ def _playout(
         seat = int(env.action_seat)
         if seat < 0:
             break
-        mask = legal_action_mask_np(env, seat).astype(bool)
-        cont = adapter.continuation_set(env, seat)  # (NUM_CONTINUATIONS, NUM_ACTIONS), legal-masked
+        cont, mask = _cont_and_mask(env, seat, adapter, memo)
         row = cont[int(choice_fn(seat))]
         a = _sample_action(row, mask, float(rng.random()))
         env = apply_action_np(env, a)
@@ -124,6 +201,15 @@ def _payoff_matrix(
     (i,j) cell, so cross-cell differences isolate the continuation choice (not the board luck)."""
     k = NUM_CONTINUATIONS
     M = np.zeros((k, k), dtype=np.float64)
+    if not cfg.resample_board:
+        # GUARD: the env from state_bridge carries an UNREPAIRED deck (arange(52), ptr 0). The per-runout
+        # _reshuffle_undealt below is what removes the in-play hole/board cards; with resample_board=False
+        # there is no repair, so _playout reveals DUPLICATE board cards and corrupts every leaf value.
+        # resample_board=False is only valid with a pre-repaired env (not the live bridge deck).
+        import warnings
+        warnings.warn("pluribus_rollout: resample_board=False with an unrepaired bridge deck deals "
+                      "duplicate cards -> invalid leaf values; use resample_board=True.", RuntimeWarning)
+    memo = {} if leaf_memo_enabled() else None
     for r in range(cfg.rollout_samples):
         # One board per runout (CRN: identical across all i,j cells); fresh action rng per cell but seeded
         # from the same per-runout base so cross-cell differences isolate the continuation choice.
@@ -135,7 +221,7 @@ def _payoff_matrix(
             for j in range(k):
                 rng = np.random.default_rng(cfg.base_seed + 1000003 * (r + 1))
                 choice = (lambda s, _i=i, _j=j: _i if s == hero else _j)
-                M[i, j] += _playout(env_r, hero, adapter, choice, rng, cfg.max_playout_depth)
+                M[i, j] += _playout(env_r, hero, adapter, choice, rng, cfg.max_playout_depth, memo)
     return M / float(cfg.rollout_samples)
 
 
@@ -193,7 +279,25 @@ def continuation_leaf_value(
         return float(env.rewards[hero]) / CHIP_UNIT
 
     if cfg.select == "uniform":
+        # NATIVE FAST PATH (opt-in): the whole uniform playout in Rust, no per-step marshaling. Only
+        # the read-blind uniform draw (cont_weights is None) is ported; model-aware leaves stay Python.
+        if cont_weights is None and _native_rollout_enabled():
+            from pokerbot.engine.jax_weva_encode import _POSTFLOP_NUM_BUCKETS
+
+            v = native_uniform_leaf_value(
+                env, hero, adapter,
+                base_seed=cfg.base_seed,
+                rollout_samples=cfg.rollout_samples,
+                resample_board=cfg.resample_board,
+                max_playout_depth=cfg.max_playout_depth,
+                num_buckets=int(_POSTFLOP_NUM_BUCKETS),
+            )
+            if v is not None:
+                return float(v)
+            # else: native unavailable/unsupported config -> fall through to the Python loop.
+
         total = 0.0
+        memo = {} if leaf_memo_enabled() else None
         for r in range(cfg.rollout_samples):
             env_r = (
                 _reshuffle_undealt(env, np.random.default_rng(cfg.base_seed + 7919 * (r + 1)))
@@ -216,7 +320,7 @@ def continuation_leaf_value(
                     _d[s] = c
                 return c
 
-            total += _playout(env_r, hero, adapter, choice, rng, cfg.max_playout_depth)
+            total += _playout(env_r, hero, adapter, choice, rng, cfg.max_playout_depth, memo)
         return total / float(cfg.rollout_samples)
 
     if cfg.select == "gadget":

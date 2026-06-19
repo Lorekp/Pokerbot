@@ -37,6 +37,27 @@ NUM_PLAYERS = 6
 STARTING_STACK_BB = 100.0
 SB_BB = 0.5
 BB_BB = 1.0
+_CHIP = 0.01  # smallest indivisible unit (matches the engine's round(_, 2) bet granularity)
+
+
+def _split_layer_chips(layer_pot: float, winners: list[int], button_seat: int) -> dict[int, float]:
+    """Award a tied pot layer in whole chips (0.01bb), routing the indivisible remainder to the first
+    eligible winner left of the button — bit-identical to the live JAX settlement
+    (``side_pots_jax.award_layer``). The previous exact float share (``layer_pot / n``) diverged from the
+    served engine on odd-chip ties (eval-only, sub-cent, but now matched)."""
+    n = len(winners)
+    chips = round(layer_pot / _CHIP)
+    base, rem = divmod(chips, n)
+    out = {w: base * _CHIP for w in winners}
+    if rem:
+        wset = set(winners)
+        odd = next(
+            (s for off in range(NUM_PLAYERS)
+             for s in ((button_seat + 1 + off) % NUM_PLAYERS,) if s in wset),
+            winners[0],
+        )
+        out[odd] += rem * _CHIP
+    return out
 
 
 @dataclass
@@ -52,7 +73,9 @@ class PlayerState:
 
     @property
     def active(self) -> bool:
-        return not self.folded and self.stack_bb > 0 or self.committed_street_bb > 0
+        # parenthesized: a FOLDED player with chips already in this street must NOT read active
+        # (operator precedence made `committed_street_bb > 0` an independent OR term before).
+        return not self.folded and (self.stack_bb > 0 or self.committed_street_bb > 0)
 
 
 @dataclass
@@ -142,14 +165,20 @@ class GameState:
         else:
             actions.append(Action(ActionType.CALL))
 
-        min_raise = max(BB_BB, self.current_bet_bb * 2 - player.committed_street_bb)
+        # Minimum legal raise TOTAL (above committed) = the call plus the last FULL-raise increment (>= BB),
+        # NOT current_bet*2 (which wrongly assumes the next increment equals the whole standing bet).
+        min_inc = max(BB_BB, getattr(self, "last_raise_increment", BB_BB))
+        min_raise = to_call + min_inc
         if player.stack_bb > to_call:
-            for frac in BET_SIZE_BUCKETS:
+            for i, frac in enumerate(BET_SIZE_BUCKETS):
                 target = max(self.current_bet_bb, self.pot_bb * frac)
                 bet_total = target - player.committed_street_bb
                 if bet_total >= min_raise and bet_total <= player.stack_bb:
                     atype = ActionType.BET if self.current_bet_bb <= 1e-9 else ActionType.RAISE
-                    actions.append(Action(atype, round(bet_total, 2)))
+                    # Tag the EXACT abstraction menu index (3 + frac position) so the serve path
+                    # (action_to_index) recovers the trained bucket instead of mis-bucketing the
+                    # absolute-BB amount. The frac IS the bucket here — no pot-fraction re-derivation.
+                    actions.append(Action(atype, round(bet_total, 2), bucket=3 + i))
             if player.stack_bb > to_call:
                 actions.append(Action(ActionType.ALL_IN, player.stack_bb))
         return actions
@@ -176,9 +205,15 @@ class GameState:
             total = to_call + amount
             self._commit(seat, total)
             if player.committed_street_bb > prev_bet + 1e-9:
+                increment = player.committed_street_bb - prev_bet
+                min_inc = max(BB_BB, getattr(self, "last_raise_increment", BB_BB))
                 self.current_bet_bb = player.committed_street_bb
                 self.last_aggressor = seat
-                self._acted_this_street = {seat}
+                if increment >= min_inc - 1e-9:        # FULL raise -> reopens the round, resets acted
+                    self.last_raise_increment = increment
+                    self._acted_this_street = {seat}
+                # else: a short all-in UNDER-raise raises current_bet but does NOT reopen (already-acted
+                # seats only owe the extra to call) -> fall through to the acted.add(seat) below.
         else:
             raise ValueError(f"Unknown action {action}")
 
@@ -211,6 +246,7 @@ class GameState:
         for p in self.players:
             p.committed_street_bb = 0.0
         self.current_bet_bb = 0.0
+        self.last_raise_increment = BB_BB    # new street: the minimum raise increment resets to one BB
         self._acted_this_street.clear()
 
         if self.street == Street.PREFLOP:
@@ -264,20 +300,42 @@ class GameState:
         return self.street == Street.SHOWDOWN or self.active_player_count() <= 1
 
     def resolve_showdown(self) -> dict[int, float]:
-        """Return chip deltas in BB per seat for this hand."""
+        """Return chip deltas in BB per seat for this hand. Side-pot aware: the pot is layered by each
+        seat's committed_total, and each layer is awarded to the best hand among the contenders still
+        ELIGIBLE for it (committed at least that much). A single largest contributor's uncalled excess is
+        returned. (The old code split the WHOLE pot among the overall winners, overpaying a short all-in
+        that won the main pot and shorting the side-pot contenders — eval-only: the live JAX serve path
+        settles via side_pots_jax, which was already correct.)"""
         if self.active_player_count() == 1:
             winner = next(p.seat for p in self.players if not p.folded)
             return self._award_pot([winner])
 
-        hands = []
-        seats = []
-        for p in self.players:
-            if not p.folded and p.hole:
-                seats.append(p.seat)
-                hands.append(list(p.hole) + list(self.board))
-        winners = compare_hands(hands)
-        winner_seats = [seats[i] for i in winners]
-        return self._award_pot(winner_seats)
+        deltas = {i: -self.players[i].committed_total_bb for i in range(NUM_PLAYERS)}
+        totals = [self.players[i].committed_total_bb for i in range(NUM_PLAYERS)]
+        # Uncalled-bet return: the single largest contribution is only matched up to the 2nd largest.
+        srt = sorted(totals)
+        if len(srt) >= 2 and srt[-1] > srt[-2] + 1e-9:
+            top = max(range(NUM_PLAYERS), key=lambda i: totals[i])
+            deltas[top] += totals[top] - srt[-2]   # refund the uncalled excess
+            totals[top] = srt[-2]                  # cap it for the layering below
+
+        hole = {p.seat: list(p.hole) for p in self.players if p.hole}
+        contenders = [p.seat for p in self.players if not p.folded and p.hole]
+        levels = sorted({t for t in totals if t > 1e-9})
+        prev = 0.0
+        for lvl in levels:
+            layer_pot = (lvl - prev) * sum(1 for t in totals if t >= lvl - 1e-9)
+            prev = lvl
+            if layer_pot <= 1e-12:
+                continue
+            elig = [s for s in contenders if totals[s] >= lvl - 1e-9]
+            if not elig:
+                continue   # layer made up purely of folded dead money with no eligible claimant
+            win_idx = compare_hands([hole[s] + list(self.board) for s in elig])
+            winners = [elig[i] for i in win_idx]
+            for w, amt in _split_layer_chips(layer_pot, winners, self.button_seat).items():
+                deltas[w] += amt
+        return deltas
 
     def _award_pot(self, winner_seats: list[int]) -> dict[int, float]:
         share = self.pot_bb / len(winner_seats)
@@ -300,6 +358,7 @@ def play_hand(
     state: GameState | None = None,
     rng: random.Random | None = None,
     allin_settle: "callable | None" = None,
+    chance_sink: "callable | None" = None,
 ) -> tuple[GameState, dict[int, float]]:
     """Play one hand; policies map seat -> callable(state) -> Action.
 
@@ -308,7 +367,13 @@ def play_hand(
     cards dealt after that (``_advance_street`` auto-deals the next street when the closing call
     completes it) are information-free runout luck the hook may integrate out. If it returns a deltas
     dict, the hand settles on that (all-in EV / equity settlement — a mean-preserving variance reducer
-    for evals); on None the board runs out as usual. Default None ⇒ behavior unchanged."""
+    for evals); on None the board runs out as usual. Default None ⇒ behavior unchanged.
+
+    ``chance_sink``: optional hook ``(state, prev_board_len) -> None`` called immediately AFTER an action
+    that revealed new board cards (``_advance_street`` dealt them inside ``apply_action``), with
+    ``prev_board_len`` = the board length before the reveal. Used by the chance control variate
+    (``pokerbot.eval.chance_cv``) to correct board-runout luck; observe-only, never mutates state, so
+    default None ⇒ behavior byte-identical."""
     state = state or GameState.new_hand(rng=rng)
     state.deal_hole_cards()
     n_board_seen = 0
@@ -353,6 +418,8 @@ def play_hand(
                 )
         n_board_seen = len(state.board)
         state.apply_action(action)
+        if chance_sink is not None and len(state.board) > n_board_seen:
+            chance_sink(state, n_board_seen)
         if state.is_terminal():
             break
         state.advance_to_next_actor()

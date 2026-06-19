@@ -84,7 +84,8 @@ def user_data(*, bucket, prefix, region, code_key, run_subdir, workers, iteratio
               keep_alive=False, bet_buckets=None, postflop_buckets=None, betting_abstraction=False,
               client_bet_sizing=False, trainer="pool", hogwild_capacity=None, arch="arm64",
               occupancy="hu", cfr_variant="cfr_plus", vr_baseline=False,
-              preflop_lossless=False, preflop_lossless_betting=False) -> str:
+              preflop_lossless=False, preflop_lossless_betting=False,
+              depth_buckets=False, depth_bb=None, occupancy_mix=None) -> str:
     run_prefix = f"{prefix}/{run_subdir}"
     s3log = f"s3://{bucket}/{run_prefix}/logs"
     # --no-sft-init avoids the torch dependency (torch is only needed to load the .pt SFT). Skip the
@@ -115,7 +116,20 @@ def user_data(*, bucket, prefix, region, code_key, run_subdir, workers, iteratio
     # much larger --hogwild-capacity and more iters; default OFF (cards-only is tractable + fits).
     if preflop_lossless_betting:
         postflop_env = (postflop_env + " POKERBOT_PREFLOP_LOSSLESS_BETTING=1").strip()
-    torch_check = ("echo torch-skipped-no-sft" if no_sft
+    # Depth-aware blueprint (A2/A3): key a per-seat effective-STARTING-depth bucket into the PREFLOP key
+    # (POKERBOT_DEPTH_BUCKETS) AND randomize each deal's starting stack over the live range
+    # (POKERBOT_TRAIN_DEPTH_BB=lo,hi, log-uniform). Both are needed for a coherent depth retrain. Serve MUST
+    # set POKERBOT_DEPTH_BUCKETS=1 (stamped into the checkpoint + cross-checked by check_blueprint_serve_env).
+    if depth_buckets:
+        postflop_env = (postflop_env + " POKERBOT_DEPTH_BUCKETS=1").strip()
+    if depth_bb:
+        postflop_env = (postflop_env + f" POKERBOT_TRAIN_DEPTH_BB={depth_bb}").strip()
+    # Short-handed coverage (C1): randomize each deal's live-seat count/occupancy over LO,HI so the
+    # blueprint prior covers 5/4/3-handed + heads-up (the engine + search already play any count; this adds
+    # the trained warm-start). No abstraction-key change — position/history already separate seat counts.
+    if occupancy_mix:
+        postflop_env = (postflop_env + f" POKERBOT_TRAIN_OCCUPANCY_MIX={occupancy_mix}").strip()
+    torch_check =("echo torch-skipped-no-sft" if no_sft
                    else 'python3 -c "import torch; print(\'torch\', torch.__version__)"')
     # Validation: keep the box alive on finish so we can inspect via get-console-output; production:
     # shut down (and the launcher sets InstanceInitiatedShutdownBehavior=terminate) to stop billing.
@@ -235,6 +249,16 @@ def main() -> None:
     p.add_argument("--preflop-lossless", action="store_true",
                    help="lossless preflop CARDS: 169 canonical class x position (no WEVA k-means; SMALLER "
                         "than the 10k-WEVA blueprint). Fixes the proven +180 card-merge leak. From-scratch.")
+    p.add_argument("--depth-buckets", action="store_true",
+                   help="A2: key an effective-starting-depth bucket into the PREFLOP key (depth-aware "
+                        "blueprint); serve must also set POKERBOT_DEPTH_BUCKETS=1")
+    p.add_argument("--depth-bb", default=None,
+                   help="A3: randomize each deal's starting stack over LO,HI bb (e.g. '40,200', log-uniform). "
+                        "Pair with --depth-buckets for the depth retrain.")
+    p.add_argument("--occupancy-mix", default=None,
+                   help="C1: randomize each deal's live-seat count over LO,HI (e.g. '2,6', weighted toward "
+                        "fuller tables) so the blueprint prior covers short-handed/HU tables. Requires "
+                        "--occupancy 6max. No key change; the engine/search already play any seat count.")
     p.add_argument("--preflop-lossless-betting", action="store_true",
                    help="ALSO make preflop BETTING lossless (Pluribus-exact). Explodes the infoset count "
                         "(~10^7-10^8) -> needs a big --hogwild-capacity + more iters. Opt-in; default OFF.")
@@ -259,6 +283,21 @@ def main() -> None:
     p.add_argument("--run-subdir-ts", type=int, default=0, help="timestamp for run subdir (pass from caller)")
     args = p.parse_args()
 
+    # Depth-retrain coherence guards (a mis-launch silently trains a wasted/incoherent table over hours):
+    #   * --depth-buckets keys the depth byte ONLY inside the betting-abstraction digest branch, so without
+    #     --betting-abstraction the byte is dropped at train time while the stamp still claims depth_bucketed.
+    #   * --depth-buckets and --depth-bb must come together: keying depth while every deal is fixed-100bb
+    #     fills one bucket; randomizing stacks without keying them folds incoherent ranges into one row.
+    if args.depth_buckets and not args.betting_abstraction:
+        p.error("--depth-buckets requires --betting-abstraction (the depth byte is only hashed in the "
+                "betting-abstraction digest branch; otherwise it is silently dropped).")
+    if bool(args.depth_buckets) != bool(args.depth_bb):
+        p.error("--depth-buckets and --depth-bb must be used together (key + randomized deals); "
+                f"got depth_buckets={args.depth_buckets!r} depth_bb={args.depth_bb!r}.")
+    if args.occupancy_mix and args.occupancy != "6max":
+        p.error("--occupancy-mix requires --occupancy 6max (it samples a subset of the 6 ring seats per "
+                f"deal); got --occupancy {args.occupancy}.")
+
     s3 = boto3.client("s3", region_name=args.region)
     ec2 = boto3.client("ec2", region_name=args.region)
 
@@ -278,6 +317,8 @@ def main() -> None:
         trainer=args.trainer, hogwild_capacity=args.hogwild_capacity, arch=args.arch,
         occupancy=args.occupancy, cfr_variant=args.cfr_variant, vr_baseline=args.vr_baseline,
         preflop_lossless=args.preflop_lossless, preflop_lossless_betting=args.preflop_lossless_betting,
+        depth_buckets=args.depth_buckets, depth_bb=args.depth_bb,
+        occupancy_mix=args.occupancy_mix,
     )
     run_kwargs = dict(
         ImageId=ami,
