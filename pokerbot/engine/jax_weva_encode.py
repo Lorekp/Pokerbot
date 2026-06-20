@@ -145,6 +145,43 @@ def active_abstraction_config() -> dict:
     return cfg
 
 
+def _made_hand_only_active() -> bool:
+    """PRECISE predicate for the made-hand-only ('fast') postflop abstraction.
+
+    True ONLY when postflop bucketing is actually ON and the mode is the made-hand 'fast' bucketer.
+    If ``postflop_buckets`` is OFF there is no bucketing to be 'made-hand-only' — a lossless/non-bucketed
+    run carries no draw-equity leak and must NOT be blocked. This is the predicate the HARD ship guard
+    (``require_potential_aware_buckets``) uses; the advisory ``warn_if_made_hand_only`` keeps a LOOSER
+    mode-only predicate (see its docstring) so its pinned test stays green."""
+    cfg = active_abstraction_config()
+    return bool(cfg["postflop_buckets"]) and cfg.get("postflop_mode") == "fast"
+
+
+def require_potential_aware_buckets(context: str = "blueprint training") -> bool:
+    """FAIL-CLOSED ship guard: refuse to train/save a production NLHE blueprint on the made-hand-only
+    ('fast') postflop bucketer, which IGNORES DRAW EQUITY (the documented +188 bb/100 structural leak).
+
+    - Not made-hand-only active (precise predicate) -> return False (nothing to guard).
+    - Made-hand-only active + POKERBOT_ALLOW_MADE_HAND_BUCKETS acknowledged -> emit the visible
+      RuntimeWarning (so a deliberate smoke is still loud) and return True.
+    - Made-hand-only active + NOT acknowledged -> raise RuntimeError with an actionable message.
+    """
+    if not _made_hand_only_active():
+        return False
+    msg = (
+        f"[postflop-abstraction] {context}: POKERBOT_POSTFLOP_MODE=fast = MADE-HAND-ONLY buckets "
+        "(ignores draw equity = documented +188 bb/100 structural leak). For a production blueprint set "
+        "POKERBOT_POSTFLOP_MODE=emd (potential-aware) with POKERBOT_POSTFLOP_EMD_TABLE=<centroids.json> "
+        "(fit it offline via scripts/precompute_emd_buckets.py), or set POKERBOT_ALLOW_MADE_HAND_BUCKETS=1 "
+        "to acknowledge a deliberate made-hand run."
+    )
+    if os.environ.get("POKERBOT_ALLOW_MADE_HAND_BUCKETS", "0").lower() in ("0", "", "false", "no", "off"):
+        raise RuntimeError(msg)
+    import warnings
+    warnings.warn(msg, RuntimeWarning, stacklevel=2)
+    return True
+
+
 @dataclass(frozen=True)
 class NLHEEncodeBundle:
     weva_id: int

@@ -9,6 +9,7 @@
 //! is native.
 
 pub mod core;
+pub mod emd;
 pub mod fingerprint;
 pub mod icm;
 pub mod lbr;
@@ -812,6 +813,77 @@ mod py {
         crate::icm::icm_delta(&pre_stacks, &chip_delta, &payouts)
     }
 
+    // -----------------------------------------------------------------------
+    // EMD postflop bucketer (potential-aware abstraction) — Workstream F.
+    // Cross-checked by tests/test_native_emd_equiv.py:
+    //   * emd_bucket_from_hist is BIT-IDENTICAL to numpy's argmin-of-L1-of-CDF;
+    //   * emd_strength_histogram is STATISTICALLY EQUIVALENT (fast native RNG, not a PCG64 replay);
+    //   * emd_fit is calibration-equivalent (independent init, deterministic per seed).
+    // -----------------------------------------------------------------------
+
+    /// `emd_strength_histogram(hole, board, n_bins, n_runouts, seed)` -> normalized length-`n_bins`
+    /// strength-percentile histogram. `hole` must have length 2 (extra entries are ignored).
+    #[pyfunction]
+    fn emd_strength_histogram(
+        hole: Vec<i32>,
+        board: Vec<i32>,
+        n_bins: usize,
+        n_runouts: usize,
+        seed: u64,
+    ) -> PyResult<Vec<f64>> {
+        if hole.len() < 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err("hole must have 2 cards"));
+        }
+        let h = [hole[0], hole[1]];
+        Ok(crate::emd::strength_histogram(&h, &board, n_bins, n_runouts, seed))
+    }
+
+    /// `emd_bucket_from_hist(hist, centroids)` -> argmin centroid index (numpy-identical keep-first).
+    #[pyfunction]
+    fn emd_bucket_from_hist(hist: Vec<f64>, centroids: Vec<Vec<f64>>) -> usize {
+        crate::emd::emd_bucket_from_hist(&hist, &centroids)
+    }
+
+    /// `emd_fit(histograms, num_buckets, iters, seed)` -> `num_buckets` centroids (k-means under EMD).
+    #[pyfunction]
+    fn emd_fit(
+        histograms: Vec<Vec<f64>>,
+        num_buckets: usize,
+        iters: usize,
+        seed: u64,
+    ) -> Vec<Vec<f64>> {
+        crate::emd::emd_fit(&histograms, num_buckets, iters, seed)
+    }
+
+    /// `emd_mean_inertia(histograms, centroids)` -> mean within-cluster EMD (clustering quality scalar).
+    #[pyfunction]
+    fn emd_mean_inertia(histograms: Vec<Vec<f64>>, centroids: Vec<Vec<f64>>) -> f64 {
+        crate::emd::mean_inertia(&histograms, &centroids)
+    }
+
+    /// `emd_strength_histograms_batch(spots, n_bins, n_runouts, seed_base)` -> per-spot histograms,
+    /// rayon-parallel, deterministic per index. Each spot is `(hole[2], board)`.
+    #[pyfunction]
+    fn emd_strength_histograms_batch(
+        py: Python<'_>,
+        spots: Vec<(Vec<i32>, Vec<i32>)>,
+        n_bins: usize,
+        n_runouts: usize,
+        seed_base: u64,
+    ) -> PyResult<Vec<Vec<f64>>> {
+        let mut conv: Vec<([i32; 2], Vec<i32>)> = Vec::with_capacity(spots.len());
+        for (hole, board) in spots {
+            if hole.len() < 2 {
+                return Err(pyo3::exceptions::PyValueError::new_err("each spot hole must have 2 cards"));
+            }
+            conv.push(([hole[0], hole[1]], board));
+        }
+        let out = py.detach(|| {
+            crate::emd::strength_histograms_batch(&conv, n_bins, n_runouts, seed_base)
+        });
+        Ok(out)
+    }
+
     /// Flat buffer length + engine dims, for the wrapper's startup self-check.
     #[pyfunction]
     fn engine_dims() -> (usize, usize, usize, usize, usize) {
@@ -841,6 +913,11 @@ mod py {
         m.add_function(wrap_pyfunction!(icm_equity, m)?)?;
         m.add_function(wrap_pyfunction!(bubble_factor, m)?)?;
         m.add_function(wrap_pyfunction!(icm_delta, m)?)?;
+        m.add_function(wrap_pyfunction!(emd_strength_histogram, m)?)?;
+        m.add_function(wrap_pyfunction!(emd_bucket_from_hist, m)?)?;
+        m.add_function(wrap_pyfunction!(emd_fit, m)?)?;
+        m.add_function(wrap_pyfunction!(emd_mean_inertia, m)?)?;
+        m.add_function(wrap_pyfunction!(emd_strength_histograms_batch, m)?)?;
         m.add_class::<PlayoutEngine>()?;
         m.add_class::<SubgameSolver>()?;
         m.add_class::<Lbr6Harness>()?;

@@ -586,10 +586,10 @@ class SDCFRNLHETrainer:
         start_iter: int = 0,
     ) -> list[float]:
         losses: list[float] = []
-        # Guard: never SILENTLY ship a new blueprint on the made-hand-only postflop abstraction (it
-        # ignores draw equity). Warns loudly unless POKERBOT_ALLOW_MADE_HAND_BUCKETS=1 (smoke runs).
-        from pokerbot.engine.jax_weva_encode import warn_if_made_hand_only
-        warn_if_made_hand_only(context="SD-CFR NLHE blueprint training")
+        # Guard: never ship a new blueprint on the made-hand-only postflop abstraction (it ignores
+        # draw equity). FAIL-CLOSED — raises unless POKERBOT_ALLOW_MADE_HAND_BUCKETS=1 (smoke runs).
+        from pokerbot.engine.jax_weva_encode import require_potential_aware_buckets
+        require_potential_aware_buckets(context="SD-CFR NLHE blueprint training")
         t0 = time.perf_counter()
         for i in range(start_iter, self.config.iterations):
             iter_num = i + 1
@@ -716,6 +716,12 @@ def save_nlhe_checkpoint(trainer: SDCFRNLHETrainer, path: Path, *, worker_base: 
     durable S3 resume checkpoint always uses the FULL save (worker_base=False).
     """
     import pickle
+
+    # Universal ship-time safety net: refuse to persist ANY NLHE blueprint artifact (full base OR slim
+    # worker base — both are made-hand-only tables) keyed with the draw-equity-blind 'fast' bucketer,
+    # unless POKERBOT_ALLOW_MADE_HAND_BUCKETS=1 acknowledges a deliberate made-hand run.
+    from pokerbot.engine.jax_weva_encode import require_potential_aware_buckets
+    require_potential_aware_buckets(context="saving NLHE blueprint checkpoint")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as f:

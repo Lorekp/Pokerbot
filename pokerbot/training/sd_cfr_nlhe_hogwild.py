@@ -424,6 +424,10 @@ def run_nlhe_hogwild(
     "load_factor": float}``. ``reservoir`` is populated only when ``reservoir_cap > 0`` (for H6 net
     distillation). The fingerprint mode follows POKERBOT_BETTING_ABSTRACTION at encoder import time.
     """
+    # Guard FIRST (fail fast before workers burn compute): never run hogwild blueprint training on the
+    # made-hand-only 'fast' bucketer (ignores draw equity). FAIL-CLOSED unless the ack env is set.
+    from pokerbot.engine.jax_weva_encode import require_potential_aware_buckets
+    require_potential_aware_buckets(context="hogwild NLHE blueprint training")
     ctx = mp.get_context("spawn")
     table = SharedHogwildTable.create(capacity, NLHE_NUM_ACTIONS, ctx=ctx, with_baseline=use_baseline)
     _seed_table(table, init_strat, init_regret)
