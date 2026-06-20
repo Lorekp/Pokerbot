@@ -46,6 +46,29 @@ def icm_action_value(pre_stacks: Sequence[float], outcomes: Sequence[tuple[float
     return val / total_p if total_p > 0 else float(icm_equity(pre, payouts)[hero])
 
 
+def chip_ev_action_value(pre_stacks: Sequence[float],
+                         outcomes: Sequence[tuple[float, Sequence[float]]], hero: int) -> float:
+    """Pure CHIP-EV value of an action: the probability-weighted hero chip delta, with NO ICM bend.
+
+    This is the deal-time toggle-off counterpart to :func:`icm_action_value`: once a final-table deal
+    is struck the remaining play is payout-agnostic (the money is already split by the deal), so the
+    engine optimizes raw chips exactly like the cash game. It deliberately ignores ``payouts`` and the
+    stacks' ICM curvature -- it is the chip-EV the cash blueprint/search already maximizes, so handing
+    off to the value-extraction layer is seamless. ``outcomes`` = ``[(prob, chip_delta_per_seat), ...]``.
+    """
+    pre = [float(s) for s in pre_stacks]
+    total_p = 0.0
+    val = 0.0
+    for prob, delta in outcomes:
+        if prob == 0:
+            continue
+        val += prob * float(delta[hero])
+        total_p += prob
+    if total_p <= 0:
+        return 0.0
+    return val / total_p
+
+
 def icm_tilt(chip_values: Sequence[float], action_risk: Sequence[float],
              stacks: Sequence[float], payouts: Sequence[float], hero: int, villain: int) -> np.ndarray:
     """Heuristic ICM tilt of a chip-EV action-value vector when no outcome distribution is available.

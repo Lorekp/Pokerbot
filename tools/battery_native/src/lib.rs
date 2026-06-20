@@ -10,6 +10,7 @@
 
 pub mod core;
 pub mod fingerprint;
+pub mod icm;
 pub mod lbr;
 pub mod nnet;
 pub mod phe_tables;
@@ -790,6 +791,27 @@ mod py {
         }
     }
 
+    /// `icm_equity(stacks, payouts)` -> per-seat $-equity (Malmuth-Harville). Pool-conserving.
+    /// Cross-checked against `pokerbot.tournament.icm.icm_equity` by `tests/test_native_icm_equiv.py`.
+    #[pyfunction]
+    fn icm_equity(stacks: Vec<f64>, payouts: Vec<f64>) -> Vec<f64> {
+        crate::icm::icm_equity(&stacks, &payouts)
+    }
+
+    /// `bubble_factor(stacks, payouts, hero, villain)` -> pairwise ICM risk premium (inf if hero
+    /// cannot gain). Mirrors `pokerbot.tournament.icm.bubble_factor`.
+    #[pyfunction]
+    fn bubble_factor(stacks: Vec<f64>, payouts: Vec<f64>, hero: usize, villain: usize) -> f64 {
+        crate::icm::bubble_factor(&stacks, &payouts, hero, villain)
+    }
+
+    /// `icm_delta(pre_stacks, chip_delta, payouts)` -> per-seat $-equity change (busts clamp at 0).
+    /// Mirrors `pokerbot.tournament.icm.icm_delta`.
+    #[pyfunction]
+    fn icm_delta(pre_stacks: Vec<f64>, chip_delta: Vec<f64>, payouts: Vec<f64>) -> Vec<f64> {
+        crate::icm::icm_delta(&pre_stacks, &chip_delta, &payouts)
+    }
+
     /// Flat buffer length + engine dims, for the wrapper's startup self-check.
     #[pyfunction]
     fn engine_dims() -> (usize, usize, usize, usize, usize) {
@@ -816,6 +838,9 @@ mod py {
         m.add_function(wrap_pyfunction!(fingerprint_fast_depth, m)?)?;
         m.add_function(wrap_pyfunction!(eval_seven_phe, m)?)?;
         m.add_function(wrap_pyfunction!(multiway_equity_river, m)?)?;
+        m.add_function(wrap_pyfunction!(icm_equity, m)?)?;
+        m.add_function(wrap_pyfunction!(bubble_factor, m)?)?;
+        m.add_function(wrap_pyfunction!(icm_delta, m)?)?;
         m.add_class::<PlayoutEngine>()?;
         m.add_class::<SubgameSolver>()?;
         m.add_class::<Lbr6Harness>()?;

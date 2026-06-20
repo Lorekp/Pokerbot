@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from pokerbot.tournament.icm_overlay import icm_action_value
+from pokerbot.tournament.icm_overlay import chip_ev_action_value, icm_action_value
 from pokerbot.tournament.open_shove_icm import solve_open_shove_icm
 from pokerbot.tournament.pushfold_icm import hand_to_label
 
@@ -38,7 +38,8 @@ def _eff_bb(stacks: Sequence[float], hero: int, contenders: Sequence[int]) -> fl
 
 
 def decide_deep(stacks: Sequence[float], payouts: Sequence[float], hero: int,
-                action_outcomes: dict[str, Sequence[tuple[float, Sequence[float]]]]) -> Decision:
+                action_outcomes: dict[str, Sequence[tuple[float, Sequence[float]]]],
+                *, deal_struck: bool = False) -> Decision:
     """Deep-stack decision: the ICM-correct choice over a chip-EV strategy's actions.
 
     ``action_outcomes`` maps each candidate action -> its chip-outcome distribution
@@ -47,9 +48,17 @@ def decide_deep(stacks: Sequence[float], payouts: Sequence[float], hero: int,
     taken. Far from the money this reduces to the chip-EV choice automatically (chips are $-linear),
     so the strong cash engine is used unchanged; near the money it tightens correctly. This removes
     the blind >20bb defer: deep play = the cash engine's lines, ICM-graded.
+
+    ``deal_struck`` toggles ICM OFF: after a final-table deal the money is already split, so play is
+    payout-agnostic CHIP-EV -- the action is valued by :func:`chip_ev_action_value` and the bot plays
+    exactly the cash chip-EV line, handing off cleanly to the value-extraction layer.
     """
     if not action_outcomes:
         return Decision("defer", 0.0, "deep", note="no chip-EV actions provided")
+    if deal_struck:
+        vals = {a: chip_ev_action_value(stacks, outs, hero) for a, outs in action_outcomes.items()}
+        best = max(vals, key=vals.get)
+        return Decision(best, 1.0, "deal-chip-ev", note=f"chip_ev={vals[best]:.4f}")
     vals = {a: icm_action_value(stacks, outs, payouts, hero) for a, outs in action_outcomes.items()}
     best = max(vals, key=vals.get)
     return Decision(best, 1.0, "deep-icm-graded", note=f"icm_value={vals[best]:.4f}")
