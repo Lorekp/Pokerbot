@@ -337,6 +337,57 @@ pub fn blake2b(out_len: usize, person: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// Byte-identical `fingerprint_fast(state, seat)` for the bounded eval config (16-byte key).
 pub fn fingerprint_fast(s: &EnvState, seat: usize, num_buckets: i32) -> [u8; 16] {
+    fingerprint_fast_depth(s, seat, num_buckets, &[])
+}
+
+/// `effective_depth_bb`: min over non-folded seats (with positive total) of (stacks+committed_total),
+/// in BB. Mirrors `jax_weva_fast.effective_depth_bb` including its fallbacks.
+fn effective_depth_bb(s: &EnvState) -> f64 {
+    let mut m: Option<i64> = None;
+    for i in 0..NUM_PLAYERS {
+        let st = s.seat_status[i];
+        if st != SEAT_EMPTY && st != SEAT_FOLDED {
+            let total = s.stacks[i] as i64 + s.committed_total[i] as i64;
+            if total > 0 {
+                m = Some(match m {
+                    Some(x) => x.min(total),
+                    None => total,
+                });
+            }
+        }
+    }
+    let chips = match m {
+        Some(x) => x as f64,
+        None => {
+            // fallback: max over all seats' totals (empty seats are 0); else 100bb.
+            let mut mx: i64 = 0;
+            let mut any = false;
+            for i in 0..NUM_PLAYERS {
+                let total = s.stacks[i] as i64 + s.committed_total[i] as i64;
+                if !any || total > mx {
+                    mx = total;
+                    any = true;
+                }
+            }
+            if any {
+                mx as f64
+            } else {
+                100.0 * CHIP_UNIT
+            }
+        }
+    };
+    chips / CHIP_UNIT
+}
+
+/// Depth-aware fingerprint (`POKERBOT_DEPTH_BUCKETS=1`). When `depth_edges` is non-empty, the PREFLOP
+/// key gains `b"D" + depth_bucket(1 byte)` between weva_id and the betting_state -- byte-identical to
+/// `NLHEEncodeBundle._digest` with `_DEPTH_BUCKETS`. Pass `&[]` for the non-depth blueprint (unchanged).
+pub fn fingerprint_fast_depth(
+    s: &EnvState,
+    seat: usize,
+    num_buckets: i32,
+    depth_edges: &[f64],
+) -> [u8; 16] {
     let button = s.button;
     let pos_enum = POS_BY_OFFSET[(((seat as i32 - button) % NUM_PLAYERS as i32
         + NUM_PLAYERS as i32) % NUM_PLAYERS as i32) as usize];
@@ -346,16 +397,19 @@ pub fn fingerprint_fast(s: &EnvState, seat: usize, num_buckets: i32) -> [u8; 16]
     let bucket = compute_postflop_bucket(h0, h1, &s.board, num_buckets);
     let betting_state = betting_abstraction_key(s, seat);
 
-    // _digest(b"") in betting-abstraction mode, PREFLOP_LOSSLESS_BETTING=0:
-    //   postflop_bucket >= 0:  b"B" + bucket(i32 LE) + b"S" + betting_state
-    //   else (preflop)      :  b"w" + weva_id(i32 LE) + b"S" + betting_state
-    let mut msg: Vec<u8> = Vec::with_capacity(1 + 4 + 1 + 6);
+    let mut msg: Vec<u8> = Vec::with_capacity(1 + 4 + 2 + 1 + 6);
     if bucket >= 0 {
         msg.push(b'B');
         msg.extend_from_slice(&bucket.to_le_bytes());
     } else {
         msg.push(b'w');
         msg.extend_from_slice(&weva_id.to_le_bytes());
+        // Depth byte: preflop only, when depth bucketing is on.
+        if !depth_edges.is_empty() {
+            let dbucket = bucket_edge(effective_depth_bb(s), depth_edges);
+            msg.push(b'D');
+            msg.push(dbucket);
+        }
     }
     msg.push(b'S');
     msg.extend_from_slice(&betting_state);

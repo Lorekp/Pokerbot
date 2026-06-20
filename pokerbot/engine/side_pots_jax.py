@@ -8,6 +8,11 @@ from jax import Array
 
 from pokerbot.engine.hand_eval_jax import player_showdown_score
 
+# NUM_PLAYERS / MAX_POTS are the 6-max DEFAULTS (cash). They are NOT used for SIZING any more: every
+# function below derives the seat count ``n`` from the shape of its ``seat_status`` / ``committed_total``
+# input (``.shape[0]``, which is STATIC under jit, so jit-safety is preserved) and uses that for array
+# allocation and seat wraps. This lets a 7-wide (or N-wide) state flow through unchanged while keeping
+# byte-identity for the deployed 6-wide path. Do NOT change these module constants.
 NUM_PLAYERS: int = 6
 MAX_POTS: int = NUM_PLAYERS
 SEAT_FOLDED = jnp.int8(1)
@@ -29,8 +34,9 @@ def _cap_contributions(committed_total: Array) -> Array:
 
 
 def _odd_chip_seat(eligible: Array, button: Array) -> Array:
-    offsets = jnp.arange(NUM_PLAYERS)
-    seats = (button + 1 + offsets) % NUM_PLAYERS
+    n = eligible.shape[0]  # seat count (static under jit)
+    offsets = jnp.arange(n)
+    seats = (button + 1 + offsets) % n
     is_elig = eligible[seats]
     idx = jnp.argmax(is_elig)
     return jnp.where(jnp.any(is_elig), seats[idx], button)
@@ -65,17 +71,23 @@ def compute_returns(
         total = jnp.sum(committed_total)
         return (-committed_total).at[winner].add(total)
 
+    # Seat count (and hence the max distinct side-pot levels) is the width of the dealt state, derived
+    # from the input arrays. Static under jit, so the kernel re-traces cleanly per seat count and stays
+    # byte-identical for n == 6.
+    n = seat_status.shape[0]
+    max_pots = n
+
     def showdown(_: None) -> Array:
         board_valid = board >= 0
-        scores = jax.vmap(lambda s: player_showdown_score(holes[s], board, board_valid))(jnp.arange(NUM_PLAYERS))
+        scores = jax.vmap(lambda s: player_showdown_score(holes[s], board, board_valid))(jnp.arange(n))
         scores = jnp.where(_eligible_to_win(seat_status), scores, jnp.int32(-1))
 
         capped = _cap_contributions(committed_total)
         excess = committed_total - capped
-        winnings = jnp.zeros(NUM_PLAYERS, dtype=jnp.int32)
+        winnings = jnp.zeros(n, dtype=jnp.int32)
 
         positive = jnp.where(capped > 0, capped, -1)
-        levels = jnp.sort(jnp.unique(positive, size=MAX_POTS, fill_value=-1))
+        levels = jnp.sort(jnp.unique(positive, size=max_pots, fill_value=-1))
         levels = jnp.where(levels >= 0, levels, -1)
         prev = jnp.int32(0)
 

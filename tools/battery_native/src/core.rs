@@ -14,7 +14,10 @@ pub const NUM_PLAYERS: usize = 6;
 pub const NUM_ACTIONS: usize = 11;
 pub const MAX_BOARD: usize = 5;
 pub const MAX_HISTORY: usize = 64;
+pub const CHIP_UNIT: i32 = 100;
 pub const BB_CHIPS: i32 = 100;
+pub const SB_CHIPS: i32 = CHIP_UNIT / 2; // 50
+pub const STREET_PREFLOP: i32 = 0;
 
 pub const FOLD: usize = 0;
 pub const CHECK: usize = 1;
@@ -46,16 +49,23 @@ pub const BET_BUCKETS_F32: [f32; N_BUCKETS] = [
 ];
 
 // ---------------------------------------------------------------------------
-// EnvState (flat, Copy) — only the fields the engine transitions need.
+// EnvStateN<N> (flat, Copy) — only the fields the engine transitions need.
+//
+// Const-generic over seat count `N`. The public `EnvState` alias pins `N = NUM_PLAYERS` (= 6) so
+// every existing reference across the crate keeps the exact 6-seat layout and behavior (the alias
+// monomorphizes to a struct byte-identical to the pre-refactor `EnvState`). A 7-seat (or any-N)
+// instantiation is `EnvStateN<7>`; the state-machine functions below are generic over `N` so the
+// same engine drives any seat count. Seat-sized fields are `[_; N]`; fixed-size fields
+// (`board`/`deck`/`rng_key`/`hist_*`) are independent of seat count and stay as-is.
 // ---------------------------------------------------------------------------
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EnvState {
-    pub holes: [[i32; 2]; NUM_PLAYERS],
+pub struct EnvStateN<const N: usize> {
+    pub holes: [[i32; 2]; N],
     pub board: [i32; MAX_BOARD],
-    pub seat_status: [i8; NUM_PLAYERS],
-    pub stacks: [i32; NUM_PLAYERS],
-    pub committed_street: [i32; NUM_PLAYERS],
-    pub committed_total: [i32; NUM_PLAYERS],
+    pub seat_status: [i8; N],
+    pub stacks: [i32; N],
+    pub committed_street: [i32; N],
+    pub committed_total: [i32; N],
     pub street: i32,
     pub pot_dead: i32,
     pub current_bet: i32,
@@ -63,7 +73,7 @@ pub struct EnvState {
     pub button: i32,
     pub action_seat: i32,
     pub last_aggressor: i32,
-    pub acted: [bool; NUM_PLAYERS],
+    pub acted: [bool; N],
     pub last_raise_full: bool,
     pub deck: [i32; 52],
     pub deck_ptr: i32,
@@ -73,9 +83,14 @@ pub struct EnvState {
     pub hist_amount: [i32; MAX_HISTORY],
     pub hist_len: i32,
     pub done: bool,
-    pub rewards: [i32; NUM_PLAYERS],
+    pub rewards: [i32; N],
     pub pending_deal: bool,
 }
+
+/// The default 6-seat state. ALIAS: every existing `EnvState` reference across the crate (lib.rs
+/// flat marshaling + PyO3 exports, fingerprint.rs, playout.rs, subgame.rs, tests) resolves to this
+/// and is unchanged. Public API surface (`EnvState`, `NUM_PLAYERS`) is preserved verbatim.
+pub type EnvState = EnvStateN<NUM_PLAYERS>;
 
 // ---------------------------------------------------------------------------
 // Hand evaluation (port of hand_eval portion of np_engine.py)
@@ -260,18 +275,18 @@ fn player_showdown_score(holes: &[i32; 2], board: &[i32; MAX_BOARD]) -> i32 {
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn eligible_to_win(seat_status: &[i8; NUM_PLAYERS]) -> [bool; NUM_PLAYERS] {
-    let mut e = [false; NUM_PLAYERS];
-    for i in 0..NUM_PLAYERS {
+fn eligible_to_win<const N: usize>(seat_status: &[i8; N]) -> [bool; N] {
+    let mut e = [false; N];
+    for i in 0..N {
         e[i] = seat_status[i] == SEAT_LIVE || seat_status[i] == SEAT_ALLIN;
     }
     e
 }
 
 /// `_cap_contributions`: cap each positive contribution at the second-highest (or highest if <2).
-fn cap_contributions(committed_total: &[i32; NUM_PLAYERS]) -> [i32; NUM_PLAYERS] {
-    let mut positive = [0i32; NUM_PLAYERS];
-    for i in 0..NUM_PLAYERS {
+fn cap_contributions<const N: usize>(committed_total: &[i32; N]) -> [i32; N] {
+    let mut positive = [0i32; N];
+    for i in 0..N {
         positive[i] = if committed_total[i] > 0 {
             committed_total[i]
         } else {
@@ -289,8 +304,8 @@ fn cap_contributions(committed_total: &[i32; NUM_PLAYERS]) -> [i32; NUM_PLAYERS]
     if n_pos < 1 {
         cap = 0;
     }
-    let mut out = [0i32; NUM_PLAYERS];
-    for i in 0..NUM_PLAYERS {
+    let mut out = [0i32; N];
+    for i in 0..N {
         out[i] = if positive[i] > 0 {
             positive[i].min(cap)
         } else {
@@ -301,15 +316,15 @@ fn cap_contributions(committed_total: &[i32; NUM_PLAYERS]) -> [i32; NUM_PLAYERS]
 }
 
 /// `_odd_chip_seat(eligible, button)`: first eligible seat clockwise after the button.
-fn odd_chip_seat(eligible: &[bool; NUM_PLAYERS], button: i32) -> i32 {
+fn odd_chip_seat<const N: usize>(eligible: &[bool; N], button: i32) -> i32 {
     let any = eligible.iter().any(|&e| e);
     if !any {
         return button;
     }
-    // seats = (button+1+offsets) % NUM_PLAYERS for offsets 0..NUM_PLAYERS; idx = argmax(is_elig).
+    // seats = (button+1+offsets) % N for offsets 0..N; idx = argmax(is_elig).
     // np.argmax returns the FIRST max (first True).
-    for off in 0..NUM_PLAYERS {
-        let seat = ((button as i64 + 1 + off as i64).rem_euclid(NUM_PLAYERS as i64)) as usize;
+    for off in 0..N {
+        let seat = ((button as i64 + 1 + off as i64).rem_euclid(N as i64)) as usize;
         if eligible[seat] {
             return seat as i32;
         }
@@ -318,30 +333,30 @@ fn odd_chip_seat(eligible: &[bool; NUM_PLAYERS], button: i32) -> i32 {
 }
 
 /// `award_layer(amount, eligible, scores, button)`.
-fn award_layer(
+fn award_layer<const N: usize>(
     amount: i32,
-    eligible: &[bool; NUM_PLAYERS],
-    scores: &[i32; NUM_PLAYERS],
+    eligible: &[bool; N],
+    scores: &[i32; N],
     button: i32,
-) -> [i32; NUM_PLAYERS] {
+) -> [i32; N] {
     // best = max(where(eligible, scores, -1))
     let mut best = i32::MIN;
-    for i in 0..NUM_PLAYERS {
+    for i in 0..N {
         let v = if eligible[i] { scores[i] } else { -1 };
         if v > best {
             best = v;
         }
     }
-    let mut winners = [false; NUM_PLAYERS];
-    for i in 0..NUM_PLAYERS {
+    let mut winners = [false; N];
+    for i in 0..N {
         winners[i] = eligible[i] && scores[i] == best && best >= 0;
     }
     let n_winners = (winners.iter().filter(|&&w| w).count() as i32).max(1);
     let base = amount / n_winners;
     let rem = amount - base * n_winners;
     let odd_seat = odd_chip_seat(&winners, button);
-    let mut winnings = [0i32; NUM_PLAYERS];
-    for i in 0..NUM_PLAYERS {
+    let mut winnings = [0i32; N];
+    for i in 0..N {
         winnings[i] = if winners[i] { base } else { 0 };
     }
     if rem > 0 && winners[odd_seat as usize] {
@@ -351,27 +366,27 @@ fn award_layer(
 }
 
 /// Bit-identical `compute_returns_np`. Returns per-seat net chip delta (sums to zero).
-pub fn compute_returns(
-    holes: &[[i32; 2]; NUM_PLAYERS],
+pub fn compute_returns<const N: usize>(
+    holes: &[[i32; 2]; N],
     board: &[i32; MAX_BOARD],
-    seat_status: &[i8; NUM_PLAYERS],
-    committed_total: &[i32; NUM_PLAYERS],
+    seat_status: &[i8; N],
+    committed_total: &[i32; N],
     button: i32,
     n_showdown: i32,
-) -> [i32; NUM_PLAYERS] {
+) -> [i32; N] {
     if n_showdown <= 1 {
         // fold_win: winner = first eligible (argmax of live as int)
         let live = eligible_to_win(seat_status);
         let mut winner = 0usize;
-        for i in 0..NUM_PLAYERS {
+        for i in 0..N {
             if live[i] {
                 winner = i;
                 break;
             }
         }
         let total: i32 = committed_total.iter().sum();
-        let mut out = [0i32; NUM_PLAYERS];
-        for i in 0..NUM_PLAYERS {
+        let mut out = [0i32; N];
+        for i in 0..N {
             out[i] = -committed_total[i];
         }
         out[winner] += total;
@@ -380,64 +395,63 @@ pub fn compute_returns(
 
     // showdown
     let eligible_mask = eligible_to_win(seat_status);
-    let mut scores = [-1i32; NUM_PLAYERS];
-    for s in 0..NUM_PLAYERS {
+    let mut scores = [-1i32; N];
+    for s in 0..N {
         if eligible_mask[s] {
             scores[s] = player_showdown_score(&holes[s], board);
         }
     }
 
     let capped = cap_contributions(committed_total);
-    let mut excess = [0i32; NUM_PLAYERS];
-    for i in 0..NUM_PLAYERS {
+    let mut excess = [0i32; N];
+    for i in 0..N {
         excess[i] = committed_total[i] - capped[i];
     }
-    let mut winnings = [0i32; NUM_PLAYERS];
+    let mut winnings = [0i32; N];
 
     // positive = where(capped>0, capped, -1); uniq sorted ascending; levels padded to MAX_POTS(-1);
-    // re-sorted; clamp <0 -> -1.
-    let mut positive = [0i32; NUM_PLAYERS];
-    for i in 0..NUM_PLAYERS {
+    // re-sorted; clamp <0 -> -1. MAX_POTS == N (one pot level per seat is the worst case).
+    let mut positive = [0i32; N];
+    for i in 0..N {
         positive[i] = if capped[i] > 0 { capped[i] } else { -1 };
     }
     // np.unique => sorted ascending unique
     let mut uniq_vec: Vec<i32> = positive.to_vec();
     uniq_vec.sort_unstable();
     uniq_vec.dedup();
-    const MAX_POTS: usize = NUM_PLAYERS;
-    let mut levels = [-1i32; MAX_POTS];
-    let take = uniq_vec.len().min(MAX_POTS);
+    let mut levels = [-1i32; N];
+    let take = uniq_vec.len().min(N);
     for i in 0..take {
         levels[i] = uniq_vec[i];
     }
     levels.sort_unstable();
-    for i in 0..MAX_POTS {
+    for i in 0..N {
         if levels[i] < 0 {
             levels[i] = -1;
         }
     }
 
     let mut prev_level: i32 = 0;
-    for li in 0..MAX_POTS {
+    for li in 0..N {
         let level = levels[li];
         let valid = level >= 0;
         let layer_size = if valid { level - prev_level } else { 0 };
         let mut n_contrib = 0i32;
-        let mut contributing = [false; NUM_PLAYERS];
-        for i in 0..NUM_PLAYERS {
+        let mut contributing = [false; N];
+        for i in 0..N {
             contributing[i] = capped[i] >= level && valid;
             if contributing[i] {
                 n_contrib += 1;
             }
         }
         let pot_amt = layer_size * n_contrib;
-        let mut eligible = [false; NUM_PLAYERS];
-        for i in 0..NUM_PLAYERS {
+        let mut eligible = [false; N];
+        for i in 0..N {
             eligible[i] = (seat_status[i] == SEAT_LIVE || seat_status[i] == SEAT_ALLIN)
                 && contributing[i];
         }
         let win = award_layer(pot_amt, &eligible, &scores, button);
-        for i in 0..NUM_PLAYERS {
+        for i in 0..N {
             winnings[i] += win[i];
         }
         if valid {
@@ -445,8 +459,8 @@ pub fn compute_returns(
         }
     }
 
-    let mut out = [0i32; NUM_PLAYERS];
-    for i in 0..NUM_PLAYERS {
+    let mut out = [0i32; N];
+    for i in 0..N {
         out[i] = winnings[i] + excess[i] - committed_total[i];
     }
     out
@@ -456,7 +470,7 @@ pub fn compute_returns(
 // Seat helpers
 // ---------------------------------------------------------------------------
 
-fn live_count(seat_status: &[i8; NUM_PLAYERS]) -> i32 {
+fn live_count<const N: usize>(seat_status: &[i8; N]) -> i32 {
     let mut c = 0;
     for &v in seat_status.iter() {
         if v == SEAT_LIVE || v == SEAT_ALLIN {
@@ -466,18 +480,18 @@ fn live_count(seat_status: &[i8; NUM_PLAYERS]) -> i32 {
     c
 }
 
-fn pot_for_sizing(s: &EnvState) -> i32 {
+fn pot_for_sizing<const N: usize>(s: &EnvStateN<N>) -> i32 {
     let mut p = s.pot_dead;
-    for i in 0..NUM_PLAYERS {
+    for i in 0..N {
         p += s.committed_street[i];
     }
     p
 }
 
-fn first_live_after(seat_status: &[i8; NUM_PLAYERS], from_seat: i32) -> i32 {
+fn first_live_after<const N: usize>(seat_status: &[i8; N], from_seat: i32) -> i32 {
     let base = from_seat;
-    for off in 1..=(NUM_PLAYERS as i32) {
-        let seat = ((base + off).rem_euclid(NUM_PLAYERS as i32)) as usize;
+    for off in 1..=(N as i32) {
+        let seat = ((base + off).rem_euclid(N as i32)) as usize;
         if seat_status[seat] == SEAT_LIVE {
             return seat as i32;
         }
@@ -485,7 +499,7 @@ fn first_live_after(seat_status: &[i8; NUM_PLAYERS], from_seat: i32) -> i32 {
     -1
 }
 
-fn first_postflop_actor(s: &EnvState) -> i32 {
+fn first_postflop_actor<const N: usize>(s: &EnvStateN<N>) -> i32 {
     // _nth_live_after(seat_status, button, 1) = first_live_after(button)
     first_live_after(&s.seat_status, s.button)
 }
@@ -543,7 +557,7 @@ pub fn _test_split_consume(key: [u32; 2]) -> [u32; 2] {
 // Street / chance
 // ---------------------------------------------------------------------------
 
-pub fn is_chance_node(s: &EnvState) -> bool {
+pub fn is_chance_node<const N: usize>(s: &EnvStateN<N>) -> bool {
     s.pending_deal && !s.done
 }
 
@@ -552,7 +566,7 @@ fn n_board(board: &[i32; MAX_BOARD]) -> usize {
 }
 
 /// `_deal_n_cards`: deal n_new board cards from deck, advance ptr, advance rng_key 3 times.
-fn deal_n_cards(s: &mut EnvState, n_new: usize) {
+fn deal_n_cards<const N: usize>(s: &mut EnvStateN<N>, n_new: usize) {
     let mut ptr = s.deck_ptr as usize;
     let nb = n_board(&s.board);
     let mut key = s.rng_key;
@@ -569,7 +583,7 @@ fn deal_n_cards(s: &mut EnvState, n_new: usize) {
 }
 
 /// `sample_chance_np`: deal next street after betting closed.
-pub fn sample_chance(s_in: &EnvState) -> EnvState {
+pub fn sample_chance<const N: usize>(s_in: &EnvStateN<N>) -> EnvStateN<N> {
     let mut s = *s_in;
     let new_street = s.street + 1;
     let n_new = if new_street == STREET_FLOP {
@@ -597,16 +611,16 @@ pub fn sample_chance(s_in: &EnvState) -> EnvState {
     };
     s.street = new_street2;
     s.action_seat = actor;
-    s.committed_street = [0; NUM_PLAYERS];
+    s.committed_street = [0; N];
     s.current_bet = 0;
     s.min_raise = BB_CHIPS;
-    s.acted = [false; NUM_PLAYERS];
+    s.acted = [false; N];
     s.last_aggressor = -1;
     s.last_raise_full = true;
     s
 }
 
-fn run_out(s: &mut EnvState) {
+fn run_out<const N: usize>(s: &mut EnvStateN<N>) {
     let mut ptr = s.deck_ptr as usize;
     for _ in 0..MAX_BOARD {
         let nb = n_board(&s.board);
@@ -620,13 +634,13 @@ fn run_out(s: &mut EnvState) {
     s.pending_deal = false;
 }
 
-fn close_street(s: &mut EnvState) {
+fn close_street<const N: usize>(s: &mut EnvStateN<N>) {
     let mut pot_dead = s.pot_dead;
-    for i in 0..NUM_PLAYERS {
+    for i in 0..N {
         pot_dead += s.committed_street[i];
     }
     s.pot_dead = pot_dead;
-    s.committed_street = [0; NUM_PLAYERS];
+    s.committed_street = [0; N];
     s.current_bet = 0;
     s.pending_deal = true;
     s.action_seat = -1;
@@ -636,12 +650,12 @@ fn close_street(s: &mut EnvState) {
     }
 }
 
-fn street_complete(s: &EnvState) -> bool {
+fn street_complete<const N: usize>(s: &EnvStateN<N>) -> bool {
     let cur = s.current_bet;
     let mut n_can_act = 0;
     let mut matched = true;
     let mut all_acted = true;
-    for i in 0..NUM_PLAYERS {
+    for i in 0..N {
         if s.seat_status[i] == SEAT_LIVE {
             n_can_act += 1;
             if s.committed_street[i] < cur {
@@ -661,7 +675,7 @@ fn street_complete(s: &EnvState) -> bool {
 // Betting
 // ---------------------------------------------------------------------------
 
-fn commit(s: &mut EnvState, seat: usize, amount_in: i32) {
+fn commit<const N: usize>(s: &mut EnvStateN<N>, seat: usize, amount_in: i32) {
     let amount = amount_in.min(s.stacks[seat]);
     s.stacks[seat] -= amount;
     s.committed_street[seat] += amount;
@@ -680,7 +694,7 @@ fn bucket_prod(pot: i32, frac: f32) -> i32 {
 }
 
 /// Bit-identical `legal_action_mask_np(state, seat)`.
-pub fn legal_action_mask(s: &EnvState, seat_in: i32) -> [bool; NUM_ACTIONS] {
+pub fn legal_action_mask<const N: usize>(s: &EnvStateN<N>, seat_in: i32) -> [bool; NUM_ACTIONS] {
     let seat = if seat_in < 0 {
         s.action_seat as usize
     } else {
@@ -726,7 +740,7 @@ pub fn legal_action_mask(s: &EnvState, seat_in: i32) -> [bool; NUM_ACTIONS] {
     mask
 }
 
-fn action_amount(s: &EnvState, seat: usize, action: usize) -> i32 {
+fn action_amount<const N: usize>(s: &EnvStateN<N>, seat: usize, action: usize) -> i32 {
     let committed = s.committed_street[seat];
     let to_call = (s.current_bet - committed).max(0);
     let stack = s.stacks[seat];
@@ -749,7 +763,7 @@ fn action_amount(s: &EnvState, seat: usize, action: usize) -> i32 {
 }
 
 /// Bit-identical `apply_action_np(state, action)`.
-pub fn apply_action(s_in: &EnvState, action: usize) -> EnvState {
+pub fn apply_action<const N: usize>(s_in: &EnvStateN<N>, action: usize) -> EnvStateN<N> {
     let mut s = *s_in;
     let seat = s.action_seat as usize;
     let amount = action_amount(&s, seat, action);
@@ -772,7 +786,7 @@ pub fn apply_action(s_in: &EnvState, action: usize) -> EnvState {
 
     s.acted[seat] = true;
     if full_raise {
-        s.acted = [false; NUM_PLAYERS];
+        s.acted = [false; N];
         s.acted[seat] = true;
     }
 
@@ -823,7 +837,147 @@ pub fn apply_action(s_in: &EnvState, action: usize) -> EnvState {
             n_live,
         );
     } else {
-        s.rewards = [0; NUM_PLAYERS];
+        s.rewards = [0; N];
     }
     s
+}
+
+// ---------------------------------------------------------------------------
+// Native root construction (port of jax_engine `_post_blinds` + `init_hand`, with the B2/B3 fixes).
+// Concrete to the default `EnvState` (= `EnvStateN<NUM_PLAYERS>`); the 7-seat root is a Workstream-C
+// deliverable (it needs the deck/RNG + Python-side wiring), so this stays 6-seat by design.
+// ---------------------------------------------------------------------------
+
+/// Mirror `_nth_live_after(seat_status, from_seat, n)`: the n-th live seat clockwise after
+/// `from_seat` (n >= 1). Bit-identical to the Python `fori_loop` of `_first_live_after`.
+fn nth_live_after(seat_status: &[i8; NUM_PLAYERS], from_seat: i32, n: i32) -> i32 {
+    let mut seat = from_seat;
+    for _ in 0..n {
+        seat = first_live_after(seat_status, seat);
+    }
+    seat
+}
+
+/// Port of `_post_blinds(stacks, seat_status, button, ante)` with the B2/B3 fixes.
+/// Mutates `stacks`/`seat_status` in place and returns
+/// `(committed_street, committed_total, pot_dead, current_bet, min_raise)`.
+fn post_blinds(
+    stacks: &mut [i32; NUM_PLAYERS],
+    seat_status: &mut [i8; NUM_PLAYERS],
+    button: i32,
+    ante: i32,
+) -> ([i32; NUM_PLAYERS], [i32; NUM_PLAYERS], i32, i32, i32) {
+    let sb = nth_live_after(seat_status, button, 1) as usize;
+    let bb = nth_live_after(seat_status, button, 2) as usize;
+    let mut committed = [0i32; NUM_PLAYERS];
+    let sb_live = (seat_status[sb] != SEAT_EMPTY) as i32;
+    let bb_live = (seat_status[bb] != SEAT_EMPTY) as i32;
+    // B2: clamp each blind to the poster's stack (no negative stack).
+    let sb_paid = (SB_CHIPS * sb_live).min(stacks[sb].max(0));
+    let bb_paid = (BB_CHIPS * bb_live).min(stacks[bb].max(0));
+    stacks[sb] -= sb_paid;
+    stacks[bb] -= bb_paid;
+    committed[sb] = sb_paid;
+    committed[bb] = bb_paid;
+    // Per-player ante: dead money clamped to the post-blind stack, added to pot_dead + committed_total
+    // (NOT committed_street). ante=0 -> committed_total == committed, pot_dead == 0 (byte-identical).
+    let mut ante_each = [0i32; NUM_PLAYERS];
+    let mut committed_total = [0i32; NUM_PLAYERS];
+    let mut pot_dead = 0i32;
+    for i in 0..NUM_PLAYERS {
+        let live_mask = (seat_status[i] != SEAT_EMPTY) as i32;
+        ante_each[i] = ante.min(stacks[i].max(0)) * live_mask;
+        stacks[i] -= ante_each[i];
+        pot_dead += ante_each[i];
+        committed_total[i] = committed[i] + ante_each[i];
+    }
+    // B2: a live seat that committed its entire stack (blind and/or ante) is ALL-IN.
+    for i in 0..NUM_PLAYERS {
+        let live_mask = seat_status[i] != SEAT_EMPTY;
+        if live_mask && stacks[i] == 0 {
+            seat_status[i] = SEAT_ALLIN;
+        }
+    }
+    // B3: standing bet is the largest street commitment, min raise stays a full BB.
+    let mut current_bet = 0i32;
+    for i in 0..NUM_PLAYERS {
+        if committed[i] > current_bet {
+            current_bet = committed[i];
+        }
+    }
+    let min_raise = BB_CHIPS;
+    (committed, committed_total, pot_dead, current_bet, min_raise)
+}
+
+/// Native root construction, byte-identical to `jax_engine.init_hand(rng_key, button, stacks,
+/// occupancy, ante)` WHEN GIVEN jax's permuted deck (the Threefry permutation is not replicated; the
+/// caller supplies the already-permuted `deck`, which is how the gate cross-checks byte-identity).
+pub fn init_hand(
+    button: i32,
+    stacks_in: &[i32; NUM_PLAYERS],
+    occupancy: &[bool; NUM_PLAYERS],
+    ante: i32,
+    deck: &[i32; 52],
+    rng_key: [u32; 2],
+) -> EnvState {
+    let mut seat_status = [SEAT_EMPTY; NUM_PLAYERS];
+    for i in 0..NUM_PLAYERS {
+        seat_status[i] = if occupancy[i] { SEAT_LIVE } else { SEAT_EMPTY };
+    }
+    let mut stacks = *stacks_in;
+
+    let (committed, committed_total, pot_dead, current_bet, min_raise) =
+        post_blinds(&mut stacks, &mut seat_status, button, ante);
+
+    // Deal holes from the supplied deck exactly as the jax fori_loop does.
+    let mut holes = [[-1i32; 2]; NUM_PLAYERS];
+    let mut p: usize = 0;
+    for i in 0..NUM_PLAYERS {
+        let live = seat_status[i] != SEAT_EMPTY;
+        if live {
+            holes[i][0] = deck[p];
+            holes[i][1] = deck[p + 1];
+            p += 2;
+        }
+    }
+    let deck_ptr = p as i32;
+
+    let mut n_live = 0i32;
+    for i in 0..NUM_PLAYERS {
+        if seat_status[i] == SEAT_LIVE {
+            n_live += 1;
+        }
+    }
+    let btn_first = nth_live_after(&seat_status, button, 1);
+    let utg = nth_live_after(&seat_status, button, 3);
+    let action_seat = if n_live <= 2 { btn_first } else { utg };
+
+    // Construct the 6-seat alias; Rust infers N = NUM_PLAYERS from the array fields.
+    EnvStateN {
+        holes,
+        board: [-1i32; MAX_BOARD],
+        seat_status,
+        stacks,
+        committed_street: committed,
+        committed_total,
+        street: STREET_PREFLOP,
+        pot_dead,
+        current_bet,
+        min_raise,
+        button,
+        action_seat,
+        last_aggressor: -1,
+        acted: [false; NUM_PLAYERS],
+        last_raise_full: true,
+        deck: *deck,
+        deck_ptr,
+        rng_key,
+        hist_seat: [-1i32; MAX_HISTORY],
+        hist_action: [-1i32; MAX_HISTORY],
+        hist_amount: [0i32; MAX_HISTORY],
+        hist_len: 0,
+        done: false,
+        rewards: [0i32; NUM_PLAYERS],
+        pending_deal: false,
+    }
 }

@@ -39,6 +39,7 @@ from dataclasses import replace  # noqa: E402
 
 from pokerbot.encoding.weva_encoder import assert_production_weva_index  # noqa: E402
 from pokerbot.training.neural_cfr import (  # noqa: E402
+    DEFAULT_EPSILON,
     VRDeepPDCFRConfig,
     VRDeepPDCFRPlusTrainer,
     load_trainer_checkpoint,
@@ -63,7 +64,9 @@ def main() -> None:
     parser.add_argument("--buffer-capacity", type=int, default=100_000)
     parser.add_argument("--alpha", type=float, default=2.3)
     parser.add_argument("--gamma", type=float, default=2.0)
-    parser.add_argument("--epsilon", type=float, default=0.1)
+    parser.add_argument("--epsilon", type=float, default=DEFAULT_EPSILON,
+                        help="traverser exploration (ext-sampling). Default = reference 0.6; the prior "
+                             "0.1 default under-explored rarely-visited infosets over a long run.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--game", default="nlhe", choices=["nlhe", "nlhe-hu", "leduc"],
@@ -80,6 +83,13 @@ def main() -> None:
                         help="override SGD steps for the HistoryValueNet baseline")
     parser.add_argument("--checkpoint-every", type=int, default=0,
                         help="atomically save a resumable checkpoint every N iters (overnight safety)")
+    parser.add_argument("--buffer-checkpoint-every", type=int, default=0,
+                        help="snapshot the heavy reservoirs only every N iters (0=every checkpoint). The "
+                             "cheap core checkpoint still writes every --checkpoint-every; keeps the "
+                             "frequent write small on a slow mount.")
+    parser.add_argument("--log-every", type=int, default=None,
+                        help="print a progress line every N iters (default: iterations//50). Set small "
+                             "(e.g. 25) so a long run shows throughput promptly.")
     parser.add_argument(
         "--traversal-workers", type=int, default=0,
         help="independent worker PROCESSES that generate traversals data-parallel (the saturation "
@@ -169,9 +179,11 @@ def main() -> None:
               f"{cfg.train_steps_per_iter}/{cfg.avg_strategy_steps_per_iter}/"
               f"{cfg.history_value_steps_per_iter}")
 
+    log_every = args.log_every if args.log_every is not None else max(1, args.iterations // 50)
     try:
-        trainer.train(log_every=max(1, args.iterations // 50),
-                      checkpoint_every=args.checkpoint_every, checkpoint_path=args.checkpoint)
+        trainer.train(log_every=log_every,
+                      checkpoint_every=args.checkpoint_every, checkpoint_path=args.checkpoint,
+                      buffer_checkpoint_every=args.buffer_checkpoint_every)
     finally:
         trainer.close()  # release the worker pool
     full_out = save_trainer_checkpoint(trainer, args.checkpoint)

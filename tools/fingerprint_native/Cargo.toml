@@ -1,0 +1,27 @@
+[package]
+name = "fingerprint_native"
+version = "0.1.0"
+edition = "2021"
+description = "Bit-identical native port of the blueprint infoset fingerprint (pokerbot.engine.jax_weva_fast.fingerprint_fast)."
+
+[lib]
+name = "fingerprint_native"
+# rlib  -> `cargo test` runs the pure-Rust unit tests (blake2b / phevaluator goldens, no Python).
+# cdylib -> the importable CPython extension module (loaded by pokerbot/encoding/fingerprint_native.py).
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# PyO3 with abi3 (stable ABI) so a single .pyd works across CPython 3.14+ without re-linking.
+# blake2b is VENDORED in src/blake2b.rs (exact match to CPython hashlib.blake2b w/ personalization),
+# so the crate has no third-party crypto dependency to drift against.
+pyo3 = { version = "0.28", features = ["abi3-py314", "extension-module"], optional = true }
+
+[features]
+default = []
+python = ["dep:pyo3"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

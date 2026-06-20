@@ -13,6 +13,9 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 # PyO3 with abi3 (stable ABI) so a single .pyd works across CPython 3.14+ without re-linking.
 pyo3 = { version = "0.28", features = ["abi3-py314", "extension-module"], optional = true }
+# Data-parallelism for the native LBR harness (one independent hand per rayon task). NOTE: with
+# `panic = "abort"` a worker panic aborts the process (acceptable for an offline validator).
+rayon = "1"
 
 [features]
 default = []

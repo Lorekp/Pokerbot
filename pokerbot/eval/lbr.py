@@ -85,6 +85,11 @@ class LBRConfig:
     range_cap: int = 120          # max belief combos carried (weighted-subsample beyond this)
     equity_rollouts: int = 16     # runout samples per combo for showdown equity
     bet_candidates: tuple[int, ...] = (_POT_BET_INDEX, ALL_IN)  # LBR's own bet menu
+    # Stack depth + per-player ante (BB) the hand is dealt at. None => the engine default 100bb /
+    # ante 0 (legacy behavior, unchanged). Set both to measure a TOURNAMENT-shallow target (e.g.
+    # stack_bb=20, ante_bb=0.125) -- the regime a tournament HU net actually trained + plays in.
+    stack_bb: float | None = None
+    ante_bb: float = 0.0
 
 
 @dataclass
@@ -412,7 +417,10 @@ def lbr_exploitability(policy_fn, cfg: LBRConfig | None = None) -> LBRResult:
         # the button on a live seat, rotated DECOUPLED from the LBR/target assignment (h//2 vs h%2) so all
         # four (who-is-LBR) x (who-has-button) combinations are sampled equally -> unbiased position.
         button = jnp.int32(_HU_LIVE[(h // 2) % 2])
-        env = to_numpy_state(init_hand(k, button=button, occupancy=occ))
+        stacks = (jnp.full(len(_HU_OCC), int(round(cfg.stack_bb * CHIP_UNIT)), dtype=jnp.int32)
+                  if cfg.stack_bb is not None else None)
+        ante = jnp.int32(int(round(cfg.ante_bb * CHIP_UNIT)))
+        env = to_numpy_state(init_hand(k, button=button, stacks=stacks, occupancy=occ, ante=ante))
         lbr_seat = _HU_LIVE[h % 2]
         bp_seat = _HU_LIVE[1 - (h % 2)]
 

@@ -98,6 +98,11 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--range-cap", type=int, default=120)
     ap.add_argument("--equity-rollouts", type=int, default=16)
+    ap.add_argument("--stack-bb", type=float, default=None,
+                    help="deal at this effective stack depth (BB). Default = engine 100bb. Set e.g. 20 "
+                         "to measure the TOURNAMENT-shallow regime the net actually plays.")
+    ap.add_argument("--ante-bb", type=float, default=0.0,
+                    help="per-player ante (BB), e.g. 0.125 for the tournament structure. Default 0.")
     ap.add_argument("--output", default=None)
     args = ap.parse_args()
 
@@ -110,7 +115,8 @@ def main() -> int:
     else:
         policy_fn, meta = make_nit_policy(), {"policy": "nit"}
     cfg = LBRConfig(hands=args.hands, seed=args.seed,
-                    range_cap=args.range_cap, equity_rollouts=args.equity_rollouts)
+                    range_cap=args.range_cap, equity_rollouts=args.equity_rollouts,
+                    stack_bb=args.stack_bb, ante_bb=args.ante_bb)
 
     print(f"checkpoint: {args.checkpoint}  meta={meta}")
     print(f"LBR config: hands={cfg.hands} seed={cfg.seed} range_cap={cfg.range_cap} "

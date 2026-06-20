@@ -66,9 +66,9 @@ def jax_action_to_python(action: int, amount_chips: int) -> Action:
     return Action(ActionType.CHECK)
 
 
-def _position_for_seat(button: int, seat: int) -> Position:
+def _position_for_seat(button: int, seat: int, n_seats: int = NUM_PLAYERS) -> Position:
     pos_order = [Position.BTN, Position.SB, Position.BB, Position.UTG, Position.HJ, Position.CO]
-    offset = (seat - button) % NUM_PLAYERS
+    offset = (seat - button) % n_seats
     return pos_order[offset]
 
 
@@ -79,10 +79,22 @@ def game_state_from_jax(
     oop_range: str = "",
     ip_range: str = "",
 ) -> GameState:
-    """Reconstruct a ``GameState`` snapshot matching JAX public/private fields."""
+    """Reconstruct a ``GameState`` snapshot matching JAX public/private fields.
+
+    SCOPE: ``game.py``'s ``GameState`` is a FIXED 6-player engine (``Position`` has exactly 6 values,
+    ``new_hand`` builds 6 ``PlayerState`` slots). There is no 7+ -player ``GameState``, so this bridge
+    only supports states up to 6 wide. The width is derived from the dealt state's arrays (so a HU/3/4-
+    handed occupancy reconstructs correctly); a >6-wide state has no target representation and asserts.
+    """
+    seat_status_arr = np.asarray(state.seat_status)
+    n_seats = int(seat_status_arr.shape[0])
+    assert n_seats <= NUM_PLAYERS, (
+        f"game_state_from_jax: game.py GameState is fixed {NUM_PLAYERS}-player; cannot bridge an "
+        f"{n_seats}-seat state. Use the JAX/np engine directly for n>6 tables."
+    )
     holes = np.asarray(state.holes)
     board = np.asarray(state.board)
-    seat_status = np.asarray(state.seat_status)
+    seat_status = seat_status_arr
     stacks = np.asarray(state.stacks)
     committed_street = np.asarray(state.committed_street)
     committed_total = np.asarray(state.committed_total)
@@ -102,12 +114,20 @@ def game_state_from_jax(
     if gs.last_aggressor < 0:
         gs.last_aggressor = None
 
-    for seat in range(NUM_PLAYERS):
+    for seat in range(n_seats):
         p = gs.players[seat]
-        p.position = _position_for_seat(button, seat)
+        p.position = _position_for_seat(button, seat, n_seats)
         if seat_status[seat] == SEAT_EMPTY:
+            # An EMPTY seat is not in the hand. ``GameState.new_hand`` posted blinds on whichever seats
+            # are SB/BB by position, so an empty SB/BB seat carries a PHANTOM blind commitment unless we
+            # zero it here -- otherwise ``resolve_showdown`` charges a seat that never played (corrupts
+            # settlement, esp. on HU/short-handed occupancy where 4 seats are empty). Reset all commits.
             p.folded = True
+            p.all_in = False
             p.stack_bb = 0.0
+            p.committed_street_bb = 0.0
+            p.committed_total_bb = 0.0
+            p.hole = None
         else:
             p.stack_bb = float(stacks[seat]) / float(CHIP_UNIT)
             p.committed_street_bb = float(committed_street[seat]) / float(CHIP_UNIT)
@@ -150,7 +170,7 @@ def env_state_from_numpy(d: dict[str, np.ndarray]) -> EnvState:
 
 def live_seat_indices(occupancy: np.ndarray | tuple[bool, ...]) -> list[int]:
     occ = np.asarray(occupancy, dtype=bool)
-    return [i for i in range(NUM_PLAYERS) if occ[i]]
+    return [i for i in range(occ.shape[0]) if occ[i]]
 
 
 def opponent_seats(seat: int, occupancy: np.ndarray | tuple[bool, ...]) -> list[int]:

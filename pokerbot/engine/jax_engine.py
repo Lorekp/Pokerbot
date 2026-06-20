@@ -6,6 +6,7 @@ Pure-functional transitions, fixed-shape int32 chip math (1 BB = 100 chips),
 
 from __future__ import annotations
 
+import functools
 import os
 from typing import Any, NamedTuple
 
@@ -13,6 +14,7 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
+from pokerbot.engine.actions import BET_SIZE_BUCKETS
 from pokerbot.engine.hand_eval_jax import card_rank, card_suit
 from pokerbot.engine.side_pots_jax import SEAT_ALLIN, SEAT_FOLDED, SEAT_LIVE, compute_returns
 
@@ -22,18 +24,26 @@ SEAT_EMPTY = jnp.int8(0)
 # Constants
 # ---------------------------------------------------------------------------
 
+# NUM_PLAYERS is the 6-max DEFAULT (cash). It is the default width of ``init_hand`` / ``reset_state``
+# and the normalization scale in the feature encoders, but it is NO LONGER used to SIZE any transition.
+# Every transition function below derives the seat count from the SHAPE of the state arrays it receives
+# (``state.seat_status.shape[0]`` etc.), which is STATIC under jit, so the engine re-traces cleanly for
+# a 7-wide (or N-wide) state while staying byte-identical for the deployed 6-wide path. DO NOT change
+# this constant -- it is the module default and the deployed cash width.
 NUM_PLAYERS: int = 6
 NUM_ACTIONS: int = 11
 NUM_STREETS: int = 4
 MAX_BOARD: int = 5
 MAX_HISTORY: int = 64
-MAX_POTS: int = NUM_PLAYERS
+MAX_POTS: int = NUM_PLAYERS  # default; side-pot levels derive from the state width at runtime
 CHIP_UNIT: int = 100
 STARTING_STACK_BB: float = 100.0
 STARTING_STACK_CHIPS: int = int(STARTING_STACK_BB * CHIP_UNIT)
 SB_CHIPS: int = CHIP_UNIT // 2
 BB_CHIPS: int = CHIP_UNIT
-BET_SIZE_BUCKETS: tuple[float, ...] = (1.0 / 3, 0.50, 0.66, 0.75, 1.0, 1.5, 2.0)
+# BET_SIZE_BUCKETS is the SINGLE SOURCE OF TRUTH, imported from ``pokerbot.engine.actions`` above
+# (smallest bucket = 1/3 pot). Do not redefine it here — the serve menu, engine sizing and trained
+# policy head must all key off the same tuple object. ``core.rs`` mirrors it as f32 (BET_BUCKETS_F32).
 INFO_FEATURE_DIM: int = 256
 HISTORY_FEATURE_DIM: int = 128
 
@@ -126,12 +136,15 @@ def _pot_for_sizing(state: EnvState) -> Array:
 
 
 def _next_seat_cw(from_seat: Array, offset: Array) -> Array:
+    # NOTE: this helper has no array to derive width from; callers pass an explicit modulus where it
+    # matters. It is unused in the seat-count-agnostic paths below (kept for API compatibility).
     return (from_seat + offset) % NUM_PLAYERS
 
 
 def _first_live_after(seat_status: Array, from_seat: Array) -> Array:
-    offsets = jnp.arange(1, NUM_PLAYERS + 1)
-    seats = (from_seat + offsets) % NUM_PLAYERS
+    n = seat_status.shape[0]  # seat count (static under jit)
+    offsets = jnp.arange(1, n + 1)
+    seats = (from_seat + offsets) % n
     live = seat_status[seats] == SEAT_LIVE
     idx = jnp.argmax(live)
     return jnp.where(jnp.any(live), seats[idx], jnp.int32(-1))
@@ -177,7 +190,8 @@ def current_player(state: EnvState) -> Array:
 
 
 def _street_complete(state: EnvState) -> Array:
-    can_act = jax.vmap(lambda s: _can_act(state, s))(jnp.arange(NUM_PLAYERS))
+    n = state.seat_status.shape[0]
+    can_act = jax.vmap(lambda s: _can_act(state, s))(jnp.arange(n))
     n_can_act = jnp.sum(can_act)
     matched = jnp.all(jnp.where(can_act, state.committed_street >= state.current_bet, True))
     all_acted = jnp.all(jnp.where(can_act, state.acted, True))
@@ -225,13 +239,14 @@ def sample_chance(state: EnvState) -> EnvState:
         lambda _: _first_postflop_actor(state),
         None,
     )
+    n = state.seat_status.shape[0]
     return state._replace(
         street=new_street,
         action_seat=actor,
-        committed_street=jnp.zeros(NUM_PLAYERS, dtype=jnp.int32),
+        committed_street=jnp.zeros(n, dtype=jnp.int32),
         current_bet=jnp.int32(0),
         min_raise=jnp.int32(BB_CHIPS),
-        acted=jnp.zeros(NUM_PLAYERS, dtype=bool),
+        acted=jnp.zeros(n, dtype=bool),
         last_aggressor=jnp.int32(-1),
         last_raise_full=jnp.bool_(True),
     )
@@ -252,15 +267,16 @@ def _run_out(state: EnvState) -> EnvState:
 
 
 def _close_street(state: EnvState) -> EnvState:
+    n = state.seat_status.shape[0]
     pot_dead = state.pot_dead + jnp.sum(state.committed_street)
     state = state._replace(
         pot_dead=pot_dead,
-        committed_street=jnp.zeros(NUM_PLAYERS, dtype=jnp.int32),
+        committed_street=jnp.zeros(n, dtype=jnp.int32),
         current_bet=jnp.int32(0),
         pending_deal=jnp.bool_(True),
         action_seat=jnp.int32(-1),
     )
-    actors = jnp.any(jax.vmap(lambda s: _can_act(state, s))(jnp.arange(NUM_PLAYERS)))
+    actors = jnp.any(jax.vmap(lambda s: _can_act(state, s))(jnp.arange(n)))
     state = jax.lax.cond(
         (~actors) & (state.street < STREET_RIVER),
         _run_out,
@@ -364,6 +380,7 @@ def step_state(state: EnvState, action: Array) -> EnvState:
 
 @jax.jit
 def apply_action(state: EnvState, action: Array) -> EnvState:
+    n = state.seat_status.shape[0]  # seat count (static under jit)
     seat = state.action_seat
     amount = _action_amount(state, seat, action)
 
@@ -379,7 +396,7 @@ def apply_action(state: EnvState, action: Array) -> EnvState:
     raised = is_aggressive & (new_street_bet > prev_bet)
     full_raise = raised & (new_street_bet >= prev_bet + state.min_raise)
     acted = state.acted.at[seat].set(True)
-    acted = jnp.where(full_raise, jnp.zeros(NUM_PLAYERS, dtype=bool).at[seat].set(True), acted)
+    acted = jnp.where(full_raise, jnp.zeros(n, dtype=bool).at[seat].set(True), acted)
     current_bet = jnp.where(raised, new_street_bet, state.current_bet)
     raise_size = jnp.where(raised, new_street_bet - prev_bet, state.min_raise)
     min_raise = jnp.where(raised, jnp.maximum(BB_CHIPS, raise_size), state.min_raise)
@@ -428,7 +445,7 @@ def apply_action(state: EnvState, action: Array) -> EnvState:
             button=s.button,
             n_showdown=n_live,
         ),
-        lambda _: jnp.zeros(NUM_PLAYERS, dtype=jnp.int32),
+        lambda _: jnp.zeros(n, dtype=jnp.int32),
         state,
     )
     return state._replace(rewards=rets)
@@ -444,55 +461,108 @@ def returns(state: EnvState) -> Array:
 # ---------------------------------------------------------------------------
 
 
-def _post_blinds(stacks: Array, seat_status: Array, button: Array) -> tuple[Array, Array, Array, Array, Array]:
+def _post_blinds(stacks: Array, seat_status: Array, button: Array,
+                 ante: Array | int = 0) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
+    n = seat_status.shape[0]  # seat count (static under jit)
     sb = _nth_live_after(seat_status, button, 1)
     bb = _nth_live_after(seat_status, button, 2)
-    committed = jnp.zeros(NUM_PLAYERS, dtype=jnp.int32)
-    sb_live = seat_status[sb] != SEAT_EMPTY
-    bb_live = seat_status[bb] != SEAT_EMPTY
-    stacks = stacks.at[sb].add(-SB_CHIPS * sb_live.astype(jnp.int32))
-    stacks = stacks.at[bb].add(-BB_CHIPS * bb_live.astype(jnp.int32))
-    committed = committed.at[sb].set(SB_CHIPS * sb_live.astype(jnp.int32))
-    committed = committed.at[bb].set(BB_CHIPS * bb_live.astype(jnp.int32))
-    pot_dead = jnp.int32(0)
-    current_bet = jnp.int32(BB_CHIPS)
+    committed = jnp.zeros(n, dtype=jnp.int32)
+    sb_live = (seat_status[sb] != SEAT_EMPTY).astype(jnp.int32)
+    bb_live = (seat_status[bb] != SEAT_EMPTY).astype(jnp.int32)
+    # B2: CLAMP each blind to the poster's stack. A seat too short for its blind posts only what it
+    # has (it cannot owe chips it doesn't have). Without the clamp the stack goes NEGATIVE, which
+    # corrupts legal_action_mask (`stack > to_call`) and side-pot eligibility. This mirrors the ante
+    # clamp below. For stacks >= 1BB the clamp is a no-op, so the result is byte-identical.
+    sb_paid = jnp.minimum(SB_CHIPS * sb_live, jnp.maximum(stacks[sb], 0))
+    bb_paid = jnp.minimum(BB_CHIPS * bb_live, jnp.maximum(stacks[bb], 0))
+    stacks = stacks.at[sb].add(-sb_paid)
+    stacks = stacks.at[bb].add(-bb_paid)
+    committed = committed.at[sb].set(sb_paid)
+    committed = committed.at[bb].set(bb_paid)
+    # Per-player ante: every LIVE seat antes `ante` chips. Antes are dead money -> they go into the
+    # pot (pot_dead, so bet sizing sees the inflated pot) and into committed_total (so the winner
+    # collects them at showdown and chips stay conserved -- compute_returns distributes from
+    # committed_total only). They are NOT added to committed_street: an ante does not reduce what a
+    # seat owes to call the blind. Clamp to the post-blind stack so a tiny stack can't go negative.
+    # ante=0 (the default) makes committed_total == committed and pot_dead == 0 -> byte-identical to
+    # the pre-ante engine, so the np-engine parity and every non-ante caller are unaffected.
+    ante_c = jnp.int32(ante)
+    live_mask = (seat_status != SEAT_EMPTY).astype(jnp.int32)
+    ante_each = jnp.minimum(ante_c, jnp.maximum(stacks, 0)) * live_mask
+    stacks = stacks - ante_each
+    pot_dead = jnp.sum(ante_each)
+    committed_total = committed + ante_each
+    # B2: a live seat that has committed its ENTIRE stack to the blind (and/or ante) is ALL-IN, so
+    # legal_action_mask excludes it and side-pot eligibility is correct. For ante=0 and stacks >= 1BB
+    # nothing reaches 0 here, so seat_status is byte-identical to the pre-fix engine.
+    all_in_now = (live_mask == 1) & (stacks == 0)
+    seat_status = jnp.where(all_in_now, SEAT_ALLIN, seat_status)
+    # B3: the standing bet is the LARGEST street commitment, NOT an unconditional full BB. A BB that
+    # is all-in for < 1BB must set `to_call` to its short commit (others owe only the short amount),
+    # while the minimum raise stays a full BB (min_raise below). For stacks >= 1BB the largest
+    # commitment is exactly BB_CHIPS, so current_bet is byte-identical.
+    current_bet = jnp.max(committed)
     min_raise = jnp.int32(BB_CHIPS)
-    return stacks, committed, pot_dead, current_bet, min_raise
+    return stacks, committed, committed_total, pot_dead, current_bet, min_raise, seat_status
 
 
-@jax.jit
+# ``n_players`` sizes the dealt arrays, so it MUST be a STATIC (compile-time) jit argument -- a traced
+# value can't drive a shape. Marking it static makes jit re-compile per distinct seat count (6, 7, ...),
+# exactly like passing differently-shaped ``occupancy``/``stacks`` already does.
+@functools.partial(jax.jit, static_argnames=("n_players",))
 def reset_state(
     key: Array,
     button: Array | None = None,
     occupancy: Array | None = None,
+    n_players: int | None = None,
 ) -> EnvState:
-    return init_hand(key, button, None, occupancy)
+    return init_hand(key, button, None, occupancy, n_players=n_players)
 
 
-@jax.jit
+@functools.partial(jax.jit, static_argnames=("n_players",))
 def init_hand(
     rng_key: Array,
     button: Array | None = None,
     stacks: Array | None = None,
     occupancy: Array | None = None,
+    ante: Array | int = 0,
+    n_players: int | None = None,
 ) -> EnvState:
+    # Seat count: ``occupancy``/``stacks`` (when provided) IMPLY the table width, so the width is DERIVED
+    # from their (static) length. ``n_players`` is an OPTIONAL explicit override: if given alongside
+    # occupancy/stacks it must agree (assertion); if given alone it sizes the all-live default table.
+    # With nothing provided the table is the module default (6) -> BYTE-IDENTICAL to the pre-parameter
+    # engine. ``n_players`` is a static (compile-time) int so it can size arrays under jit.
+    n: int | None = None if n_players is None else int(n_players)
+    if occupancy is not None:
+        occ_n = occupancy.shape[0]
+        assert n is None or n == occ_n, f"occupancy width {occ_n} != n_players {n}"
+        n = occ_n
+    if stacks is not None:
+        stk_n = stacks.shape[0]
+        assert n is None or n == stk_n, f"stacks width {stk_n} != n_players {n}"
+        n = stk_n
+    if n is None:
+        n = NUM_PLAYERS
+
     key, k_deck, k_btn = jax.random.split(rng_key, 3)
-    button = jax.random.randint(k_btn, (), 0, NUM_PLAYERS) if button is None else button
+    button = jax.random.randint(k_btn, (), 0, n) if button is None else button
 
     if occupancy is None:
-        seat_status = jnp.full(NUM_PLAYERS, SEAT_LIVE, dtype=jnp.int8)
+        seat_status = jnp.full(n, SEAT_LIVE, dtype=jnp.int8)
     else:
         seat_status = jnp.where(occupancy, SEAT_LIVE, SEAT_EMPTY)
 
     deck = jax.random.permutation(k_deck, jnp.arange(52, dtype=jnp.int32))
     if stacks is None:
-        stacks = jnp.full(NUM_PLAYERS, STARTING_STACK_CHIPS, dtype=jnp.int32)
+        stacks = jnp.full(n, STARTING_STACK_CHIPS, dtype=jnp.int32)
     else:
         stacks = stacks.astype(jnp.int32)
 
-    stacks, committed, pot_dead, current_bet, min_raise = _post_blinds(stacks, seat_status, button)
+    stacks, committed, committed_total, pot_dead, current_bet, min_raise, seat_status = _post_blinds(
+        stacks, seat_status, button, ante)
     ptr = jnp.int32(0)
-    holes = jnp.full((NUM_PLAYERS, 2), -1, dtype=jnp.int32)
+    holes = jnp.full((n, 2), -1, dtype=jnp.int32)
 
     def deal_hole(i: Array, carry: tuple[Array, Array]) -> tuple[Array, Array]:
         h, p = carry
@@ -503,7 +573,7 @@ def init_hand(
         p = p + (2 * live.astype(jnp.int32))
         return h, p
 
-    holes, ptr = jax.lax.fori_loop(0, NUM_PLAYERS, deal_hole, (holes, ptr))
+    holes, ptr = jax.lax.fori_loop(0, n, deal_hole, (holes, ptr))
 
     n_live = jnp.sum(seat_status == SEAT_LIVE)
     utg = _nth_live_after(seat_status, button, 3)
@@ -516,7 +586,7 @@ def init_hand(
         seat_status=seat_status,
         stacks=stacks,
         committed_street=committed,
-        committed_total=committed,
+        committed_total=committed_total,
         street=jnp.int32(STREET_PREFLOP),
         pot_dead=pot_dead,
         current_bet=current_bet,
@@ -524,7 +594,7 @@ def init_hand(
         button=button,
         action_seat=action_seat,
         last_aggressor=jnp.int32(-1),
-        acted=jnp.zeros(NUM_PLAYERS, dtype=bool),
+        acted=jnp.zeros(n, dtype=bool),
         last_raise_full=jnp.bool_(True),
         deck=deck,
         deck_ptr=ptr,
@@ -534,7 +604,7 @@ def init_hand(
         hist_amount=jnp.zeros(MAX_HISTORY, dtype=jnp.int32),
         hist_len=jnp.int32(0),
         done=jnp.bool_(False),
-        rewards=jnp.zeros(NUM_PLAYERS, dtype=jnp.int32),
+        rewards=jnp.zeros(n, dtype=jnp.int32),
         pending_deal=jnp.bool_(False),
     )
 

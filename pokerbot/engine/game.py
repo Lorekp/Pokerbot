@@ -8,6 +8,7 @@ from enum import Enum, IntEnum, auto
 from typing import Iterator
 
 from pokerbot.engine.actions import Action, ActionType, BET_SIZE_BUCKETS
+from pokerbot.engine.betting_rules import reopen_step
 from pokerbot.engine.cards import Card, Deck
 from pokerbot.engine.hand_eval import compare_hands
 
@@ -42,9 +43,14 @@ _CHIP = 0.01  # smallest indivisible unit (matches the engine's round(_, 2) bet 
 
 def _split_layer_chips(layer_pot: float, winners: list[int], button_seat: int) -> dict[int, float]:
     """Award a tied pot layer in whole chips (0.01bb), routing the indivisible remainder to the first
-    eligible winner left of the button — bit-identical to the live JAX settlement
-    (``side_pots_jax.award_layer``). The previous exact float share (``layer_pot / n``) diverged from the
-    served engine on odd-chip ties (eval-only, sub-cent, but now matched)."""
+    eligible winner left of the button.
+
+    The remainder ROUTING matches the int-chip JAX settlement (``side_pots_jax.award_layer``) exactly —
+    proven over odd-chip multiway scenarios by ``tests/test_game_jax_equiv.py``. The one residual
+    divergence risk is UPSTREAM, not here: ``layer_pot`` derives from float-BB ``committed_total_bb`` that
+    game.py accumulates during play, so a fractional bet (e.g. 1/3 pot) can leave sub-0.01bb float drift
+    that ``round(layer_pot / _CHIP)`` resolves differently than the engine's pure-int chips. game.py is a
+    float-BB eval engine by convention; the settlement-parity gate feeds clean integer chips and passes."""
     n = len(winners)
     chips = round(layer_pot / _CHIP)
     base, rem = divmod(chips, n)
@@ -113,13 +119,31 @@ class GameState:
     def _post_blinds(self) -> None:
         sb_seat = (self.button_seat + 1) % NUM_PLAYERS
         bb_seat = (self.button_seat + 2) % NUM_PLAYERS
-        self._commit(sb_seat, SB_BB)
-        self._commit(bb_seat, BB_BB)
-        self.current_bet_bb = BB_BB
-        self.pot_bb = SB_BB + BB_BB
+        sb_paid = self._commit(sb_seat, SB_BB)  # _commit clamps to stack + flags all_in
+        bb_paid = self._commit(bb_seat, BB_BB)
+        # B3: standing bet = largest actual street commitment, NOT an unconditional full BB (a BB
+        # all-in for < 1BB sets to_call to its short commit). _commit already accumulated pot_bb from
+        # the clamped amounts -- do NOT overwrite it with SB_BB+BB_BB (which would ignore clamping).
+        # For full stacks max(0.5, 1.0) == BB_BB and the pot is 1.5, so this is byte-identical.
+        self.current_bet_bb = max(sb_paid, bb_paid)
+
+    def _nth_live_after(self, start: int, n: int) -> int:
+        """The n-th non-folded seat clockwise after ``start`` (n >= 1), skipping folded/empty seats.
+        Mirrors jax ``_nth_live_after`` so short-handed/occupancy play is correct, not accidental."""
+        seat = start
+        for _ in range(max(1, n)):
+            for _ in range(NUM_PLAYERS):
+                seat = (seat + 1) % NUM_PLAYERS
+                if not self.players[seat].folded:
+                    break
+        return seat
 
     def _first_preflop_actor(self) -> int:
-        return (self.button_seat + 3) % NUM_PLAYERS
+        # BUG-B7: occupancy-aware (was ``button+3`` unconditionally, wrong for non-6-handed). Heads-up =>
+        # the button (== SB) acts first; otherwise the 3rd live seat after the button (UTG). At a full
+        # ring with no folds this is exactly ``button+3``, so 6-max behaviour is byte-identical.
+        live = sum(1 for p in self.players if not p.folded)
+        return self._nth_live_after(self.button_seat, 1 if live <= 2 else 3)
 
     def _first_postflop_actor(self) -> int:
         for offset in range(1, NUM_PLAYERS + 1):
@@ -204,16 +228,17 @@ class GameState:
             prev_bet = self.current_bet_bb
             total = to_call + amount
             self._commit(seat, total)
-            if player.committed_street_bb > prev_bet + 1e-9:
-                increment = player.committed_street_bb - prev_bet
-                min_inc = max(BB_BB, getattr(self, "last_raise_increment", BB_BB))
-                self.current_bet_bb = player.committed_street_bb
+            # BUG-B4: the reopen / min-raise update is the ONE canonical rule in betting_rules.reopen_step
+            # (mirrors the deployed engine), no longer re-derived here. A FULL raise reopens (resets the
+            # acted set); a short all-in under-raise advances current_bet but does NOT reopen.
+            prior_min_raise = max(BB_BB, getattr(self, "last_raise_increment", BB_BB))
+            res = reopen_step(prev_bet, player.committed_street_bb, prior_min_raise, BB_BB, eps=1e-9)
+            if res.raised:
+                self.current_bet_bb = res.new_current_bet
                 self.last_aggressor = seat
-                if increment >= min_inc - 1e-9:        # FULL raise -> reopens the round, resets acted
-                    self.last_raise_increment = increment
+                self.last_raise_increment = res.new_min_raise
+                if res.resets_acted:
                     self._acted_this_street = {seat}
-                # else: a short all-in UNDER-raise raises current_bet but does NOT reopen (already-acted
-                # seats only owe the extra to call) -> fall through to the acted.add(seat) below.
         else:
             raise ValueError(f"Unknown action {action}")
 
@@ -376,7 +401,12 @@ def play_hand(
     default None ⇒ behavior byte-identical."""
     state = state or GameState.new_hand(rng=rng)
     state.deal_hole_cards()
-    n_board_seen = 0
+    # BUG-P0: seed from the CURRENT board, not 0. ``play_hand`` may be called on a RESUMED mid-hand state
+    # (e.g. an eval subgame root already past preflop) that immediately has no actors remaining (all-in);
+    # the top-of-loop ``not actors_remaining()`` branch would then pass ``n_board_seen=0`` to
+    # ``allin_settle``, telling it 0 board cards were seen when the board is already dealt -> wrong
+    # variance-reduction baseline. A fresh hand has an empty board, so this is identical there.
+    n_board_seen = len(state.board)
 
     def _runout_or_settle():
         if allin_settle is not None:

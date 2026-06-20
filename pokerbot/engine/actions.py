@@ -15,8 +15,20 @@ class ActionType(Enum):
     ALL_IN = auto()
 
 
-# Solver-native pot fractions used by PokerBench / GTO solvers
-BET_SIZE_BUCKETS = (0.33, 0.50, 0.66, 0.75, 1.0, 1.5, 2.0)
+# Solver-native pot fractions used by PokerBench / GTO solvers.
+#
+# SINGLE SOURCE OF TRUTH for the bet-size abstraction menu. The engine state machine
+# (``jax_engine`` / ``np_engine`` / ``core.rs``), the serve/translation path
+# (``action_to_index`` / ``pseudo_harmonic_bucket``) and the trained policy head ALL key off this
+# one tuple. The smallest bucket is the exact rational ``1/3`` (33.33% pot), NOT ``0.33`` — the
+# engine has always sized at ``1/3``; the serve menu previously used ``0.33`` and silently
+# mis-bucketed the smallest size relative to the trained policy. Unified to ``1/3`` here so
+# ``jax_engine.BET_SIZE_BUCKETS is actions.BET_SIZE_BUCKETS`` (same object) and every consumer agrees.
+#
+# NOTE: the EXTERNAL postflop-solver CLI / CoinPoker client use a literal ``0.33`` ("33% of pot",
+# see ``coinpoker_bet_sizes`` and ``solver_exploitability._BET_BUCKET_FRACS``) — that is a DISTINCT
+# menu aligned to a different system and is intentionally NOT this constant.
+BET_SIZE_BUCKETS = (1.0 / 3, 0.50, 0.66, 0.75, 1.0, 1.5, 2.0)
 
 
 @dataclass(frozen=True, slots=True)

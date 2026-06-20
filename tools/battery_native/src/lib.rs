@@ -10,6 +10,8 @@
 
 pub mod core;
 pub mod fingerprint;
+pub mod lbr;
+pub mod nnet;
 pub mod phe_tables;
 pub mod playout;
 pub mod subgame;
@@ -158,9 +160,11 @@ pub mod flat {
 
 #[cfg(feature = "python")]
 mod py {
-    use crate::core::{self, MAX_BOARD, NUM_ACTIONS, NUM_PLAYERS};
+    use crate::core::{self, EnvState, MAX_BOARD, NUM_ACTIONS, NUM_PLAYERS};
     use crate::fingerprint;
     use crate::flat;
+    use crate::lbr::{self, LbrCfg, LbrPolicy, TabularPolicy};
+    use crate::nnet::Net;
     use crate::playout::{self, Blueprint, PlayoutConfig};
     use crate::subgame::{self, SubgameConfig};
     use pyo3::prelude::*;
@@ -203,6 +207,46 @@ mod py {
         let s = flat::from_flat(&bytes_to_flat(state));
         let out = flat::to_flat(&core::sample_chance(&s));
         PyBytes::new(py, &flat_to_bytes(&out))
+    }
+
+    /// `init_hand(button, stacks, occupancy, ante, deck, rng_key)` -> flat root state as bytes.
+    /// Byte-identical to `jax_engine.init_hand(rng_key, button, stacks, occupancy, ante)` WHEN given
+    /// jax's permuted `deck` (52 ints) and the jax state's `rng_key` (2 u32). `stacks`/`occupancy` are
+    /// length-NUM_PLAYERS; `occupancy` non-zero => SEAT_LIVE. The Threefry deck permutation is supplied
+    /// by the caller (the cross-check feeds jax's own deck), not replicated natively.
+    #[pyfunction]
+    #[pyo3(signature = (button, stacks, occupancy, ante, deck, rng_key))]
+    fn init_hand<'py>(
+        py: Python<'py>,
+        button: i32,
+        stacks: Vec<i32>,
+        occupancy: Vec<i32>,
+        ante: i32,
+        deck: Vec<i32>,
+        rng_key: Vec<u32>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        if stacks.len() != NUM_PLAYERS || occupancy.len() != NUM_PLAYERS {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "stacks and occupancy must have length NUM_PLAYERS",
+            ));
+        }
+        if deck.len() != 52 {
+            return Err(pyo3::exceptions::PyValueError::new_err("deck must have length 52"));
+        }
+        if rng_key.len() != 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err("rng_key must have length 2"));
+        }
+        let mut st = [0i32; NUM_PLAYERS];
+        let mut occ = [false; NUM_PLAYERS];
+        for i in 0..NUM_PLAYERS {
+            st[i] = stacks[i];
+            occ[i] = occupancy[i] != 0;
+        }
+        let mut dk = [0i32; 52];
+        dk.copy_from_slice(&deck[..52]);
+        let key = [rng_key[0], rng_key[1]];
+        let out = flat::to_flat(&core::init_hand(button, &st, &occ, ante, &dk, key));
+        Ok(PyBytes::new(py, &flat_to_bytes(&out)))
     }
 
     /// `legal_action_mask_np(state_bytes, seat)` -> list[bool] (len NUM_ACTIONS).
@@ -263,6 +307,29 @@ mod py {
         let s = flat::from_flat(&bytes_to_flat(state));
         let d = fingerprint::fingerprint_fast(&s, seat, num_buckets);
         PyBytes::new(py, &d)
+    }
+
+    /// `fingerprint_fast_depth(state_bytes, seat, num_buckets, depth_edges)` -> 16-byte digest with the
+    /// depth byte hashed into the preflop key (empty `depth_edges` => identical to `fingerprint_fast`).
+    #[pyfunction]
+    fn fingerprint_fast_depth<'py>(
+        py: Python<'py>,
+        state: &[u8],
+        seat: usize,
+        num_buckets: i32,
+        depth_edges: Vec<f64>,
+    ) -> Bound<'py, PyBytes> {
+        let s = flat::from_flat(&bytes_to_flat(state));
+        let d = fingerprint::fingerprint_fast_depth(&s, seat, num_buckets, &depth_edges);
+        PyBytes::new(py, &d)
+    }
+
+    /// `multiway_equity_river(lbr0, lbr1, opp_flat, board5)` -> P(LBR best, ties shared) at a full board
+    /// (deterministic; cross-check entry for the LBR showdown equity).
+    #[pyfunction]
+    fn multiway_equity_river(lbr0: i32, lbr1: i32, opp_flat: Vec<i32>, board: Vec<i32>) -> f64 {
+        let opps: Vec<(i32, i32)> = opp_flat.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+        lbr::multiway_equity_river_test((lbr0, lbr1), &opps, &board)
     }
 
     /// `eval_seven_phe(cards)` -> phevaluator 1..7462 rank for 5..7 card ids (cross-check helper).
@@ -452,6 +519,277 @@ mod py {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Native LBR exploitability harness (tabular blueprint / calibration policies).
+    // -----------------------------------------------------------------------
+    /// Result of a native LBR run. `per_seat` is a list of (seat, n_hands, bb_per_100, std_bb_per_hand).
+    #[pyclass(skip_from_py_object)]
+    #[derive(Clone)]
+    struct Lbr6Out {
+        #[pyo3(get)]
+        ev_bb_per_hand: f64,
+        #[pyo3(get)]
+        stderr_bb_per_hand: f64,
+        #[pyo3(get)]
+        hands: usize,
+        #[pyo3(get)]
+        per_seat: Vec<(usize, u64, f64, f64)>,
+    }
+
+    fn roots_from_blob(blob: &[u8], n: usize) -> Vec<EnvState> {
+        let stride = flat::FLAT_LEN * 8;
+        let mut out = Vec::with_capacity(n);
+        for h in 0..n {
+            let window = &blob[h * stride..(h + 1) * stride];
+            out.push(flat::from_flat(&bytes_to_flat(window)));
+        }
+        out
+    }
+
+    fn pack_outcome(o: lbr::LbrOutcome) -> Lbr6Out {
+        let per_seat = o
+            .per_seat
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.n > 0)
+            .map(|(seat, a)| {
+                let nf = a.n as f64;
+                let bb100 = a.sum / nf * 100.0;
+                let std = if a.n > 1 {
+                    ((a.sumsq - a.sum * a.sum / nf) / (nf - 1.0)).max(0.0).sqrt()
+                } else {
+                    0.0
+                };
+                (seat, a.n, bb100, std)
+            })
+            .collect();
+        Lbr6Out {
+            ev_bb_per_hand: o.ev_bb_per_hand,
+            stderr_bb_per_hand: o.stderr_bb_per_hand,
+            hands: o.hands,
+            per_seat,
+        }
+    }
+
+    fn allowed_arr(v: &[bool]) -> [bool; NUM_ACTIONS] {
+        let mut a = [false; NUM_ACTIONS];
+        for i in 0..NUM_ACTIONS {
+            a[i] = *v.get(i).unwrap_or(&false);
+        }
+        a
+    }
+
+    /// Holds the blueprint snapshot ONCE; `lbr_tabular` runs the whole native LBR (engine + belief +
+    /// equity + fingerprint serve) across rayon workers, returning the exploitability lower bound.
+    #[pyclass]
+    struct Lbr6Harness {
+        bp: Blueprint,
+        allowed_pre: [bool; NUM_ACTIONS],
+        allowed_post: [bool; NUM_ACTIONS],
+        num_buckets: i32,
+        depth_edges: Vec<f64>,
+    }
+
+    #[pymethods]
+    impl Lbr6Harness {
+        /// blueprint: dict[bytes(16) -> seq[float] len 11] (may be EMPTY for calibration modes).
+        /// `depth_edges`: depth-bucket edges for a DEPTH-BUCKETED blueprint (e.g. [50,90,140]); pass an
+        /// empty list for a non-depth blueprint -- the preflop key then omits the depth byte.
+        #[new]
+        fn new(
+            blueprint: &Bound<'_, PyDict>,
+            allowed_pre: Vec<bool>,
+            allowed_post: Vec<bool>,
+            num_buckets: i32,
+            depth_edges: Vec<f64>,
+        ) -> PyResult<Self> {
+            let mut bp: Blueprint = HashMap::with_capacity(blueprint.len());
+            for (k, v) in blueprint.iter() {
+                let kb: &[u8] = k.extract()?;
+                if kb.len() != 16 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "blueprint key must be 16 bytes",
+                    ));
+                }
+                let mut key = [0u8; 16];
+                key.copy_from_slice(kb);
+                let row: Vec<f64> = v.extract()?;
+                if row.len() != NUM_ACTIONS {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "blueprint row must have 11 entries",
+                    ));
+                }
+                let mut r = [0.0f64; NUM_ACTIONS];
+                r.copy_from_slice(&row[..NUM_ACTIONS]);
+                bp.insert(key, r);
+            }
+            Ok(Lbr6Harness {
+                bp,
+                allowed_pre: allowed_arr(&allowed_pre),
+                allowed_post: allowed_arr(&allowed_post),
+                num_buckets,
+                depth_edges,
+            })
+        }
+
+        fn n_keys(&self) -> usize {
+            self.bp.len()
+        }
+
+        /// Serve the tabular policy for one (state, seat) -- the blueprint/calibration cross-check entry.
+        /// `policy_mode`: 0 blueprint, 1 fold, 2 nit, 3 uniform.
+        fn serve(&self, state: &[u8], seat: usize, policy_mode: u8) -> Vec<f64> {
+            let s = flat::from_flat(&bytes_to_flat(state));
+            let policy = TabularPolicy {
+                bp: self.bp.clone(),
+                allowed_pre: self.allowed_pre,
+                allowed_post: self.allowed_post,
+                num_buckets: self.num_buckets,
+                depth_edges: self.depth_edges.clone(),
+                mode: policy_mode,
+            };
+            policy.probs(&s, seat).to_vec()
+        }
+
+        /// Run the LBR. `roots` is a contiguous int64-LE blob of `lbr_seats.len()` flat EnvStates.
+        /// `policy_mode`: 0 blueprint, 1 always-fold, 2 nit, 3 uniform (1-3 are harness calibration).
+        #[allow(clippy::too_many_arguments)]
+        fn lbr_tabular(
+            &self,
+            py: Python<'_>,
+            roots: &[u8],
+            lbr_seats: Vec<usize>,
+            seeds: Vec<u64>,
+            n_seats: usize,
+            track_ranges: bool,
+            range_cap: usize,
+            eq_samples: i32,
+            eq_runouts: i32,
+            settle_samples: i32,
+            max_depth: i32,
+            bet_candidates: Vec<usize>,
+            value_only_raises: bool,
+            policy_mode: u8,
+        ) -> PyResult<Lbr6Out> {
+            let n = lbr_seats.len();
+            if seeds.len() != n {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "lbr_seats and seeds must have equal length",
+                ));
+            }
+            if roots.len() != n * flat::FLAT_LEN * 8 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "roots blob length != n_hands * FLAT_LEN * 8",
+                ));
+            }
+            // Clone the blueprint handle into the policy. The HashMap clone is the one non-trivial copy,
+            // but it is per-call (not per-hand) and keeps the policy self-contained for the rayon closure.
+            let policy = TabularPolicy {
+                bp: self.bp.clone(),
+                allowed_pre: self.allowed_pre,
+                allowed_post: self.allowed_post,
+                num_buckets: self.num_buckets,
+                depth_edges: self.depth_edges.clone(),
+                mode: policy_mode,
+            };
+            let cfg = LbrCfg {
+                n_seats,
+                track_ranges,
+                range_cap,
+                eq_samples,
+                eq_runouts,
+                settle_samples,
+                max_depth,
+                bet_candidates,
+                value_only_raises,
+            };
+            let states = roots_from_blob(roots, n);
+            let outcome = py.detach(|| lbr::run(&states, &lbr_seats, &seeds, &policy, &cfg));
+            Ok(pack_outcome(outcome))
+        }
+    }
+
+    /// Native HU/6-max LBR serving the trained neural average-strategy net (the CFR validator). Holds
+    /// the small MLP weights ONCE; `lbr_neural` runs the same native LBR as `Lbr6Harness` but with the
+    /// net as the policy (no fingerprint/abstraction -- the net sees raw cards).
+    #[pyclass]
+    struct LbrNeuralHarness {
+        net: Net,
+    }
+
+    #[pymethods]
+    impl LbrNeuralHarness {
+        /// 3 dense layers as flat f32 arrays (kernel row-major in-major, bias len out) + dims + the
+        /// checkpoint's info_suits flag.
+        #[allow(clippy::too_many_arguments)]
+        #[new]
+        fn new(
+            w0: Vec<f32>, b0: Vec<f32>,
+            w1: Vec<f32>, b1: Vec<f32>,
+            w2: Vec<f32>, b2: Vec<f32>,
+            din: Vec<usize>, dout: Vec<usize>,
+            info_suits: bool,
+        ) -> PyResult<Self> {
+            if din.len() != 3 || dout.len() != 3 {
+                return Err(pyo3::exceptions::PyValueError::new_err("din/dout must have length 3"));
+            }
+            let check = |w: &[f32], b: &[f32], i: usize, o: usize, l: usize| -> PyResult<()> {
+                if w.len() != i * o || b.len() != o {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "layer {l}: expected w={}*{}, b={}; got w={}, b={}",
+                        i, o, o, w.len(), b.len()
+                    )));
+                }
+                Ok(())
+            };
+            check(&w0, &b0, din[0], dout[0], 0)?;
+            check(&w1, &b1, din[1], dout[1], 1)?;
+            check(&w2, &b2, din[2], dout[2], 2)?;
+            Ok(LbrNeuralHarness {
+                net: Net::new(w0, b0, w1, b1, w2, b2, [din[0], din[1], din[2]],
+                              [dout[0], dout[1], dout[2]], info_suits),
+            })
+        }
+
+        /// Serve the net's action distribution for one (state, seat) -- the golden cross-check entry.
+        fn serve(&self, state: &[u8], seat: usize) -> Vec<f64> {
+            let s = flat::from_flat(&bytes_to_flat(state));
+            self.net.probs(&s, seat).to_vec()
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn lbr_neural(
+            &self,
+            py: Python<'_>,
+            roots: &[u8],
+            lbr_seats: Vec<usize>,
+            seeds: Vec<u64>,
+            n_seats: usize,
+            track_ranges: bool,
+            range_cap: usize,
+            eq_samples: i32,
+            eq_runouts: i32,
+            settle_samples: i32,
+            max_depth: i32,
+            bet_candidates: Vec<usize>,
+            value_only_raises: bool,
+        ) -> PyResult<Lbr6Out> {
+            let n = lbr_seats.len();
+            if seeds.len() != n || roots.len() != n * flat::FLAT_LEN * 8 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "roots/seeds length mismatch",
+                ));
+            }
+            let cfg = LbrCfg {
+                n_seats, track_ranges, range_cap, eq_samples, eq_runouts, settle_samples,
+                max_depth, bet_candidates, value_only_raises,
+            };
+            let states = roots_from_blob(roots, n);
+            let outcome = py.detach(|| lbr::run(&states, &lbr_seats, &seeds, &self.net, &cfg));
+            Ok(pack_outcome(outcome))
+        }
+    }
+
     /// Flat buffer length + engine dims, for the wrapper's startup self-check.
     #[pyfunction]
     fn engine_dims() -> (usize, usize, usize, usize, usize) {
@@ -468,15 +806,21 @@ mod py {
     fn battery_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(apply_action, m)?)?;
         m.add_function(wrap_pyfunction!(sample_chance, m)?)?;
+        m.add_function(wrap_pyfunction!(init_hand, m)?)?;
         m.add_function(wrap_pyfunction!(legal_action_mask, m)?)?;
         m.add_function(wrap_pyfunction!(is_chance_node, m)?)?;
         m.add_function(wrap_pyfunction!(evaluate_seven, m)?)?;
         m.add_function(wrap_pyfunction!(compute_returns, m)?)?;
         m.add_function(wrap_pyfunction!(engine_dims, m)?)?;
         m.add_function(wrap_pyfunction!(fingerprint_fast, m)?)?;
+        m.add_function(wrap_pyfunction!(fingerprint_fast_depth, m)?)?;
         m.add_function(wrap_pyfunction!(eval_seven_phe, m)?)?;
+        m.add_function(wrap_pyfunction!(multiway_equity_river, m)?)?;
         m.add_class::<PlayoutEngine>()?;
         m.add_class::<SubgameSolver>()?;
+        m.add_class::<Lbr6Harness>()?;
+        m.add_class::<LbrNeuralHarness>()?;
+        m.add_class::<Lbr6Out>()?;
         Ok(())
     }
 }

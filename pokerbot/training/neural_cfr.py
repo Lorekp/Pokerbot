@@ -26,6 +26,7 @@ from pokerbot.engine.jax_engine import (
     NUM_PLAYERS,
     STARTING_STACK_CHIPS,
     EnvState,
+    CHECK,
     encode_history_state,
     encode_info_state,
     is_chance_node,
@@ -519,8 +520,35 @@ def _traversal_step_partial(
     key, ka = jax.random.split(key)
     action = jax.random.choice(ka, env.num_actions, p=xi)
 
-    state = jax.lax.cond(env.is_chance(state), env.sample_chance, lambda s: s, state)
+    # Apply the action, then IMMEDIATELY deal any street the action just closed, so the next scan
+    # step always lands on a real decision node (or terminal) -- NEVER a standalone chance node. The
+    # previous code dealt the CURRENT state if it was a chance node and *then* applied `action` to the
+    # dealt state, which (a) recorded the chance node as a phantom seat=-1 "decision" that polluted the
+    # average-strategy + history-value buffers and (b) OVERWROTE the genuine first decision of the new
+    # street with a sampled action -- corrupting essentially all postflop learning. It also left every
+    # street-closing action's record pointing at a chance node (next_seat=-1), flipping the VR
+    # perspective sign. Folding the deal into the transition keeps every record's next_* fields on a
+    # real decision node, exactly what the VR bootstrap in _finalize_advantages requires. A single deal
+    # suffices: jax_engine emits at most one standalone chance node per street close (all-in runouts go
+    # straight to terminal via _run_out), so there is never a chain to drain. Mirrors the canonical
+    # `while is_chance: sample_chance` deal-through used by every other engine consumer (sd_cfr_nlhe,
+    # lbr6, pluribus_search, ...). Leduc's sample_chance is identity / is_chance is always False, so
+    # this is a no-op there -- only NLHE has standalone chance nodes (jax_engine.is_chance_node).
     next_state = env.step(state, action)
+    next_state = jax.lax.cond(env.is_chance(next_state), env.sample_chance, lambda s: s, next_state)
+    # Finalize a river showdown. Dealing past the river advances the street to TERMINAL but jax_engine
+    # computes the pot only on the FOLLOWING apply_action, so sample_chance leaves a no-actor
+    # (action_seat<0), not-yet-done node. Resolve it now with an inert CHECK -- CHECK never folds or
+    # commits chips, and at a TERMINAL-street node apply_action forces done + compute_returns -- so the
+    # showdown reads the unmodified seat status and next_state becomes a genuinely-done terminal that
+    # carries the river actor's payoff. Without this, that no-actor node would be ingested as a phantom
+    # seat=-1 "decision" (and the old code finalized it with a SAMPLED action that could fold a live
+    # seat at showdown). The predicate is False for every chance/decision/fold/all-in node and for
+    # Leduc (its step sets done directly), so this fires only on a genuine NLHE river-to-showdown.
+    showdown_pending = jnp.logical_and(jnp.logical_not(env.done(next_state)),
+                                       env.action_seat(next_state) < 0)
+    next_state = jax.lax.cond(showdown_pending, lambda s: env.step(s, jnp.int32(CHECK)),
+                              lambda s: s, next_state)
     next_seat = env.action_seat(next_state)
     next_mask = env.legal_mask(next_state)
     next_info = env.encode_info(next_state, next_seat)
@@ -850,6 +878,9 @@ class VRDeepPDCFRPlusTrainer:
         inst_states: tuple[Any, ...] | None = None,
         hv_state: Any | None = None,
         avg_state: Any | None = None,
+        strat_buffer: Any | None = None,
+        hist_buffer: Any | None = None,
+        prev_cum_params: tuple[Any, ...] | None = None,
     ) -> None:
         self.config = config or VRDeepPDCFRConfig()
         # Pluggable game. Default = 6-max NLHE (production); the gate passes a Leduc EnvSpec.
@@ -867,6 +898,13 @@ class VRDeepPDCFRPlusTrainer:
         self.hist_buffer = init_history_value_buffer(
             spec=history_value_buffer_spec(self.env.info_dim, self.env.history_dim,
                                            self.env.num_actions, cap))
+        # RESUME (R2): restore the reservoirs the served avg-strategy + VR-baseline nets train on. The
+        # avg net trains ONLY on strat_buffer, so a cold (empty) reservoir after a mid-run resume would
+        # re-weight the served policy toward post-resume iterations and lose accumulated coverage.
+        if strat_buffer is not None:
+            self.strat_buffer = strat_buffer
+        if hist_buffer is not None:
+            self.hist_buffer = hist_buffer
 
         hidden = self.config.hidden_dim
         lr = self.config.learning_rate
@@ -890,7 +928,11 @@ class VRDeepPDCFRPlusTrainer:
             self.hv_state = _make_train_state(HistoryValueNet(hidden, na), subkeys[-2], lr, self.env)
             self.avg_state = _make_train_state(AverageStrategyNet(hidden, na), subkeys[-1], lr, self.env)
 
-        self._prev_cum_params = tuple(s.params for s in self.cum_states)
+        # RESUME (R3): the PDCFR+ cumulative bootstrap target reads last iteration's cum params; on a
+        # fresh start prev == current is correct, but on resume we restore the genuine previous-iteration
+        # params so the first post-resume iteration's target is not computed against the current net.
+        self._prev_cum_params = (prev_cum_params if prev_cum_params is not None
+                                 else tuple(s.params for s in self.cum_states))
         self._batched_scans = jax.jit(
             _batched_traversal_scans,
             static_argnames=("alpha", "epsilon", "reward_scale", "hidden_dim", "env"),
@@ -1170,13 +1212,19 @@ class VRDeepPDCFRPlusTrainer:
         return {"iteration": float(iteration)}
 
     def train(self, *, log_every: int = 0, label: str = "VR-DeepPDCFR+",
-              checkpoint_every: int = 0, checkpoint_path: str | None = None) -> NetworkParams:
+              checkpoint_every: int = 0, checkpoint_path: str | None = None,
+              buffer_checkpoint_every: int = 0) -> NetworkParams:
         """Run full VR-DeepPDCFR+ training. ``log_every>0`` prints periodic ETA progress.
 
         ``checkpoint_every>0`` with ``checkpoint_path`` set saves a resumable full checkpoint every
         N iterations (ATOMICALLY: written to a temp path then ``os.replace``-promoted, so an
         interrupted write -- OOM, kill -- never corrupts the last good checkpoint). Essential for
         unattended overnight runs; a crash at hour 6 resumes from the last save, not from zero.
+
+        ``buffer_checkpoint_every`` decouples the HEAVY reservoir snapshot from the cheap core
+        checkpoint. <=0 (default) snapshots the reservoirs every checkpoint (legacy). >0 writes them
+        only every that many iters (plus once early so resume is never reservoir-cold), so the frequent
+        core checkpoint stays small/fast on a slow mount while the reservoirs are captured occasionally.
         """
 
         from pokerbot.training.train_logging import ProgressLogger
@@ -1188,11 +1236,24 @@ class VRDeepPDCFRPlusTrainer:
             extra=lambda: f"strat_buf={int(self.strat_buffer.buffer.size)} "
                           f"hist_buf={int(self.hist_buffer.buffer.size)}",
         ).begin()
+        wrote_buffers = False
         for t in range(start + 1, total + 1):
             self.train_iteration(t)
             plog.step(t)
             if checkpoint_every and checkpoint_path and (t % checkpoint_every == 0):
-                _atomic_save_trainer_checkpoint(self, checkpoint_path)
+                # F1: never overwrite the last good checkpoint with a poisoned (NaN/Inf) net. Halt
+                # loudly instead -- the babysitter resumes from the last finite _full checkpoint.
+                if not _trainer_params_finite(self):
+                    raise FloatingPointError(
+                        f"[neural_cfr] non-finite network params at iter {t}; refusing to overwrite the "
+                        f"last good checkpoint {checkpoint_path}. Resume from the last finite _full "
+                        f"checkpoint (lower LR or check the inputs if this recurs).")
+                # Snapshot the heavy reservoirs only on the buffer cadence -- but always once early
+                # (wrote_buffers=False) so a crash before the first heavy save still resumes warm.
+                include_buffers = (buffer_checkpoint_every <= 0
+                                   or (t % buffer_checkpoint_every == 0) or not wrote_buffers)
+                _atomic_save_trainer_checkpoint(self, checkpoint_path, include_buffers=include_buffers)
+                wrote_buffers = wrote_buffers or include_buffers
         return NetworkParams(
             cumulative=self.cum_states,
             instantaneous=self.inst_states,
@@ -1238,9 +1299,15 @@ def _config_to_dict(config: VRDeepPDCFRConfig) -> dict[str, Any]:
     }
 
 
-def _train_state_from_params(module: nn.Module, params: Any, lr: float) -> train_state.TrainState:
+def _train_state_from_params(module: nn.Module, params: Any, lr: float,
+                             opt_state: Any | None = None) -> train_state.TrainState:
     tx = optax.adam(lr)
-    return train_state.TrainState.create(apply_fn=module.apply, params=params, tx=tx)
+    state = train_state.TrainState.create(apply_fn=module.apply, params=params, tx=tx)
+    # RESUME (R1): restore the Adam moments. Without this every resume re-zeros (m, v), so the first
+    # post-resume steps take huge effective strides (v~0 -> 1/sqrt(v) blows up) and kick the served net.
+    if opt_state is not None:
+        state = state.replace(opt_state=jax.tree_util.tree_map(jnp.asarray, opt_state))
+    return state
 
 
 def save_network_params(
@@ -1285,8 +1352,31 @@ def load_network_params(path: str | Path) -> dict[str, Any]:
         return pickle.load(f)
 
 
-def save_trainer_checkpoint(trainer: VRDeepPDCFRPlusTrainer, path: str | Path) -> Path:
-    """Save inference + full trainer checkpoint (all four networks, config, iteration)."""
+def _trainer_params_finite(trainer: "VRDeepPDCFRPlusTrainer") -> bool:
+    """True iff every learned/served network param is finite. Cheap host check run only at checkpoint
+    cadence. A NaN/Inf (e.g. a divergent bootstrap or optimizer overflow over a long run) must NOT be
+    silently written over the last good checkpoint -- that would poison the 'latest checkpoint is always
+    good' invariant the unattended overnight run relies on, with no crash to alert the babysitter."""
+    states = (trainer.avg_state, trainer.hv_state, *trainer.cum_states, *trainer.inst_states)
+    for s in states:
+        for leaf in jax.tree_util.tree_leaves(s.params):
+            if not bool(jnp.all(jnp.isfinite(leaf))):
+                return False
+    return True
+
+
+def _buffers_path(path: Path) -> Path:
+    return path.with_name(f"{path.stem}_buffers{path.suffix}")
+
+
+def save_trainer_checkpoint(trainer: VRDeepPDCFRPlusTrainer, path: str | Path,
+                            include_buffers: bool = True) -> Path:
+    """Save the inference + full trainer checkpoint. The CORE ``_full`` payload (params + Adam moments +
+    prev-cum + iteration + rng) is small (~tens of MB) and written every time. The reservoirs (R2) are
+    the heavy part (~hundreds of MB at full capacity), so they go in a SEPARATE ``_buffers`` sidecar
+    written only when ``include_buffers`` -- letting the resumable core checkpoint stay cheap+frequent
+    while the reservoir snapshot is taken less often (a slightly stale reservoir on resume is fine; it
+    is a slowly-changing sample). Returns the promoted full-checkpoint path."""
 
     import pickle
 
@@ -1305,18 +1395,36 @@ def save_trainer_checkpoint(trainer: VRDeepPDCFRPlusTrainer, path: str | Path) -
         "average_strategy_params": jax.device_get(trainer.avg_state.params),
         "cumulative_advantage_params": [jax.device_get(s.params) for s in trainer.cum_states],
         "instantaneous_advantage_params": [jax.device_get(s.params) for s in trainer.inst_states],
+        # R1: Adam optimizer moments for every net (else resume cold-starts the optimizer).
+        "history_value_opt_state": jax.device_get(trainer.hv_state.opt_state),
+        "average_strategy_opt_state": jax.device_get(trainer.avg_state.opt_state),
+        "cumulative_advantage_opt_states": [jax.device_get(s.opt_state) for s in trainer.cum_states],
+        "instantaneous_advantage_opt_states": [jax.device_get(s.opt_state) for s in trainer.inst_states],
+        # R3: previous-iteration cumulative params for the PDCFR+ bootstrap target.
+        "prev_cumulative_advantage_params": [jax.device_get(p) for p in trainer._prev_cum_params],
         "config": _config_to_dict(trainer.config),
         "iteration": trainer._iteration,
         "prng_key": jax.device_get(trainer.key),
     }
     with full_path.open("wb") as f:
         pickle.dump(full_payload, f)
+
+    if include_buffers:
+        # R2: the reservoirs the served avg-strategy + VR-baseline nets train on (incl. reservoir count).
+        buf_payload = {
+            "strategy_buffer": jax.device_get(trainer.strat_buffer.buffer),
+            "history_value_buffer": jax.device_get(trainer.hist_buffer.buffer),
+            "iteration": trainer._iteration,
+        }
+        with _buffers_path(path).open("wb") as f:
+            pickle.dump(buf_payload, f)
     return full_path
 
 
-def _atomic_save_trainer_checkpoint(trainer: VRDeepPDCFRPlusTrainer, path: str | Path) -> Path:
-    """Crash-safe ``save_trainer_checkpoint``: write both files (inference + ``_full``) to a temp
-    stem, then ``os.replace``-promote each to its final name. ``os.replace`` is atomic on the same
+def _atomic_save_trainer_checkpoint(trainer: VRDeepPDCFRPlusTrainer, path: str | Path,
+                                    include_buffers: bool = True) -> Path:
+    """Crash-safe ``save_trainer_checkpoint``: write each file (inference + ``_full`` + optional
+    ``_buffers``) to a temp stem, then ``os.replace``-promote it. ``os.replace`` is atomic on the same
     filesystem, so an interrupted write leaves the previous good checkpoint untouched. Returns the
     promoted full-checkpoint path."""
 
@@ -1324,11 +1432,16 @@ def _atomic_save_trainer_checkpoint(trainer: VRDeepPDCFRPlusTrainer, path: str |
 
     path = Path(path)
     tmp = path.with_name(f"{path.stem}.writing{path.suffix}")
-    save_trainer_checkpoint(trainer, tmp)  # writes tmp + <tmp_stem>_full<suffix>
+    save_trainer_checkpoint(trainer, tmp, include_buffers=include_buffers)
     tmp_full = tmp.with_name(f"{tmp.stem}_full{tmp.suffix}")
     final_full = path.with_name(f"{path.stem}_full{path.suffix}")
-    os.replace(tmp, path)
+    # A1 ordering: promote the resume-critical files BEFORE the served .pkl. The renames are not jointly
+    # atomic; a crash between them must never leave a NEWER served .pkl paired with a STALE _full/_buffers,
+    # because resume reads those. Worst case here is an older served .pkl with newer resume files (fine).
+    if include_buffers:
+        os.replace(_buffers_path(tmp), _buffers_path(path))   # heavy reservoir sidecar (when written)
     os.replace(tmp_full, final_full)
+    os.replace(tmp, path)
     return final_full
 
 
@@ -1351,16 +1464,47 @@ def load_trainer_checkpoint(path: str | Path) -> VRDeepPDCFRPlusTrainer:
     cfg = VRDeepPDCFRConfig(**payload["config"])
     hidden = cfg.hidden_dim
     lr = cfg.learning_rate
+    # Backward-compatible: pre-R1/R2/R3 checkpoints lack opt_states / buffers / prev-cum. .get(...) ->
+    # None falls back to the prior behavior (fresh optimizer, empty reservoirs, prev==current).
+    cum_opt = payload.get("cumulative_advantage_opt_states")
+    inst_opt = payload.get("instantaneous_advantage_opt_states")
     cum_states = tuple(
-        _train_state_from_params(CumulativeAdvantageNet(hidden), p, lr)
-        for p in payload["cumulative_advantage_params"]
+        _train_state_from_params(CumulativeAdvantageNet(hidden), p, lr,
+                                 opt_state=(cum_opt[i] if cum_opt is not None else None))
+        for i, p in enumerate(payload["cumulative_advantage_params"])
     )
     inst_states = tuple(
-        _train_state_from_params(InstantaneousAdvantageNet(hidden), p, lr)
-        for p in payload["instantaneous_advantage_params"]
+        _train_state_from_params(InstantaneousAdvantageNet(hidden), p, lr,
+                                 opt_state=(inst_opt[i] if inst_opt is not None else None))
+        for i, p in enumerate(payload["instantaneous_advantage_params"])
     )
-    hv_state = _train_state_from_params(HistoryValueNet(hidden), payload["history_value_params"], lr)
-    avg_state = _train_state_from_params(AverageStrategyNet(hidden), payload["average_strategy_params"], lr)
+    hv_state = _train_state_from_params(HistoryValueNet(hidden), payload["history_value_params"], lr,
+                                        opt_state=payload.get("history_value_opt_state"))
+    avg_state = _train_state_from_params(AverageStrategyNet(hidden), payload["average_strategy_params"], lr,
+                                         opt_state=payload.get("average_strategy_opt_state"))
+
+    def _restore_buffer(wrapper, saved):
+        return wrapper(buffer=jax.tree_util.tree_map(jnp.asarray, saved)) if saved is not None else None
+
+    # Reservoirs: prefer the _buffers sidecar (new split format); else the embedded keys (legacy single
+    # _full payload); else None (empty -> warm-refill on resume). The sidecar may lag the core by up to
+    # one buffer-checkpoint interval -- a slowly-changing sample, so a slightly stale reservoir is fine.
+    strat_saved = payload.get("strategy_buffer")
+    hist_saved = payload.get("history_value_buffer")
+    side_path = _buffers_path(full_path.with_name(full_path.stem.replace("_full", "") + full_path.suffix))
+    if side_path.exists():
+        try:
+            with side_path.open("rb") as f:
+                bufs = pickle.load(f)
+            strat_saved = bufs.get("strategy_buffer", strat_saved)
+            hist_saved = bufs.get("history_value_buffer", hist_saved)
+        except (OSError, ValueError, EOFError):
+            pass
+    strat_buffer = _restore_buffer(StrategyBuffer, strat_saved)
+    hist_buffer = _restore_buffer(HistoryValueBuffer, hist_saved)
+    prev_saved = payload.get("prev_cumulative_advantage_params")
+    prev_cum_params = (tuple(jax.tree_util.tree_map(jnp.asarray, p) for p in prev_saved)
+                       if prev_saved is not None else None)
     return VRDeepPDCFRPlusTrainer(
         cfg,
         start_iteration=int(payload["iteration"]),
@@ -1369,4 +1513,7 @@ def load_trainer_checkpoint(path: str | Path) -> VRDeepPDCFRPlusTrainer:
         inst_states=inst_states,
         hv_state=hv_state,
         avg_state=avg_state,
+        strat_buffer=strat_buffer,
+        hist_buffer=hist_buffer,
+        prev_cum_params=prev_cum_params,
     )

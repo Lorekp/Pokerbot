@@ -41,6 +41,10 @@ SEAT_FOLDED = np.int8(1)
 SEAT_LIVE = np.int8(2)
 SEAT_ALLIN = np.int8(3)
 
+# NUM_PLAYERS / MAX_POTS are the 6-max DEFAULTS (mirrored from jax_engine). They are NOT used to SIZE
+# any transition below: every function derives the seat count from the SHAPE of its input arrays
+# (``.shape[0]``), so a 7-wide (or N-wide) numpy state flows through unchanged while the deployed 6-wide
+# path stays byte-identical to the JAX engine. Do NOT change these constants.
 MAX_POTS = NUM_PLAYERS
 BET_BUCKETS = np.asarray(BET_SIZE_BUCKETS, dtype=np.float32)
 _N_BUCKETS = len(BET_SIZE_BUCKETS)
@@ -302,8 +306,9 @@ def _cap_contributions(committed_total: np.ndarray) -> np.ndarray:
 
 
 def _odd_chip_seat(eligible: np.ndarray, button) -> np.int32:
-    offsets = np.arange(NUM_PLAYERS)
-    seats = (int(button) + 1 + offsets) % NUM_PLAYERS
+    n = eligible.shape[0]  # seat count
+    offsets = np.arange(n)
+    seats = (int(button) + 1 + offsets) % n
     is_elig = eligible[seats]
     idx = int(np.argmax(is_elig))
     return np.int32(seats[idx]) if bool(np.any(is_elig)) else np.int32(button)
@@ -335,6 +340,8 @@ def compute_returns_np(
 ) -> np.ndarray:
     """Per-seat net chip delta (int32), sums to zero.  Port of compute_returns."""
     committed_total = committed_total.astype(np.int32)
+    n = seat_status.shape[0]          # seat count (== JAX side-pot level cap)
+    max_pots = n
     if int(n_showdown) <= 1:
         # fold_win
         live = _eligible_to_win(seat_status)
@@ -351,26 +358,26 @@ def compute_returns_np(
     # this yields the BIT-IDENTICAL ``scores`` array while skipping the expensive hand evaluation for
     # seats whose value would be discarded.  (Pure refactor of the np.where mask — no numerical change.)
     eligible_mask = _eligible_to_win(seat_status)
-    scores = np.full(NUM_PLAYERS, np.int32(-1), dtype=np.int32)
-    for s in range(NUM_PLAYERS):
+    scores = np.full(n, np.int32(-1), dtype=np.int32)
+    for s in range(n):
         if eligible_mask[s]:
             scores[s] = player_showdown_score(holes[s], board, board_valid)
 
     capped = _cap_contributions(committed_total)
     excess = committed_total - capped
-    winnings = np.zeros(NUM_PLAYERS, dtype=np.int32)
+    winnings = np.zeros(n, dtype=np.int32)
 
     positive = np.where(capped > 0, capped, -1)
-    # jnp.unique(positive, size=MAX_POTS, fill_value=-1) -> sorted unique, padded with -1.
+    # jnp.unique(positive, size=max_pots, fill_value=-1) -> sorted unique, padded with -1.
     uniq = np.unique(positive)  # sorted ascending
-    levels = np.full(MAX_POTS, -1, dtype=positive.dtype)
-    take = min(len(uniq), MAX_POTS)
+    levels = np.full(max_pots, -1, dtype=positive.dtype)
+    take = min(len(uniq), max_pots)
     levels[:take] = uniq[:take]
     levels = np.sort(levels)  # JAX sorts again
     levels = np.where(levels >= 0, levels, -1)
 
     prev_level = np.int32(0)
-    for li in range(MAX_POTS):
+    for li in range(max_pots):
         level = levels[li]
         valid = level >= 0
         layer_size = (level - prev_level) if valid else np.int32(0)
@@ -413,20 +420,24 @@ def _live_count(seat_status: np.ndarray) -> np.int32:
 
 
 def _pot_for_sizing(state: EnvState) -> np.int32:
+    # Seat-count agnostic: sum the whole committed_street vector (was an unrolled 6-element sum).
+    # For a 6-wide state this is the identical total; for n != 6 it sums the n live commitments.
     cs = state.committed_street
-    return np.int32(int(state.pot_dead) + int(cs[0]) + int(cs[1]) + int(cs[2]) + int(cs[3]) + int(cs[4]) + int(cs[5]))
+    return np.int32(int(state.pot_dead) + int(cs.sum()))
 
 
 def _next_seat_cw(from_seat, offset) -> np.int32:
+    # API-compat helper; not used on the seat-count-agnostic paths (callers carry their own modulus).
     return np.int32((int(from_seat) + int(offset)) % NUM_PLAYERS)
 
 
 def _first_live_after(seat_status: np.ndarray, from_seat) -> np.int32:
-    # jnp argmax-of-(seat_status==LIVE) over seats (from+1..from+6); first live clockwise.
+    # jnp argmax-of-(seat_status==LIVE) over seats (from+1..from+n); first live clockwise.
     ss = seat_status
+    n = seat_status.shape[0]  # seat count
     base = int(from_seat)
-    for off in range(1, NUM_PLAYERS + 1):
-        seat = (base + off) % NUM_PLAYERS
+    for off in range(1, n + 1):
+        seat = (base + off) % n
         if ss[seat] == SEAT_LIVE:
             return np.int32(seat)
     return np.int32(-1)
@@ -471,10 +482,11 @@ def _street_complete(state: EnvState) -> bool:
     cs = state.committed_street.tolist()
     acted = state.acted.tolist()
     cur = int(state.current_bet)
+    n = state.seat_status.shape[0]  # seat count
     n_can_act = 0
     matched = True
     all_acted = True
-    for i in range(NUM_PLAYERS):
+    for i in range(n):
         if ss[i] == 2:  # SEAT_LIVE
             n_can_act += 1
             if cs[i] < cur:
@@ -533,13 +545,14 @@ def sample_chance_np(state: EnvState) -> EnvState:
     else:
         actor = _first_postflop_actor(state)
 
+    n = state.seat_status.shape[0]
     return state._replace(
         street=_scalar(new_street, np.int32),
         action_seat=_scalar(actor, np.int32),
-        committed_street=np.zeros(NUM_PLAYERS, dtype=np.int32),
+        committed_street=np.zeros(n, dtype=np.int32),
         current_bet=_scalar(0, np.int32),
         min_raise=_scalar(BB_CHIPS, np.int32),
-        acted=np.zeros(NUM_PLAYERS, dtype=np.bool_),
+        acted=np.zeros(n, dtype=np.bool_),
         last_aggressor=_scalar(-1, np.int32),
         last_raise_full=_scalar(True, np.bool_),
     )
@@ -562,10 +575,11 @@ def _run_out(state: EnvState) -> EnvState:
 
 
 def _close_street(state: EnvState) -> EnvState:
+    n = state.seat_status.shape[0]
     pot_dead = int(state.pot_dead) + int(np.sum(state.committed_street))
     state = state._replace(
         pot_dead=_scalar(pot_dead, np.int32),
-        committed_street=np.zeros(NUM_PLAYERS, dtype=np.int32),
+        committed_street=np.zeros(n, dtype=np.int32),
         current_bet=_scalar(0, np.int32),
         pending_deal=_scalar(True, np.bool_),
         action_seat=_scalar(-1, np.int32),
@@ -667,6 +681,7 @@ def _action_amount(state: EnvState, seat, action: int) -> int:
 
 def apply_action_np(state: EnvState, action: int) -> EnvState:
     action = int(action)
+    n = state.seat_status.shape[0]  # seat count
     seat = int(state.action_seat)
     amount = _action_amount(state, seat, action)
 
@@ -688,7 +703,7 @@ def apply_action_np(state: EnvState, action: int) -> EnvState:
     acted = state.acted.copy()
     acted[seat] = True
     if full_raise:
-        acted = np.zeros(NUM_PLAYERS, dtype=np.bool_)
+        acted = np.zeros(n, dtype=np.bool_)
         acted[seat] = True
 
     if raised:
@@ -759,7 +774,7 @@ def apply_action_np(state: EnvState, action: int) -> EnvState:
             n_showdown=n_live,
         )
     else:
-        rets = np.zeros(NUM_PLAYERS, dtype=np.int32)
+        rets = np.zeros(n, dtype=np.int32)
     return state._replace(rewards=rets.astype(np.int32))
 
 

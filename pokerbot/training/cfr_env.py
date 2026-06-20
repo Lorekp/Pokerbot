@@ -16,6 +16,8 @@ plus the static ints num_players, num_actions, info_dim, history_dim.
 
 from __future__ import annotations
 
+import math
+import os
 from typing import Any, Callable, NamedTuple
 
 import jax
@@ -83,6 +85,34 @@ def nlhe_env_spec() -> EnvSpec:
 # ---------------------------------------------------------------------------
 
 
+def _read_hu_depth_band() -> tuple[float, float] | None:
+    """POKERBOT_HU_DEPTH_BB='lo,hi' -> per-deal log-uniform effective stack (in BB). Unset -> None
+    (fixed 100bb starts, byte-identical to the legacy reset). Tournament HU is late & high-blind, so the
+    intended band is SHALLOW (e.g. 5,60); a deeper band covers cash too."""
+    raw = os.environ.get("POKERBOT_HU_DEPTH_BB", "").strip()
+    if not raw:
+        return None
+    try:
+        lo_s, hi_s = raw.split(",")
+        lo, hi = float(lo_s), float(hi_s)
+    except ValueError as e:
+        raise ValueError(f"POKERBOT_HU_DEPTH_BB must be 'lo,hi' BB, got {raw!r}") from e
+    if not (0 < lo <= hi):
+        raise ValueError(f"POKERBOT_HU_DEPTH_BB needs 0 < lo <= hi, got {lo},{hi}")
+    return lo, hi
+
+
+def _read_hu_ante() -> tuple[float, float]:
+    """POKERBOT_HU_ANTE_BB (per-player ante in BB, default 0 = no ante = cash/legacy) and
+    POKERBOT_HU_ANTE_ZERO_PROB (default 0 = always ante; >0 zeroes that fraction of deals so ONE net
+    also covers no-ante/cash HU, conditioning on the encoded pot)."""
+    ante_bb = float(os.environ.get("POKERBOT_HU_ANTE_BB", "0") or "0")
+    zero_p = float(os.environ.get("POKERBOT_HU_ANTE_ZERO_PROB", "0") or "0")
+    if ante_bb < 0 or not (0.0 <= zero_p <= 1.0):
+        raise ValueError("POKERBOT_HU_ANTE_BB must be >= 0 and POKERBOT_HU_ANTE_ZERO_PROB in [0,1]")
+    return ante_bb, zero_p
+
+
 def nlhe_hu_env_spec(seat_a: int = 3, seat_b: int = 5) -> EnvSpec:
     """Heads-up (2-player) NLHE adapter for neural CFR.
 
@@ -103,11 +133,35 @@ def nlhe_hu_env_spec(seat_a: int = 3, seat_b: int = 5) -> EnvSpec:
     base = nlhe_env_spec()
     occ = jnp.array([(i == seat_a or i == seat_b) for i in range(je.NUM_PLAYERS)], dtype=bool)
     live = jnp.array([seat_a, seat_b], dtype=jnp.int32)
+    # Tournament/cash training distribution, read once at spec build (env-gated; defaults reproduce the
+    # legacy fixed-100bb no-ante reset exactly). Captured as Python constants -> static under jit; only
+    # the per-deal draws are traced.
+    band = _read_hu_depth_band()
+    ante_bb, ante_zero_p = _read_hu_ante()
+    unit = je.CHIP_UNIT
 
     def reset(key: Array):
-        k_btn, k_hand = jax.random.split(key)
+        k_btn, k_hand, k_depth, k_ante = jax.random.split(key, 4)
         button = live[jax.random.randint(k_btn, (), 0, 2)]  # rotate SB/BB across the 2 live seats
-        return je.init_hand(k_hand, button=button, occupancy=occ)
+        # Per-deal effective depth: both live seats share it. Chip-EV only needs the COVERING (shorter)
+        # stack -- you can't win more than that heads-up -- so symmetric stacks suffice; asymmetric-stack
+        # ($/ICM) effects are handled by the serve-time ICM overlay, not the chip-EV net.
+        if band is None:
+            stacks = None
+        else:
+            lo, hi = band
+            u = jax.random.uniform(k_depth, (), minval=math.log(lo), maxval=math.log(hi))
+            chips = jnp.round(jnp.exp(u) * unit).astype(jnp.int32)
+            stacks = jnp.full((je.NUM_PLAYERS,), chips, dtype=jnp.int32)
+        # Per-player ante (tournament). Optionally zero a fraction of deals so one net also covers
+        # no-ante cash HU (it conditions on the encoded pot, which carries the antes).
+        if ante_bb <= 0.0:
+            ante = jnp.int32(0)
+        else:
+            base_ante = jnp.int32(round(ante_bb * unit))
+            ante = (jnp.where(jax.random.uniform(k_ante, ()) < ante_zero_p, jnp.int32(0), base_ante)
+                    if ante_zero_p > 0.0 else base_ante)
+        return je.init_hand(k_hand, button=button, stacks=stacks, occupancy=occ, ante=ante)
 
     return base._replace(reset=reset)
 

@@ -41,3 +41,24 @@ data/datasets/
 
 # CoinPoker client binary snapshots (proprietary, ~41MB each) - kept on disk for post-update diffing, never committed
 artifacts/client_snapshot/
+
+# Claude Code tooling state (agent worktrees ~GB, session transcripts) — never commit
+.claude/
+.ultracode_backup/
+# scratch / crash dumps
+*.stackdump
+bash.exe.stackdump
+diag_fix.out
+hu_oracle_check.out
+err.txt
+# Rust build artifacts (regenerable) — source under tools/*/src is versioned
+target/
+*.rlib
+*.rmeta
+# large regenerable data / vendored external repos / venvs (keep OUT of git history)
+data/validate50/
+data/validate50_ec2/
+.venv*/
+external/AlphaNLHoldem/
+external/pokerbench/
+external/*/target/

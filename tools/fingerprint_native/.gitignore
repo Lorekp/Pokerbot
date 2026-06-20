@@ -1,0 +1,6 @@
+/target
+*.pyd
+*.dll
+*.so
+Cargo.lock
+dev_vectors/

@@ -125,6 +125,12 @@ class LBR6Config:
     cont_rollouts: int = 2           # runout samples for the continuation equity estimate
     settle_samples: int = 64         # all-in EV: runouts averaged when every contender is all-in (var-cut)
     bet_candidates: tuple[int, ...] = (_HALF_POT_INDEX, _POT_BET_INDEX, ALL_IN)  # LBR bet menu (+fold/chk/call)
+    # Stack depth + per-player ante (BB) the hand is dealt at. None => engine default 100bb / ante 0
+    # (unchanged). Set to measure a TOURNAMENT-shallow target (e.g. stack_bb=20, ante_bb=0.125) -- the
+    # regime a tournament net actually plays. Honoured by the NATIVE harness (lbr_native.py); the pure-
+    # Python driver below still deals at the engine default (these fields parameterise the fast path).
+    stack_bb: float | None = None
+    ante_bb: float = 0.0
     value_only_raises: bool = False  # VALUE-ONLY raise valuation: price each raise assuming it is ALWAYS
                                      # called (fp=0, no fold-equity credit), so the LBR bets/jams only when it
                                      # profits on pure showdown value vs the calling range. Needed when the

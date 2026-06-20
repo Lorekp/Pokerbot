@@ -29,14 +29,14 @@
     },
     {
       "num_players": 4,
-      "solver": "fictitious_play_4max_vec",
-      "iterations": 400,
+      "solver": "fictitious_play_4max_vec_resolved",
+      "iterations": 2000,
       "seed": 42,
       "exploitability_bb_per_hand": 0.0,
       "exploitability_mbb_g": 0.0,
-      "br_method": "mc_combo_br_legal_split",
+      "br_method": "out-of-sample split-MC @ 30000x2",
       "player_improvements": null,
-      "nash_disclaimer": "N=4 vectorized legal FP; per-depth independent MC gap in manifest.depth_grid_4max.",
+      "nash_disclaimer": "N=4 re-solved; exploitability is held-out OUT-OF-SAMPLE (in-sample is meaningless for sampled FP).",
       "n_infosets": 16562
     }
   ],
@@ -44,7 +44,7 @@
     "4": 0.0,
     "6": 0.0,
     "8": 0.0,
-    "10": 5.574356560968082,
+    "10": 0.0,
     "12": 0.0,
     "15": 0.0,
     "20": 0.0
