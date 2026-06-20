@@ -25,10 +25,11 @@ so escalating size strictly increases extraction. (GTO Wizard MDF/over-bet, Upsw
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 import numpy as np
 
-from pokerbot.engine.actions import NUM_ACTIONS
+from pokerbot.engine.actions import BET_SIZE_BUCKETS, NUM_ACTIONS
 
 # Action layout: 0=fold, 1=check, 2=call, 3..NUM_ACTIONS-2 = bet/raise size buckets ascending
 # (1/3, 1/2, 2/3, 3/4, 1, 1.5, 2 pot), NUM_ACTIONS-1 = all-in.
@@ -61,6 +62,89 @@ _THIN_HI = 0.50                            # ceiling: at/above this value_sizing
 _WSD_THIN_MAX = 0.50                       # require a weak showdown range (won-at-sd < this) to bet thin
 _K_THIN = 0.6                              # boost to the small/mid value buckets for a thin value bet
 _K_THIN_CHECK = 0.45                       # discourage checking back a thin-value hand vs a station
+
+
+# --- Rake-aware SIZE-escalation discount -----------------------------------------------------------
+# The SIZE escalation (mid->big bet buckets) grows the final pot, and CoinPoker rakes min(5%*pot, cap).
+# BELOW the cap, every BB of extra pot forfeits 5% to rake -> escalating thin value into a small pot can
+# cost more rake than the marginal extraction is worth. ABOVE the cap the rake is FLAT, so growing the
+# pot is rake-FREE and the escalation must NOT be discounted (over-bets above the cap are rake-efficient).
+# We therefore DAMPEN the _K_BIG/_K_MID boosts by ``rake_keep`` in (0,1]: 1.0 = keep the full escalation
+# (no rake bite, or no context), shrinking toward 0 only when the marginal rake of the mid->big step
+# rivals the marginal extraction. Default-safe: no context (no stake/pot) => rake_keep = 1.0 (today).
+
+# Representative pot-fraction of the mid band (1/3..0.75) and the big band (1.0..2.0) the escalation
+# shifts mass between — the medians of BET_SIZE_BUCKETS' lower/upper halves (0.66 and 1.5 for the
+# standard 7-bucket menu). Computed from the single-source-of-truth menu so it tracks any re-bucketing.
+_MID_BUCKETS = [b for b in BET_SIZE_BUCKETS if b < 1.0] or [BET_SIZE_BUCKETS[0]]
+_BIG_BUCKETS = [b for b in BET_SIZE_BUCKETS if b >= 1.0] or [BET_SIZE_BUCKETS[-1]]
+_MID_FRAC = float(np.median(_MID_BUCKETS))   # ~0.66 pot
+_BIG_FRAC = float(np.median(_BIG_BUCKETS))   # ~1.5  pot
+
+_RAKE_EPS = 1e-6
+
+
+def _rake_aware_enabled() -> bool:
+    return os.environ.get("POKERBOT_RAKE_AWARE_SIZING", "1") != "0"
+
+
+@dataclass(frozen=True)
+class RakeContext:
+    """Postflop rake context for the SIZE-escalation discount. Optional everywhere — absent (or preflop)
+    => no discount (rake_keep == 1.0, today's behaviour byte-for-byte)."""
+    pot_bb: float                 # whole-hand pot BEFORE hero's value bet, in BB
+    n_dealt: int                  # ACTUAL players dealt this hand (cap tier) — never max-seats
+    stake_key: str                # a key in rake.STAKES (e.g. "0.10/0.25")
+    is_preflop: bool = False      # True => rake is a postflop sink that hasn't applied yet => no discount
+
+
+def _pot_after_bet(pot_before_bb: float, frac: float, call_through: float) -> float:
+    """Final pot after hero bets ``frac``·pot and the station calls through with prob ``call_through``.
+
+    Hero wagers ``frac·P``; the station matches ``call_through·frac·P`` in expectation. Expected final
+    pot = ``P·(1 + frac·(1 + call_through))``. (call_through=1 => P·(1+2·frac); a pure fold => P+frac·P.)"""
+    return pot_before_bb * (1.0 + frac * (1.0 + call_through))
+
+
+def rake_keep_factor(stats, ctx: RakeContext | None) -> float:
+    """Magnitude-scaling factor in (0,1] applied to the SIZE-escalation boost (_K_BIG/_K_MID).
+
+    ``rake_keep = 1 - clip(marginal_rake / max(marginal_extraction, eps), 0, 1)`` where
+      * ``marginal_rake`` = ``rake.marginal_rake_bb`` of moving from the mid-size resulting pot to the
+        big-size resulting pot (the extra rake the escalation actually incurs). Above the cap this is 0
+        (flat rake) => no discount; below the cap it is 5%·(pot growth) => the discount bites.
+      * ``marginal_extraction`` = a CONSERVATIVE estimate of the extra value the bigger size extracts =
+        ``call_through · (big_frac - mid_frac) · pot`` — the station's expected call-through on the size
+        increment. Conservative (underestimating extraction) makes the discount a SOFT scaling, not a
+        hard block: even when marginal rake equals the estimate we only floor at rake_keep>0 below.
+
+    Default-safe: no context, preflop, missing stake, or the kill-switch off => 1.0 (no discount)."""
+    if ctx is None or not _rake_aware_enabled():
+        return 1.0
+    if ctx.is_preflop or ctx.pot_bb <= 0.0:
+        return 1.0
+    try:
+        from pokerbot.economics.rake import STAKES, marginal_rake_bb
+    except Exception:  # noqa: BLE001 — economics layer optional; degrade to no-discount
+        return 1.0
+    if ctx.stake_key not in STAKES:
+        return 1.0
+
+    # Station call-through on the value bet: how often they pay it off (the same sticky read that drives
+    # the escalation). Use the payoff score as a proxy for continue-frequency, floored so extraction is
+    # never zero (a value hand always extracts SOMETHING) — this keeps the discount conservative.
+    score, _conf = station_payoff_score(stats)
+    call_through = float(np.clip(0.5 + 0.5 * score, 0.0, 1.0))   # 0.5 (neutral) .. 1.0 (pure station)
+
+    pot_mid = _pot_after_bet(ctx.pot_bb, _MID_FRAC, call_through)
+    pot_big = _pot_after_bet(ctx.pot_bb, _BIG_FRAC, call_through)
+    marg_rake = marginal_rake_bb(pot_mid, pot_big, ctx.n_dealt, ctx.stake_key)
+
+    # Conservative extraction estimate: the station calls ``call_through`` of the extra wager
+    # (big_frac - mid_frac)·pot. Floor at eps so a degenerate pot can't divide-by-zero.
+    marg_extract = max(call_through * (_BIG_FRAC - _MID_FRAC) * ctx.pot_bb, _RAKE_EPS)
+    discount = float(np.clip(marg_rake / marg_extract, 0.0, 1.0))
+    return float(np.clip(1.0 - discount, 0.0, 1.0))
 
 
 def overlay_hand_strength(state, seat, *, n_iter: int = 300) -> float | None:
@@ -162,10 +246,19 @@ def station_payoff_score(stats) -> tuple[float, float]:
     return float(max(0.0, min(1.0, score))), float(max(0.0, min(1.0, conf)))
 
 
-def value_sizing_logits(stats, hand_strength: float | None) -> np.ndarray:
+def value_sizing_logits(
+    stats, hand_strength: float | None, *, rake_ctx: RakeContext | None = None
+) -> np.ndarray:
     """Logit overlay that escalates OUR value bet-SIZE vs a payoff station. Zero unless hero holds a
     value hand AND the opponent reads as a sticky/weak-showdown station with enough confidence. Bounded
-    and additive — the mixer's confidence-α and the LAG/RNR firewall still clamp it on top."""
+    and additive — the mixer's confidence-α and the LAG/RNR firewall still clamp it on top.
+
+    ``rake_ctx`` (optional, keyword-only, default None): postflop rake context (pot/dealt/stake). When
+    supplied, the SIZE-escalation boost is DAMPENED by ``rake_keep_factor`` so we don't over-escalate
+    into a pot where the marginal rake (5% below the cap) eats the marginal extraction. ABOVE the cap
+    rake is flat ⇒ rake_keep→1 ⇒ no discount. No context / preflop / kill-switch off ⇒ rake_keep == 1.0,
+    i.e. BYTE-IDENTICAL to the no-rake-context behaviour. The discount only scales the escalation
+    MAGNITUDE; it is not a safety bound (the mixer α-cap and LAG/RNR firewall remain the hard clamps)."""
     adj = np.zeros(NUM_ACTIONS, dtype=np.float64)
     if not _enabled() or NUM_ACTIONS < 5:
         return adj
@@ -177,9 +270,10 @@ def value_sizing_logits(stats, hand_strength: float | None) -> np.ndarray:
     mag = score * conf * value                # in [0,1]
     if mag <= 0.0:
         return adj
-    adj[_BIG_LO:_ALL_IN] += _K_BIG * mag       # push toward the over-bet (>=1x pot, excl. all-in)
-    adj[_BET_LO:_BIG_LO] += _K_MID * mag       # keep mid bets live so total betting still rises
-    adj[1] -= _K_CHECK * mag                    # don't check back value vs a station
+    rake_keep = rake_keep_factor(stats, rake_ctx)   # 1.0 (no discount) by default; <1 below the cap
+    adj[_BIG_LO:_ALL_IN] += _K_BIG * mag * rake_keep   # over-bet (>=1x pot, excl all-in); rake-discounted
+    adj[_BET_LO:_BIG_LO] += _K_MID * mag * rake_keep   # mid bets; same rake discount on the size boost
+    adj[1] -= _K_CHECK * mag                    # don't check back value vs a station (read, not a size)
     return adj
 
 

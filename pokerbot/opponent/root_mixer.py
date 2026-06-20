@@ -377,8 +377,50 @@ def _overlay_hand_strength(state, seat: int) -> float | None:
     return overlay_hand_strength(state, seat)
 
 
+def _live_rake_context(state):
+    """Resolve the postflop ``RakeContext`` (pot/dealt/stake/is_preflop) for the rake-aware SIZE
+    discount, from the live ``GameState`` + env stake. Returns None on any failure (→ no discount).
+
+    * stake_key: ``POKERBOT_CASH_STAKE`` if it names a known stake, else the documented rake-VALLEY
+      default ``POKERBOT_CASH_STAKE_DEFAULT`` (``0.10/0.25``) — the SAME resolution precedence the live
+      coach / table_select use. CoinPoker play-money is raked exactly like cash, so a stake always resolves.
+    * pot_bb: the whole-hand pot BEFORE hero's value bet (state.pot_bb).
+    * n_dealt: ACTUAL players DEALT this hand (cap tier) — a folded player was still dealt, so count any
+      seat that holds cards / has committed chips / is not folded. NEVER max-seats (would over-tier the cap).
+    * is_preflop: no board yet ⇒ rake hasn't applied (no-flop-no-drop) ⇒ the discount must not fire."""
+    import os
+
+    try:
+        from pokerbot.economics.rake import STAKES
+        from pokerbot.opponent.value_sizing import RakeContext
+    except Exception:  # noqa: BLE001
+        return None
+    sk = os.environ.get("POKERBOT_CASH_STAKE", "").strip()
+    if sk not in STAKES:
+        sk = os.environ.get("POKERBOT_CASH_STAKE_DEFAULT", "0.10/0.25").strip()
+    if sk not in STAKES:
+        return None
+    try:
+        pot_bb = float(getattr(state, "pot_bb", 0.0) or 0.0)
+        players = list(getattr(state, "players", None) or [])
+        n_dealt = sum(
+            1 for p in players
+            if (getattr(p, "hole", None) is not None)
+            or (float(getattr(p, "committed_total_bb", 0.0) or 0.0) > 0.0)
+            or (not getattr(p, "folded", False))
+        )
+        n_dealt = max(2, int(n_dealt))
+        board = [c for c in (getattr(state, "board", None) or []) if c is not None]
+        is_preflop = len(board) < 3
+    except Exception:  # noqa: BLE001
+        return None
+    return RakeContext(pot_bb=pot_bb, n_dealt=n_dealt, stake_key=sk, is_preflop=is_preflop)
+
+
 def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict | None,
-                            *, max_alpha: float = 0.7) -> np.ndarray:
+                            *, max_alpha: float | None = None,
+                            stability_tracker=None, gift_register=None,
+                            villain_key=None) -> np.ndarray:
     """LIVE-only HUD value-SIZING / bluff-suppression overlay on the SEARCH base.
 
     The validated value_sizing overlay (value_sizing.py, +11.9 bb/100 vs stations) lived ONLY on the
@@ -387,6 +429,15 @@ def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict 
     loose-aggressive (the SAME firewalls the root mixer uses), tilt the hero's own value bets toward
     bigger sizes + cut bluffs, bounded by the alpha-cap. Distinct from the proven-dead bluff-CATCH read
     mixer (this is sizing, not a frequency call-boost). Returns ``probs`` unchanged when it doesn't fire.
+
+    RNR CEILING (Workstream F): the alpha ceiling is no longer the flat 0.7 — it is the N-DEPENDENT
+    Restricted-Nash-Response cap ``rnr_cap.default_exploit_cap(n_players)`` (1.0 heads-up / 3-max where
+    a BR is minimax-safe; the lower multiway ceilings where it is not). The played weight is folded
+    through read STABILITY: ``alpha = effective_alpha(confidence, n_players, stability)``, so a villain
+    the (optional) ``stability_tracker`` has caught ADAPTING is clamped toward CAP_FLOOR. With no
+    tracker wired, stability defaults to 1.0 (commit fully, bounded only by the N-ceiling). The
+    GiftRegister (BEFEWP) may relax the BASE ceiling UP TO — but never past — the RNR ceiling.
+    Passing ``max_alpha`` explicitly overrides the RNR ceiling (back-compat / tests).
 
     Env kill-switch ``POKERBOT_LIVE_VALUE_SIZING=0``. The component overlays keep their own switches
     (POKERBOT_VALUE_SIZING / POKERBOT_BLUFF_SUPPRESS / POKERBOT_RIVER_THIN_VALUE)."""
@@ -404,6 +455,7 @@ def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict 
         return probs
 
     from pokerbot.opponent.mixer import _stats_confidence, safe_mix_policies
+    from pokerbot.opponent.rnr_cap import default_exploit_cap, effective_alpha, n_live_players
     from pokerbot.opponent.value_sizing import (bluff_suppression_logits, river_thin_value_logits,
                                                 station_payoff_score, value_sizing_logits)
     from pokerbot.training.self_play import _legal_mask
@@ -411,7 +463,11 @@ def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict 
     # BOARD-AWARE strength (not the preflop-rank proxy): so the value-SIZE escalation never fires on air.
     hs = _overlay_hand_strength(state, seat)
     board = [str(c) for c in (getattr(state, "board", None) or [])]
-    overlay = (value_sizing_logits(prof, hs)
+    # RAKE-AWARE SIZE discount (Workstream F): postflop, BELOW the cap, growing the pot forfeits 5% to
+    # rake — so dampen the value-SIZE escalation by the marginal rake of the mid→big step (vanishes above
+    # the cap, where rake is flat). Resolved from the live pot/dealt + env stake; None ⇒ no discount.
+    rake_ctx = _live_rake_context(state)
+    overlay = (value_sizing_logits(prof, hs, rake_ctx=rake_ctx)
                + bluff_suppression_logits(prof, hs)
                + river_thin_value_logits(prof, hs, board))
     if not np.any(overlay):
@@ -421,12 +477,56 @@ def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict 
     base_logits = np.log(np.clip(probs, 1e-9, 1.0))
     exploit_logits = base_logits + overlay
     exploit_logits[~legal] = -1e9            # never let the overlay leak prob onto an illegal action
+
+    # --- RNR exploitation cap (Workstream F) -------------------------------------------------------
+    # Replaces the flat max_alpha=0.7. The HARD ceiling is the stability-adjusted N-dependent RNR cap
+    # cap_eff(stability, n) (== default_exploit_cap(n) when stable; relaxes to CAP_FLOOR on a caught
+    # adapter). Nothing below may exceed it.
+    from pokerbot.opponent.rnr_cap import cap_eff as _cap_eff
+    n_players = n_live_players(state, hero=seat)
+    # The villain the overlay reads is the one whose stability gates the cap (per-read stability,
+    # mirroring the AoF _per_read_stability single-opponent case for this targeted overlay).
+    vkey = villain_key
+    if vkey is None:
+        vkey = getattr(state, "last_aggressor", None)
+    stability = 1.0
+    if stability_tracker is not None and vkey is not None:
+        try:
+            stability = float(stability_tracker.opponent_stability(vkey))
+        except Exception:  # noqa: BLE001 — a malformed tracker must never break the serve path
+            stability = 1.0
+    rnr_hard = _cap_eff(stability, n_players)        # the hard RNR bound for this read
+    if max_alpha is not None:
+        # Explicit override (back-compat / tests): the caller's value is the hard ceiling.
+        ceiling = float(max_alpha)
+    elif gift_register is not None and vkey is not None:
+        # GiftRegister (BEFEWP) composition: a banked gift relaxes the LEGACY base cap (0.7) toward the
+        # RNR bound but is then HARD-CAPPED by it (the RNR cap is the bound; the gift can never push
+        # past it). Where the RNR ceiling RAISED the legacy cap (HU/3-max, rnr_hard >= 0.7) the gift
+        # lifts 0.7 toward rnr_hard; where it LOWERED it (6-max, rnr_hard < 0.7) rnr_hard already binds
+        # and the gift is inert. With a fully-banked gift the result still never exceeds rnr_hard.
+        _LEGACY_BASE_CAP = 0.7
+        base_cap = min(rnr_hard, _LEGACY_BASE_CAP)
+        try:
+            base_cap = float(gift_register.capped_max_alpha(vkey, base_cap))
+        except Exception:  # noqa: BLE001
+            pass
+        ceiling = min(rnr_hard, base_cap)
+    else:
+        # No gift, no override: the RNR cap IS the ceiling. This is the intended RNR change — HU/3-max
+        # commit up to 1.0 (minimax-safe), 6-max is bounded at the (placeholder) 0.5 ceiling.
+        ceiling = rnr_hard
+
     # EXTREMITY-gate the blend weight (mirrors the root mixer's tv-scaling): the live overlay previously
     # blended at a fixed _stats_confidence*max_alpha, which over-deviates against a marginal/neutral read.
     # Scale alpha by the station score so a borderline station collapses the tilt toward 0.
     score, _sconf = station_payoff_score(prof)
-    alpha = _stats_confidence(prof) * float(min(1.0, score))
-    mixed = safe_mix_policies(probs, exploit_logits, alpha, max_alpha=max_alpha)
+    confidence = _stats_confidence(prof) * float(min(1.0, score))
+    # The single RNR clamp: alpha = min(confidence, ceiling). `effective_alpha` enforces the same
+    # min(confidence, cap_eff) shape; we additionally min with `ceiling` so an override/gift-relaxed
+    # bound is honoured. safe_mix_policies re-clips at max_alpha=ceiling as a defensive backstop.
+    alpha = min(effective_alpha(confidence, n_players, stability), ceiling)
+    mixed = safe_mix_policies(probs, exploit_logits, alpha, max_alpha=ceiling)
     mixed = mixed * legal
     s = float(mixed.sum())
     return mixed / s if s > 1e-12 else probs

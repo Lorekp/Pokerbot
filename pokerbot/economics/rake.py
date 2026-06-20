@@ -87,6 +87,30 @@ def coinpoker_rake_bb(pot_bb: float, n_dealt: int, ended_preflop: bool, stake_ke
     return min(RAKE_PCT * pot_bb, cap)
 
 
+def marginal_rake_bb(
+    pot_before_bb: float, pot_after_bb: float, n_dealt: int, stake_key: str
+) -> float:
+    """Extra TOTAL rake incurred by growing a (postflop) pot from ``pot_before`` to ``pot_after``, in BB.
+
+    ``= coinpoker_rake_bb(pot_after) - coinpoker_rake_bb(pot_before)`` with ``ended_preflop=False`` (a
+    pot that reaches a postflop bet has, by definition, seen a flop — no-flop-no-drop does not apply).
+
+    Direction (the whole point of the rake-aware sizing discount): rake is ``min(5%·pot, cap)``.
+      * BELOW the cap, both endpoints are on the 5% ramp ⇒ marginal rake = ``5%·(after - before)`` —
+        growing the pot by Δ forfeits 5% of Δ. Thin value into a small pot pays this in full.
+      * AT/ABOVE the cap, rake is FLAT ⇒ marginal rake → 0 — an over-bet above the cap is rake-FREE,
+        so escalation there must NOT be discounted. The ``min`` makes this fall out naturally: when both
+        endpoints are above the cap the difference is 0; when ``before`` is below and ``after`` above,
+        only the taxed portion up to the cap counts.
+
+    Never negative (``pot_after >= pot_before`` for an escalation; clamped at 0 defensively)."""
+    if pot_after_bb <= pot_before_bb:
+        return 0.0
+    after = coinpoker_rake_bb(pot_after_bb, n_dealt, ended_preflop=False, stake_key=stake_key)
+    before = coinpoker_rake_bb(pot_before_bb, n_dealt, ended_preflop=False, stake_key=stake_key)
+    return max(0.0, after - before)
+
+
 def contributed_rake_bb(
     pot_bb: float, hero_committed_bb: float, n_dealt: int, ended_preflop: bool, stake_key: str
 ) -> float:
