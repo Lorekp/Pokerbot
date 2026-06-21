@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
@@ -21,6 +23,8 @@ from pokerbot.engine.jax_engine import (
 from pokerbot.engine.side_pots_jax import SEAT_ALLIN, SEAT_FOLDED, SEAT_LIVE
 from pokerbot.search.pbs_tracker import PBSTracker
 
+_log = logging.getLogger(__name__)
+
 STREET_MAP = {
     Street.PREFLOP: 0,
     Street.FLOP: 1,
@@ -28,6 +32,67 @@ STREET_MAP = {
     Street.RIVER: 3,
     Street.SHOWDOWN: 4,
 }
+
+# Largest pot/commit inconsistency we treat as benign float noise. The live feed reports pot_bb and
+# per-seat street commitments in whole 0.01bb chips, so any REAL reconstruction error is >= one chip
+# (1/CHIP_UNIT bb); we tolerate strictly less than that so genuine rounding never trips the alarm.
+_POT_DEAD_TOL_BB: float = 0.5 / CHIP_UNIT
+
+
+@dataclass
+class PotConservationBreach:
+    """A LOUD, structured signal that the live reconstruction produced ``pot_bb < sum(committed_street)``.
+
+    Ground-rule 5 (no silent clamps that hide bugs): the old code did ``pot_dead = max(pot_dead, 0)`` and
+    SHRANK the dead-money pot to absorb the inconsistency, masking a reconstruction bug on the LIVE serve
+    path. We now emit this record instead -- the state stays usable (we still floor pot_dead at 0 so the
+    int-chip engine never sees a negative dead pot, i.e. no crash) but the breach is VISIBLE and auditable.
+    """
+
+    pot_bb: float          # the feed-reported total pot
+    committed_street_bb: float  # sum of per-seat street commitments the reconstruction derived
+    pot_dead_bb: float     # the (negative) raw dead-money pot = pot_bb - committed_street_bb
+    deficit_bb: float      # how far pot_bb fell short of committed_street_bb (positive magnitude)
+    street: str
+    hero_seat: int
+
+
+# Module-level audit trail + optional sink so the live integrity plumbing (pokerbot/live/state_invariants
+# -> an I3 pot-conservation check) and the decision log can CONSUME breaches without this module importing
+# the live stack. The counter makes the breach rate queryable in tests / monitors; the sink is an optional
+# observer callback. Default sink None => the loud logging.warning is the only side effect (do-no-harm).
+_pot_breach_count: int = 0
+_pot_breach_sink: "Callable[[PotConservationBreach], None] | None" = None
+
+
+def set_pot_breach_sink(sink: "Callable[[PotConservationBreach], None] | None") -> None:
+    """Register (or clear with None) an observer called on every pot-conservation breach. Observe-only —
+    it must not mutate the serve path. Used by the live decision log / state-invariant I3 consumer."""
+    global _pot_breach_sink
+    _pot_breach_sink = sink
+
+
+def pot_breach_count() -> int:
+    """Total pot-conservation breaches recorded this process (monitor / test introspection)."""
+    return _pot_breach_count
+
+
+def _record_pot_breach(breach: PotConservationBreach) -> None:
+    global _pot_breach_count
+    _pot_breach_count += 1
+    # LOUD: a warning (not debug) so it surfaces in the live log instead of being silently absorbed.
+    _log.warning(
+        "[state_bridge] POT-CONSERVATION BREACH: pot_bb=%.4f < sum(committed_street)=%.4f "
+        "(deficit=%.4f bb, raw pot_dead=%.4f) street=%s hero_seat=%d -- reconstruction inconsistency; "
+        "flooring pot_dead at 0 to keep the state usable but NOT silently shrinking it away.",
+        breach.pot_bb, breach.committed_street_bb, breach.deficit_bb, breach.pot_dead_bb,
+        breach.street, breach.hero_seat,
+    )
+    if _pot_breach_sink is not None:
+        try:
+            _pot_breach_sink(breach)
+        except Exception:  # noqa: BLE001 — a buggy observer must never break the live serve path
+            _log.exception("[state_bridge] pot-breach sink raised; ignoring")
 
 
 def _card_to_idx(card) -> int:
@@ -82,7 +147,27 @@ def game_state_to_env(state: GameState, hero_seat: int) -> EnvState:
         hist_amount[i] = _bb_to_chips(action.amount_bb)
         hist_len = i + 1
 
-    pot_dead = _bb_to_chips(state.pot_bb - sum(p.committed_street_bb for p in state.players))
+    # Dead-money pot = total pot minus the chips still on the table this street. A correct reconstruction
+    # always has pot_bb >= sum(committed_street); pot_bb < sum(committed_street) means the live feed's pot
+    # total and the per-seat street commitments DISAGREE -> a reconstruction bug. The OLD code did
+    # ``pot_dead = max(pot_dead, 0)`` and SILENTLY shrank the dead pot to swallow that inconsistency
+    # (ground-rule 5 violation: a clamp that hides a bug). We now VALIDATE: if pot_bb falls short by more
+    # than half-a-chip of float noise we emit a LOUD, structured PotConservationBreach (warning + counter +
+    # optional sink) and only THEN floor pot_dead at 0 to keep the int-chip engine from crashing on a
+    # negative dead pot. The state stays usable; the inconsistency is no longer invisible.
+    committed_street_sum_bb = sum(p.committed_street_bb for p in state.players)
+    pot_dead = _bb_to_chips(state.pot_bb - committed_street_sum_bb)
+    deficit_bb = committed_street_sum_bb - state.pot_bb
+    if deficit_bb > _POT_DEAD_TOL_BB:
+        _record_pot_breach(PotConservationBreach(
+            pot_bb=float(state.pot_bb),
+            committed_street_bb=float(committed_street_sum_bb),
+            pot_dead_bb=float(state.pot_bb - committed_street_sum_bb),
+            deficit_bb=float(deficit_bb),
+            street=getattr(state.street, "name", str(state.street)),
+            hero_seat=int(hero_seat),
+        ))
+    pot_dead_chips = max(pot_dead, 0)  # floored AFTER the loud signal: keep usable, never silent.
 
     # Per-street "has acted" flags. The jax engine's _street_complete / reopen logic keys on `acted`
     # (round closes only when every still-actable seat has acted + matched). GameState tracks this in
@@ -110,7 +195,7 @@ def game_state_to_env(state: GameState, hero_seat: int) -> EnvState:
         committed_street=jnp.asarray(committed_street),
         committed_total=jnp.asarray(committed_total),
         street=jnp.int32(STREET_MAP.get(state.street, 4)),
-        pot_dead=jnp.int32(max(pot_dead, 0)),
+        pot_dead=jnp.int32(pot_dead_chips),
         current_bet=jnp.int32(_bb_to_chips(state.current_bet_bb)),
         min_raise=jnp.int32(min_raise_chips),
         button=jnp.int32(state.button_seat),
