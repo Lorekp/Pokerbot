@@ -78,8 +78,14 @@ def _is_value_fish(prof) -> bool:
         ftc = _pct(hud, "foldToCbet", "foldtocbet")
         passive = vpip is not None and pfr is not None and (vpip - pfr) >= 0.25  # big limp/flat gap
         sticky = ftc is not None and ftc <= 0.40                                 # doesn't fold to c-bets
+        # FIX B3: a play-money HUD often lacks the sticky/weak postflop stats (foldToCbet/wsd) the
+        # original station gate required, so a clearly loose-passive limp/flat field never admitted ->
+        # the fish gate stayed shut and the whole table read "tough". Admit a LOOSE (VPIP>=0.50)
+        # loose-passive read as fish too. `passive` REQUIRES the wide VPIP-PFR gap, so a loose-AGGRESSIVE
+        # maniac (high VPIP, small gap) is NOT admitted here and is still vetoed by _table_too_aggressive.
+        loose = vpip is not None and vpip >= 0.50
         score, conf = station_payoff_score(prof)
-        if conf >= 0.8 and (score >= 0.5 or (passive and sticky)):
+        if conf >= 0.8 and (score >= 0.5 or (passive and sticky) or (loose and passive)):
             return True
     if getattr(prof, "hands", 0) < FISH_MIN_HANDS:
         return False
@@ -417,10 +423,41 @@ def _live_rake_context(state):
     return RakeContext(pot_bb=pot_bb, n_dealt=n_dealt, stake_key=sk, is_preflop=is_preflop)
 
 
+def _exp_size(p: np.ndarray) -> float:
+    """Expected bet SIZE in pot fractions over the bet/raise mass of policy ``p``.
+
+    Sum over the bet/raise buckets of ``prob * frac`` (BET_SIZE_BUCKETS), NORMALIZED over the
+    bet/raise probability mass only (so a policy that mostly checks still reports the size it would
+    pick WHEN it bets). All-in is mapped to the largest menu fraction (an over-bet shove). Returns
+    0.0 when there is no bet/raise mass (a pure check/call/fold policy has no size to report).
+
+    This is the live mirror of the sim acceptance's bet_shift metric (the change in this quantity
+    from the pre-overlay search base to the post-overlay mixed policy)."""
+    from pokerbot.engine.actions import BET_SIZE_BUCKETS, NUM_ACTIONS
+
+    n = len(p)
+    lo = 3                                  # first bet/raise bucket (0=fold,1=check,2=call)
+    if n <= lo:
+        return 0.0
+    fracs = list(BET_SIZE_BUCKETS) + [BET_SIZE_BUCKETS[-1]]   # all-in ≈ the largest size
+    mass = 0.0
+    acc = 0.0
+    for i in range(lo, n):
+        bi = i - lo
+        if bi >= len(fracs):
+            break
+        w = float(p[i])
+        if w <= 0.0:
+            continue
+        mass += w
+        acc += w * float(fracs[bi])
+    return float(acc / mass) if mass > 1e-12 else 0.0
+
+
 def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict | None,
                             *, max_alpha: float | None = None,
                             stability_tracker=None, gift_register=None,
-                            villain_key=None) -> np.ndarray:
+                            villain_key=None, out: dict | None = None) -> np.ndarray:
     """LIVE-only HUD value-SIZING / bluff-suppression overlay on the SEARCH base.
 
     The validated value_sizing overlay (value_sizing.py, +11.9 bb/100 vs stations) lived ONLY on the
@@ -440,19 +477,52 @@ def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict 
     Passing ``max_alpha`` explicitly overrides the RNR ceiling (back-compat / tests).
 
     Env kill-switch ``POKERBOT_LIVE_VALUE_SIZING=0``. The component overlays keep their own switches
-    (POKERBOT_VALUE_SIZING / POKERBOT_BLUFF_SUPPRESS / POKERBOT_RIVER_THIN_VALUE)."""
+    (POKERBOT_VALUE_SIZING / POKERBOT_BLUFF_SUPPRESS / POKERBOT_RIVER_THIN_VALUE).
+
+    ``out`` (optional, keyword-only, default None): a capture dict for the live-smoke harness. When a
+    dict is passed it is populated with the overlay diagnostics REGARDLESS of fire/no-fire — the SAME
+    bet_shift metric the sim acceptance used (the change in hero's expected bet SIZE from the pre-overlay
+    base to the post-overlay mix), plus the station score, the RNR ceiling, the rake discount, and the
+    reason it did not fire. Purely observational and exception-safe: a capture failure NEVER alters the
+    returned policy (default None == BYTE-IDENTICAL to the pre-capture behaviour)."""
     import os
 
+    # --- capture scaffold (observational; never affects the returned array) ------------------------
+    # Pre-filled so EVERY early return leaves a complete, reason-stamped row. Populated in-place.
+    if out is not None:
+        try:
+            _street = getattr(getattr(state, "street", None), "name", "") or ""
+            out.clear()
+            out.update({
+                "fired": False, "reason": "", "exp_size_pre": _exp_size(probs),
+                "exp_size_post": _exp_size(probs), "bet_shift": 0.0,
+                "station_score": 0.0, "station_conf": 0.0, "n_players": 0,
+                "rnr_ceiling": 0.0, "alpha": 0.0, "rake_keep": 1.0,
+                "street": str(_street), "hand_strength": float("nan"),
+            })
+        except Exception:  # noqa: BLE001 — capture must never break the serve
+            out = None
+
+    def _bail(reason: str):
+        if out is not None:
+            try:
+                out["reason"] = reason
+            except Exception:  # noqa: BLE001
+                pass
+        return probs
+
     if os.environ.get("POKERBOT_LIVE_VALUE_SIZING", "1").lower() in ("0", "false", "no", "off"):
-        return probs
+        return _bail("kill_switch_off")
     if profiles is None or probs.sum() <= 0:
-        return probs
+        return _bail("no_profiles_or_empty_probs")
     # FIREWALLS (reuse the root-mixer gates): only vs an all-station table, never vs a lag-heavy one.
-    if _table_too_aggressive(profiles) or not _all_live_villains_fish(state, seat, profiles):
-        return probs
+    if _table_too_aggressive(profiles):
+        return _bail("table_too_aggressive")
+    if not _all_live_villains_fish(state, seat, profiles):
+        return _bail("not_all_villains_fish")
     prof = _select_profile(profiles, getattr(state, "last_aggressor", None))
     if prof is None:
-        return probs
+        return _bail("no_profile_selected")
 
     from pokerbot.opponent.mixer import _stats_confidence, safe_mix_policies
     from pokerbot.opponent.rnr_cap import default_exploit_cap, effective_alpha, n_live_players
@@ -467,11 +537,21 @@ def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict 
     # rake — so dampen the value-SIZE escalation by the marginal rake of the mid→big step (vanishes above
     # the cap, where rake is flat). Resolved from the live pot/dealt + env stake; None ⇒ no discount.
     rake_ctx = _live_rake_context(state)
+    if out is not None:
+        try:
+            from pokerbot.opponent.value_sizing import rake_keep_factor, station_payoff_score
+            _ssc, _scf = station_payoff_score(prof)
+            out["station_score"] = float(_ssc)
+            out["station_conf"] = float(_scf)
+            out["hand_strength"] = float(hs) if hs is not None else float("nan")
+            out["rake_keep"] = float(rake_keep_factor(prof, rake_ctx))
+        except Exception:  # noqa: BLE001
+            pass
     overlay = (value_sizing_logits(prof, hs, rake_ctx=rake_ctx)
                + bluff_suppression_logits(prof, hs)
                + river_thin_value_logits(prof, hs, board))
     if not np.any(overlay):
-        return probs
+        return _bail("zero_overlay")
 
     legal = np.asarray(_legal_mask(state, seat), dtype=bool)
     base_logits = np.log(np.clip(probs, 1e-9, 1.0))
@@ -529,4 +609,19 @@ def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict 
     mixed = safe_mix_policies(probs, exploit_logits, alpha, max_alpha=ceiling)
     mixed = mixed * legal
     s = float(mixed.sum())
-    return mixed / s if s > 1e-12 else probs
+    final = mixed / s if s > 1e-12 else probs
+    if out is not None:
+        try:
+            post = _exp_size(final)
+            out["n_players"] = int(n_players)
+            out["rnr_ceiling"] = float(ceiling)
+            out["alpha"] = float(alpha)
+            out["exp_size_post"] = float(post)
+            out["bet_shift"] = float(post - out.get("exp_size_pre", post))
+            # "fired" = the overlay actually moved the policy (alpha > 0 and a measurable size shift).
+            fired = bool(alpha > 1e-6 and abs(out["bet_shift"]) > 1e-9)
+            out["fired"] = fired
+            out["reason"] = "fired" if fired else "alpha_zero_or_no_shift"
+        except Exception:  # noqa: BLE001
+            pass
+    return final

@@ -153,9 +153,20 @@ class OpponentStats:
         return self.fold_to_cbet / max(self.cbet_faced, 1)
 
     def archetype(self) -> str:
-        if self.hands < 5:
+        # FIX B1 (table-toughness read): the 5-hand window let 1/5 VPIP tag a villain and 0/5 brand a
+        # NIT, so a fresh play-money table read "tough" hand-one. Require a real local sample (>=12)
+        # before ANY tag, and a larger one (>=20) before the high-impact "nit" verdict. A server HUD with
+        # a wide VPIP-PFR gap (a loose-passive limp/flat field — the population signal) overrides the
+        # count window directly as a calling_station, the dominant play-money archetype.
+        hud = getattr(self, "hud", None)
+        if hud:
+            from pokerbot.opponent.value_sizing import _pct
+            v, pf = _pct(hud, "vpip"), _pct(hud, "pfr")
+            if v is not None and pf is not None and (v - pf) >= 0.25:
+                return "calling_station"
+        if self.hands < 12:
             return "unknown"
-        if self.vpip_pct < 0.15 and self.pfr_pct < 0.12:
+        if self.hands >= 20 and self.vpip_pct < 0.15 and self.pfr_pct < 0.12:
             return "nit"
         if self.vpip_pct > 0.45 and self.aggression_factor < 1.5:
             return "calling_station"

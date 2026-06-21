@@ -528,10 +528,12 @@ class PlayerProfileStore:
     def confidence(self, key: str) -> float:
         s = self.get(key)
         base = min(1.0, s.hands / 50.0)
-        # A server-HUD station (whole-history stats) is high-confidence even with few locally observed
-        # hands -> floor it (matches mixer._stats_confidence) so the captured HUD lever isn't zeroed.
+        # A server-HUD station (whole-history stats) raises confidence even with few locally observed
+        # hands. FIX B2: the old FLAT 0.6 floor reached full HUD trust on hand ONE, so a single play-money
+        # HUD lit the whole exploit. Ramp it: 0.6 is only reached after ~5 corroborating LOCAL hands
+        # (0.1 + 0.1*hands), so a 1-hand HUD read sits at ~0.2, not 0.6. (Matches mixer._stats_confidence.)
         if getattr(s, "hud", None) and len(s.hud) >= 3:
-            return max(base, 0.6)
+            return max(base, min(0.6, 0.1 + 0.1 * s.hands))
         return base
 
     def update_from_hand(self, record: dict) -> int:
@@ -616,11 +618,29 @@ class PlayerProfileStore:
             return False
         with self._lock:
             s = self.get(key)
-            if s.hud == stats:
-                return False
-            s.hud = dict(stats)
+            changed = s.hud != stats
+            if changed:
+                s.hud = dict(stats)
             if name:
                 self.names[key] = name
+            # FIX D.2: the decision/overlay path looks a seat up via _player_key(seat), which returns
+            # `name:<name>` whenever the seat exposes NO user_id (the live seats in this session are
+            # name-only). HUD is seeded here by user_id (key=str(uid)), and get()/snapshot() do NOT apply
+            # _canonical_key, so a name-only lookup hit an EMPTY profile -> station_payoff_score ~0 ->
+            # the overlay fired but escalated ~0. Mirror the HUD onto the `name:<name>` profile so the
+            # SAME key the decision path uses carries it. Both keys hold the identical dict (no desync);
+            # the alias map still folds the name profile into the uid one once a hand shows both. Skip
+            # when key already IS the name key (no self-mirror) or no name is known.
+            mirrored = False
+            if name and not key.startswith("name:"):
+                nkey = f"name:{name}"
+                ns = self.get(nkey)
+                if ns.hud != stats:
+                    ns.hud = dict(stats)
+                    self.names[nkey] = name
+                    mirrored = True
+            if not (changed or mirrored):
+                return False
             self._dirty = True
             if _count:
                 self._updates_since_save += 1

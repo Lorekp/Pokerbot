@@ -175,7 +175,10 @@ def _stats_confidence(stats) -> float:
     conf = min(1.0, float(getattr(stats, "hands", 0)) / 50.0)
     hud = getattr(stats, "hud", None)
     if isinstance(hud, dict) and len(hud) >= 3:
-        conf = max(conf, 0.6)
+        # FIX B2: ramp the HUD floor instead of a flat 0.6, so 0.6 is reached only after ~5 corroborating
+        # LOCAL hands (0.1 + 0.1*hands). A 1-hand HUD read -> ~0.2, not full exploit trust on hand one.
+        hands = float(getattr(stats, "hands", 0))
+        conf = max(conf, min(0.6, 0.1 + 0.1 * hands))
     return conf
 
 
