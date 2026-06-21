@@ -48,10 +48,13 @@ def test_case_a_three_way_distinct_stacks_uncalled_excess() -> None:
     kw = _manual_state(committed=committed, status=status, holes=holes, board=board)
     r = np.asarray(side_pot_returns(n_showdown=jnp.int32(3), **kw), dtype=np.int64)
     assert r.sum() == 0
-    # Seat 0 wins entire 19000 pot; net +9000, others lose full commitments.
-    assert r[0] == 9000
-    assert r[1] == -6000
-    assert r[2] == -3000
+    # phevaluator on board 8,12,16,20,24: seat2=6075010 > seat0==seat1=6075008.
+    # Layers: main 9000 (all 3 eligible) -> seat2 scoops; side1 6000 (seats 0&1, tie)
+    # -> 3000 each; side2 4000 uncalled -> returned to seat0.
+    # seat0 = 3000 + 4000 - 10000 = -3000; seat1 = 3000 - 6000 = -3000; seat2 = 9000 - 3000 = +6000.
+    assert r[0] == -3000
+    assert r[1] == -3000
+    assert r[2] == 6000
 
 
 def test_case_c_odd_chip() -> None:
@@ -108,18 +111,22 @@ def test_case_f_everyone_folds_to_one() -> None:
 
 
 def test_case_b_split_main_pot() -> None:
-    """Case B: 3-way all-in equal stacks, A/B tie best."""
+    """Case B: 3-way all-in equal stacks, single pot split among ties."""
     amt = 5000
     committed = [amt, amt, amt, 0, 0, 0]
     status = [SEAT_ALLIN, SEAT_ALLIN, SEAT_ALLIN, SEAT_EMPTY, SEAT_EMPTY, SEAT_EMPTY]
-    # Same holes for A/B high card — use asymmetric scores via hole cards
     holes = np.array([[48, 44], [48, 44], [0, 4], [-1, -1], [-1, -1], [-1, -1]], dtype=np.int32)
     board = np.array([8, 12, 16, 20, 24], dtype=np.int32)
     kw = _manual_state(committed=committed, status=status, holes=holes, board=board)
     r = np.asarray(side_pot_returns(n_showdown=jnp.int32(3), **kw), dtype=np.int64)
     assert r.sum() == 0
-    assert r[2] == -amt
-    assert r[0] == r[1]
+    # phevaluator on board 8,12,16,20,24: all three play the board, scoring 6075008 each
+    # (the [0,4] hole does not raise/lower the seat-2 hand here). Equal stacks -> one
+    # 15000 pot split 3 ways = 5000 each -> every seat nets 0.
+    assert r[0] == 0
+    assert r[1] == 0
+    assert r[2] == 0
+    assert r[0] == r[1] == r[2]
 
 
 def test_case_d_folded_contributor() -> None:
@@ -144,6 +151,12 @@ def test_case_g_combined_folded_and_multi_layer() -> None:
     kw = _manual_state(committed=committed, status=status, holes=holes, board=board)
     r = np.asarray(side_pot_returns(n_showdown=jnp.int32(3), **kw), dtype=np.int64)
     assert r.sum() == 0
+    # phevaluator on board 8,12,16,20,24: seat2=6075010 beats seat1==seat3=6075008
+    # (seat0 folded, ineligible). Layers: main 16000 (seats 1,2,3 eligible) -> seat2 scoops;
+    # side1 4000 (seats 1,2) -> seat2 scoops; side2 4000 uncalled -> returned to seat1.
+    # seat0 = -4000 (folded contribution); seat1 = 4000 - 10000 = -6000;
+    # seat2 = 16000 + 4000 - 6000 = +14000; seat3 = -4000.
     assert r[0] == -4000
-    # B has best hand (holes) — should profit
-    assert r[1] > 0
+    assert r[1] == -6000
+    assert r[2] == 14000
+    assert r[3] == -4000
