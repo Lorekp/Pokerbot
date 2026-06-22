@@ -29,7 +29,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from pokerbot.engine.jax_engine import CHIP_UNIT, NUM_ACTIONS
+from pokerbot.engine.actions import BET_SIZE_BUCKETS, pseudo_harmonic_bucket
+from pokerbot.engine.jax_engine import BET_BUCKET_START, CHIP_UNIT, NUM_ACTIONS
 from pokerbot.engine.np_engine import (
     to_numpy_state,
     SEAT_FOLDED,
@@ -121,6 +122,31 @@ class PluribusReBeLConfig:
 _NATIVE_SUBGAME = os.environ.get("POKERBOT_NATIVE_SUBGAME", "0") not in ("0", "", "false", "False")
 
 
+# POKERBOT_OFFTREE_RESOLVE: Pluribus-style real-time response to an OFF-TREE opponent bet size. When the
+# villain we are facing made a bet whose pot-fraction is NOT well-represented by the static keep-list bet
+# abstraction (its pseudo-harmonic-mapped bucket differs from the observed fraction by more than
+# _OFFTREE_REL_TOL relative), we ENABLE one extra bet-size bucket — the one whose fraction is closest to
+# the observed size — in the ROOT subgame's hero action set FOR THAT SOLVE ONLY (capped at one extra
+# child per decision). The solver then branches a hero response sized to the true off-tree action instead
+# of reasoning only about the rounded bucket. With the env unset the augmentation never runs and the path
+# is BYTE-IDENTICAL to today (the augmented post mask is identically the static mask). No engine / golden /
+# abstraction / opponent-store change: this reuses the existing 7 bet buckets (NUM_ACTIONS unchanged), it
+# only un-masks one that the static keep-list dropped. Falls back to the static Tier-1 pseudo-harmonic
+# translation when the time budget is tight (the insert is skipped if the decision is already budget-bound).
+_OFFTREE_RESOLVE = os.environ.get("POKERBOT_OFFTREE_RESOLVE", "0") not in ("0", "", "false", "False")
+_OFFTREE_REL_TOL = 0.15  # relative pot-fraction mismatch above which the observed size enters the solve
+
+
+def offtree_resolve_enabled() -> bool:
+    return _OFFTREE_RESOLVE
+
+
+def set_offtree_resolve(on: bool) -> None:
+    """Runtime toggle for the off-tree re-solve trigger (used by tests / the live driver)."""
+    global _OFFTREE_RESOLVE
+    _OFFTREE_RESOLVE = bool(on)
+
+
 def native_subgame_enabled() -> bool:
     return _NATIVE_SUBGAME
 
@@ -167,6 +193,14 @@ class PluribusReBeLSolver:
             blueprint_snapshot, client_bet_sizing=self.config.client_bet_sizing
         )
         self._allowed_pre, self._allowed_post = _abstraction_masks(self.config.client_bet_sizing)
+        # Per-solve off-tree augmentation: when POKERBOT_OFFTREE_RESOLVE fires, this holds the post mask
+        # to use AT THE ROOT INFOSET ONLY (the static _allowed_post + one extra bet bucket matching the
+        # observed off-tree villain size). None => no augmentation (default / interior nodes), so _abstract
+        # is byte-identical to today. Keyed by the root hero infoset so the extra child appears only where
+        # the hero is actually responding to the off-tree bet, never at deeper recursion nodes.
+        self._root_extra_key: str | None = None
+        self._root_extra_post: np.ndarray | None = None
+        self._offtree_inserted = False  # diagnostic: did an extra child enter the last solve
         self._regrets: dict[str, np.ndarray] = {}
         self._strategy_sum: dict[str, np.ndarray] = {}
         self._bp_cache: dict[str, np.ndarray] = {}  # blueprint probs by infoset key (within a solve)
@@ -178,15 +212,27 @@ class PluribusReBeLSolver:
         self._budget_bound_count = 0  # per-solver count of decisions cut short by time_budget_ms (S2)
 
     # ------------------------------------------------------------------ keys / masks
-    def _abstract(self, mask: np.ndarray, street: int) -> np.ndarray:
+    def _abstract(self, mask: np.ndarray, street: int, allowed_post: np.ndarray | None = None) -> np.ndarray:
         if self._allowed_pre is None:
             return mask
-        allowed = self._allowed_pre if street == 0 else self._allowed_post
+        if street == 0:
+            allowed = self._allowed_pre
+        else:
+            allowed = allowed_post if allowed_post is not None else self._allowed_post
         return mask & allowed
 
     def _legal(self, env, seat: int) -> np.ndarray:
         m = legal_action_mask_np(env, seat).astype(bool)
-        return self._abstract(m, int(env.street))
+        # Off-tree re-solve: AT THE ROOT INFOSET ONLY, use the augmented post mask (static keep-list +
+        # the one extra bucket matching the observed off-tree villain size) so the hero gets a response
+        # child sized to the true bet. Identified by the cached root infoset key; every other node (and
+        # every solve when the augmentation never fired) falls through to the static _allowed_post,
+        # byte-identical to today.
+        allowed_post = None
+        if self._root_extra_post is not None and int(env.street) != 0:
+            if self._infoset_key(env, seat) == self._root_extra_key:
+                allowed_post = self._root_extra_post
+        return self._abstract(m, int(env.street), allowed_post)
 
     @staticmethod
     def _effective_stack_bb(env) -> float:
@@ -197,6 +243,57 @@ class PluribusReBeLSolver:
         live = (np.asarray(env.seat_status) != SEAT_FOLDED) & (totals > 0)
         chips = totals[live].min() if live.any() else (totals.max() if totals.size else 100.0 * CHIP_UNIT)
         return float(chips) / float(CHIP_UNIT)
+
+    def _offtree_extra_bucket(self, env, hero: int) -> int | None:
+        """Off-tree re-solve trigger. Inspect the bet the hero is FACING at this root and derive its
+        pot-fraction ``frac_obs = villain_bet_to / pot_before_villain_bet``. The static abstraction's
+        Tier-1 translation rounds that to ``mapped = pseudo_harmonic_bucket(frac_obs)`` over the FULL
+        7-bucket menu (``bucket_index_for_bet``). When that rounded bucket's pot-fraction differs from the
+        observed fraction by more than ``_OFFTREE_REL_TOL`` (relative) — i.e.
+        ``|frac_obs - BET_SIZE_BUCKETS[mapped]| / frac_obs > _OFFTREE_REL_TOL`` — the observed size is
+        genuinely OFF-TREE and is being mis-served. We then INSERT the observed size into the solve by
+        un-masking the single bet bucket whose fraction is closest to ``frac_obs`` and that the static
+        postflop keep-list currently DROPS (cap: one extra child / decision). This gives the hero a
+        response sized to the true off-tree action that the keep-list otherwise denied. Return None when
+        there is no facing bet, the size is on-tree (within tolerance), or every nearby bucket is already
+        served (nothing to add). Pure read of the root env; never mutates it."""
+        if self._allowed_post is None:
+            return None
+        to_call = int(env.current_bet) - int(np.asarray(env.committed_street)[hero])
+        if to_call <= 0:
+            return None  # not facing a bet -> nothing off-tree to respond to
+        # villain bet-TO this street = current_bet; pot BEFORE that bet = current pot minus the chips the
+        # villain put in to make it. We approximate the villain's street contribution as current_bet (a
+        # clean open) which is exact for the dominant single-raise facing spot; clamp the base to > 0.
+        pot_now = float(int(env.pot_dead) + int(np.asarray(env.committed_street).sum())) / float(CHIP_UNIT)
+        villain_to = float(int(env.current_bet)) / float(CHIP_UNIT)
+        pot_before = pot_now - villain_to
+        if pot_before <= 1e-9:
+            return None
+        frac_obs = villain_to / pot_before
+        if frac_obs <= 0.0:
+            return None
+        # The observed size's best representation in the FULL 7-bucket menu vs in the SERVED keep-list.
+        # ``nearest_full`` is the true-size leaf (the bucket the abstraction WOULD use if unrestricted);
+        # ``nearest_served`` is what the static keep-list actually rounds the hero's response toward. When
+        # the keep-list DROPS the bucket the size belongs in, nearest_served is materially farther — that
+        # gap is the off-tree leak. Trigger when the served rounding is worse than the full-menu rounding
+        # by more than _OFFTREE_REL_TOL (relative to the observed fraction), and the true-size bucket is
+        # one the keep-list dropped. The Tier-1 ``pseudo_harmonic_bucket`` over the full menu identifies
+        # the intended bucket (anti-exploitation), matching bucket_index_for_bet on the serve path.
+        nearest_full = pseudo_harmonic_bucket(frac_obs, BET_SIZE_BUCKETS)
+        if bool(self._allowed_post[BET_BUCKET_START + nearest_full]):
+            return None  # the intended bucket is already served -> no keep-list leak, nothing off-tree
+        served_idx = [i for i in range(len(BET_SIZE_BUCKETS))
+                      if bool(self._allowed_post[BET_BUCKET_START + i])]
+        if not served_idx:
+            return None
+        nearest_served = min(served_idx, key=lambda i: abs(frac_obs - BET_SIZE_BUCKETS[i]))
+        d_full = abs(frac_obs - BET_SIZE_BUCKETS[nearest_full])
+        d_served = abs(frac_obs - BET_SIZE_BUCKETS[nearest_served])
+        if (d_served - d_full) / frac_obs <= _OFFTREE_REL_TOL:
+            return None  # the keep-list rounding is no worse than tolerance -> on-tree, no insert
+        return int(nearest_full)  # un-mask the dropped true-size bucket (one extra child this solve)
 
     def _infoset_key(self, env, seat: int) -> str:
         hist_len = int(np.asarray(env.hist_len))
@@ -448,6 +545,27 @@ class PluribusReBeLSolver:
             # (public state, opponent model, config) — see PluribusReBeLConfig.per_decision_seed.
             self.rng = np.random.default_rng(self._public_seed(base_state, hero))
         self._leaf_cont_weights = self._build_leaf_cont_weights(hero)
+
+        # OFF-TREE RE-SOLVE (POKERBOT_OFFTREE_RESOLVE): if the villain we are facing bet a genuinely
+        # off-tree size, augment the ROOT hero infoset's action set with the one in-abstraction bucket
+        # closest to the observed size (capped at one extra child). Set BEFORE the first _legal() so the
+        # root legal mask and every in-loop _legal at the root see the extra child. None => byte-identical
+        # to today. Budget fallback: if THIS solver has already been budget-bound on a prior decision,
+        # adding a child risks blowing the wall clock -> skip the insert and serve the static Tier-1
+        # pseudo-harmonic translation. Postflop only (preflop is served from the blueprint above).
+        self._root_extra_key = None
+        self._root_extra_post = None
+        self._offtree_inserted = False
+        if (_OFFTREE_RESOLVE and self._allowed_post is not None
+                and int(base_state.street) != 0 and self._budget_bound_count == 0):
+            extra = self._offtree_extra_bucket(base_state, hero)
+            if extra is not None:
+                aug = self._allowed_post.copy()
+                aug[BET_BUCKET_START + extra] = True
+                self._root_extra_key = self._infoset_key(base_state, hero)
+                self._root_extra_post = aug
+                self._offtree_inserted = True
+
         legal = self._legal(base_state, hero)
         if not legal.any():
             probs = np.zeros(NUM_ACTIONS, dtype=np.float32)
@@ -472,7 +590,7 @@ class PluribusReBeLSolver:
         # Python) and the model-aware leaf being off; the native solve samples opponent holes under a
         # UNIFORM belief (the eval base arm). Statistically equivalent to the Python loop below.
         if (self.opponent_model is None and self._leaf_cont_weights is None
-                and native_subgame_enabled()):
+                and native_subgame_enabled() and not self._offtree_inserted):
             from pokerbot.engine.jax_weva_encode import _POSTFLOP_NUM_BUCKETS
             from pokerbot.search import native_solver as _ns
 
@@ -540,6 +658,7 @@ class PluribusReBeLSolver:
                 "budget_used_ms": budget_ms,
                 "budget_bound": budget_bound,
                 "budget_bound_count": float(self._budget_bound_count),
+                "offtree_inserted": bool(self._offtree_inserted),
                 "served": "search",
             },
         )
