@@ -26,6 +26,7 @@ Play-money / own-account / bot-arena use only.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 # --- RNR ceiling table -------------------------------------------------------------------------
@@ -105,6 +106,39 @@ def effective_alpha(confidence: float, n_players: int, stability: float) -> floa
     exceed ``cap_eff``; below the cap the overlay's own gating still applies."""
     conf = max(0.0, float(confidence))
     return min(conf, cap_eff(stability, n_players))
+
+
+def fish_relaxed_n(n_live_seats: int, opponent_model: dict | None) -> int:
+    """RNR effective table-size N, optionally relaxed to the HU ceiling on a NO-PUNISHER table (#wipe-floor).
+
+    The multiway minimax concern (why ``default_exploit_cap`` drops below 1.0 for n>3) is COORDINATED
+    PUNISHMENT by opponents that can re-best-respond to a full BR. A confirmed loose-passive value-fish does
+    neither — it neither adapts nor punishes. So when EVERY live villain is a confirmed value-fish, the
+    table has NO punisher and a full best-response is as safe as it is heads-up (minimax), while extracting
+    MAXIMUM value — the softest, highest-$ tables are exactly where the flat 6-max ceiling (0.5) leaves the
+    most on the table. Collapsing N to 2 there lifts ``cap_eff`` to the HU ceiling (full exploitation).
+
+    SAFETY (why default-OFF): the relaxation rests on the value-fish classification being right; a pro
+    mis-read as a fish at EVERY seat would unlock a counter-exploitable full BR. That needs ALL villains to
+    fake high-VPIP + showdown-loss over many hands (implausible), and any unknown/unprofiled seat counts as
+    a potential punisher (no relax). Still, since it RAISES exposure if wrong (unlike the monotone-safe
+    restriction), it is gated by ``POKERBOT_RNR_FISH_RELAX`` (default OFF) pending the cloud fish-read
+    validation. OFF / no model / any non-fish or unknown villain => ``n_live_seats`` unchanged."""
+    n = max(2, int(n_live_seats))
+    if os.environ.get("POKERBOT_RNR_FISH_RELAX", "0") in ("0", "", "false", "False"):
+        return n
+    if not opponent_model:
+        return n
+    profs = [p for p in opponent_model.values() if p is not None]
+    if len(profs) < n - 1:
+        return n  # an unknown / unprofiled villain could be a punisher -> stay conservative
+    try:
+        from pokerbot.opponent.root_mixer import _is_value_fish
+        if profs and all(_is_value_fish(p) for p in profs):
+            return 2   # no punisher at the table -> HU ceiling -> full value extraction
+    except Exception:  # noqa: BLE001 — never let the relaxation break the solve; fall back to conservative
+        return n
+    return n
 
 
 def restricted_max_alpha(base_max_alpha: float, stability: float, n_players: int) -> float:

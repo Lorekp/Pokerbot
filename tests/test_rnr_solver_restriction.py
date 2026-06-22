@@ -149,3 +149,50 @@ def test_rnr_n_live_fallback_from_model_size():
     assert solv._rnr_n_live() == 6          # explicit caller value wins
     empty = TurboReBeLSolver(MockHistoryValueEvaluator(), cfg, opponent_model=None)
     assert empty._rnr_n_live() == 2         # no model -> HU floor
+
+
+# ---- no-punisher (all-fish) wipe-the-floor relaxation (default-OFF) -------------------------------
+
+def _value_fish():
+    return OpponentStats(hands=30, hud={"vpip": 58, "pfr": 9, "wtsd": 33})   # loose-passive => _is_value_fish
+
+
+def test_fish_relax_off_by_default(monkeypatch):
+    from pokerbot.opponent.rnr_cap import fish_relaxed_n
+    monkeypatch.delenv("POKERBOT_RNR_FISH_RELAX", raising=False)
+    model = {s: _value_fish() for s in range(1, 6)}   # 5 confirmed fish
+    assert fish_relaxed_n(6, model) == 6              # default OFF -> unchanged, even all-fish
+
+
+def test_fish_relax_all_fish_collapses_to_hu(monkeypatch):
+    from pokerbot.opponent.rnr_cap import fish_relaxed_n
+    monkeypatch.setenv("POKERBOT_RNR_FISH_RELAX", "1")
+    model = {s: _value_fish() for s in range(1, 6)}   # all 5 villains confirmed fish -> no punisher
+    assert fish_relaxed_n(6, model) == 2              # HU ceiling -> full exploitation
+
+
+def test_fish_relax_unknown_seat_blocks(monkeypatch):
+    from pokerbot.opponent.rnr_cap import fish_relaxed_n
+    monkeypatch.setenv("POKERBOT_RNR_FISH_RELAX", "1")
+    model = {s: _value_fish() for s in range(1, 5)}   # only 4 villain profiles at a 6-max (1 unknown)
+    assert fish_relaxed_n(6, model) == 6              # an unprofiled seat could be a punisher -> no relax
+
+
+def test_fish_relax_one_reg_blocks(monkeypatch):
+    from pokerbot.opponent.rnr_cap import fish_relaxed_n
+    monkeypatch.setenv("POKERBOT_RNR_FISH_RELAX", "1")
+    reg = OpponentStats(hands=200, hud={"vpip": 20, "pfr": 17, "wsd": 54, "foldToCbet": 50})  # not a fish
+    model = {1: _value_fish(), 2: _value_fish(), 3: _value_fish(), 4: _value_fish(), 5: reg}
+    assert fish_relaxed_n(6, model) == 6              # one punisher present -> stay at the conservative cap
+
+
+def test_fish_relax_drives_solver_n(monkeypatch):
+    # integration: the solver's _rnr_n_live picks up the relaxation, collapsing a 6-max all-fish table to 2.
+    monkeypatch.setenv("POKERBOT_RNR_FISH_RELAX", "1")
+    cfg = TurboReBeLConfig(rnr_restrict=True)
+    model = {s: _value_fish() for s in range(1, 6)}
+    solv = TurboReBeLSolver(MockHistoryValueEvaluator(), cfg, opponent_model=model)
+    solv.opponent_n_live = 6
+    assert solv._rnr_n_live() == 2                    # all-fish table -> HU ceiling
+    monkeypatch.delenv("POKERBOT_RNR_FISH_RELAX")
+    assert solv._rnr_n_live() == 6                    # OFF -> the conservative 6-max ceiling

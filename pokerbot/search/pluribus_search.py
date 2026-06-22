@@ -59,6 +59,7 @@ from pokerbot.search.turbo_rebel_search import (
 )
 from pokerbot.opponent.bayes_exploit import DEFAULT_MAX_ALPHA as _CTX_MAX_ALPHA
 from pokerbot.opponent.rnr_cap import cap_eff as _rnr_cap_eff  # RNR restriction of the solver BR (#28)
+from pokerbot.opponent.rnr_cap import fish_relaxed_n as _rnr_fish_relaxed_n  # no-punisher wipe-floor relax
 from pokerbot.opponent.bayes_exploit import context_read
 from pokerbot.opponent.context import action_bin as _action_bin
 
@@ -445,10 +446,13 @@ class PluribusReBeLSolver:
         else infer from the model size (modeled villains + hero), clamped to [2, 6]. Larger N => a lower
         ceiling (multiway has no minimax safety), so an unknown count defaults conservatively, never below 2."""
         if self.opponent_n_live is not None:
-            return max(2, int(self.opponent_n_live))
-        if self.opponent_model:
-            return max(2, min(6, len(self.opponent_model) + 1))
-        return 2
+            n_full = max(2, int(self.opponent_n_live))
+        elif self.opponent_model:
+            n_full = max(2, min(6, len(self.opponent_model) + 1))
+        else:
+            return 2
+        # Optionally relax to the HU ceiling on a NO-PUNISHER (all-confirmed-fish) table (default-OFF env).
+        return _rnr_fish_relaxed_n(n_full, self.opponent_model)
 
     def _opponent_strategy(
         self, env, actor: int, legal: np.ndarray, regrets: np.ndarray, key: str

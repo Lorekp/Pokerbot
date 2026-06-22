@@ -20,6 +20,7 @@ from pokerbot.engine.jax_engine import (
 from pokerbot.opponent.bayes_exploit import DEFAULT_MAX_ALPHA as _CTX_MAX_ALPHA
 from pokerbot.opponent.bayes_exploit import context_read
 from pokerbot.opponent.rnr_cap import cap_eff as _rnr_cap_eff  # RNR restriction of the solver BR (#28)
+from pokerbot.opponent.rnr_cap import fish_relaxed_n as _rnr_fish_relaxed_n  # no-punisher wipe-floor relax
 from pokerbot.opponent.context import context_key_rs as _ctx_key_rs
 from pokerbot.opponent.context import is_aggressive_action as _is_aggressive_action
 from pokerbot.search.isomorphism import cached_canonicalize_key, canonicalize_history_encoding
@@ -273,10 +274,13 @@ class TurboReBeLSolver:
         """Table size N for the RNR ceiling (rnr_cap.cap_eff). Caller-set live-seat count, else inferred
         from the model size (villains + hero), clamped to [2, 6]. Mirrors PluribusReBeLSolver._rnr_n_live."""
         if self.opponent_n_live is not None:
-            return max(2, int(self.opponent_n_live))
-        if self.opponent_model:
-            return max(2, min(6, len(self.opponent_model) + 1))
-        return 2
+            n_full = max(2, int(self.opponent_n_live))
+        elif self.opponent_model:
+            n_full = max(2, min(6, len(self.opponent_model) + 1))
+        else:
+            return 2
+        # Optionally relax to the HU ceiling on a NO-PUNISHER (all-confirmed-fish) table (default-OFF env).
+        return _rnr_fish_relaxed_n(n_full, self.opponent_model)
 
     def _opponent_strategy(
         self,
