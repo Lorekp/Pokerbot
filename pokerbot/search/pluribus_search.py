@@ -113,6 +113,34 @@ class PluribusReBeLConfig:
     # bit-identical drop-in for apply_action/legal_mask/sample_chance/showdown, so the solve output is
     # byte-unchanged either way — it only changes speed. See pokerbot/search/native_solver.py.
     native: bool | None = None
+    # STARVATION-ROBUST SERVE (blend-to-blueprint when budget-bound). None => follow the process env
+    # POKERBOT_SEARCH_BLUEPRINT_BLEND (default ON live / set OFF for the eval+LBR battery). True/False =>
+    # force per-solver. When ON and a solve is budget-bound (iterations << max_iterations), the served
+    # ROOT policy is a convex combination of the noisy CFR average and the trusted root blueprint, the
+    # blueprint weight scaling with the convergence shortfall (more starved => lean more on the prior).
+    # A fully-converged solve serves the pure search policy (byte-identical). Never changes the per-node
+    # CFR traversal — only the final extracted root policy. See _BLUEPRINT_BLEND above.
+    blueprint_blend: bool | None = None
+    # Cap on the blueprint weight at TOTAL starvation (0 iterations of the target ran). The realized weight
+    # is blueprint_blend_max * shortfall where shortfall = 1 - iters/max_iterations in [0,1]; so even a fully
+    # starved serve keeps (1 - blueprint_blend_max) of the search signal. 1.0 => a 0-iteration serve is the
+    # pure blueprint (the trusted floor); lower keeps more search. Convex either way.
+    blueprint_blend_max: float = 1.0
+    # SINGLE-TABLE ITERATION FLOOR. When the live driver knows only ONE table is demanding action
+    # (single_table=True at solve() time, or a per-solver default here), the solve is allowed up to
+    # ``single_table_iter_floor`` iterations AND ``single_table_budget_ms`` wall-clock before the budget
+    # bound fires — single-tabling has spare time, so let the solve CONVERGE rather than serving a starved
+    # average. Under multi-table load (single_table=False) the per-table time_budget_ms / max_iterations are
+    # UNCHANGED (no slowdown). None => disabled (legacy: time_budget_ms / max_iterations always bind).
+    single_table_iter_floor: int | None = None
+    single_table_budget_ms: int | None = None
+    # MEASUREMENT-ONLY: force the budget-bound blend to apply at a FIXED iteration count, treating a solve
+    # that ran ``force_budget_bound`` iterations as if it had been wall-clock-starved at that many (shortfall
+    # = 1 - force_budget_bound/max_iterations). This lets an LBR / determinism harness compare blend ON vs
+    # OFF with the iteration count held IDENTICAL between arms (no wall-clock jitter confound), so the only
+    # difference measured is the blend itself. None => off (production: starvation is detected by the real
+    # wall clock). Requires blueprint_blend active; never set in live serve.
+    force_budget_bound: int | None = None
 
 
 # POKERBOT_NATIVE_SUBGAME: when truthy AND the native SubgameSolver is built AND opponent_model is None
@@ -135,6 +163,29 @@ _NATIVE_SUBGAME = os.environ.get("POKERBOT_NATIVE_SUBGAME", "0") not in ("0", ""
 # translation when the time budget is tight (the insert is skipped if the decision is already budget-bound).
 _OFFTREE_RESOLVE = os.environ.get("POKERBOT_OFFTREE_RESOLVE", "0") not in ("0", "", "false", "False")
 _OFFTREE_REL_TOL = 0.15  # relative pot-fraction mismatch above which the observed size enters the solve
+
+
+# POKERBOT_SEARCH_BLUEPRINT_BLEND: starvation-robust serve (Pluribus/Modicum principle). When a live solve
+# is BUDGET-BOUND (the wall-clock time_budget_ms cut it short at iterations << max_iterations, see S2), the
+# served CFR AVERAGE strategy is UNDER-CONVERGED -> a noisy argmax that flips frame-to-frame under load (the
+# trash-raise amplifier). Instead of serving the noisy average, blend the served ROOT policy toward the
+# TRUSTED BLUEPRINT prior with weight proportional to the convergence shortfall: a fully-converged solve
+# (ran all iterations) serves the PURE search policy (byte-identical to today); a fully-starved solve leans
+# hard on the blueprint. The blend is a proper convex combination over the LEGAL mask, renormalized. DEFAULT
+# ON (live robustness) but the eval / LBR battery sets it OFF so the certified-exploitability path and the
+# CRN A/B stay byte-identical (a converged eval solve never blends anyway, but an env-OFF default keeps the
+# code path provably inert). Only BUDGET-BOUND serves are ever changed.
+_BLUEPRINT_BLEND = os.environ.get("POKERBOT_SEARCH_BLUEPRINT_BLEND", "1") not in ("0", "", "false", "False")
+
+
+def blueprint_blend_enabled() -> bool:
+    return _BLUEPRINT_BLEND
+
+
+def set_blueprint_blend(on: bool) -> None:
+    """Runtime toggle for the budget-bound blueprint blend (live driver / tests / eval battery)."""
+    global _BLUEPRINT_BLEND
+    _BLUEPRINT_BLEND = bool(on)
 
 
 def offtree_resolve_enabled() -> bool:
@@ -210,6 +261,13 @@ class PluribusReBeLSolver:
         self._leaf_counter = 0  # per-leaf CRN offset so distinct leaves get distinct board runouts
         self._leaf_cont_weights: dict[int, np.ndarray] | None = None  # model-aware leaf (per solve)
         self._budget_bound_count = 0  # per-solver count of decisions cut short by time_budget_ms (S2)
+
+    def _blend_active(self) -> bool:
+        """Resolve the blueprint-blend flag: the per-solver config override (True/False) wins; None
+        follows the process env (POKERBOT_SEARCH_BLUEPRINT_BLEND). Read at solve time so set_blueprint_blend()
+        and a runtime config change both take effect without rebuilding the solver."""
+        cb = self.config.blueprint_blend
+        return _BLUEPRINT_BLEND if cb is None else bool(cb)
 
     # ------------------------------------------------------------------ keys / masks
     def _abstract(self, mask: np.ndarray, street: int, allowed_post: np.ndarray | None = None) -> np.ndarray:
@@ -526,13 +584,35 @@ class PluribusReBeLSolver:
         s = bp.sum()
         return bp / s if s > 1e-12 else legal.astype(np.float64) / max(legal.sum(), 1)
 
-    def solve(self, root: SubgameRoot, pbs: PBSTracker, cancel_event=None) -> SolveResult:
+    def solve(self, root: SubgameRoot, pbs: PBSTracker, cancel_event=None,
+              single_table: bool | None = None) -> SolveResult:
         # ``cancel_event`` (optional threading.Event): if set mid-solve (e.g. by a live watchdog or the
         # multitable manager when the table moves on), the iteration loop breaks early and serves the
         # best average so far. None => only the internal time_budget_ms bounds the solve.
+        # ``single_table`` (optional): when True the live driver knows exactly ONE table is demanding
+        # action, so this solve gets the SINGLE-TABLE iteration floor / extended wall-clock budget (let it
+        # converge — single-tabling has spare time). When False/None, the per-table time_budget_ms /
+        # max_iterations bind UNCHANGED (no multi-table slowdown). None falls back to the per-solver config
+        # default (single_table_iter_floor / single_table_budget_ms gate whether the floor is active at all).
         t0 = time.perf_counter()
         cfg = self.config
         hero = int(root.hero_seat)
+        # SINGLE-TABLE ITERATION FLOOR: under single-table play we have spare wall-clock, so let the solve
+        # run more iterations / longer before the budget bound fires (converge -> less starvation noise).
+        # Multi-table (single_table is False) or floor-disabled (config None) => the plain per-table budgets.
+        eff_max_iters = cfg.max_iterations
+        eff_budget_ms = cfg.time_budget_ms
+        if single_table and cfg.single_table_iter_floor is not None:
+            eff_max_iters = max(eff_max_iters, int(cfg.single_table_iter_floor))
+        if single_table and cfg.single_table_budget_ms is not None:
+            eff_budget_ms = max(eff_budget_ms, int(cfg.single_table_budget_ms))
+        # MEASUREMENT-ONLY deterministic starvation: run exactly force_budget_bound iterations (time budget
+        # out of the way) and treat the serve as budget-bound at that count. Holds the iteration count fixed
+        # across blend ON/OFF arms so an LBR/determinism harness isolates the blend with no wall-clock jitter.
+        force_bb = cfg.force_budget_bound
+        if force_bb is not None and force_bb > 0:
+            eff_max_iters = int(force_bb)
+            eff_budget_ms = 10 ** 12  # wall clock never bounds -> exactly eff_max_iters iterations run
         # Each decision is an independent depth-limited subgame solve: reset regrets/strategy + the
         # per-solve caches so there is no cross-hand contamination and memory stays bounded over a long eval.
         self._regrets.clear()
@@ -617,10 +697,10 @@ class PluribusReBeLSolver:
         root_key = self._infoset_key(base_state, hero)
         iterations = 0
         budget_bound = False
-        while iterations < cfg.max_iterations:
+        while iterations < eff_max_iters:
             if cancel_event is not None and cancel_event.is_set():
                 break
-            if (time.perf_counter() - t0) * 1000.0 >= cfg.time_budget_ms:
+            if (time.perf_counter() - t0) * 1000.0 >= eff_budget_ms:
                 # Wall-clock budget bound before max_iterations -> the realized average strategy is
                 # machine-speed dependent, breaking the "pure function of public state" determinism/CRN
                 # contract. Count it PER SOLVER (not a one-shot process flag) and surface the count in
@@ -629,8 +709,8 @@ class PluribusReBeLSolver:
                 budget_bound = True
                 self._budget_bound_count += 1
                 if self._budget_bound_count == 1:
-                    print(f"[search] time_budget_ms={cfg.time_budget_ms} bound at {iterations}/"
-                          f"{cfg.max_iterations} iters — decisions non-reproducible under load "
+                    print(f"[search] time_budget_ms={eff_budget_ms} bound at {iterations}/"
+                          f"{eff_max_iters} iters — decisions non-reproducible under load "
                           f"(per-solver count tracked in SolveResult.metadata)", flush=True)
                 break
             sampled_holes = pbs.sample_opponent_holes(self.rng)
@@ -647,6 +727,31 @@ class PluribusReBeLSolver:
         probs = probs * legal
         probs = probs / max(probs.sum(), 1e-12)
 
+        # STARVATION-ROBUST SERVE: when this solve was BUDGET-BOUND (cut short before eff_max_iters), the
+        # average above is under-converged and its argmax flips frame-to-frame under load. Blend the served
+        # ROOT policy toward the trusted root blueprint, the blueprint weight scaling with the convergence
+        # SHORTFALL (shortfall = 1 - iters/eff_max_iters in [0,1]; more starved => lean more on the prior).
+        # Proper convex combination over the LEGAL mask, renormalized. A fully-converged solve never enters
+        # this branch (budget_bound False) => the pure search policy is served byte-identically. Gated by
+        # _blend_active() so the eval / LBR battery (env OFF) is provably inert. The exploit tail already
+        # shaped ``probs`` at the opponent nodes; this blend is at hero's ROOT serve only and pulls toward
+        # the GTO blueprint floor (it can only REDUCE exploitability vs the noisy starved average).
+        blueprint_weight = 0.0
+        # Measurement mode: a forced fixed-iteration solve is treated as budget-bound at that count, so the
+        # blend fires deterministically (shortfall relative to the real max_iterations target).
+        served_budget_bound = budget_bound or (force_bb is not None and force_bb > 0)
+        if served_budget_bound and self._blend_active():
+            target_iters = cfg.max_iterations if (force_bb is not None and force_bb > 0) else eff_max_iters
+            shortfall = 1.0 - (float(iterations) / float(target_iters)) if target_iters > 0 else 1.0
+            shortfall = float(np.clip(shortfall, 0.0, 1.0))
+            blueprint_weight = float(np.clip(self.config.blueprint_blend_max, 0.0, 1.0)) * shortfall
+            if blueprint_weight > 1e-9:
+                bp_root = self._root_blueprint(base_state, hero, legal)
+                blended = (1.0 - blueprint_weight) * probs + blueprint_weight * bp_root
+                blended = blended * legal  # convex combo of two legal-supported dists stays legal-supported
+                s = blended.sum()
+                probs = blended / s if s > 1e-12 else probs
+
         budget_ms = (time.perf_counter() - t0) * 1000.0
         return SolveResult(
             action_probs=probs.astype(np.float32),
@@ -655,6 +760,9 @@ class PluribusReBeLSolver:
             metadata={
                 "leaf_eval_count": float(self._leaf_eval_count),
                 "leaf_cache_hits": float(self._leaf_cache_hits),
+                "blueprint_blend_weight": float(blueprint_weight),
+                "eff_max_iters": int(eff_max_iters),
+                "single_table": bool(single_table) if single_table is not None else None,
                 "budget_used_ms": budget_ms,
                 "budget_bound": budget_bound,
                 "budget_bound_count": float(self._budget_bound_count),
