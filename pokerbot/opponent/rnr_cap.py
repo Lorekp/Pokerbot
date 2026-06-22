@@ -107,6 +107,18 @@ def effective_alpha(confidence: float, n_players: int, stability: float) -> floa
     return min(conf, cap_eff(stability, n_players))
 
 
+def restricted_max_alpha(base_max_alpha: float, stability: float, n_players: int) -> float:
+    """RNR-restrict an opponent-node deviation ceiling for the SOLVER (#28).
+
+    The solver models the opponent deviating from blueprint by at most ``alpha`` and hero CFR best-
+    responds to THAT. Bounding ``alpha`` by ``cap_eff(stability, n)`` makes the hero's response a
+    RESTRICTED best-response — exposed to at most ~alpha·eps_BR exploitability — so a caught adapter
+    (stability→0) or a multiway table (no minimax safety) collapses the modeled deviation toward
+    CAP_FLOOR. NEVER exceeds ``base_max_alpha`` (the un-restricted constant cap), so turning the
+    restriction on can only REDUCE the modeled deviation and hence exploitability, never raise it."""
+    return min(float(base_max_alpha), cap_eff(stability, n_players))
+
+
 def _lam(halflife: float) -> float:
     """EWMA retention per observation for a given half-life (in observations)."""
     return 0.5 ** (1.0 / max(halflife, 1e-9))

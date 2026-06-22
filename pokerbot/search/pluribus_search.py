@@ -58,6 +58,7 @@ from pokerbot.search.turbo_rebel_search import (
     _context_key_from_env,
 )
 from pokerbot.opponent.bayes_exploit import DEFAULT_MAX_ALPHA as _CTX_MAX_ALPHA
+from pokerbot.opponent.rnr_cap import cap_eff as _rnr_cap_eff  # RNR restriction of the solver BR (#28)
 from pokerbot.opponent.bayes_exploit import context_read
 from pokerbot.opponent.context import action_bin as _action_bin
 
@@ -120,6 +121,17 @@ class PluribusReBeLConfig:
     # it. Gated on the read ⇒ zero-deviation bit-identity (opponent_model=None) and the exploit-OFF
     # arm are byte-unchanged. Exploit math/keys untouched (the read is consumed, not modified).
     frozen_read_response: bool = False
+    # RNR restriction of the SOLVER-internal best-response (#28). The opponent-node tail models the
+    # villain deviating from blueprint and hero CFR best-responds to it; left unbounded (the flat
+    # _CTX_MAX_ALPHA=0.7, or the full frozen posterior), that BR crushes a STATIC reg but is maximally
+    # COUNTER-exploitable by an ADAPTIVE pro. When True, the modeled deviation is bounded by the N- and
+    # stability-dependent RNR cap cap_eff(stability, n) (rnr_cap.py): a stable read keeps the N-ceiling
+    # (HU/3-max 1.0 => unchanged; multiway lower, no minimax), a caught adapter collapses toward
+    # CAP_FLOOR. The hero's response is then a RESTRICTED BR (exposed to <= ~rnr*eps). The caller sets
+    # ``opponent_stability`` (per-seat, from a StabilityTracker) and ``opponent_n_live`` (table size).
+    # Default OFF => byte-identical (the modeled deviation is the legacy un-restricted cap); the
+    # opponent_model=None GTO path is untouched either way (the whole tail is gated on a usable read).
+    rnr_restrict: bool = False
     # Native (Rust) engine hot path. None => auto (use the bit-identical native core IFF it imported
     # cleanly AND its startup self-check passed; else silent pure-Python fallback). True => force-enable
     # (still no-op if unavailable); False => force the pure-Python np_engine. The native core is a
@@ -253,6 +265,12 @@ class PluribusReBeLSolver:
         # Parity with TurboReBeLSolver: None => regret-matched/blueprint opponents (unchanged GTO).
         self.opponent_model = opponent_model
         self.gift_register = None  # set by the live driver / battery; None => static Pmax cap.
+        # RNR restriction inputs (#28), set by the caller alongside opponent_model when config.rnr_restrict
+        # is on. ``opponent_stability``: {seat -> read stability in [0,1]} from a StabilityTracker (a caught
+        # adapter -> 0). ``opponent_n_live``: the live-seat count for the N-dependent ceiling. Both None =>
+        # stability 1.0 / N inferred from the model size (rnr still bounds multiway via cap_eff).
+        self.opponent_stability: dict | None = None
+        self.opponent_n_live: int | None = None
         self.adapter = TabularBlueprintAdapter(
             blueprint_snapshot, client_bet_sizing=self.config.client_bet_sizing
         )
@@ -422,6 +440,16 @@ class PluribusReBeLSolver:
             self._bp_cache[key] = bp
         return bp
 
+    def _rnr_n_live(self) -> int:
+        """Table size N for the RNR ceiling (rnr_cap.cap_eff). Prefer the caller-set live-seat count;
+        else infer from the model size (modeled villains + hero), clamped to [2, 6]. Larger N => a lower
+        ceiling (multiway has no minimax safety), so an unknown count defaults conservatively, never below 2."""
+        if self.opponent_n_live is not None:
+            return max(2, int(self.opponent_n_live))
+        if self.opponent_model:
+            return max(2, min(6, len(self.opponent_model) + 1))
+        return 2
+
     def _opponent_strategy(
         self, env, actor: int, legal: np.ndarray, regrets: np.ndarray, key: str
     ) -> np.ndarray:
@@ -442,6 +470,16 @@ class PluribusReBeLSolver:
                     max_alpha = _CTX_MAX_ALPHA
                     if self.gift_register is not None:
                         max_alpha = self.gift_register.capped_max_alpha(actor, _CTX_MAX_ALPHA)
+                    # RNR restriction (#28): bound the modeled deviation by cap_eff(stability, n) so hero's
+                    # response is a RESTRICTED best-response. ``rnr`` (None when the flag is off) also gates
+                    # the frozen-posterior blend below. The gift relaxation composes UNDER it (min), so the
+                    # RNR cap is the hard outer bound. Default-OFF => max_alpha is the legacy value unchanged.
+                    rnr = None
+                    if self.config.rnr_restrict:
+                        stab = (1.0 if self.opponent_stability is None
+                                else float(self.opponent_stability.get(actor, 1.0)))
+                        rnr = _rnr_cap_eff(stab, self._rnr_n_live())
+                        max_alpha = min(max_alpha, rnr)
                     if self.config.frozen_read_response:
                         # Frozen modeled policy built FROM the read posterior itself. Postflop the
                         # tabular blueprint has ~zero serve-time coverage (uniform fallback) and
@@ -460,7 +498,17 @@ class PluribusReBeLSolver:
                             frozen[a] = read.post[b] / bin_n[b]
                         fs = frozen.sum()
                         if fs > 1e-12:
-                            strategy = frozen / fs
+                            frozen = frozen / fs
+                            if rnr is None:
+                                strategy = frozen
+                            else:
+                                # RNR-blend the (confidence-aware but stability/N-blind) frozen posterior
+                                # toward the regret-match/blueprint base: (1-rnr)*base + rnr*frozen. With
+                                # rnr=1 (HU stable read) this is the pure posterior — byte-identical to the
+                                # un-restricted frozen path; multiway / caught adapters pull toward the base.
+                                mixed = (1.0 - rnr) * strategy + rnr * frozen
+                                ms = mixed.sum()
+                                strategy = mixed / ms if ms > 1e-12 else frozen
                         else:
                             strategy = apply_context_bias(strategy, read, legal, max_alpha=max_alpha)
                     else:

@@ -19,6 +19,7 @@ from pokerbot.engine.jax_engine import (
 )
 from pokerbot.opponent.bayes_exploit import DEFAULT_MAX_ALPHA as _CTX_MAX_ALPHA
 from pokerbot.opponent.bayes_exploit import context_read
+from pokerbot.opponent.rnr_cap import cap_eff as _rnr_cap_eff  # RNR restriction of the solver BR (#28)
 from pokerbot.opponent.context import context_key_rs as _ctx_key_rs
 from pokerbot.opponent.context import is_aggressive_action as _is_aggressive_action
 from pokerbot.search.isomorphism import cached_canonicalize_key, canonicalize_history_encoding
@@ -37,6 +38,10 @@ class TurboReBeLConfig:
     leaf_batch_size: int = 64
     ssmig_resample_every: int = 1
     blueprint_mix: float = 0.5
+    # RNR restriction of the solver-internal BR (#28) — see PluribusReBeLConfig.rnr_restrict. When True,
+    # the opponent-node deviation cap is bounded by cap_eff(stability, n) (the caller sets
+    # ``opponent_stability`` / ``opponent_n_live``). Default OFF => byte-identical (legacy flat cap).
+    rnr_restrict: bool = False
 
 
 @dataclass
@@ -174,6 +179,10 @@ class TurboReBeLSolver:
         # => the solve assumes regret-matched/blueprint opponents (unchanged). The exploitation bias
         # that consumes this is built later (see docs/exploitation-design.md).
         self.opponent_model = opponent_model
+        # RNR restriction inputs (#28), set by the caller when config.rnr_restrict is on (see
+        # PluribusReBeLSolver). None => stability 1.0 / N inferred from the model size.
+        self.opponent_stability: dict | None = None
+        self.opponent_n_live: int | None = None
         # Optional GiftRegister (pokerbot.opponent.safety_budget): banked opponent gifts relax the
         # per-context alpha cap (gift-modulated bounded-ε). None ⇒ the static Pmax cap (unchanged).
         self.gift_register = None
@@ -260,6 +269,15 @@ class TurboReBeLSolver:
         self._flush_leaf_batch()
         return self._leaf_cache[cache_key]
 
+    def _rnr_n_live(self) -> int:
+        """Table size N for the RNR ceiling (rnr_cap.cap_eff). Caller-set live-seat count, else inferred
+        from the model size (villains + hero), clamped to [2, 6]. Mirrors PluribusReBeLSolver._rnr_n_live."""
+        if self.opponent_n_live is not None:
+            return max(2, int(self.opponent_n_live))
+        if self.opponent_model:
+            return max(2, min(6, len(self.opponent_model) + 1))
+        return 2
+
     def _opponent_strategy(
         self,
         env,
@@ -302,6 +320,12 @@ class TurboReBeLSolver:
                     max_alpha = _CTX_MAX_ALPHA
                     if self.gift_register is not None:
                         max_alpha = self.gift_register.capped_max_alpha(actor, _CTX_MAX_ALPHA)
+                    # RNR restriction (#28): bound the modeled deviation by cap_eff(stability, n) so the
+                    # hero's response is a RESTRICTED BR. Gift composes UNDER it. Default-OFF => unchanged.
+                    if self.config.rnr_restrict:
+                        stab = (1.0 if self.opponent_stability is None
+                                else float(self.opponent_stability.get(actor, 1.0)))
+                        max_alpha = min(max_alpha, _rnr_cap_eff(stab, self._rnr_n_live()))
                     strategy = apply_context_bias(strategy, read, legal, max_alpha=max_alpha)
                 else:
                     strategy = apply_opponent_bias(strategy, stats, legal)
