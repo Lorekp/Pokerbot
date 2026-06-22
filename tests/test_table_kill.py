@@ -218,3 +218,35 @@ def test_searchagent_kill_switch_zeroes_exploit_on_lag_table():
             shifted = True
             break
     assert shifted, "below-threshold exploit never fired -> the kill-equality test would be vacuous"
+
+
+def test_searchagent_exploits_maniac_fish_but_still_kills_skilled_lags():
+    """AUDIT fix #1 end-to-end (the recovered value): a table of weak-showdown MANIAC FISH now FIRES the
+    exploit (hero output shifts from the no-profile base), where pre-fix _is_dangerous_aggressor counted
+    them as lags, tripped the kill-switch, and forced the pure base. The CONTROL — the SAME count-aggressive
+    profiles but with a WINNING-showdown HUD (skilled lags) — is still KILLED (output == base). Same
+    aggression, opposite showdown => the WSD discriminator works end-to-end. Deterministic, no EV run."""
+    import numpy as np
+
+    base = _make_agent()
+    base.set_opponent_profiles(None)
+
+    maniacs = _make_agent()
+    maniacs.set_opponent_profiles({s: _maniac_fish() for s in range(1, 6)})   # weak-showdown -> NOT killed
+    fired = False
+    for seed in range(12):
+        pb, pm = _facing_probs(base, seed), _facing_probs(maniacs, seed)
+        if pb is None or pm is None:
+            continue
+        if not np.allclose(pb, pm):
+            fired = True
+            break
+    assert fired, "maniac-fish table did not fire the exploit -> fix #1 regressed (exploit still killed)"
+
+    killed = _make_agent()
+    killed.set_opponent_profiles({s: _skilled_lag() for s in range(1, 6)})    # winning-showdown -> killed
+    for seed in range(8):
+        pb, pk = _facing_probs(base, seed), _facing_probs(killed, seed)
+        if pb is None or pk is None:
+            continue
+        assert np.allclose(pb, pk), f"skilled-lag table not killed (seed {seed}) -> kill-switch regressed"
