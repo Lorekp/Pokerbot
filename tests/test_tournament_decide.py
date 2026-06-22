@@ -55,6 +55,35 @@ def test_decide_deep_avoids_gamble_on_bubble():
     assert d.action == "fold"
 
 
+def test_deal_toggle_off_is_cash_chip_ev():
+    """The deal-time ICM toggle-off (deal_struck=True) must produce the CHIP-EV-identical decision to
+    the cash path: after a final-table deal the money is split, so play is payout-agnostic chip-EV.
+
+    Construct a bubble spot where ICM-ON and chip-EV DISAGREE (a +chip-EV but -$EV gamble): ICM folds,
+    deal-toggle takes it. Then assert the deal-toggle action == argmax of chip_ev_action_value over the
+    SAME outcomes (the exact value the cash blueprint/search maximizes), with payouts ignored."""
+    from pokerbot.tournament.decide import decide_deep
+    from pokerbot.tournament.icm_overlay import chip_ev_action_value
+    # +chip-EV gamble for hero (0.5*+12 + 0.5*-10 = +1 chip) but stack-threatening on a flat bubble.
+    outs = {"shove": [(0.5, [+12, -12, 0, 0]), (0.5, [-10, +10, 0, 0])], "fold": [(1.0, [0, 0, 0, 0])]}
+    stacks, payouts, hero = [10, 10, 10, 2], [50, 30, 20], 0
+
+    icm = decide_deep(stacks, payouts, hero, outs)                 # ICM-graded (deal NOT struck)
+    deal = decide_deep(stacks, payouts, hero, outs, deal_struck=True)  # deal struck -> chip-EV
+
+    # ICM and the deal-time chip-EV path DISAGREE here (proves the toggle is live, not a no-op).
+    assert icm.action == "fold", "bubble ICM should fold the +chip-EV/-$EV gamble"
+    assert deal.action == "shove", "post-deal play is payout-agnostic chip-EV -> takes the +chip gamble"
+    assert deal.source == "deal-chip-ev"
+
+    # The deal-toggle action is EXACTLY the cash chip-EV argmax over the same outcomes (payout-agnostic).
+    chip_vals = {a: chip_ev_action_value(stacks, o, hero) for a, o in outs.items()}
+    assert deal.action == max(chip_vals, key=chip_vals.get)
+    # And it is invariant to the payout vector (the defining property of the chip-EV / cash path).
+    deal_other_pay = decide_deep(stacks, [99, 1, 0], hero, outs, deal_struck=True)
+    assert deal_other_pay.action == deal.action
+
+
 def test_deep_provider_replaces_defer():
     # With a deep provider, a >20bb spot is graded by ICM instead of deferring.
     provider = lambda: {"shove": [(0.6, [+40, -40, 0, 0, 0, 0]), (0.4, [-40, +40, 0, 0, 0, 0])],

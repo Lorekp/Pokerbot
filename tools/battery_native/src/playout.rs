@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use crate::core::{
-    self, EnvState, BET_BUCKET_START, CALL, CHECK, FOLD, NUM_ACTIONS, NUM_PLAYERS,
+    self, EnvStateN, BET_BUCKET_START, CALL, CHECK, FOLD, NUM_ACTIONS,
 };
 use crate::fingerprint::{fingerprint_fast, CHIP_UNIT};
 
@@ -131,8 +131,8 @@ fn renorm_legal(p: &mut [f64; NUM_ACTIONS], mask: &[bool; NUM_ACTIONS]) {
 
 /// Blueprint policy lookup at (env, seat): fingerprint -> row, legal-masked + renormalized; uniform
 /// over the abstracted legal mask on miss. Mirrors make_blueprint_policy with abstraction applied.
-fn blueprint_policy(
-    s: &EnvState,
+fn blueprint_policy<const N: usize>(
+    s: &EnvStateN<N>,
     seat: usize,
     abst_mask: &[bool; NUM_ACTIONS],
     bp: &Blueprint,
@@ -262,9 +262,9 @@ fn sample_action(row: &[f64; NUM_ACTIONS], full_mask: &[bool; NUM_ACTIONS], u: f
 /// Port of `_reshuffle_undealt`: rebuild the UNDEALT deck tail as a shuffled permutation of the
 /// UNSEEN cards (52 minus every set hole/board card). Uses the native RNG (statistical equivalence:
 /// integrates board luck; not a replay of numpy's shuffle).
-fn reshuffle_undealt(env: &mut EnvState, rng: &mut Rng) {
+fn reshuffle_undealt<const N: usize>(env: &mut EnvStateN<N>, rng: &mut Rng) {
     let mut known = [false; 52];
-    for i in 0..NUM_PLAYERS {
+    for i in 0..N {
         for k in 0..2 {
             let c = env.holes[i][k];
             if c >= 0 {
@@ -298,8 +298,8 @@ fn reshuffle_undealt(env: &mut EnvState, rng: &mut Rng) {
 /// Native uniform-mode leaf value: mean over `rollout_samples` runouts of `playout`. Mirrors the
 /// uniform branch of `continuation_leaf_value` (cont_weights=None). Seeds are derived from base_seed
 /// so the arm is internally reproducible; runouts integrate board luck (statistical equivalence).
-pub fn uniform_leaf_value(
-    env: &EnvState,
+pub fn uniform_leaf_value<const N: usize>(
+    env: &EnvStateN<N>,
     hero: usize,
     bp: &Blueprint,
     cfg: &PlayoutConfig,
@@ -326,15 +326,15 @@ pub fn uniform_leaf_value(
 
 /// Native uniform-mode `_playout`. choices[seat] is the fixed continuation index for that seat
 /// (drawn lazily on first action via `rng`); -1 means "not yet drawn".
-pub fn playout(
-    env_in: &EnvState,
+pub fn playout<const N: usize>(
+    env_in: &EnvStateN<N>,
     hero: usize,
     bp: &Blueprint,
     cfg: &PlayoutConfig,
     rng: &mut Rng,
 ) -> f64 {
     let mut env = *env_in;
-    let mut choices: [i32; NUM_PLAYERS] = [-1; NUM_PLAYERS];
+    let mut choices: [i32; N] = [-1; N];
     let mut depth = 0;
     while depth < cfg.max_depth && !env.done {
         if core::is_chance_node(&env) {

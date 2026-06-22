@@ -12,7 +12,7 @@
 //! Every sub-routine is a faithful port; the acceptance gate is a fuzz cross-check against the live
 //! Python `fingerprint_fast` (see `crosscheck_fingerprint.py`) before the native rollout is trusted.
 
-use crate::core::{EnvState, NUM_PLAYERS};
+use crate::core::{EnvStateN, NUM_PLAYERS};
 use crate::phe_tables;
 
 pub const PREFLOP_NUM_CLASSES: i32 = 169;
@@ -24,6 +24,36 @@ const SEAT_FOLDED: i8 = 1;
 
 // _POS_BY_OFFSET = [3,4,5,0,1,2] (BTN, SB, BB, UTG, HJ, CO), indexed by (seat - button) % 6.
 const POS_BY_OFFSET: [i32; NUM_PLAYERS] = [3, 4, 5, 0, 1, 2];
+
+/// Generic seat-offset -> position enum, the single source for any seat count `N`.
+///
+/// For `N == NUM_PLAYERS` (6) this is BYTE-IDENTICAL to indexing `POS_BY_OFFSET` (the trained 6-max
+/// preflop position encoding the deployed blueprint was solved against). For any other `N` (e.g. the
+/// 7-seat tournament root) there is NO trained blueprint keyed by these position ids, so the exact
+/// enum is irrelevant to served correctness — the solver's blueprint lookup misses and falls back to
+/// the uniform-over-legal prior (the chip-EV base). We need only a deterministic, in-range mapping.
+/// The natural generalization keeps the 6-max ordering shape: offset 0 = button = the highest position
+/// id, then SB, BB, then UTG..(N-3) ascending — i.e. BTN=`N-1`, SB=`N-2`... wraps to UTG=0. Concretely
+/// `pos = (N - 1 - offset + 1) % N`-style; we reproduce the 6-map exactly via the table for N=6 and use
+/// the offset-rotated form otherwise.
+#[inline]
+fn pos_by_offset<const N: usize>(offset: usize) -> i32 {
+    if N == NUM_PLAYERS {
+        // Byte-identical 6-max path (the trained encoding); offset is already in 0..6.
+        POS_BY_OFFSET[offset]
+    } else {
+        // Deterministic in-range generalization: BTN(offset 0)=N-1, SB(1)=N-2, BB(2)=N-3, then
+        // UTG.. ascending from 0. Equivalent to the 6-map's shape ([3,4,5,0,1,2] = btn-relative late
+        // positions high, early positions low) generalized to width N. Only ever hit when N != 6,
+        // where no blueprint row exists for the key (uniform fallback), so this just must be stable.
+        let o = (offset % N) as i32;
+        if o <= 2 {
+            (N as i32) - 1 - o
+        } else {
+            o - 3
+        }
+    }
+}
 
 // betting_abstraction_key bin edges (jax_weva_fast).
 const POT_EDGES: [f64; 7] = [3.0, 6.0, 12.0, 25.0, 50.0, 100.0, 200.0];
@@ -70,10 +100,12 @@ fn weva_id_lossless(h0: i32, h1: i32, pos_enum: i32) -> i32 {
     pos_enum * PREFLOP_NUM_CLASSES + canonical_preflop_class(lo, hi)
 }
 
-/// Port of `betting_abstraction_key(state, seat)` -> 6 bytes.
-pub fn betting_abstraction_key(s: &EnvState, seat: usize) -> [u8; 6] {
+/// Port of `betting_abstraction_key(state, seat)` -> 6 bytes. Generic over seat count `N`
+/// (the N=6 monomorphization is byte-identical to the pre-generic 6-seat code: same loop bounds,
+/// same ops — only the loop upper bound `N` is a const, == 6 at the default instantiation).
+pub fn betting_abstraction_key<const N: usize>(s: &EnvStateN<N>, seat: usize) -> [u8; 6] {
     let mut committed_sum: i64 = 0;
-    for i in 0..NUM_PLAYERS {
+    for i in 0..N {
         committed_sum += s.committed_street[i] as i64;
     }
     let pot = s.pot_dead as i64 + committed_sum;
@@ -86,7 +118,7 @@ pub fn betting_abstraction_key(s: &EnvState, seat: usize) -> [u8; 6] {
     let pot_bb = pot as f64 / CHIP_UNIT;
     // Effective stack = min live stack (live = status not in {empty, folded}).
     let mut eff_chips: Option<i64> = None;
-    for i in 0..NUM_PLAYERS {
+    for i in 0..N {
         let st = s.seat_status[i];
         if st != SEAT_EMPTY && st != SEAT_FOLDED {
             let v = s.stacks[i] as i64;
@@ -336,15 +368,16 @@ pub fn blake2b(out_len: usize, person: &[u8], data: &[u8]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// Byte-identical `fingerprint_fast(state, seat)` for the bounded eval config (16-byte key).
-pub fn fingerprint_fast(s: &EnvState, seat: usize, num_buckets: i32) -> [u8; 16] {
+/// Generic over seat count `N` (N=6 monomorphization byte-identical to the pre-generic code).
+pub fn fingerprint_fast<const N: usize>(s: &EnvStateN<N>, seat: usize, num_buckets: i32) -> [u8; 16] {
     fingerprint_fast_depth(s, seat, num_buckets, &[])
 }
 
 /// `effective_depth_bb`: min over non-folded seats (with positive total) of (stacks+committed_total),
-/// in BB. Mirrors `jax_weva_fast.effective_depth_bb` including its fallbacks.
-fn effective_depth_bb(s: &EnvState) -> f64 {
+/// in BB. Mirrors `jax_weva_fast.effective_depth_bb` including its fallbacks. Generic over `N`.
+fn effective_depth_bb<const N: usize>(s: &EnvStateN<N>) -> f64 {
     let mut m: Option<i64> = None;
-    for i in 0..NUM_PLAYERS {
+    for i in 0..N {
         let st = s.seat_status[i];
         if st != SEAT_EMPTY && st != SEAT_FOLDED {
             let total = s.stacks[i] as i64 + s.committed_total[i] as i64;
@@ -362,7 +395,7 @@ fn effective_depth_bb(s: &EnvState) -> f64 {
             // fallback: max over all seats' totals (empty seats are 0); else 100bb.
             let mut mx: i64 = 0;
             let mut any = false;
-            for i in 0..NUM_PLAYERS {
+            for i in 0..N {
                 let total = s.stacks[i] as i64 + s.committed_total[i] as i64;
                 if !any || total > mx {
                     mx = total;
@@ -382,15 +415,15 @@ fn effective_depth_bb(s: &EnvState) -> f64 {
 /// Depth-aware fingerprint (`POKERBOT_DEPTH_BUCKETS=1`). When `depth_edges` is non-empty, the PREFLOP
 /// key gains `b"D" + depth_bucket(1 byte)` between weva_id and the betting_state -- byte-identical to
 /// `NLHEEncodeBundle._digest` with `_DEPTH_BUCKETS`. Pass `&[]` for the non-depth blueprint (unchanged).
-pub fn fingerprint_fast_depth(
-    s: &EnvState,
+pub fn fingerprint_fast_depth<const N: usize>(
+    s: &EnvStateN<N>,
     seat: usize,
     num_buckets: i32,
     depth_edges: &[f64],
 ) -> [u8; 16] {
     let button = s.button;
-    let pos_enum = POS_BY_OFFSET[(((seat as i32 - button) % NUM_PLAYERS as i32
-        + NUM_PLAYERS as i32) % NUM_PLAYERS as i32) as usize];
+    let offset = (((seat as i32 - button) % N as i32 + N as i32) % N as i32) as usize;
+    let pos_enum = pos_by_offset::<N>(offset);
     let h0 = s.holes[seat][0];
     let h1 = s.holes[seat][1];
     let weva_id = weva_id_lossless(h0, h1, pos_enum);

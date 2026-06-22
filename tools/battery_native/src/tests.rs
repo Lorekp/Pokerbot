@@ -403,3 +403,124 @@ fn n2_heads_up_root_button_is_sb() {
     let total: i64 = rewards.iter().map(|&r| r as i64).sum();
     assert_eq!(total, 0, "HU root conserves chips");
 }
+
+// ---------------------------------------------------------------------------
+// Const-generic SUBGAME SOLVER (subgame.rs) at N=7 — the tournament-engine unlock.
+//
+// The engine state machine was already generic; this proves the depth-limited CFR SUBGAME SOLVE
+// (the GTO/chip-EV base the tournament deep-stack serve uses) runs end-to-end at N=7 via the new
+// EnvStateN<7> root, through the now-generic playout leaf + fingerprint blueprint lookup. With an
+// EMPTY blueprint the policy falls back to uniform-over-legal (the pure chip-EV base), which is
+// exactly the "chip-EV subgame solve completes 7-handed" acceptance item. We assert the solver
+// returns a valid probability distribution supported only on the legal action set.
+// ---------------------------------------------------------------------------
+mod subgame_n7 {
+    use super::*;
+    use crate::playout::{Blueprint, PlayoutConfig};
+    use crate::subgame::{self, SubgameConfig};
+    use crate::core::{legal_action_mask, NUM_ACTIONS, BET_BUCKET_START, ALL_IN};
+    use std::collections::HashMap;
+
+    fn allowed_all() -> [bool; NUM_ACTIONS] {
+        // Allow the full menu (fold/check/call + all 7 bet buckets + all-in) on every street.
+        [true; NUM_ACTIONS]
+    }
+
+    fn pcfg() -> PlayoutConfig {
+        PlayoutConfig {
+            allowed_pre: allowed_all(),
+            allowed_post: allowed_all(),
+            bias_mult: 5.0,
+            bias_floor: 0.0,
+            max_depth: 24,        // per-leaf rollout depth
+            num_buckets: 200,
+        }
+    }
+
+    fn scfg() -> SubgameConfig {
+        SubgameConfig {
+            max_iterations: 32,   // small but real CFR budget — proves the loop runs, not just types
+            max_depth: 8,         // betting-round CFR recursion depth
+            blueprint_mix: 0.0,   // no blueprint -> pure regret-match (chip-EV base)
+            rollout_samples: 2,
+            resample_board: true,
+            linear_averaging: true,
+        }
+    }
+
+    fn assert_valid_root_probs(env: &EnvStateN<7>, hero: usize, probs: &[f64; NUM_ACTIONS]) {
+        let legal = legal_action_mask::<7>(env, hero as i32);
+        let mut s = 0.0;
+        for a in 0..NUM_ACTIONS {
+            assert!(probs[a] >= -1e-12, "prob[{a}] negative: {}", probs[a]);
+            if !legal[a] {
+                assert!(probs[a].abs() < 1e-9, "mass {} on illegal action {a}", probs[a]);
+            }
+            s += probs[a];
+        }
+        assert!((s - 1.0).abs() < 1e-6, "root probs must sum to 1, got {s}");
+    }
+
+    #[test]
+    fn n7_subgame_solve_completes_and_returns_valid_distribution() {
+        // 7-handed, 40bb deep, button=0 -> UTG (seat 3) is the first actor / hero.
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        assert_eq!(hero, 3, "7-handed UTG is the first preflop actor");
+        let bp: Blueprint = HashMap::new();    // no 7-seat blueprint -> uniform fallback = chip-EV base
+        let pc = pcfg();
+        let sc = scfg();
+        let probs = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 0xC0FFEE);
+        let arr: [f64; NUM_ACTIONS] = probs;
+        assert_valid_root_probs(&env, hero, &arr);
+        // The chip-EV base must put SOME mass on an aggressive/continuing action (not a degenerate
+        // all-fold), confirming the regret recursion actually explored beyond the fold leaf.
+        let aggressive: f64 = (BET_BUCKET_START..=ALL_IN).map(|a| arr[a]).sum::<f64>()
+            + arr[crate::core::CALL] + arr[crate::core::CHECK];
+        assert!(aggressive > 0.0, "chip-EV solve degenerated to pure fold");
+    }
+
+    #[test]
+    fn n7_subgame_solve_deterministic_for_fixed_seed() {
+        // Pure function of (public state, config, seed): same inputs -> identical root probs.
+        let env = init_hand_7(25);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = HashMap::new();
+        let pc = pcfg();
+        let sc = scfg();
+        let a = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 12345);
+        let b = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 12345);
+        assert_eq!(a, b, "fixed-seed 7-handed solve must be deterministic");
+    }
+
+    #[test]
+    fn n7_subgame_solve_postflop_node() {
+        // Drive the 7-handed root to a postflop decision (where the blueprint bucket path + leaf
+        // rollout both engage), then solve — proves the generic fingerprint/leaf at a board state.
+        let mut env = init_hand_7(40);
+        // Everyone calls/checks to the flop via the passive driver, then stop at the first postflop
+        // actor. Reuse the passive walk but break at street >= FLOP with a live actor.
+        for _ in 0..64 {
+            if env.done || env.street >= STREET_TERMINAL { break; }
+            if crate::core::is_chance_node::<7>(&env) {
+                env = crate::core::sample_chance::<7>(&env);
+                if env.street >= STREET_FLOP && env.action_seat >= 0 { break; }
+                continue;
+            }
+            let seat = env.action_seat;
+            if seat < 0 { break; }
+            let mask = legal_action_mask::<7>(&env, seat);
+            let a = if mask[crate::core::CHECK] { crate::core::CHECK }
+                    else if mask[crate::core::CALL] { crate::core::CALL }
+                    else if mask[crate::core::FOLD] { crate::core::FOLD }
+                    else { (0..NUM_ACTIONS).find(|&i| mask[i]).unwrap() };
+            env = crate::core::apply_action::<7>(&env, a);
+        }
+        if env.street >= STREET_FLOP && !env.done && env.action_seat >= 0 {
+            let hero = env.action_seat as usize;
+            let bp: Blueprint = HashMap::new();
+            let probs = subgame::solve::<7>(&env, hero, &bp, &pcfg(), &scfg(), 99);
+            assert_valid_root_probs(&env, hero, &probs);
+        }
+    }
+}

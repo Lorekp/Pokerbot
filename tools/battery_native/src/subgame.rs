@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 
-use crate::core::{self, EnvState, NUM_ACTIONS, NUM_PLAYERS, SEAT_FOLDED};
+use crate::core::{self, EnvStateN, NUM_ACTIONS, SEAT_FOLDED};
 use crate::fingerprint::{fingerprint_fast, CHIP_UNIT};
 use crate::playout::{self, Blueprint, PlayoutConfig, Rng};
 
@@ -69,7 +69,11 @@ struct Tables {
 // --------------------------------------------------------------------------------------------------
 
 #[inline]
-fn abstracted_legal(s: &EnvState, seat: usize, pcfg: &PlayoutConfig) -> [bool; NUM_ACTIONS] {
+fn abstracted_legal<const N: usize>(
+    s: &EnvStateN<N>,
+    seat: usize,
+    pcfg: &PlayoutConfig,
+) -> [bool; NUM_ACTIONS] {
     let full = core::legal_action_mask(s, seat as i32);
     let allowed = if s.street == 0 { &pcfg.allowed_pre } else { &pcfg.allowed_post };
     let mut m = [false; NUM_ACTIONS];
@@ -113,8 +117,8 @@ fn regret_match(regrets: &[f64; NUM_ACTIONS], legal: &[bool; NUM_ACTIONS]) -> [f
 /// Blueprint policy at (state, seat): fingerprint lookup -> masked by the abstracted legal set ->
 /// renormalized; uniform over the abstracted legal set on a miss. Mirrors `lbr.make_blueprint_policy`
 /// (== `playout::blueprint_policy`, re-implemented here to keep `playout.rs` byte-unchanged).
-fn blueprint_policy(
-    s: &EnvState,
+fn blueprint_policy<const N: usize>(
+    s: &EnvStateN<N>,
     seat: usize,
     abst: &[bool; NUM_ACTIONS],
     bp: &Blueprint,
@@ -144,8 +148,8 @@ fn blueprint_policy(
 }
 
 /// `_opponent_strategy` (model=None): blueprint-mixed regret-match over the abstracted legal set.
-fn opponent_strategy(
-    s: &EnvState,
+fn opponent_strategy<const N: usize>(
+    s: &EnvStateN<N>,
     actor: usize,
     legal: &[bool; NUM_ACTIONS],
     regrets: &[f64; NUM_ACTIONS],
@@ -213,7 +217,7 @@ fn sample_action(strat: &[f64; NUM_ACTIONS], legal: &[bool; NUM_ACTIONS], u: f64
 
 /// `_infoset_key(env, seat)` as a collision-free i64 vector (length-prefixed so field boundaries are
 /// unambiguous): [seat, street, n_board, board.., hist_len, hist_seat/action interleaved.., spr].
-fn infoset_key(s: &EnvState, seat: usize) -> Vec<i64> {
+fn infoset_key<const N: usize>(s: &EnvStateN<N>, seat: usize) -> Vec<i64> {
     let hist_len = s.hist_len.max(0) as usize;
     let mut k: Vec<i64> = Vec::with_capacity(8 + hist_len * 2);
     k.push(seat as i64);
@@ -244,14 +248,14 @@ fn infoset_key(s: &EnvState, seat: usize) -> Vec<i64> {
 /// `spr_bucket = int(pot / max(active_mean, 1.0) * 4)` with pot = pot_dead + sum(committed_street),
 /// active_mean = mean stack over non-folded seats (else mean over all). `as i64` truncates toward
 /// zero, matching Python `int()` on the non-negative ratio.
-fn spr_bucket(s: &EnvState) -> i64 {
+fn spr_bucket<const N: usize>(s: &EnvStateN<N>) -> i64 {
     let mut pot = s.pot_dead as f64;
-    for i in 0..NUM_PLAYERS {
+    for i in 0..N {
         pot += s.committed_street[i] as f64;
     }
     let mut sm = 0.0;
     let mut cnt = 0i32;
-    for i in 0..NUM_PLAYERS {
+    for i in 0..N {
         if s.seat_status[i] != SEAT_FOLDED {
             sm += s.stacks[i] as f64;
             cnt += 1;
@@ -261,17 +265,17 @@ fn spr_bucket(s: &EnvState) -> i64 {
         sm / cnt as f64
     } else {
         let mut t = 0.0;
-        for i in 0..NUM_PLAYERS {
+        for i in 0..N {
             t += s.stacks[i] as f64;
         }
-        t / NUM_PLAYERS as f64
+        t / N as f64
     };
     (pot / active_mean.max(1.0) * 4.0) as i64
 }
 
 /// `_leaf_key(env)` (pre-canonicalization): [street, n_board, board.., hist_len, action-seq.., pot*2].
 /// Uses the action sequence only (not seats) and pot*2, mirroring the Python leaf cache key inputs.
-fn leaf_key(s: &EnvState) -> Vec<i64> {
+fn leaf_key<const N: usize>(s: &EnvStateN<N>) -> Vec<i64> {
     let hist_len = s.hist_len.max(0) as usize;
     let mut k: Vec<i64> = Vec::with_capacity(6 + hist_len);
     k.push(s.street as i64);
@@ -292,7 +296,7 @@ fn leaf_key(s: &EnvState) -> Vec<i64> {
         k.push(s.hist_action[i] as i64);
     }
     let mut pot = s.pot_dead as f64;
-    for i in 0..NUM_PLAYERS {
+    for i in 0..N {
         pot += s.committed_street[i] as f64;
     }
     k.push((pot * 2.0) as i64);
@@ -321,7 +325,7 @@ fn leaf_seed(key: &[i64], public_seed: u64) -> u64 {
 /// Deal 2 distinct unseen cards to every non-hero seat (ascending seat order, folded seats included —
 /// matching `PBSTracker._opponent_seats` + uniform-belief `sample_opponent_holes`: a uniform random
 /// distinct allocation from the cards not in the hero's hand or on the board).
-fn deal_opponent_holes(env: &mut EnvState, hero: usize, rng: &mut Rng) {
+fn deal_opponent_holes<const N: usize>(env: &mut EnvStateN<N>, hero: usize, rng: &mut Rng) {
     let mut known = [false; 52];
     for k in 0..2 {
         let c = env.holes[hero][k];
@@ -344,7 +348,7 @@ fn deal_opponent_holes(env: &mut EnvState, hero: usize, rng: &mut Rng) {
         }
     }
     let mut p = 0usize;
-    for seat in 0..NUM_PLAYERS {
+    for seat in 0..N {
         if seat == hero {
             continue;
         }
@@ -360,7 +364,7 @@ fn deal_opponent_holes(env: &mut EnvState, hero: usize, rng: &mut Rng) {
 // recursion
 // --------------------------------------------------------------------------------------------------
 
-fn leaf_value(env: &EnvState, hero: usize, ctx: &Ctx, tab: &mut Tables) -> f64 {
+fn leaf_value<const N: usize>(env: &EnvStateN<N>, hero: usize, ctx: &Ctx, tab: &mut Tables) -> f64 {
     if env.done {
         return env.rewards[hero] as f64 / CHIP_UNIT;
     }
@@ -382,7 +386,15 @@ fn leaf_value(env: &EnvState, hero: usize, ctx: &Ctx, tab: &mut Tables) -> f64 {
     v
 }
 
-fn cfv(env: &EnvState, hero: usize, depth: i32, ctx: &Ctx, tab: &mut Tables, rng: &mut Rng, t: i32) -> f64 {
+fn cfv<const N: usize>(
+    env: &EnvStateN<N>,
+    hero: usize,
+    depth: i32,
+    ctx: &Ctx,
+    tab: &mut Tables,
+    rng: &mut Rng,
+    t: i32,
+) -> f64 {
     if env.done {
         return env.rewards[hero] as f64 / CHIP_UNIT;
     }
@@ -443,8 +455,8 @@ fn cfv(env: &EnvState, hero: usize, depth: i32, ctx: &Ctx, tab: &mut Tables, rng
 }
 
 /// Run the depth-limited CFR subgame solve and return the root action probabilities (length 11).
-pub fn solve(
-    root: &EnvState,
+pub fn solve<const N: usize>(
+    root: &EnvStateN<N>,
     hero: usize,
     bp: &Blueprint,
     pcfg: &PlayoutConfig,
