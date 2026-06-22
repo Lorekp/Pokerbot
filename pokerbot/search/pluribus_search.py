@@ -77,6 +77,19 @@ class PluribusReBeLConfig:
     # of serving an off-depth range. None => always trust (legacy fixed-100bb behaviour). Standard 100bb
     # tables stay on the fast blueprint path bit-for-bit; only genuinely off-depth tables divert to search.
     preflop_blueprint_band_bb: tuple[float, float] | None = (80.0, 130.0)
+    # TOURNAMENT SHALLOW-STACK PRIOR (push/fold). At N>6 there is no trained blueprint, so the search
+    # root prior is the uniform-over-legal fallback (the fingerprint misses). For a SHALLOW PREFLOP spot
+    # — folded-to-hero first-in, or facing exactly one all-in jam — within ``pushfold_prior_band_bb`` of
+    # effective stack, serve the CERTIFIED ante-aware ICM open-shove / call-vs-jam Nash range
+    # (pokerbot.search.pushfold_prior, reusing pokerbot.tournament.open_shove_icm) as the root prior
+    # INSTEAD of uniform. Generalizes 2..7. ICM-aware when ``pushfold_payouts`` is supplied; with None it
+    # is winner-take-all (chip-EV push/fold Nash) — still a real position/ante-aware range. None band =>
+    # the prior is DISABLED (default OFF => byte-identical to today; nothing changes on the 6-max path or
+    # any spot the certified push/fold abstraction does not cover, where the prior abstains and the
+    # uniform fallback stands). Set to (0.0, 20.0) to activate the shallow band.
+    pushfold_prior_band_bb: tuple[float, float] | None = None
+    # Remaining prize structure (best first) for the ICM push/fold prior; None => winner-take-all (chip-EV).
+    pushfold_payouts: tuple[float, ...] | None = None
     leaf: ContinuationLeafConfig = field(default_factory=ContinuationLeafConfig)
     # Deterministic per-decision RNG: each solve() seeds its Monte-Carlo stream from a hash of the
     # ROOT'S PUBLIC STATE (and each leaf from its canonical leaf key), so a decision is a pure function
@@ -579,7 +592,30 @@ class PluribusReBeLSolver:
             holes[seat, 1] = int(c1)
         return base_state._replace(holes=holes)
 
+    def _pushfold_prior(self, base_state, hero: int, legal: np.ndarray) -> np.ndarray | None:
+        """Certified ICM push/fold ROOT prior for a shallow preflop spot (tournament N>6 lever), or None.
+
+        Gated on ``pushfold_prior_band_bb`` being set (default None => disabled => byte-identical). Returns
+        None whenever the spot is not a certified push/fold one (postflop / limped / multiway opened / deep
+        / >1 jam / hole unknown), so the caller keeps its existing blueprint-or-uniform prior unchanged."""
+        band = self.config.pushfold_prior_band_bb
+        if band is None:
+            return None
+        from pokerbot.search.pushfold_prior import pushfold_root_prior
+
+        return pushfold_root_prior(
+            base_state, hero, legal,
+            payouts=(list(self.config.pushfold_payouts)
+                     if self.config.pushfold_payouts is not None else None),
+            band_bb=band,
+        )
+
     def _root_blueprint(self, base_state, hero: int, legal: np.ndarray) -> np.ndarray:
+        # Tournament shallow-stack lever: prefer the certified ICM push/fold range over the (uniform at
+        # N>6) blueprint adapter when in the push/fold band. Abstains (None) outside that regime.
+        pf = self._pushfold_prior(base_state, hero, legal)
+        if pf is not None:
+            return pf
         bp = self.adapter.blueprint(base_state, hero) * legal
         s = bp.sum()
         return bp / s if s > 1e-12 else legal.astype(np.float64) / max(legal.sum(), 1)
@@ -650,6 +686,24 @@ class PluribusReBeLSolver:
         if not legal.any():
             probs = np.zeros(NUM_ACTIONS, dtype=np.float32)
             return SolveResult(action_probs=probs, ev=0.0, iterations=0, metadata={})
+
+        # TOURNAMENT SHALLOW-STACK PRIOR: a folded-to-hero / facing-one-jam SHALLOW preflop spot is an
+        # exact-game push/fold node. Serve the CERTIFIED ante-aware ICM open-shove / call-vs-jam Nash
+        # range (pushfold_prior, reusing tournament.open_shove_icm) directly — at N>6 the blueprint is a
+        # miss (uniform) and depth-limited search reasons from that flat prior over a coarse postflop
+        # leaf, so the certified push/fold range is strictly the stronger serve here. Gated on
+        # ``pushfold_prior_band_bb`` (default None => never fires => byte-identical). Abstains (None)
+        # outside the certified push/fold regime, falling through to the existing serve paths below.
+        if int(base_state.street) == 0 and self.config.pushfold_prior_band_bb is not None:
+            pf = self._pushfold_prior(base_state, hero, legal)
+            if pf is not None:
+                probs = (pf * legal)
+                probs = probs / max(probs.sum(), 1e-12)
+                return SolveResult(
+                    action_probs=probs.astype(np.float32), ev=0.0, iterations=0,
+                    metadata={"served": "pushfold_icm_prior",
+                              "eff_stack_bb": round(self._effective_stack_bb(base_state), 1)},
+                )
 
         # Pluribus: preflop served directly from the blueprint (no search) — but ONLY when the table is
         # within the blueprint's trained depth band (A1). Off-band (deep/short), fall through to the
