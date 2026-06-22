@@ -89,65 +89,24 @@ fn threefry_carry(key: [u32; 2]) -> [u32; 2] {
 
 const SB_CHIPS: i32 = BB_CHIPS / 2; // 50, mirrors jax_engine.SB_CHIPS = CHIP_UNIT // 2
 
-/// Build a 7-seat preflop post-blinds state equivalent to `init_hand` for button=0, all 7 seats
-/// live, equal `stack_bb` BB stacks, a fixed 52-card deck (identity order), ante=0. Holes are dealt
-/// from the top of the deck (2 per live seat, ascending seat order), board cleared.
+/// Build a 7-seat preflop root via the REAL generic `init_hand_n::<7>` (NOT a hand-built duplicate),
+/// for button=0, all 7 seats live, equal `stack_bb` BB stacks, a fixed 52-card identity-order deck,
+/// ante=0. This exercises the production deal+blinds+ante+occupancy+button path at N=7.
 fn init_hand_7(stack_bb: i32) -> EnvStateN<7> {
+    init_hand_7_ante(stack_bb, 0)
+}
+
+/// As `init_hand_7` but with a per-player `ante` (dead money -> pot_dead + committed_total).
+fn init_hand_7_ante(stack_bb: i32, ante: i32) -> EnvStateN<7> {
     let stack0 = stack_bb * BB_CHIPS;
-    let mut stacks = [stack0; 7];
-    let mut committed = [0i32; 7];
-    let seat_status = [SEAT_LIVE; 7];
-
-    // button = 0 => SB = seat 1, BB = seat 2, UTG (first to act) = seat 3 (n_live > 2).
-    let button = 0i32;
-    let sb = 1usize;
-    let bb = 2usize;
-    stacks[sb] -= SB_CHIPS;
-    committed[sb] = SB_CHIPS;
-    stacks[bb] -= BB_CHIPS;
-    committed[bb] = BB_CHIPS;
-
-    // Identity deck 0..52; deal 2 holes per seat off the top (14 cards), board cleared.
+    let stacks = [stack0; 7];
+    let occupancy = [true; 7];
+    // Identity deck 0..52 (the supplied permutation; jax would supply its Threefry permutation).
     let mut deck = [0i32; 52];
     for (i, d) in deck.iter_mut().enumerate() {
         *d = i as i32;
     }
-    let mut holes = [[-1i32; 2]; 7];
-    let mut p = 0usize;
-    for seat in 0..7 {
-        holes[seat][0] = deck[p];
-        holes[seat][1] = deck[p + 1];
-        p += 2;
-    }
-    let deck_ptr = p as i32; // next undealt card index (board deals continue from here)
-
-    EnvStateN::<7> {
-        holes,
-        board: [-1i32; MAX_BOARD],
-        seat_status,
-        stacks,
-        committed_street: committed,
-        committed_total: committed,
-        street: 0, // STREET_PREFLOP
-        pot_dead: 0,
-        current_bet: BB_CHIPS,
-        min_raise: BB_CHIPS,
-        button,
-        action_seat: 3, // UTG
-        last_aggressor: -1,
-        acted: [false; 7],
-        last_raise_full: true,
-        deck,
-        deck_ptr,
-        rng_key: [0u32, 0u32],
-        hist_seat: [-1i32; MAX_HISTORY],
-        hist_action: [-1i32; MAX_HISTORY],
-        hist_amount: [0i32; MAX_HISTORY],
-        hist_len: 0,
-        done: false,
-        rewards: [0i32; 7],
-        pending_deal: false,
-    }
+    init_hand_n::<7>(0, &stacks, &occupancy, ante, &deck, [0u32, 0u32])
 }
 
 /// Drive `env` to a terminal by always taking the most passive legal action (CHECK > CALL > FOLD).
@@ -160,7 +119,12 @@ fn init_hand_7(stack_bb: i32) -> EnvStateN<7> {
 /// `compute_returns` once it observes `street >= STREET_TERMINAL`. Only the fold-to-one-live and
 /// all-in-runout lines set `done=true` from inside `apply_action`. So "terminal" here means
 /// `done || street >= STREET_TERMINAL || action_seat < 0`.
-fn play_passive_to_terminal(mut env: EnvStateN<7>) -> EnvStateN<7> {
+fn play_passive_to_terminal(env: EnvStateN<7>) -> EnvStateN<7> {
+    play_passive_to_terminal_n::<7>(env)
+}
+
+/// Generic-N version of `play_passive_to_terminal` (CHECK > CALL > FOLD), resolving chance nodes.
+fn play_passive_to_terminal_n<const N: usize>(mut env: EnvStateN<N>) -> EnvStateN<N> {
     for _ in 0..400 {
         if env.done || env.street >= STREET_TERMINAL {
             break;
@@ -263,4 +227,179 @@ fn n7_fold_around_returns_sum_to_zero() {
     // BB (seat 2) wins the dead small blind: net positive for exactly one seat.
     let winners = env.rewards.iter().filter(|&&r| r > 0).count();
     assert_eq!(winners, 1, "uncontested pot has exactly one net winner");
+}
+
+#[test]
+fn n7_root_positions_and_blinds_correct() {
+    // 7-handed, button=0, all live: SB=1, BB=2, UTG=3 acts first. Blinds posted, ante=0.
+    let env = init_hand_7(100);
+    assert_eq!(env.button, 0);
+    // committed_street: SB=50, BB=100, everyone else 0.
+    assert_eq!(env.committed_street[1], SB_CHIPS, "SB posts 50");
+    assert_eq!(env.committed_street[2], BB_CHIPS, "BB posts 100");
+    for s in [0usize, 3, 4, 5, 6] {
+        assert_eq!(env.committed_street[s], 0, "non-blind seat {s} posts nothing");
+    }
+    // Stacks reduced by the blind only (ante=0).
+    assert_eq!(env.stacks[1], 100 * BB_CHIPS - SB_CHIPS);
+    assert_eq!(env.stacks[2], 100 * BB_CHIPS - BB_CHIPS);
+    assert_eq!(env.stacks[0], 100 * BB_CHIPS);
+    // current_bet = max committed = BB; first actor = UTG = seat 3 (n_live > 2).
+    assert_eq!(env.current_bet, BB_CHIPS);
+    assert_eq!(env.min_raise, BB_CHIPS);
+    assert_eq!(env.action_seat, 3, "UTG acts first 7-handed");
+    // ante=0 byte-identity invariant: committed_total == committed_street, pot_dead == 0.
+    assert_eq!(env.committed_total, env.committed_street);
+    assert_eq!(env.pot_dead, 0);
+    // 14 cards dealt (2 * 7 live), deck_ptr advanced.
+    assert_eq!(env.deck_ptr, 14);
+    for s in 0..7 {
+        assert!(env.holes[s][0] >= 0 && env.holes[s][1] >= 0, "seat {s} dealt");
+    }
+}
+
+#[test]
+fn n7_root_button_rotation() {
+    // Rotating the button rotates SB/BB/UTG by the same generic clockwise walk.
+    // button=3, 7 live: SB=4, BB=5, UTG=6.
+    let stacks = [100 * BB_CHIPS; 7];
+    let occ = [true; 7];
+    let mut deck = [0i32; 52];
+    for (i, d) in deck.iter_mut().enumerate() {
+        *d = i as i32;
+    }
+    let env = init_hand_n::<7>(3, &stacks, &occ, 0, &deck, [0, 0]);
+    assert_eq!(env.committed_street[4], SB_CHIPS, "SB = btn+1 = seat 4");
+    assert_eq!(env.committed_street[5], BB_CHIPS, "BB = btn+2 = seat 5");
+    assert_eq!(env.action_seat, 6, "UTG = btn+3 = seat 6");
+    // Wrapping button=6: SB=0, BB=1, UTG=2.
+    let env2 = init_hand_n::<7>(6, &stacks, &occ, 0, &deck, [0, 0]);
+    assert_eq!(env2.committed_street[0], SB_CHIPS);
+    assert_eq!(env2.committed_street[1], BB_CHIPS);
+    assert_eq!(env2.action_seat, 2);
+}
+
+#[test]
+fn n7_ante_is_dead_money_and_conserves() {
+    // Per-player ante goes to pot_dead + committed_total, NOT committed_street.
+    let ante = 13i32;
+    let env = init_hand_7_ante(100, ante);
+    // committed_street is blinds-only (ante NOT here).
+    assert_eq!(env.committed_street[1], SB_CHIPS);
+    assert_eq!(env.committed_street[2], BB_CHIPS);
+    assert_eq!(env.committed_street[3], 0);
+    // committed_total = committed_street + ante for every live seat.
+    for s in 0..7 {
+        assert_eq!(
+            env.committed_total[s],
+            env.committed_street[s] + ante,
+            "seat {s} committed_total includes its ante"
+        );
+    }
+    // pot_dead == sum of antes (7 live seats).
+    assert_eq!(env.pot_dead, ante * 7);
+    // Stacks reduced by blind + ante.
+    assert_eq!(env.stacks[1], 100 * BB_CHIPS - SB_CHIPS - ante);
+    assert_eq!(env.stacks[2], 100 * BB_CHIPS - BB_CHIPS - ante);
+    assert_eq!(env.stacks[0], 100 * BB_CHIPS - ante);
+    // Chip conservation through a full check-down showdown with antes in the pot.
+    let term = play_passive_to_terminal(env);
+    assert_eq!(term.street, STREET_TERMINAL);
+    let n_showdown = term
+        .seat_status
+        .iter()
+        .filter(|&&s| s == SEAT_LIVE || s == SEAT_ALLIN)
+        .count() as i32;
+    let rewards = compute_returns::<7>(
+        &term.holes,
+        &term.board,
+        &term.seat_status,
+        &term.committed_total,
+        term.button,
+        n_showdown,
+    );
+    let total: i64 = rewards.iter().map(|&r| r as i64).sum();
+    assert_eq!(total, 0, "ante pot must still conserve chips");
+}
+
+#[test]
+fn n7_occupancy_empty_seats_skipped() {
+    // 7-seat table with 4 empty seats (occupancy = [T,F,T,F,T,F,T]) => 4 live; empties are SEAT_EMPTY,
+    // get no holes, and are skipped by the clockwise blind/UTG walk.
+    let stacks = [100 * BB_CHIPS; 7];
+    let occ = [true, false, true, false, true, false, true];
+    let mut deck = [0i32; 52];
+    for (i, d) in deck.iter_mut().enumerate() {
+        *d = i as i32;
+    }
+    let env = init_hand_n::<7>(0, &stacks, &occ, 0, &deck, [0, 0]);
+    // Empty seats stay SEAT_EMPTY with no holes.
+    for s in [1usize, 3, 5] {
+        assert_eq!(env.seat_status[s], SEAT_EMPTY, "seat {s} empty");
+        assert_eq!(env.holes[s], [-1, -1], "empty seat {s} undealt");
+    }
+    let n_live = env.seat_status.iter().filter(|&&s| s == SEAT_LIVE).count();
+    assert_eq!(n_live, 4);
+    // button=0; live seats are 0,2,4,6. SB = 1st live after 0 = 2, BB = 2nd live after = 4,
+    // UTG = 3rd live after = 6.
+    assert_eq!(env.committed_street[2], SB_CHIPS, "SB = first live after button");
+    assert_eq!(env.committed_street[4], BB_CHIPS, "BB = second live after button");
+    assert_eq!(env.action_seat, 6, "UTG = third live after button (4 live)");
+    // Only live seats dealt: deck_ptr = 2 * 4.
+    assert_eq!(env.deck_ptr, 8);
+    // Play to terminal; chips conserve over the live subset.
+    let term = play_passive_to_terminal(env);
+    let n_showdown = term
+        .seat_status
+        .iter()
+        .filter(|&&s| s == SEAT_LIVE || s == SEAT_ALLIN)
+        .count() as i32;
+    let rewards = compute_returns::<7>(
+        &term.holes,
+        &term.board,
+        &term.seat_status,
+        &term.committed_total,
+        term.button,
+        n_showdown,
+    );
+    let total: i64 = rewards.iter().map(|&r| r as i64).sum();
+    assert_eq!(total, 0, "occupancy-mixed table conserves chips");
+}
+
+#[test]
+fn n2_heads_up_root_button_is_sb() {
+    // HU root via the generic path at N=2. jax posts SB = nth_live_after(button,1),
+    // BB = nth_live_after(button,2); with 2 live seats SB = the non-button seat, BB = button.
+    // Preflop the button (= BB poster here) acts first via the n_live<=2 branch -> action_seat = btn.
+    let stacks = [100 * BB_CHIPS; 2];
+    let occ = [true; 2];
+    let mut deck = [0i32; 52];
+    for (i, d) in deck.iter_mut().enumerate() {
+        *d = i as i32;
+    }
+    let env = init_hand_n::<2>(0, &stacks, &occ, 0, &deck, [0, 0]);
+    // button=0: SB = nth_live_after(0,1) = seat 1, BB = nth_live_after(0,2) = seat 0 (wrap).
+    assert_eq!(env.committed_street[1], SB_CHIPS, "HU SB = non-button seat");
+    assert_eq!(env.committed_street[0], BB_CHIPS, "HU BB = button seat");
+    assert_eq!(env.current_bet, BB_CHIPS);
+    // n_live <= 2 => first actor is btn_first = first live after button = seat 1 (the SB).
+    assert_eq!(env.action_seat, 1, "HU preflop SB acts first");
+    assert_eq!(env.deck_ptr, 4, "HU deals 2 seats");
+    // Full hand conserves chips.
+    let term = play_passive_to_terminal_n::<2>(env);
+    let n_showdown = term
+        .seat_status
+        .iter()
+        .filter(|&&s| s == SEAT_LIVE || s == SEAT_ALLIN)
+        .count() as i32;
+    let rewards = compute_returns::<2>(
+        &term.holes,
+        &term.board,
+        &term.seat_status,
+        &term.committed_total,
+        term.button,
+        n_showdown,
+    );
+    let total: i64 = rewards.iter().map(|&r| r as i64).sum();
+    assert_eq!(total, 0, "HU root conserves chips");
 }

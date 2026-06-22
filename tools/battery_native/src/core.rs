@@ -844,13 +844,19 @@ pub fn apply_action<const N: usize>(s_in: &EnvStateN<N>, action: usize) -> EnvSt
 
 // ---------------------------------------------------------------------------
 // Native root construction (port of jax_engine `_post_blinds` + `init_hand`, with the B2/B3 fixes).
-// Concrete to the default `EnvState` (= `EnvStateN<NUM_PLAYERS>`); the 7-seat root is a Workstream-C
-// deliverable (it needs the deck/RNG + Python-side wiring), so this stays 6-seat by design.
+//
+// GENERIC over seat count `N` (2..=7), the SINGLE source for any-seat root construction. The default
+// 6-seat path (`init_hand`/`post_blinds`, used by the PyO3 binding + the np_engine parity gate) is the
+// `N = NUM_PLAYERS` monomorphization of `init_hand_n`/`post_blinds_n` and is BYTE-IDENTICAL to the
+// pre-generic concrete code (same loop bounds, same ops, same field order). 7-seat is the additive
+// `N = 7` instantiation — NO second concrete copy, NO change to the N=6 default. `ante=0` keeps
+// `committed_total == committed_street` and `pot_dead == 0` (byte-identical to the no-ante engine).
 // ---------------------------------------------------------------------------
 
 /// Mirror `_nth_live_after(seat_status, from_seat, n)`: the n-th live seat clockwise after
 /// `from_seat` (n >= 1). Bit-identical to the Python `fori_loop` of `_first_live_after`.
-fn nth_live_after(seat_status: &[i8; NUM_PLAYERS], from_seat: i32, n: i32) -> i32 {
+/// Generic over seat count `N` (`first_live_after` already is).
+fn nth_live_after<const N: usize>(seat_status: &[i8; N], from_seat: i32, n: i32) -> i32 {
     let mut seat = from_seat;
     for _ in 0..n {
         seat = first_live_after(seat_status, seat);
@@ -858,18 +864,25 @@ fn nth_live_after(seat_status: &[i8; NUM_PLAYERS], from_seat: i32, n: i32) -> i3
     seat
 }
 
-/// Port of `_post_blinds(stacks, seat_status, button, ante)` with the B2/B3 fixes.
-/// Mutates `stacks`/`seat_status` in place and returns
+/// Port of `_post_blinds(stacks, seat_status, button, ante)` with the B2/B3 fixes, generic over the
+/// seat count `N`. Mutates `stacks`/`seat_status` in place and returns
 /// `(committed_street, committed_total, pot_dead, current_bet, min_raise)`.
-fn post_blinds(
-    stacks: &mut [i32; NUM_PLAYERS],
-    seat_status: &mut [i8; NUM_PLAYERS],
+///
+/// HU (`n_live == 2`) blind posting: jax `_post_blinds` does NOT special-case HU — it ALWAYS posts
+/// SB = `nth_live_after(button, 1)` and BB = `nth_live_after(button, 2)` for every N. We mirror jax
+/// verbatim (bit-identity to jax is the binding constraint). With exactly 2 live seats the clockwise
+/// walk makes the 1st-live-after-button the non-button seat (SB) and the 2nd-live-after wrap back to
+/// the button (BB); preflop, the button then acts first (`action_seat = btn_first = SB` via the
+/// `n_live <= 2` branch in `init_hand_n`), matching jax. No extra branch is needed for any N.
+fn post_blinds_n<const N: usize>(
+    stacks: &mut [i32; N],
+    seat_status: &mut [i8; N],
     button: i32,
     ante: i32,
-) -> ([i32; NUM_PLAYERS], [i32; NUM_PLAYERS], i32, i32, i32) {
+) -> ([i32; N], [i32; N], i32, i32, i32) {
     let sb = nth_live_after(seat_status, button, 1) as usize;
     let bb = nth_live_after(seat_status, button, 2) as usize;
-    let mut committed = [0i32; NUM_PLAYERS];
+    let mut committed = [0i32; N];
     let sb_live = (seat_status[sb] != SEAT_EMPTY) as i32;
     let bb_live = (seat_status[bb] != SEAT_EMPTY) as i32;
     // B2: clamp each blind to the poster's stack (no negative stack).
@@ -881,10 +894,10 @@ fn post_blinds(
     committed[bb] = bb_paid;
     // Per-player ante: dead money clamped to the post-blind stack, added to pot_dead + committed_total
     // (NOT committed_street). ante=0 -> committed_total == committed, pot_dead == 0 (byte-identical).
-    let mut ante_each = [0i32; NUM_PLAYERS];
-    let mut committed_total = [0i32; NUM_PLAYERS];
+    let mut ante_each = [0i32; N];
+    let mut committed_total = [0i32; N];
     let mut pot_dead = 0i32;
-    for i in 0..NUM_PLAYERS {
+    for i in 0..N {
         let live_mask = (seat_status[i] != SEAT_EMPTY) as i32;
         ante_each[i] = ante.min(stacks[i].max(0)) * live_mask;
         stacks[i] -= ante_each[i];
@@ -892,7 +905,7 @@ fn post_blinds(
         committed_total[i] = committed[i] + ante_each[i];
     }
     // B2: a live seat that committed its entire stack (blind and/or ante) is ALL-IN.
-    for i in 0..NUM_PLAYERS {
+    for i in 0..N {
         let live_mask = seat_status[i] != SEAT_EMPTY;
         if live_mask && stacks[i] == 0 {
             seat_status[i] = SEAT_ALLIN;
@@ -900,7 +913,7 @@ fn post_blinds(
     }
     // B3: standing bet is the largest street commitment, min raise stays a full BB.
     let mut current_bet = 0i32;
-    for i in 0..NUM_PLAYERS {
+    for i in 0..N {
         if committed[i] > current_bet {
             current_bet = committed[i];
         }
@@ -909,30 +922,34 @@ fn post_blinds(
     (committed, committed_total, pot_dead, current_bet, min_raise)
 }
 
-/// Native root construction, byte-identical to `jax_engine.init_hand(rng_key, button, stacks,
-/// occupancy, ante)` WHEN GIVEN jax's permuted deck (the Threefry permutation is not replicated; the
-/// caller supplies the already-permuted `deck`, which is how the gate cross-checks byte-identity).
-pub fn init_hand(
+/// Native root construction generic over seat count `N` (2..=7), byte-identical to
+/// `jax_engine.init_hand(rng_key, button, stacks, occupancy, ante, n_players=N)` WHEN GIVEN jax's
+/// permuted deck (the Threefry permutation is not replicated; the caller supplies the already-permuted
+/// `deck`, which is how the gate cross-checks byte-identity). Deck-as-input + per-player ante +
+/// occupancy (`SEAT_EMPTY` for absent seats) + button rotation + HU button=SB are all handled by the
+/// generic blind/deal walk (see `post_blinds_n`). The default 6-seat `init_hand` is the
+/// `N = NUM_PLAYERS` instantiation.
+pub fn init_hand_n<const N: usize>(
     button: i32,
-    stacks_in: &[i32; NUM_PLAYERS],
-    occupancy: &[bool; NUM_PLAYERS],
+    stacks_in: &[i32; N],
+    occupancy: &[bool; N],
     ante: i32,
     deck: &[i32; 52],
     rng_key: [u32; 2],
-) -> EnvState {
-    let mut seat_status = [SEAT_EMPTY; NUM_PLAYERS];
-    for i in 0..NUM_PLAYERS {
+) -> EnvStateN<N> {
+    let mut seat_status = [SEAT_EMPTY; N];
+    for i in 0..N {
         seat_status[i] = if occupancy[i] { SEAT_LIVE } else { SEAT_EMPTY };
     }
     let mut stacks = *stacks_in;
 
     let (committed, committed_total, pot_dead, current_bet, min_raise) =
-        post_blinds(&mut stacks, &mut seat_status, button, ante);
+        post_blinds_n(&mut stacks, &mut seat_status, button, ante);
 
     // Deal holes from the supplied deck exactly as the jax fori_loop does.
-    let mut holes = [[-1i32; 2]; NUM_PLAYERS];
+    let mut holes = [[-1i32; 2]; N];
     let mut p: usize = 0;
-    for i in 0..NUM_PLAYERS {
+    for i in 0..N {
         let live = seat_status[i] != SEAT_EMPTY;
         if live {
             holes[i][0] = deck[p];
@@ -943,7 +960,7 @@ pub fn init_hand(
     let deck_ptr = p as i32;
 
     let mut n_live = 0i32;
-    for i in 0..NUM_PLAYERS {
+    for i in 0..N {
         if seat_status[i] == SEAT_LIVE {
             n_live += 1;
         }
@@ -952,7 +969,6 @@ pub fn init_hand(
     let utg = nth_live_after(&seat_status, button, 3);
     let action_seat = if n_live <= 2 { btn_first } else { utg };
 
-    // Construct the 6-seat alias; Rust infers N = NUM_PLAYERS from the array fields.
     EnvStateN {
         holes,
         board: [-1i32; MAX_BOARD],
@@ -967,7 +983,7 @@ pub fn init_hand(
         button,
         action_seat,
         last_aggressor: -1,
-        acted: [false; NUM_PLAYERS],
+        acted: [false; N],
         last_raise_full: true,
         deck: *deck,
         deck_ptr,
@@ -977,7 +993,21 @@ pub fn init_hand(
         hist_amount: [0i32; MAX_HISTORY],
         hist_len: 0,
         done: false,
-        rewards: [0i32; NUM_PLAYERS],
+        rewards: [0i32; N],
         pending_deal: false,
     }
+}
+
+/// Default 6-seat native root construction. THIN alias over the generic `init_hand_n::<NUM_PLAYERS>`
+/// — the N=6 monomorphization is byte-identical to the pre-generic concrete code (same loop bounds,
+/// same field order). Public API surface (`init_hand`, PyO3 binding) is preserved verbatim.
+pub fn init_hand(
+    button: i32,
+    stacks_in: &[i32; NUM_PLAYERS],
+    occupancy: &[bool; NUM_PLAYERS],
+    ante: i32,
+    deck: &[i32; 52],
+    rng_key: [u32; 2],
+) -> EnvState {
+    init_hand_n::<NUM_PLAYERS>(button, stacks_in, occupancy, ante, deck, rng_key)
 }
