@@ -91,6 +91,66 @@ def test_threshold_constant_is_three():
     assert AGG_KILL_COUNT == 3
 
 
+# ---- AUDIT wiup89smb fixes: maniac-FISH vs skilled-LAG (showdown discriminator) ----
+
+def _maniac_fish():
+    # count-aggressive (raises facing bets, never folds — like a lag) BUT a weak-showdown server HUD
+    # (WSD 0.38 < break-even) -> a loose-aggressive MANIAC FISH that PAYS OFF, not a skilled LAG.
+    prof = _lag()
+    prof.hud = {"vpip": 62, "pfr": 45, "wsd": 38, "foldToCbet": 22, "wtsd": 42}
+    return prof
+
+
+def _skilled_lag():
+    # count-aggressive AND wins at showdown (WSD 0.54 >= break-even) -> a real LAG, must STILL be dangerous.
+    prof = _lag()
+    prof.hud = {"vpip": 30, "pfr": 26, "wsd": 54, "foldToCbet": 48, "wtsd": 28}
+    return prof
+
+
+def test_maniac_fish_excused_skilled_lag_still_dangerous():
+    # finding #1 (HIGH): a confident weak-showdown maniac is a FISH, NOT a dangerous LAG -> exploit it.
+    assert _is_dangerous_aggressor(_maniac_fish()) is False
+    # a real skilled LAG (wins at showdown) is STILL dangerous (kill-switch preserved vs regs/pros).
+    assert _is_dangerous_aggressor(_skilled_lag()) is True
+    # a HUD-less loose-aggressor (no showdown signal) is still dangerous (veto fails CLOSED).
+    assert _is_dangerous_aggressor(_lag()) is True
+
+
+def test_maniac_fish_table_not_killed():
+    # 3 maniac fish must NOT trip the kill-switch — we WANT to crush them (the headline value fix).
+    assert _table_too_aggressive({s: _maniac_fish() for s in range(1, 4)}) is False
+    # 3 real skilled LAGs still trip it (protect-over-extract preserved).
+    assert _table_too_aggressive({s: _skilled_lag() for s in range(1, 4)}) is True
+
+
+def test_partial_hud_loose_passive_admitted_as_fish():
+    # finding #5: a loose-passive station on a PARTIAL play-money HUD (vpip/pfr only, no wsd/foldToCbet)
+    # is admitted as a value-fish (whole-history vpip/pfr are high-confidence), so the value lever fires.
+    from pokerbot.opponent.root_mixer import _is_value_fish
+    from pokerbot.opponent.stats import OpponentStats
+
+    assert _is_value_fish(OpponentStats(hands=0, hud={"vpip": 60, "pfr": 10})) is True   # wide gap = station
+    # do-no-harm: a loose-AGGRESSIVE maniac (small gap) on a partial HUD is NOT admitted here.
+    assert _is_value_fish(OpponentStats(hands=0, hud={"vpip": 62, "pfr": 48})) is False
+
+
+def test_fish_relax_vetoes_hud_fish_that_is_count_aggressor(monkeypatch):
+    # finding #8: a HUD-loose-passive villain who is ALSO locally count-aggressive must NOT collapse the
+    # RNR N to the HU ceiling (a real punisher is present). fish_relaxed_n now requires not-dangerous too.
+    from pokerbot.opponent.rnr_cap import fish_relaxed_n
+
+    monkeypatch.setenv("POKERBOT_RNR_FISH_RELAX", "1")
+
+    def _hud_fish_but_count_aggressor():
+        prof = _lag()                                          # count-aggressive (raises, never folds)
+        prof.hud = {"vpip": 55, "pfr": 10, "wsd": 54}          # wide gap -> _is_value_fish; wsd 0.54 not weak
+        return prof
+
+    model = {s: _hud_fish_but_count_aggressor() for s in range(1, 6)}
+    assert fish_relaxed_n(6, model) == 6                       # a punisher present -> NOT relaxed to HU(2)
+
+
 # ---- end-to-end: the kill-switch actually disables the exploit in SearchAgent (deterministic, no EV) ----
 
 def _facing_probs(agent, seed):

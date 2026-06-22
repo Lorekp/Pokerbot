@@ -133,8 +133,13 @@ def fish_relaxed_n(n_live_seats: int, opponent_model: dict | None) -> int:
     if len(profs) < n - 1:
         return n  # an unknown / unprofiled villain could be a punisher -> stay conservative
     try:
-        from pokerbot.opponent.root_mixer import _is_value_fish
-        if profs and all(_is_value_fish(p) for p in profs):
+        from pokerbot.opponent.root_mixer import _is_dangerous_aggressor, _is_value_fish
+        # AUDIT wiup89smb finding #8: also veto a count-aggressor. _is_value_fish has a HUD path that can
+        # admit a server-HUD-loose-passive villain who is LOCALLY count-aggressive (raising back) — the one
+        # case where the fish/aggressor classifiers can both fire on the SAME villain. Requiring
+        # not _is_dangerous_aggressor here keeps the no-punisher relaxation from collapsing N to the HU
+        # ceiling while an actual punisher (who raises) is at the table.
+        if profs and all(_is_value_fish(p) and not _is_dangerous_aggressor(p) for p in profs):
             return 2   # no punisher at the table -> HU ceiling -> full value extraction
     except Exception:  # noqa: BLE001 — never let the relaxation break the solve; fall back to conservative
         return n

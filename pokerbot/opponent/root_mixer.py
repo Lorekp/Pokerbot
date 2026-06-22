@@ -85,7 +85,15 @@ def _is_value_fish(prof) -> bool:
         # maniac (high VPIP, small gap) is NOT admitted here and is still vetoed by _table_too_aggressive.
         loose = vpip is not None and vpip >= 0.50
         score, conf = station_payoff_score(prof)
-        if conf >= 0.8 and (score >= 0.5 or (passive and sticky) or (loose and passive)):
+        # AUDIT wiup89smb finding #5: a `loose and passive` read (whole-history VPIP>=0.50 with the wide
+        # VPIP-PFR limp/flat gap) is a high-confidence loose-passive STATION from the server stats ALONE,
+        # so admit it WITHOUT the station_payoff_score conf gate — that gate fails CLOSED on a partial
+        # play-money HUD lacking the postflop wsd/foldToCbet stats, leaving a visibly-soft station inert.
+        # The conf>=0.8 gate still guards the score/sticky paths (those genuinely need showdown stats).
+        # `passive` REQUIRES the wide gap, so a loose-AGGRESSIVE maniac is still NOT admitted here.
+        if loose and passive:
+            return True
+        if conf >= 0.8 and (score >= 0.5 or (passive and sticky)):
             return True
     if getattr(prof, "hands", 0) < FISH_MIN_HANDS:
         return False
@@ -122,6 +130,8 @@ def _all_live_villains_fish(state, hero: int, profiles: dict | None) -> bool:
 AGG_KILL_COUNT = 3            # >= this many confirmed lags at the table -> exploit OFF (protect > extract)
 LAG_MIN_AGG_EXCESS = 0.10    # own-initiative OR facing-raise aggression this far above the Nash reference
 LAG_MAX_FOLD_EXCESS = 0.0    # LOOSE: folds to bets at most the population average (a tag folds MORE)
+LAG_MIN_WSD = 0.45           # a loose-aggressor winning BELOW this at showdown (server HUD) is a maniac FISH
+                             # (pays off), not a skilled LAG (>= break-even) -> excused from the lag count
 
 
 def _is_dangerous_aggressor(prof) -> bool:
@@ -141,6 +151,20 @@ def _is_dangerous_aggressor(prof) -> bool:
     raise_excess = float((fr.post[2] + fr.post[3]) - (fr.pop[2] + fr.pop[3]))
     aggressive = init_agg > LAG_MIN_AGG_EXCESS or raise_excess > LAG_MIN_AGG_EXCESS
     loose = fold_excess <= LAG_MAX_FOLD_EXCESS
+    if aggressive and loose:
+        # AUDIT wiup89smb finding #1 (HIGH): the frequency-only test above can't tell a skilled LAG from a
+        # loose-aggressive MANIAC FISH (raises a lot, folds little, but LOSES at showdown) — so a maniac-fish
+        # table tripped the kill-switch and the WHOLE exploit was disabled against the softest, most
+        # exploitable field (the toughness fix reads them SOFT, then this nulled the exploit). The clean
+        # discriminator is WON-AT-SHOWDOWN: a maniac fish shows up weak (low WSD = pays off), a skilled LAG
+        # wins at showdown (WSD at/above break-even). Veto a CONFIDENT weak-showdown server-HUD read so the
+        # maniac is exploited, not killed. NB do NOT use station_payoff_score here — it x0.3-damps an
+        # archetype "lag", which a real maniac IS, so it cannot separate the two; WSD is read DIRECTLY. An
+        # unknown / HUD-less aggressor has wsd=None -> NOT vetoed (fails closed), preserving lag protection.
+        from pokerbot.opponent.value_sizing import _pct
+        wsd = _pct(getattr(prof, "hud", None) or {}, "wsd")
+        if wsd is not None and wsd < LAG_MIN_WSD:
+            return False   # confident weak-showdown loose-aggressor = maniac FISH, exploit it (do not kill)
     return aggressive and loose
 
 
