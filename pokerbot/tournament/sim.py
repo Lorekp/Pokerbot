@@ -12,11 +12,18 @@ ladders past opponents on the bubble (folds where chip-EV players bust, shoves w
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from aof_equity_grids import _eval7
 from pokerbot.tournament.decide import decide_pushfold
 from pokerbot.tournament.pushfold_icm import _hu_grid, hand_to_label
+
+# Solver iteration budget for the "icm"/"exploit" arms. Default 1500 (the certified setting); the
+# push/fold ranges are stable enough that a >0.5 threshold decision converges far sooner, so a
+# measurement harness may lower this via POKERBOT_SIM_PUSHFOLD_ITERS for speed (default-identical).
+_PUSHFOLD_ITERS = int(os.environ.get("POKERBOT_SIM_PUSHFOLD_ITERS", "1500"))
 
 _, _LABELS, _ = _hu_grid()
 _LABEL_TO_IDX = {l: i for i, l in enumerate(_LABELS)}
@@ -53,15 +60,23 @@ def _settle_allin(contenders, committed, holes, board, dead=0.0) -> dict[int, fl
 
 
 def _strategy_action(kind, stacks, payouts, hero, hand, *, blinds, ante, behind=None, jammer=None,
-                     cache=None, field):
+                     cache=None, field, rng=None):
     """Return 'jam'/'fold' (first-in) or 'call'/'fold' (facing a jam) for a strategy ``kind``."""
+    if kind == "uniform":
+        # Uniform-over-legal baseline: the search root's N>6 fallback before the certified push/fold
+        # prior replaced it (pokerbot.search.pushfold_prior). 50/50 jam-or-fold / call-or-fold, so the
+        # SNG can measure the prior (the "icm" kind) end-to-end against the fallback it supersedes.
+        r = rng.random() if rng is not None else 0.5
+        if jammer is None:
+            return "jam" if r < 0.5 else "fold"
+        return "call" if r < 0.5 else "fold"
     if kind == "icm":
         key = (tuple(round(s, 1) for s in stacks), hero, tuple(behind or []), jammer)
         if cache is not None and key in cache:
             d = cache[key]
         else:
             d = decide_pushfold(stacks, payouts, hero, hand, blinds=blinds, behind=behind,
-                                jammer=jammer, ante=ante, pushfold_max_bb=1e9, iters=1500)
+                                jammer=jammer, ante=ante, pushfold_max_bb=1e9, iters=_PUSHFOLD_ITERS)
             if cache is not None:
                 cache[key] = d
         if d.action in ("jam", "call"):
@@ -116,14 +131,16 @@ def play_hand(stacks, order, kinds, payouts, blinds_bb, ante, rng, cache, field)
         if not jammers:                               # first-in: jam or fold
             behind = [o for o in order if o != s and o not in folded and order.index(o) > order.index(s)]
             act = _strategy_action(kinds[s], stacks_snapshot(stacks, committed), payouts, s, hand,
-                                   blinds=blinds, ante=ante, behind=behind, cache=cache, field=field)
+                                   blinds=blinds, ante=ante, behind=behind, cache=cache, field=field,
+                                   rng=rng)
             if act == "jam":
                 add = stacks[s]; stacks[s] = 0.0; committed[s] += add; jammers.append(s)
             else:
                 folded.add(s)
         else:                                         # facing a jam: call or fold
             act = _strategy_action(kinds[s], stacks_snapshot(stacks, committed), payouts, s, hand,
-                                   blinds=blinds, ante=ante, jammer=jammers[0], cache=cache, field=field)
+                                   blinds=blinds, ante=ante, jammer=jammers[0], cache=cache, field=field,
+                                   rng=rng)
             if act == "call":
                 add = stacks[s]; stacks[s] = 0.0; committed[s] += add; jammers.append(s)
             else:
