@@ -47,6 +47,7 @@ pub const MODE_BLUEPRINT: u8 = 0;
 pub const MODE_FOLD: u8 = 1;
 pub const MODE_NIT: u8 = 2;
 pub const MODE_UNIFORM: u8 = 3;
+pub const MODE_STATION: u8 = 4;
 
 /// Tabular blueprint policy (also the home of the fixed calibration policies, so calibration needs no
 /// fake dict). Mirrors `make_blueprint_policy` in `pokerbot/eval/lbr.py`: full legal mask -> abstraction
@@ -126,6 +127,19 @@ impl LbrPolicy for TabularPolicy {
                 }
             }
             MODE_UNIFORM => uniform_over(&full),
+            MODE_STATION => {
+                // _station_policy (scripts/lbr6_audit.py): calling station -- CALL if legal, else
+                // CHECK, else FOLD, else argmax(mask). Never folds when it can call, never bets.
+                if full[CALL] {
+                    fixed_single(&full, CALL)
+                } else if full[CHECK] {
+                    fixed_single(&full, CHECK)
+                } else if full[FOLD] {
+                    fixed_single(&full, FOLD)
+                } else {
+                    fixed_single(&full, CALL) // falls back to first-legal
+                }
+            }
             MODE_NIT => {
                 // make_nit_policy: bet pot / call with strong made hands, else check/fold.
                 let h = s.holes[seat];

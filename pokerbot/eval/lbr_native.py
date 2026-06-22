@@ -39,13 +39,14 @@ from pokerbot.search import native_solver  # noqa: E402  (reuse the .dll->.pyd l
 
 _HU_OCC = np.array([False, False, False, True, False, True], dtype=bool)
 _HU_LIVE = (3, 5)
-_POLICY_MODE = {"blueprint": 0, "fold": 1, "nit": 2, "uniform": 3}
+_POLICY_MODE = {"blueprint": 0, "fold": 1, "nit": 2, "uniform": 3, "station": 4}
 
 # Calibration policy modes need no snapshot; blueprint needs the real abstraction masks.
 MODE_BLUEPRINT = 0
 MODE_FOLD = 1
 MODE_NIT = 2
 MODE_UNIFORM = 3
+MODE_STATION = 4
 
 
 # --------------------------------------------------------------------------- #
@@ -194,7 +195,8 @@ def _per_seat_dict(out) -> dict:
 def lbr6_exploitability_native(snapshot, cfg: LBR6Config | None = None, *,
                                policy: str = "blueprint", depth_edges=None) -> LBR6Result:
     """Native 6-max LBR lower bound. `policy`: 'blueprint' (real) or a calibration ref
-    ('fold' ~ +128 bb/100, 'nit', 'uniform'). Mirrors `lbr6_exploitability`'s 6-max convention
+    ('fold' ~ +128 bb/100, 'station' ~ +1400 bb/100, 'nit', 'uniform'). Mirrors
+    `lbr6_exploitability`'s 6-max convention
     (occupancy = first n_seats live, random button, LBR seat = h % n_seats).
 
     `depth_edges`: pass the trained blueprint's depth-bucket edges (e.g. [50,90,140]) for a

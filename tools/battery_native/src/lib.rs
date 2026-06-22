@@ -12,6 +12,7 @@ pub mod core;
 pub mod emd;
 pub mod fingerprint;
 pub mod icm;
+pub mod leduc;
 pub mod lbr;
 pub mod nnet;
 pub mod phe_tables;
@@ -639,7 +640,7 @@ mod py {
         }
 
         /// Serve the tabular policy for one (state, seat) -- the blueprint/calibration cross-check entry.
-        /// `policy_mode`: 0 blueprint, 1 fold, 2 nit, 3 uniform.
+        /// `policy_mode`: 0 blueprint, 1 fold, 2 nit, 3 uniform, 4 calling-station.
         fn serve(&self, state: &[u8], seat: usize, policy_mode: u8) -> Vec<f64> {
             let s = flat::from_flat(&bytes_to_flat(state));
             let policy = TabularPolicy {
@@ -654,7 +655,8 @@ mod py {
         }
 
         /// Run the LBR. `roots` is a contiguous int64-LE blob of `lbr_seats.len()` flat EnvStates.
-        /// `policy_mode`: 0 blueprint, 1 always-fold, 2 nit, 3 uniform (1-3 are harness calibration).
+        /// `policy_mode`: 0 blueprint, 1 always-fold, 2 nit, 3 uniform, 4 calling-station
+        /// (1-4 are harness calibration policies).
         #[allow(clippy::too_many_arguments)]
         fn lbr_tabular(
             &self,
@@ -792,6 +794,99 @@ mod py {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Native Leduc CFR+ trainer (Workstream F: the "native Rust trainer" acceptance, tabular path).
+    // The whole train -> exact infoset-BR exploitability -> checkpoint/resume loop runs natively.
+    // Equivalence-gated vs the Python reference (leduc_tabular_cfr.py) by tests/test_native_leduc_cfr.py.
+    // -----------------------------------------------------------------------
+    use crate::leduc;
+
+    /// Durable native Leduc CFR+ trainer. Holds the regret/strategy tables; `train` continues from the
+    /// last iteration, `exploitability` returns the EXACT infoset-BR number (mbb), and `save_bytes`/
+    /// `load_bytes` give atomic checkpoint/resume (Python writes the bytes to disk via os.replace).
+    #[pyclass]
+    struct LeducCFRTrainer {
+        tab: leduc::Tables,
+    }
+
+    #[pymethods]
+    impl LeducCFRTrainer {
+        #[new]
+        fn new() -> Self {
+            LeducCFRTrainer { tab: leduc::Tables::default() }
+        }
+
+        /// Run `iterations` CFR+ sweeps (continuing from where the trainer left off).
+        fn train(&mut self, py: Python<'_>, iterations: u64) {
+            py.detach(|| leduc::train(&mut self.tab, iterations));
+        }
+
+        /// Iterations completed so far.
+        fn iters_done(&self) -> u64 {
+            self.tab.iters_done
+        }
+
+        /// Exact information-set BR exploitability (mbb) of the current average strategy:
+        /// (expl_mbb, u0, u1, br0, br1). Matches `leduc_tabular_cfr.infoset_exploitability_mbb`.
+        fn exploitability(&self, py: Python<'_>) -> (f64, f64, f64, f64, f64) {
+            py.detach(|| {
+                let avg = leduc::average_strategy(&self.tab);
+                leduc::infoset_exploitability_mbb(&avg)
+            })
+        }
+
+        /// Serve the average strategy at one (own_card, public, round, to_call, raises, hist, seat).
+        /// Cross-check entry: returns the 3-action distribution for the matching infoset (uniform-over-
+        /// legal if unseen). `hist` is the action sequence (ints in 0..3).
+        #[pyo3(signature = (seat, own_card, public, round, to_call, raises, hist))]
+        fn serve(
+            &self,
+            seat: i64,
+            own_card: i64,
+            public: i64,
+            round: i64,
+            to_call: i64,
+            raises: i64,
+            hist: Vec<i64>,
+        ) -> Vec<f64> {
+            let mut key: Vec<i64> =
+                vec![seat, own_card, public, round, to_call, raises, hist.len() as i64];
+            key.extend_from_slice(&hist);
+            let avg = leduc::average_strategy(&self.tab);
+            match avg.get(&key) {
+                Some(row) => row.to_vec(),
+                None => {
+                    // uniform over the 2 (preflop) / variable legal -- caller masks; return uniform-3.
+                    vec![1.0 / 3.0; leduc::NUM_ACTIONS]
+                }
+            }
+        }
+
+        /// Atomic-checkpoint payload: a versioned byte blob of the regret/strategy tables. Python writes
+        /// it to a temp file and `os.replace`s it onto the checkpoint path (atomic on the same volume).
+        fn save_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+            PyBytes::new(py, &leduc::serialize(&self.tab))
+        }
+
+        /// Resume from a `save_bytes` blob: rebuilds the tables and re-derives the per-sweep strategy so
+        /// continuing the solve reproduces a straight-through run. Returns True on success.
+        fn load_bytes(&mut self, blob: &[u8]) -> bool {
+            match leduc::deserialize(blob) {
+                Some(t) => {
+                    self.tab = t;
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
+    /// One-shot: train from scratch for `iterations` and return exploitability — the gate entry point.
+    #[pyfunction]
+    fn leduc_solve_exploitability(py: Python<'_>, iterations: u64) -> (f64, f64, f64, f64, f64) {
+        py.detach(|| leduc::solve_and_exploitability(iterations))
+    }
+
     /// `icm_equity(stacks, payouts)` -> per-seat $-equity (Malmuth-Harville). Pool-conserving.
     /// Cross-checked against `pokerbot.tournament.icm.icm_equity` by `tests/test_native_icm_equiv.py`.
     #[pyfunction]
@@ -910,6 +1005,7 @@ mod py {
         m.add_function(wrap_pyfunction!(fingerprint_fast_depth, m)?)?;
         m.add_function(wrap_pyfunction!(eval_seven_phe, m)?)?;
         m.add_function(wrap_pyfunction!(multiway_equity_river, m)?)?;
+        m.add_function(wrap_pyfunction!(leduc_solve_exploitability, m)?)?;
         m.add_function(wrap_pyfunction!(icm_equity, m)?)?;
         m.add_function(wrap_pyfunction!(bubble_factor, m)?)?;
         m.add_function(wrap_pyfunction!(icm_delta, m)?)?;
@@ -923,6 +1019,7 @@ mod py {
         m.add_class::<Lbr6Harness>()?;
         m.add_class::<LbrNeuralHarness>()?;
         m.add_class::<Lbr6Out>()?;
+        m.add_class::<LeducCFRTrainer>()?;
         Ok(())
     }
 }
