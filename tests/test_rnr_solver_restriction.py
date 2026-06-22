@@ -107,6 +107,40 @@ def test_rnr_off_ignores_stability_inputs():
     assert np.array_equal(s_plain, s_with), "rnr_restrict=False must ignore opponent_stability/opponent_n_live"
 
 
+def test_profile_stability_from_fast_slow_divergence():
+    from pokerbot.opponent.bayes_exploit import profile_stability
+
+    # no maintained dual-EWMA data => trust the read (stability 1.0)
+    assert profile_stability(OpponentStats()) == 1.0
+    # fast == slow (no gear change) => stable
+    ck = "flop|dry|facing_bet"
+    steady = OpponentStats(ctx_fast={ck: [10.0, 10.0, 10.0, 10.0]},
+                           ctx_slow={ck: [10.0, 10.0, 10.0, 10.0]})
+    assert profile_stability(steady) == 1.0
+    # fast strongly diverged from slow with ample fast evidence => caught adapting => stability << 1
+    adapt = OpponentStats(ctx_fast={ck: [40.0, 0.0, 0.0, 0.0]},
+                          ctx_slow={ck: [10.0, 10.0, 10.0, 10.0]})
+    s = profile_stability(adapt)
+    assert 0.0 <= s < 0.5, f"a hard gear-change must collapse stability, got {s}"
+
+
+def test_profile_stability_drives_the_solver_clamp():
+    # end-to-end: the SAME station read, but one profile also shows a fast/slow gear change -> the derived
+    # stability shrinks the modeled deviation vs the steady profile, all via profile_stability (no tracker).
+    from pokerbot.opponent.bayes_exploit import profile_stability
+
+    env, legal, regrets, villain, station = _FIX
+    cfg_on = TurboReBeLConfig(max_depth=2, rnr_restrict=True)
+    base = _solve(TurboReBeLConfig(max_depth=2, rnr_restrict=False), None)
+    steady_stab = {villain: 1.0}
+    adapt_stab = {villain: 0.0}
+    s_steady = _solve(cfg_on, {villain: station}, stability=steady_stab, n_live=6)
+    s_adapt = _solve(cfg_on, {villain: station}, stability=adapt_stab, n_live=6)
+    assert _dev(s_adapt, base) < _dev(s_steady, base) - 1e-9
+    # and profile_stability yields exactly such a scalar from a real profile
+    assert 0.0 <= profile_stability(station) <= 1.0
+
+
 def test_rnr_n_live_fallback_from_model_size():
     cfg = TurboReBeLConfig(rnr_restrict=True)
     solv = TurboReBeLSolver(MockHistoryValueEvaluator(), cfg, opponent_model={1: None, 2: None, 3: None})

@@ -281,6 +281,15 @@ class SearchAgent:
         ``None`` disables both — the zero-deviation arm."""
         self._opponent_profiles = profiles
         self.solver.opponent_model = profiles
+        # RNR restriction inputs (#28): per-seat stability from each profile's own fast/slow divergence,
+        # so a caught adapter collapses the solver's modeled deviation toward CAP_FLOOR. No-op unless
+        # config.rnr_restrict is on; N falls back to the model size (_rnr_n_live) when opponent_n_live unset.
+        if profiles and getattr(self.solver.config, "rnr_restrict", False):
+            from pokerbot.opponent.bayes_exploit import profile_stability
+            self.solver.opponent_stability = {
+                s: profile_stability(p) for s, p in profiles.items() if p is not None}
+        else:
+            self.solver.opponent_stability = None
 
     def _apply_root_mixer(self, state: GameState, seat: int, probs: np.ndarray) -> np.ndarray:
         """Delegate to the shared root mixer (pokerbot.opponent.root_mixer) — the validated
