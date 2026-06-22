@@ -371,6 +371,65 @@ class Suite:
         else:
             print("VALUEEXTRACT ALL-FAILED — no DONE marker (check FAIL_*.log)\n" + body, flush=True)
 
+    # ---- RNR restriction validation (#29): the solver RNR cap's crush-retention vs the fishy field ----
+    _RNR_FIELDS = ("soft_table", "realistic_table", "pro_table")
+    _RNR_ARMS = (("off", {"POKERBOT_RNR_SOLVER_EVAL": "0"}),
+                 ("on", {"POKERBOT_RNR_SOLVER_EVAL": "1"}))
+
+    def rnr_validation_jobs(self) -> list[tuple[str, list[str], dict | None]]:
+        """Per (field, RNR-arm, seed): the pluribus frozen-BR + overlays exploit A/B with the SOLVER RNR
+        restriction OFF (POKERBOT_RNR_SOLVER_EVAL=0) vs ON (=1), per-seat profiles. Comparing exploit_bb
+        across arms measures how much of the crush the 0.5 6-max RNR cap RETAINS vs the soft/realistic
+        field (the over-clamp probe) and the pro-table safety. Each cell self-uploads rnr_<arm>_<field>_
+        s<seed>.json and is resumable (S3 skip)."""
+        a, jobs = self.a, []
+        it = int(getattr(a, "rnr_iters", 150))
+        for field in self._RNR_FIELDS:
+            for arm, env in self._RNR_ARMS:
+                for seed in range(a.seeds):
+                    n = f"rnr_{arm}_{field}_s{seed}"
+                    cmd = battery_cmd(RUNS / f"{n}.json", hero="pluribus", arch=field, seed=seed,
+                                      hands=a.hands, bp=a.bp, is_field=True, per_seat=True,
+                                      iters=it, leaf="uniform",
+                                      extra=("--frozen-br", "--root-mixer", "--root-mixer-unopened"))
+                    jobs.append((n, cmd, dict(env)))
+        return jobs
+
+    def run_rnr_validation(self) -> None:
+        a = self.a
+        jobs = self.rnr_validation_jobs()
+        print(f"rnr_validation: {len(jobs)} jobs ({len(self._existing)} already in S3)", flush=True)
+        with ThreadPoolExecutor(max_workers=a.workers) as ex:
+            list(ex.map(lambda j: self.run_job(*j), jobs))
+        fields = {}
+        for field in self._RNR_FIELDS:
+            arms = {}
+            for arm, _ in self._RNR_ARMS:
+                p = self.pool_absolute(f"rnr_{arm}_{field}_s*.json", field)
+                if p:
+                    arms[arm] = p
+            if "off" in arms and "on" in arms:
+                off_u, on_u = arms["off"]["uplift_bb"], arms["on"]["uplift_bb"]
+                arms["rnr_uplift_retained_frac"] = (on_u / off_u) if abs(off_u) > 1e-9 else None
+                arms["rnr_uplift_delta_bb"] = on_u - off_u
+            if arms:
+                fields[field] = arms
+        summary = {"mode": "rnr_validation", "hands": a.hands, "seeds": a.seeds,
+                   "iters": int(getattr(a, "rnr_iters", 150)), "fields": fields,
+                   "note": ("base_bb=pure base, exploit_bb=base+exploit (the crush), uplift_bb=exploit-base. "
+                            "off vs on: ON retaining most of OFF's uplift => the RNR cap does NOT over-clamp "
+                            "the fishy field (default-ON live is safe); a large drop on soft/realistic => "
+                            "over-clamp (ship the per-punisher effective-N, task #32). pro_table: ON should "
+                            "be <= OFF (the cap reduces exposure vs strong fields).")}
+        body = json.dumps(summary, indent=1, default=str)
+        self.s3.put_object(Bucket=a.bucket, Key=f"{self.rk}/SUMMARY.json", Body=body.encode())
+        if fields:
+            self.s3.put_object(Bucket=a.bucket, Key=f"{a.prefix}/eval_suite_DONE.marker",
+                               Body=time.strftime("%Y-%m-%d %H:%M:%S").encode())
+            print("RNR_VALIDATION DONE\n" + body, flush=True)
+        else:
+            print("RNR_VALIDATION ALL-FAILED - no DONE marker (check FAIL_*.log)\n" + body, flush=True)
+
     # ---- LBR6: certified 6-max best-response exploitability of the blueprint foundation ----
     # GRADED Lisy-Bowling protocol: sweep the action menu (fc floor / fcpa / full) to map HOW the exploit
     # grows with the adversary's betting options, with a per-seat deviation-gain breakdown. One cell per
@@ -643,6 +702,9 @@ class Suite:
         if getattr(self.a, "mode", "full") == "lbr6":
             self.run_lbr6()
             return
+        if getattr(self.a, "mode", "full") == "rnr_validation":
+            self.run_rnr_validation()
+            return
         a = self.a
         jobs = self.phase_a_jobs()
         print(f"phase A: {len(jobs)} jobs ({len(self._existing)} results already in S3)", flush=True)
@@ -687,8 +749,12 @@ def main() -> None:
     ap.add_argument("--seeds", type=int, default=18)
     ap.add_argument("--hands", type=int, default=3000)
     ap.add_argument("--bp", default="/tmp/bp6max_v2_iter200.pkl")
+    ap.add_argument("--rnr-iters", type=int, default=150,
+                    help="--mode rnr_validation: pluribus solve iterations per decision (>=100 so the "
+                         "frozen-BR exploit actually fires; the local 300ms/12-iter pilot was too starved)")
     ap.add_argument("--mode",
-                    choices=("full", "confirm", "hybrid", "basestrength", "valueextract", "lbr6"),
+                    choices=("full", "confirm", "hybrid", "basestrength", "valueextract", "lbr6",
+                             "rnr_validation"),
                     default="full",
                     help="full = P0+sweep+priorAB+gate+phaseB; confirm = read-gated mixer ON vs "
                          "pure-search OFF (G1 verification); hybrid = HybridAgent production hero "

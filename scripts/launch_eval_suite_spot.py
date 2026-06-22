@@ -192,7 +192,7 @@ def main() -> None:
     p.add_argument("--run-subdir", default="run_evalsuite1")
     p.add_argument("--mode",
                    choices=("full", "confirm", "hybrid", "calibrate", "basestrength", "valueextract",
-                            "lbr6"),
+                            "lbr6", "rnr_validation"),
                    default="full")
     p.add_argument("--bucket", default=DEFAULT_BUCKET)
     p.add_argument("--prefix", default=DEFAULT_PREFIX)
