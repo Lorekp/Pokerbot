@@ -249,9 +249,13 @@ def derive_hand_stats(record: dict) -> dict[str, dict]:
         fold_to_cbet = False
         if cbet_idx is not None and cbet_key != key:
             post_cbet = [a for i, a in iacts if a.get("street") == "flop" and i > cbet_idx]
-            if post_cbet:
+            # ingestion audit #6: a SERVER AUTO (timeout / sit-out / disconnect) fold facing the c-bet is
+            # NOT a fold-to-c-bet DECISION — counting it would mis-read a timed-out player as a sticky-
+            # avoiding over-folder (and wrongly tighten the toughness read). Drop the whole observation
+            # when the first post-c-bet action was an auto-fold; a deliberate fold/call still counts.
+            if post_cbet and not (post_cbet[0].get("type") == "fold" and post_cbet[0].get("auto")):
                 cbet_faced = True
-                fold_to_cbet = any(a.get("type") == "fold" for a in post_cbet)
+                fold_to_cbet = any(a.get("type") == "fold" and not a.get("auto") for a in post_cbet)
 
         out[key] = {
             "hands": 1,
