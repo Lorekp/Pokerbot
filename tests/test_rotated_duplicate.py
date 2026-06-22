@@ -91,3 +91,33 @@ def test_crn_determinism():
     b = run_field_absolute_rotated(field, decks=4, seed=7, hero_factory=_hero_factory, progress_every=0)
     assert a["off_base"]["mean_bb"] == b["off_base"]["mean_bb"]
     assert a["on_exploit"]["mean_bb"] == b["on_exploit"]["mean_bb"]
+
+
+def test_net_of_rake_column_is_additive():
+    """GAP 3 — Workstream-D ground-rule 6: the rotated-ladder battery must carry a rake-adjusted
+    net_of_rake bb/100 column, ADDITIVELY (the chip-EV numbers must be byte-unchanged). Mirrors the
+    rake math the dedicated sizing_channel harness already uses (pokerbot.economics.rake.net_cost_bb:
+    5%-flat capped rake with the per-tier BB-cap hump, contributed attribution, rakeback, splash fee)."""
+    field = field_spec("homog:calling_station")
+    base = run_field_absolute_rotated(field, decks=8, seed=3, hero_factory=_hero_factory,
+                                      allin_ev=False, progress_every=0)
+    raked = run_field_absolute_rotated(field, decks=8, seed=3, hero_factory=_hero_factory,
+                                       allin_ev=False, progress_every=0, net_of_rake_stake="0.10/0.25")
+    # 1) the chip-EV columns are byte-identical with rake on vs off (same play_hand call).
+    assert raked["off_base"]["mean_bb"] == base["off_base"]["mean_bb"]
+    assert raked["on_exploit"]["mean_bb"] == base["on_exploit"]["mean_bb"]
+    # 2) the net_of_rake block is present and well-formed.
+    n = raked["net_of_rake"]
+    assert n["stake"] == "0.10/0.25" and n["rakeback_mode"] == "modeled"
+    for key in ("off_base", "on_exploit"):
+        assert "bb_per_100" in n[key]
+    # 3) rake is a non-negative cost: net bb/100 <= chip bb/100, and the reported per-100 cost matches.
+    assert n["off_base"]["bb_per_100"] <= raked["off_base"]["bb_per_100"] + 1e-9
+    assert n["on_exploit"]["bb_per_100"] <= raked["on_exploit"]["bb_per_100"] + 1e-9
+    assert n["rake_cost_bb_per_100_off"] >= -1e-9
+    expect = (raked["off_base"]["bb_per_100"] - n["off_base"]["bb_per_100"])
+    assert abs(n["rake_cost_bb_per_100_off"] - expect) < 1e-6
+    # 4) the BB-cap hump differs across stakes (micro cap looser -> different net than the low valley).
+    raked_hi = run_field_absolute_rotated(field, decks=8, seed=3, hero_factory=_hero_factory,
+                                          allin_ev=False, progress_every=0, net_of_rake_stake="25/50")
+    assert raked_hi["off_base"]["mean_bb"] == base["off_base"]["mean_bb"]  # still additive

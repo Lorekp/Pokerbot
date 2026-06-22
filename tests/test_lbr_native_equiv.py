@@ -50,6 +50,62 @@ def test_calibration_fold_hu():
     assert 680.0 <= r.mbb_per_g <= 820.0, f"fold HU {r.mbb_per_g:+.0f} mbb/g off anchor +750"
 
 
+def test_calibration_station_6max():
+    """GAP 1 — the station ~ +1400 calibration leg, previously DOC-ONLY (artifacts/
+    lbr6_6max_exploitability.md:208 + :303 cite "station +1400"; :121 +1500; :80 +1937; :159 +833 — a
+    noisy, high-variance point estimate of the *value-betting competence* control). Made a runnable,
+    asserted cell: the native analytic LBR vs the deterministic calling-STATION policy (CALL-if-legal-
+    else-CHECK-else-FOLD; mirrors `scripts/lbr6_audit.py::_station_policy`, native MODE_STATION=4 in
+    `tools/battery_native/src/lbr.rs`) must DEMOLISH the station by many hundreds of bb/100.
+
+    Band documented from the native estimator (this build, python-feature lib, full bet menu [4,7,10],
+    8000 hands/seed): the native LBR REPRODUCES the markdown +1400/+1500 anchor — per-seed it lands
+    +1320 (seed0, CI +-189) / +1464 (seed1, CI +-197) / +1563 (seed2, CI +-202), centred ~ +1450, fully
+    consistent with artifacts/lbr6_6max_exploitability.md's +1400 (:208,:303) and +1500 (:121). The
+    Python `lbr6` reference (the markdown source) is far noisier still (+1937 / +833 across runs) — both
+    are valid lower bounds. The asserted band [1000, 1850] brackets every observed seed +- its 95% CI and
+    certifies the qualitative anchor: a competent best-responder relentlessly value-bets a calling
+    station to ~ +1400 bb/100, the leak-detection control of the markdown's §3 contrast."""
+    from pokerbot.eval import lbr_native as L
+
+    r = L.lbr6_exploitability_native(None, LBR6Config(hands=8000, seed=0, n_seats=6), policy="station")
+    ci = 1.96 * r.stderr_bb_per_hand * 100.0
+    # station must crush far above the foldbot anchor (+128): a distinct VALUE-betting leak, not steal.
+    assert r.bb_per_100 > 900.0, (
+        f"station {r.bb_per_100:+.1f} bb/100 — LBR failed to crush the value leak (must be >>+128 fold)")
+    assert 1000.0 <= r.bb_per_100 <= 1850.0, (
+        f"station {r.bb_per_100:+.1f} bb/100 off the native ~+1400 anchor band [1000,1850] "
+        f"(doc markdown +1400/+1500, lbr6_6max_exploitability.md:208/:121)")
+    assert ci < 250.0, f"station calibration CI unexpectedly wide ({ci:.1f}) at 8k hands"
+
+
+def test_calibration_hu_shallow_fold_anchor():
+    """GAP 2 — the HU-shallow (tournament-finals) anchor, previously only PLUMBING (stack_bb/ante_bb
+    threaded but never recorded/asserted). The native HU always-fold LBR at shallow depths (10/25/50bb)
+    with ante=0.125 steals the dead blinds + ante; the steal value (mbb/g) is depth-INVARIANT in HU, so
+    all three depths land on the SAME anchor. The ante lifts it above the deep no-ante +750 anchor
+    (test_calibration_fold_hu) by the dead ante it collects -> ~ +870 mbb/g. Values + band recorded in
+    artifacts/hu_shallow_lbr_anchor.json (regenerate from that script if the engine ante math changes)."""
+    import json
+    import os
+
+    from pokerbot.eval import lbr_native as L
+
+    art = os.path.join(os.path.dirname(__file__), "..", "artifacts", "hu_shallow_lbr_anchor.json")
+    with open(art) as f:
+        rec = json.load(f)
+    lo, hi = rec["asserted_band_mbb_per_g"]
+    for depth in (10.0, 25.0, 50.0):
+        cfg = LBRConfig(hands=8000, seed=0, stack_bb=depth, ante_bb=0.125)
+        r = L.lbr_hu_tabular_native(None, cfg, policy="fold")
+        assert lo <= r.mbb_per_g <= hi, (
+            f"HU-shallow fold {depth:g}bb ante=0.125: {r.mbb_per_g:+.0f} mbb/g off band [{lo},{hi}]")
+        # cross-check the recorded artifact value matches this run (within the tight fold CI).
+        recorded = rec["shallow_anchors"][f"{depth:g}bb"]["mbb_per_g"]
+        assert abs(r.mbb_per_g - recorded) <= 20.0, (
+            f"HU-shallow {depth:g}bb: live {r.mbb_per_g:+.0f} drifted from artifact {recorded:+.0f} mbb/g")
+
+
 def test_native_matches_python_fold_6max_ci_overlap():
     """Native and Python lbr6 must agree within their combined 95% CI on the shared fold policy."""
     from pokerbot.eval import lbr_native as L
