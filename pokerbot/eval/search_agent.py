@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -77,6 +78,11 @@ class SearchAgent:
                     # the preflop eliminates it (+180 -> <=0). Deployed paths pass True. Default False
                     # keeps the eval/battery (and the basestrength +9.1 baseline) reproducible.
                     search_preflop=search_preflop,
+                    # RNR-restrict the solver BR (#28). Default OFF in eval (byte-identical baselines);
+                    # POKERBOT_RNR_SOLVER_EVAL=1 enables the A/B that validates the restriction on the
+                    # search path (set_opponent_profiles then feeds per-seat stability). Live is ON via
+                    # the bridge's own POKERBOT_RNR_SOLVER gate.
+                    rnr_restrict=os.environ.get("POKERBOT_RNR_SOLVER_EVAL", "0") not in ("0", "", "false", "False"),
                 ),
             )
         else:
