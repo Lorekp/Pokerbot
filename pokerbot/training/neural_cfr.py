@@ -1378,6 +1378,7 @@ def save_trainer_checkpoint(trainer: VRDeepPDCFRPlusTrainer, path: str | Path,
     while the reservoir snapshot is taken less often (a slightly stale reservoir on resume is fine; it
     is a slowly-changing sample). Returns the promoted full-checkpoint path."""
 
+    import os
     import pickle
 
     path = Path(path)
@@ -1408,6 +1409,9 @@ def save_trainer_checkpoint(trainer: VRDeepPDCFRPlusTrainer, path: str | Path,
     }
     with full_path.open("wb") as f:
         pickle.dump(full_payload, f)
+        f.flush()
+        os.fsync(f.fileno())   # data durable BEFORE _atomic_save's os.replace -> survives a power cut
+                               # (2026-06-23: a power-cut zeroed this file's tail; rename alone is not enough)
 
     if include_buffers:
         # R2: the reservoirs the served avg-strategy + VR-baseline nets train on (incl. reservoir count).
@@ -1418,6 +1422,8 @@ def save_trainer_checkpoint(trainer: VRDeepPDCFRPlusTrainer, path: str | Path,
         }
         with _buffers_path(path).open("wb") as f:
             pickle.dump(buf_payload, f)
+            f.flush()
+            os.fsync(f.fileno())
     return full_path
 
 
@@ -1445,8 +1451,15 @@ def _atomic_save_trainer_checkpoint(trainer: VRDeepPDCFRPlusTrainer, path: str |
     return final_full
 
 
-def load_trainer_checkpoint(path: str | Path) -> VRDeepPDCFRPlusTrainer:
-    """Load a full trainer checkpoint for resume."""
+def load_trainer_checkpoint(path: str | Path, env: "EnvSpec | None" = None) -> VRDeepPDCFRPlusTrainer:
+    """Load a full trainer checkpoint for resume.
+
+    ``env`` pins the game spec the trainer is rebuilt with. Pass it for any game whose ``num_players``
+    differs from the 6-max default (e.g. ``nlhe-7max``): the trainer's per-seat advantage buffers are
+    sized from ``env.num_players`` in ``__init__``, so a 7-max checkpoint loaded with the default 6-max
+    env would build only 6 advantage buffers while restoring 7 per-seat nets -> an index error on the
+    7th traverser. Defaulting to None keeps the 6-max / HU resume path byte-identical (both num_players=6).
+    """
 
     import pickle
 
@@ -1507,6 +1520,7 @@ def load_trainer_checkpoint(path: str | Path) -> VRDeepPDCFRPlusTrainer:
                        if prev_saved is not None else None)
     return VRDeepPDCFRPlusTrainer(
         cfg,
+        env=env,
         start_iteration=int(payload["iteration"]),
         prng_key=jnp.asarray(payload["prng_key"]),
         cum_states=cum_states,
