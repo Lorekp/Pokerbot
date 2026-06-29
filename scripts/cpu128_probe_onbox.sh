@@ -61,48 +61,47 @@ printf 'kernel.perf_event_paranoid=-1\nkernel.kptr_restrict=0\n' > /etc/sysctl.d
 sysctl --system || true
 sysctl -w kernel.perf_event_max_sample_rate=10000 || true
 
-# ---------------------------------------------------------------------------- BUILD (debug-symbol'd v3) — TWO .so for the PHE A/B
+# ---------------------------------------------------------------------------- BUILD (debug-symbol'd v3) — TWO .so for the f32_regret A/B
 # KEEP -C target-cpu=x86-64-v3 (must match production codegen — the profiled binary IS the shipping
 # binary). debuginfo=2 -> DWARF symbol names for inlined leaves; force-frame-pointers -> cheap --call
 # -graph fp unwind; strip=none -> keep the symtab. Cargo.toml is NOT edited (firewall-clean; lto=fat /
 # codegen-units=1 / panic=abort stay production).
 #
-# The PHE showdown-swap A/B needs TWO binaries from the SAME crate via the `phe_showdown` feature gate:
-#   phe-ON  = DEFAULT features (default=['phe_showdown']) -> perfect-hash fingerprint::evaluate_cards
-#   phe-OFF = --no-default-features --features python      -> 21-combo brute-force core::evaluate_seven baseline
-# Both keep target-cpu=x86-64-v3 + debuginfo. The driver imports a FIXED /opt/pokerbot/battery_native.so,
-# so the A/B is done by building BOTH once and per-shape COPYING the chosen flavor over that fixed path
-# before launching the (fresh-process) driver — NO driver change.
+# The f32_regret A/B needs TWO binaries from the SAME crate via the `f32_regret` feature gate, both with the
+# production-default features (phe_showdown + phe_site1) so ONLY the persistent regret-row precision differs:
+#   f64 (baseline) = DEFAULT features              -> persistent cum_regret rows are [f64;11]
+#   f32 (lever)    = --features python,f32_regret  -> persistent cum_regret rows are [f32;11] (strat_sum stays f64)
+# Both keep target-cpu=x86-64-v3 + debuginfo. The driver imports a FIXED /opt/pokerbot/battery_native.so, so
+# the A/B is done by building BOTH once and per-shape COPYING the chosen flavor over that fixed path before
+# launching the (fresh-process) driver — NO driver change. This measures whether halving the cum_regret read/
+# write bytes relieves the 128t memory-contention the prior attribution probe (probe_1782704164) certified.
 export PYO3_PYTHON="$(python3 -c 'import sys;print(sys.executable)')"
 export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
 RF='-C target-cpu=x86-64-v3 -C force-frame-pointers=yes -C debuginfo=2 -C strip=none'
-# phe-ON (DEFAULT features include phe_showdown) — the PRODUCTION showdown path being certified.
-RUSTFLAGS="$RF" cargo build --release --features python --lib --manifest-path tools/battery_native/Cargo.toml || { echo "BUILD_FAIL_PHE_ON"; marker BUILD_FAIL "phe-ON cargo build failed"; exit 1; }
+# f64 baseline (DEFAULT features) — the production regret precision; the REGIME-GATE binary (perf-statted 128t).
+RUSTFLAGS="$RF" cargo build --release --features python --lib --manifest-path tools/battery_native/Cargo.toml || { echo "BUILD_FAIL_F64"; marker BUILD_FAIL "f64 cargo build failed"; exit 1; }
 SO_ON="$(ls tools/battery_native/target/release/libbattery_native.so 2>/dev/null || ls tools/battery_native/target/release/battery_native.so 2>/dev/null)"
 cp "$SO_ON" /opt/pokerbot/battery_native_phe_on.so
-# ab_stub (--features python,ab_stub keeps DEFAULT features = post-site-1 phe ON, ADDS the attribution stubs).
-# The ATTRIBUTION harness: env POKERBOT_AB_STUB neutralizes ONE profile-twin phase (emd_const / emd_nomemo /
-# regret_zero / showdown_const) for the STEP-2 S_emd nodes/s A/B. The default build (phe-on) above is the REGIME
-# gate binary (perf-statted at 128t); this ab_stub build is the S_emd A/B binary.
-RUSTFLAGS="$RF" cargo build --release --features python,ab_stub --lib --manifest-path tools/battery_native/Cargo.toml || { echo "BUILD_FAIL_ABSTUB"; marker BUILD_FAIL "ab_stub cargo build failed"; exit 1; }
-SO_AB="$(ls tools/battery_native/target/release/libbattery_native.so 2>/dev/null || ls tools/battery_native/target/release/battery_native.so 2>/dev/null)"
-cp "$SO_AB" /opt/pokerbot/battery_native_abstub.so
-ls -la /opt/pokerbot/battery_native_phe_on.so /opt/pokerbot/battery_native_abstub.so
-# Default the live import to PROD (phe-on, post-site-1) until the per-shape cp overrides it.
+# f32 lever (--features python,f32_regret keeps DEFAULT features = phe ON, ADDS the f32 cum_regret rows).
+RUSTFLAGS="$RF" cargo build --release --features python,f32_regret --lib --manifest-path tools/battery_native/Cargo.toml || { echo "BUILD_FAIL_F32"; marker BUILD_FAIL "f32 cargo build failed"; exit 1; }
+SO_F32="$(ls tools/battery_native/target/release/libbattery_native.so 2>/dev/null || ls tools/battery_native/target/release/battery_native.so 2>/dev/null)"
+cp "$SO_F32" /opt/pokerbot/battery_native_f32.so
+ls -la /opt/pokerbot/battery_native_phe_on.so /opt/pokerbot/battery_native_f32.so
+# Default the live import to the f64 baseline until the per-shape cp overrides it.
 cp /opt/pokerbot/battery_native_phe_on.so /opt/pokerbot/battery_native.so
-# BUILD_OK verify: debug_info present, PyInit resolves, AND prod vs ab_stub DIFFER (cmp -s non-zero = differ).
-# If byte-identical the ab_stub feature gate did nothing -> the S_emd A/B would be void, so DIFFER is required.
-AB_DIFFER=0; cmp -s /opt/pokerbot/battery_native_phe_on.so /opt/pokerbot/battery_native_abstub.so || AB_DIFFER=1
+# BUILD_OK verify: debug_info present, PyInit resolves, AND f64 vs f32 DIFFER (cmp -s non-zero = differ).
+# If byte-identical the f32_regret feature gate did nothing -> the A/B would be void, so DIFFER is required.
+AB_DIFFER=0; cmp -s /opt/pokerbot/battery_native_phe_on.so /opt/pokerbot/battery_native_f32.so || AB_DIFFER=1
 if file /opt/pokerbot/battery_native_phe_on.so | grep -q 'debug_info' \
-   && nm /opt/pokerbot/battery_native_abstub.so 2>/dev/null | grep -q 'PyInit_battery_native' \
+   && nm /opt/pokerbot/battery_native_f32.so 2>/dev/null | grep -q 'PyInit_battery_native' \
    && nm /opt/pokerbot/battery_native_phe_on.so 2>/dev/null | grep -q 'PyInit_battery_native' \
    && [ "$AB_DIFFER" = 1 ]; then
-  marker BUILD_OK "prod(phe-on) + ab_stub built; debug_info + PyInit_battery_native resolved + binaries DIFFER (S_emd A/B valid)"
+  marker BUILD_OK "f64 baseline + f32 lever built; debug_info + PyInit_battery_native resolved + binaries DIFFER (f32 A/B valid)"
 else
-  echo "BUILD_VERIFY_WARN: missing debug_info / PyInit symbol, or prod==ab_stub byte-identical (AB_DIFFER=$AB_DIFFER -> S_emd A/B void)"
+  echo "BUILD_VERIFY_WARN: missing debug_info / PyInit symbol, or f64==f32 byte-identical (AB_DIFFER=$AB_DIFFER -> f32 A/B void)"
   marker BUILD_OK "WARN: verify weak — AB_DIFFER=$AB_DIFFER; file/nm did not match"
 fi
-marker AB_BUILD "prod + ab_stub built; AB_DIFFER=$AB_DIFFER (1=valid; ab_stub feature flipped codegen)"
+marker AB_BUILD "f64 + f32 built; AB_DIFFER=$AB_DIFFER (1=valid; f32_regret feature flipped codegen)"
 
 # ---------------------------------------------------------------------------- FLAMEGRAPH TOOLCHAINS (both)
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -247,17 +246,16 @@ for SHAPE in "${SHAPE_ARR[@]}"; do
   unset RAYON_NUM_THREADS || true
   unset POKERBOT_AB_STUB || true
   SO_SEL=/opt/pokerbot/battery_native_phe_on.so
-  # ATTRIBUTION shapes (post-site-1). P1 = the STEP-1 REGIME GATE (prod 128t + the WINDOW-B perf-stat reads
-  # memory_bound=stalls_mem_any/cycles, IPC, L3-miss local/remote DRAM). SBASE/SEMD/SNOMEMO = the STEP-2 S_emd
-  # nodes/s A/B on the ab_stub build: SEMD/SNOMEMO vs SBASE = the 152MB frozen-lookup's contention-amplified
-  # contribution (emd_const subtractive; emd_nomemo ZERO-drift cross-check). POKERBOT_AB_STUB is exported into
-  # the (fresh-process) driver's env below.
+  # f32_regret A/B shapes (a 2x2: f64/f32 x rayon 128t/64t, all at the production EMD-K160 fanout N=1024). P1 =
+  # the STEP-1 REGIME GATE (f64 128t + the WINDOW-B perf-stat reads memory_bound=stalls_mem_any/cycles, IPC,
+  # L3-miss local/remote DRAM). PF32 = the SAME at 128t on the f32 build = THE A/B vs P1 (does halving cum_regret
+  # bytes lower stalls + raise nodes/s under 128t contention?). P3/PF32_64 = the 64t SMT cross-check pair. No
+  # POKERBOT_AB_STUB here (the attribution stubs were the prior probe; this run isolates the f32 precision lever).
   case "$SHAPE" in
-    P1)      N=1024; SO_SEL=/opt/pokerbot/battery_native_phe_on.so ;;                                       # REGIME GATE: prod (post-site-1) 128t + perf-stat
-    SBASE)   N=1024; SO_SEL=/opt/pokerbot/battery_native_abstub.so; export POKERBOT_AB_STUB=none ;;         # S_emd baseline nodes/s (ab_stub, no stub)
-    SEMD)    N=1024; SO_SEL=/opt/pokerbot/battery_native_abstub.so; export POKERBOT_AB_STUB=emd_const ;;     # S_emd: skip the 152MB frozen-lookup probe (subtractive)
-    SNOMEMO) N=1024; SO_SEL=/opt/pokerbot/battery_native_abstub.so; export POKERBOT_AB_STUB=emd_nomemo ;;    # zero-drift: force a real lookup EVERY postflop node
-    P3)      N=1024; SO_SEL=/opt/pokerbot/battery_native_phe_on.so; export RAYON_NUM_THREADS=64 ;;           # SMT-negative cross-check (prod 64t vs P1 128t)
+    P1)      N=1024; SO_SEL=/opt/pokerbot/battery_native_phe_on.so ;;                                       # REGIME GATE: f64 baseline 128t + perf-stat
+    PF32)    N=1024; SO_SEL=/opt/pokerbot/battery_native_f32.so ;;                                          # THE A/B vs P1: f32 cum_regret 128t + perf-stat
+    P3)      N=1024; SO_SEL=/opt/pokerbot/battery_native_phe_on.so; export RAYON_NUM_THREADS=64 ;;          # SMT cross-check: f64 baseline 64t (vs P1 128t)
+    PF32_64) N=1024; SO_SEL=/opt/pokerbot/battery_native_f32.so;    export RAYON_NUM_THREADS=64 ;;          # THE A/B vs P3: f32 cum_regret 64t
     *) echo "UNKNOWN SHAPE $SHAPE — skip"; continue ;;
   esac
   CAP="$WARMUP_CAP"; [ "$N" = 200 ] && CAP=600   # per-N cap (cosmetic; the driver's steady-detect is primary)
@@ -458,19 +456,20 @@ upload_one /var/log/probe/probe_env.txt probe_env.txt
   echo "--- per-shape ---"
   cat "$PROBE_SUMMARY"
   echo "--- per-decoder answerability ---"
-  echo "PHE_DIFFER=${PHE_DIFFER:-?} (1=feature gate flipped codegen -> A/B valid; 0=void)"
-  echo "--- PHE showdown-swap certification ---"
-  echo "THE CLINCHER A/B (phe-ON vs phe-OFF)     : ANSWERABLE (nodes/s + deals/s, P1-vs-P2 @128t, P3-vs-P4 @64t; PMU-immune). TWO independent sign reads (128t + 64t) replicate the +10.2% local warm gain."
-  echo "A/B SIGNIFICANCE (n=1 between-run noise)  : ANSWERABLE-FROM-DATA — the decoder MUST compute a within-window bootstrap CI on per-iter nodes/s (nodes / total_ms*1000) from the ~180 P1/P2 (and P3/P4) profileB.jsonl rows, and REQUIRE the +X% phe delta to EXCEED that CI before calling it certified. The prior probe flagged P(S3>S1)=0.648 / p10-p90 21-43M nodes/s, so a bare single-window delta is NOT sufficient. The 128t AND 64t pairs are two independent sign confirmations; a 5th replicate shape was deliberately NOT added (doubled fat-LTO build time would risk cutting later shapes inside the 5400s wall-guard)."
+  echo "F32_DIFFER=${AB_DIFFER:-?} (1=f32_regret feature flipped codegen -> A/B valid; 0=void)"
+  echo "--- f32_regret memory-traffic-relief certification ---"
+  echo "THE CLINCHER A/B (f64 vs f32 cum_regret)  : ANSWERABLE (nodes/s + deals/s, P1-vs-PF32 @128t, P3-vs-PF32_64 @64t; PMU-immune). 128t pair = the contention-regime read; 64t pair = the SMT cross-check."
+  echo "A/B SIGNIFICANCE (n=1 between-run noise)   : ANSWERABLE-FROM-DATA — the decoder MUST compute a within-window bootstrap CI on per-iter nodes/s (nodes / total_ms*1000) from the ~180 P1/PF32 (and P3/PF32_64) profileB.jsonl rows, and REQUIRE the f32 delta to EXCEED that CI before calling a speedup. EXPECT LOW-SINGLE-DIGIT (the f32 verdict: ~0-8%; the 152MB frozen EMD lookup is the bigger >L3 hog), so a null/marginal result is the EXPECTED outcome, not a failure."
+  echo "MEMORY-CONTENTION RELIEF (the mechanism)   : ANSWERABLE if PERF — does f32 LOWER cycle_activity.stalls_mem_any/cycle AND RAISE IPC AND RAISE nodes/s at 128t (P1 vs PF32 perfstat_vendor+portable)? Direct test of 'halving cum_regret bytes relieves the infoset-table memory traffic'. A bigger 128t gain than 64t (PF32_64 vs P3) corroborates a CONTENTION mechanism (the relief amplifies with thread count)."
   if [ "$PERF_AVAILABLE" = 1 ]; then
     echo "memory-latency-bound (IPC/backend-stall) : ANSWERABLE (perf: IPC + cycle_activity.stalls_mem_any + mem_load_l3_miss_retired.{local,remote}_dram)"
-    echo "compute-hidden-under-L3-stall test       : ANSWERABLE (did phe LOWER stalls_mem_any AND RAISE nodes/s, or was it hidden? P1 vs P2 perf delta)"
+    echo "compute-hidden-under-L3-stall test       : ANSWERABLE (did f32 LOWER stalls_mem_any AND RAISE nodes/s, or was it hidden? P1 vs PF32 perf delta)"
     echo "NEXT hot kernel (flamegraph)             : ANSWERABLE (P1 perf_top.txt + flame.svg widest non-showdown frame; expect EnvStateN copy or fingerprint probe). CHECK P1_PERF_RECORD_LIVE_SECS end=live before trusting the flamegraph (record runs FIRST in WINDOW B on a guaranteed-live steady process)."
   else
-    echo "memory-latency-bound (IPC/backend-stall) : NOT (perf unavailable on this box) -> PHE A/B clincher (nodes/s) still ANSWERABLE PMU-free; convergence test N/A"
+    echo "memory-latency-bound (IPC/backend-stall) : NOT (perf unavailable on this box) -> f32 A/B clincher (nodes/s) still ANSWERABLE PMU-free; mechanism test N/A"
     echo "NEXT hot kernel (flamegraph)             : NOT (perf unavailable) -> flamegraph N/A"
   fi
-  echo "SMT-sibling contention (rayon 64 vs 128)  : ANSWERABLE (P3-vs-P1 + P4-vs-P2 deals/s, no PMU)"
+  echo "SMT-sibling contention (rayon 64 vs 128)  : ANSWERABLE (P3-vs-P1 + PF32_64-vs-PF32 deals/s, no PMU)"
   echo "traverse collect-barrier imbalance       : ANSWERABLE (mpstat/pidstat, no PMU)"
   echo "128-thread allocator/atomic contention   : $([ "$PERF_AVAILABLE" = 1 ] && echo 'ANSWERABLE (flamegraph+%sys)' || echo 'PARTIAL (mpstat %sys + P3-vs-P1)')"
   echo "CloudWatch wall-average contamination    : ANSWERABLE (mpstat %idle/%steal vs in-process)"
