@@ -17,14 +17,52 @@ key misses (the train/serve skew :func:`check_blueprint_serve_env` guards) -- th
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import pickle
+from pathlib import Path
 
 import numpy as np
 
 from pokerbot.tournament.icm import bubble_factor
 
+_log = logging.getLogger(__name__)
+
 # action vocab: 0=fold, 1=check, 2=call, 3..10 = bets/raises (chip-committing)
 _COMMIT = np.array([i >= 2 for i in range(11)], dtype=bool)
+
+# Only snapshots rooted under these project-owned directories may be loaded. This is the
+# P0 pickle-RCE hardening called out in artifacts/REFUTE-TOURN-PROD.md §4.1: a path supplied
+# by a non-trusted caller (e.g. the live bridge) cannot pull arbitrary bytes into pickle.
+_SNAPSHOT_ROOTS = (
+    Path(__file__).resolve().parent.parent.parent / "data",  # <repo>/data
+    Path(__file__).resolve().parent.parent.parent / "checkpoints",  # <repo>/checkpoints
+    Path(__file__).resolve().parent.parent.parent / "artifacts",  # <repo>/artifacts
+)
+
+
+def _verify_snapshot_integrity(snapshot_path: Path) -> None:
+    """If `<snapshot>.sha256` sidecar exists, refuse to load on hash mismatch.
+
+    Mirrors the live-babysitter pattern (MEMORY task #594). If no sidecar is present we
+    log a single warning at construction time so an operator can add one for hardening
+    without blocking local dev.
+    """
+    sidecar = snapshot_path.with_suffix(snapshot_path.suffix + ".sha256")
+    if not sidecar.exists():
+        _log.warning("[deep_provider] no SHA-256 sidecar at %s; load is unguarded", sidecar)
+        return
+    expected = sidecar.read_text(encoding="utf-8").strip().split()[0].lower()
+    h = hashlib.sha256()
+    with open(snapshot_path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    actual = h.hexdigest()
+    if actual != expected:
+        raise ValueError(
+            f"[deep_provider] SHA-256 mismatch for {snapshot_path}: "
+            f"expected={expected[:16]}.. got={actual[:16]}.. (refusing to unpickle)"
+        )
 
 
 class BlueprintDeepProvider:
@@ -33,7 +71,16 @@ class BlueprintDeepProvider:
     def __init__(self, snapshot_path: str, *, client_bet_sizing: bool = True, strict: bool = False):
         from pokerbot.eval.lbr import check_blueprint_serve_env, make_blueprint_policy
         check_blueprint_serve_env(strict=strict)          # warn/raise on train/serve flag skew
-        snap = pickle.load(open(snapshot_path, "rb"))
+
+        resolved = Path(snapshot_path).resolve()
+        if not any(root.exists() and resolved.is_relative_to(root) for root in _SNAPSHOT_ROOTS):
+            raise ValueError(
+                f"[deep_provider] snapshot {resolved} is not under any project snapshot root "
+                f"({[str(r) for r in _SNAPSHOT_ROOTS]}) - refusing to unpickle"
+            )
+        _verify_snapshot_integrity(resolved)
+        with open(resolved, "rb") as fh:
+            snap = pickle.load(fh)
         if isinstance(snap, dict) and "strat_sum" in snap:
             snap = snap["strat_sum"]
         self._n_entries = len(snap)

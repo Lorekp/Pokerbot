@@ -98,16 +98,28 @@ def _try_load():
     global _EXT
     if os.environ.get("POKERBOT_NO_NATIVE_BATTERY"):
         return None
-    try:
-        import battery_native as ext  # already on sys.path
-        return ext
-    except Exception:  # noqa: BLE001
-        pass
     here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     rel = os.path.join(here, "tools", "battery_native", "target", "release")
     pyd = os.path.join(rel, "battery_native.pyd")
     dll = os.path.join(rel, "battery_native.dll")
     so = os.path.join(rel, "battery_native.so")
+    try:
+        import battery_native as ext  # already on sys.path
+        # A stale root/ABI-tagged .pyd can shadow a freshly rebuilt release dll before the fallback
+        # freshness check below gets a chance to copy dll -> pyd. If the release dll is newer than the
+        # imported extension, ignore this import and fall through to the explicit target loader.
+        ext_path = getattr(ext, "__file__", None)
+        if ext_path and os.path.exists(dll) and os.path.exists(ext_path):
+            if os.path.getmtime(dll) > os.path.getmtime(ext_path):
+                raise ImportError(
+                    f"stale battery_native extension {ext_path}; release dll is newer"
+                )
+        return ext
+    except Exception as _e:  # noqa: BLE001
+        if os.environ.get("POKERBOT_NATIVE_DEBUG"):
+            import traceback as _tb
+            print(f"[native_solver] import battery_native failed: {_e!r}\n{_tb.format_exc()}", flush=True)
+        pass
     try:
         # Refresh the .pyd from the freshly built .dll when the dll is newer (or the pyd is missing).
         # Without the mtime check a stale .pyd silently shadows a rebuilt .dll (e.g. after adding the
@@ -125,13 +137,18 @@ def _try_load():
             return None
         target = pyd if os.path.exists(pyd) else so
         import importlib.util
+        import sys
         spec = importlib.util.spec_from_file_location("battery_native", target)
         if spec is None or spec.loader is None:
             return None
         mod = importlib.util.module_from_spec(spec)
+        sys.modules["battery_native"] = mod
         spec.loader.exec_module(mod)
         return mod
-    except Exception:  # noqa: BLE001
+    except Exception as _e2:  # noqa: BLE001
+        if os.environ.get("POKERBOT_NATIVE_DEBUG"):
+            import traceback as _tb
+            print(f"[native_solver] importlib fallback failed: {_e2!r}\n{_tb.format_exc()}", flush=True)
         return None
 
 

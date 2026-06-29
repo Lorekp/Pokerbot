@@ -341,6 +341,14 @@ def insert_advantage_sample(
     legal_mask: Array,
     iteration: Array,
 ) -> LinearBufferState:
+    # 4.1 fix (CFR-AUDIT): clamp advantages to [-1, 1] at insert so a runaway regret value
+    # (e.g. a single infoset that was visited O(10^4) times) cannot dominate the network's
+    # MSE loss. The distillation loss in sd_cfr_nlhe._finish_iteration_after_traversal is
+    # ``MSE(logits, advantages) * mask`` — a single un-clipped outlier 100x the median scales
+    # the gradient 100x and the net never converges. Clamp is symmetric (the regret sign
+    # carries the "better than alternative" signal); the loss penalty for a saturated
+    # magnitude is a clean second-order regularizer, not a bias.
+    advantages = jnp.clip(advantages, -1.0, 1.0)
     sample = {
         "info_state": info_state,
         "advantages": advantages,

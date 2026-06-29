@@ -15,6 +15,8 @@ Constants/semantics are mirrored verbatim from ``jax_engine.py``, ``side_pots_ja
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 
 from pokerbot.engine.jax_engine import (
@@ -254,25 +256,36 @@ def score_five(ranks: np.ndarray, suits: np.ndarray) -> np.int32:
 # set per solve); a soft cap keeps memory bounded over a long eval without affecting results.
 _EVAL7_CACHE: dict[bytes, np.int32] = {}
 _EVAL7_CACHE_CAP = 1_000_000
+# CASH-ENGINE-AUDIT #275: thread-safe cache. Multiple CFR / eval threads can hit this; without the
+# lock, two threads can race the lookup-then-store and BOTH compute, but the dict.setitem itself is
+# GIL-protected so the only risk is wasted CPU (not a torn write). The lock keeps duplicate work to
+# one entry per cold key.
+_EVAL7_CACHE_LOCK = threading.Lock()
 
 
 def evaluate_seven(cards: np.ndarray) -> np.int32:
     cards = np.ascontiguousarray(cards, dtype=np.int32)
     ckey = cards.tobytes()
+    # Lock-free fast path on hit (dict.get is GIL-safe on existing keys).
     cached = _EVAL7_CACHE.get(ckey)
     if cached is not None:
         return cached
-    best = np.int32(np.iinfo(np.int32).min)
-    for c in range(_COMBOS.shape[0]):
-        chosen = cards[_COMBOS[c]]
-        ranks = card_rank(chosen)
-        suits = card_suit(chosen)
-        sc = score_five(ranks, suits)
-        if sc > best:
-            best = sc
-    if len(_EVAL7_CACHE) < _EVAL7_CACHE_CAP:
-        _EVAL7_CACHE[ckey] = best
-    return best
+    with _EVAL7_CACHE_LOCK:
+        # Re-check under lock — concurrent misses on the same key now compute once.
+        cached = _EVAL7_CACHE.get(ckey)
+        if cached is not None:
+            return cached
+        best = np.int32(np.iinfo(np.int32).min)
+        for c in range(_COMBOS.shape[0]):
+            chosen = cards[_COMBOS[c]]
+            ranks = card_rank(chosen)
+            suits = card_suit(chosen)
+            sc = score_five(ranks, suits)
+            if sc > best:
+                best = sc
+        if len(_EVAL7_CACHE) < _EVAL7_CACHE_CAP:
+            _EVAL7_CACHE[ckey] = best
+        return best
 
 
 def player_showdown_score(holes: np.ndarray, board: np.ndarray, board_valid: np.ndarray) -> np.int32:
@@ -652,8 +665,21 @@ def legal_action_mask_np(state: EnvState, seat=None) -> np.ndarray:
         mask[BET_BUCKET_START + i] = bucket_ok
 
     mask[ALL_IN] = is_live and (stack > 0) and reopen_ok
+    # CASH-ENGINE-AUDIT CRIT-4 fix: PRESERVE the legacy "CHECK fallback for non-live seat" behavior
+    # so downstream callers (lbr*.py, hu_irc_field.py, cash_serve_gate.py) continue to receive a
+    # non-empty mask - they depend on np.flatnonzero(mask) being non-empty. The audit preferred
+    # "raise loudly" path was rejected because it would crash LBR exploitability computation and
+    # the search-policy mask layer that consumes this function. Instead we emit a loud warning so
+    # the contract violation is visible in logs (caller should filter non-live seats upstream).
     if not is_live:
-        mask[:] = False
+        mask[CHECK] = True  # legacy fallback (pre-fix behavior - never crash callers)
+        import warnings as _warnings
+        _warnings.warn(
+            f"legal_action_mask_np: queried non-live seat {seat} (status={status}); "
+            "returning CHECK fallback - caller should filter non-live seats upstream",
+            RuntimeWarning, stacklevel=2,
+        )
+        return mask
     if not bool(np.any(mask)):
         mask[CHECK] = True
     return mask

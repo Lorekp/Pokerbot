@@ -471,7 +471,13 @@ def save_checkpoint(trainer: SDCFRTrainer, path: Path) -> None:
     import pickle
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as f:
+    # CRASH-RESUME-AUDIT #5: wrap the Leduc pickle in tmp + fsync + os.replace + dir-fsync. The
+    # 2026-06-23 power-cut precedent in sd_cfr_nlhe applies equally here — without atomicity a kill -9
+    # mid-pickle truncates the file and resume picks up a torn pickle. Reference pattern in
+    # pokerbot/training/neural_cfr.py (_atomic_save_trainer_checkpoint) and the leduc floor cache.
+    import os
+    tmp = path.with_name(path.name + ".atomic.tmp")
+    with tmp.open("wb") as f:
         pickle.dump(
             {
                 "params": trainer.state.params,
@@ -483,14 +489,60 @@ def save_checkpoint(trainer: SDCFRTrainer, path: Path) -> None:
             },
             f,
         )
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    os.replace(tmp, path)
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def load_checkpoint(trainer: SDCFRTrainer, path: Path) -> int:
-    """Restore params from checkpoint; returns completed iteration count."""
+    """Restore params from checkpoint; returns completed iteration count.
+
+    CRASH-RESUME-AUDIT cross-cutting E: torn-pickle recovery (mirrors the sd_cfr_nlhe variant).
+    If the primary ``path`` is unreadable, scan sibling ``sd_cfr_leduc_iter_NNNN.pkl`` files in
+    descending order and recover from the highest valid one."""
+    import logging
     import pickle
 
-    with Path(path).open("rb") as f:
-        data = pickle.load(f)
+    target = Path(path)
+    try:
+        with target.open("rb") as f:
+            data = pickle.load(f)
+    except (OSError, pickle.UnpicklingError, EOFError, ValueError, ImportError) as primary_exc:
+        parent = target.parent
+        try:
+            import re as _re
+            siblings = sorted(
+                (p for p in parent.glob("sd_cfr_leduc_iter_*.pkl")),
+                key=lambda p: int((_re.search(r"iter_(\d+)", p.stem) or _re.Match("", "x")).group(1)
+                                  if _re.search(r"iter_(\d+)", p.stem) else -1),
+                reverse=True,
+            )
+        except OSError:
+            siblings = []
+        for sib in siblings:
+            try:
+                with sib.open("rb") as f:
+                    data = pickle.load(f)
+                logging.getLogger(__name__).warning(
+                    "load_checkpoint: primary %s torn (%s), recovered from %s",
+                    target, primary_exc, sib,
+                )
+                break
+            except (OSError, pickle.UnpicklingError, EOFError, ValueError, ImportError):
+                continue
+        else:
+            raise
     trainer.state = trainer.state.replace(params=data["params"])
     if "config" in data:
         trainer.config = data["config"]

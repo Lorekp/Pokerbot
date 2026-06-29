@@ -68,7 +68,8 @@ def _derive_contexts(actions: list, board: list | None) -> dict[str, dict[str, l
             continue
         if atype in _DECISION_TYPES:
             key = _player_key(a.get("user_id"), a.get("name"))
-            if key is not None:
+            is_auto = bool(a.get("auto"))
+            if key is not None and not is_auto:
                 board_slice = list((board or [])[: _STREET_BOARD_LEN.get(st, 0)])
                 ck = _context_key(st, board_slice, aggr_count)
                 is_large = atype == "all_in" or (
@@ -143,10 +144,11 @@ def _derive_bluffs(actions: list, board: list | None, shown: list | None) -> dic
         if st != cur_street:
             cur_street, aggr_count = st, 0
         atype = (a.get("type") or "").lower()
+        is_auto = bool(a.get("auto"))
         if atype in _AGGRESSIVE_TYPES:
             key = _player_key(a.get("user_id"), a.get("name"))
             hole = holes.get(key)
-            if hole is not None:
+            if hole is not None and not is_auto:
                 n_board = _STREET_BOARD_LEN.get(st, 0)
                 bslice = [c for c in board_cards[:n_board] if c is not None]
                 if len(bslice) == n_board:  # skip if any board card failed to parse
@@ -193,6 +195,10 @@ def derive_hand_stats(record: dict) -> dict[str, dict]:
     """
     actions = record.get("actions") or []
     aggr = _aggressive_idxs(actions)     # genuine-aggression action indices (all-in CALL excluded)
+    # ingestion audit #6 (extended): SERVER auto-actions (timeout / sit-out / disconnect) must not
+    # land in voluntary-decision metrics. The action still advances the standing bet for sizing math,
+    # but it is NOT counted as a fold / call / raise DECISION by the player.
+    auto_idxs: set[int] = {i for i, a in enumerate(actions) if a.get("auto")}
     # group actions (with their global index) by player key, preserving order
     by_player: dict[str, list[tuple[int, dict]]] = {}
     keys_seen: dict[str, str] = {}  # player_key -> display name
@@ -204,13 +210,14 @@ def derive_hand_stats(record: dict) -> dict[str, dict]:
         keys_seen[key] = a.get("name") or keys_seen.get(key)
 
     # 3-bet per player: their first preflop AGGRESSION happened after >=1 prior (re)raise.
+    # Auto-actions are excluded — an AFK seat's server-side auto-raise is not a real 3-bet.
     three_bettors: set[str] = set()
     pre_raises_so_far = 0
     for i, a in enumerate(actions):
         if a.get("street") != "preflop":
             continue
         key = _player_key(a.get("user_id"), a.get("name"))
-        if i in aggr:                    # genuine raise (not an all-in call)
+        if i in aggr and i not in auto_idxs:    # genuine raise (not an all-in call, not auto)
             if pre_raises_so_far >= 1 and key is not None:
                 three_bettors.add(key)
             pre_raises_so_far += 1
@@ -234,15 +241,16 @@ def derive_hand_stats(record: dict) -> dict[str, dict]:
         atypes = [a.get("type") for a in acts]
         pre_idxs = [i for i, a in iacts if a.get("street") == "preflop"]
 
-        vpip = any(t in ("call", "bet", "raise", "all_in") for t in (a.get("type") for a in pre))
-        pfr = any(i in aggr for i in pre_idxs)                  # genuine preflop aggression (not all-in call)
+        vpip = any(t in ("call", "bet", "raise", "all_in") and not a.get("auto")
+                  for t, a in zip((a.get("type") for a in pre), pre))
+        pfr = any(i in aggr and i not in auto_idxs for i in pre_idxs)   # genuine preflop aggression (excl auto)
         three_bet = key in three_bettors
         saw_flop = bool(postflop) or (flop_seen and not _folded_preflop(pre))
         # WTSD: of hands where the player saw the flop, did they reach showdown (board complete, not
         # folded)? Keyed on saw_flop (the standard denominator), NOT on the winners-capture succeeding.
         wtsd = saw_flop and len(record.get("board") or []) >= 5 and not _folded(atypes)
-        bet_or_raise = sum(1 for i in idxs if i in aggr)        # aggression-factor numerator (true raises)
-        calls = sum(1 for t in atypes if t == "call")
+        bet_or_raise = sum(1 for i in idxs if i in aggr and i not in auto_idxs)
+        calls = sum(1 for a, t in zip(acts, atypes) if t == "call" and not a.get("auto"))
         # fold-to-cbet, aggressor-attributed: did this player face the flop c-bet (a flop aggression by
         # SOMEONE ELSE, before their flop action) and fold to it? Excludes the c-bettor and check-throughs.
         cbet_faced = False
@@ -431,7 +439,13 @@ class PlayerProfileStore:
             **({"alias": self.alias} if self.alias else {}),
         }
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=0), encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as _fh:
+            _fh.write(json.dumps(payload, ensure_ascii=False, indent=0))
+            _fh.flush()
+            try:
+                os.fsync(_fh.fileno())
+            except OSError:
+                pass  # some filesystems (e.g. tmpfs on Linux without sync) refuse fsync
         if self.path.exists():  # rotate a recovery copy before the swap (disk-fault insurance)
             try:
                 import shutil
@@ -550,6 +564,11 @@ class PlayerProfileStore:
                 line = json.dumps(record, ensure_ascii=False) + "\n"
                 with self._wal_lock, open(self.wal_path, "a", encoding="utf-8") as wf:
                     wf.write(line)
+                    wf.flush()
+                    try:
+                        os.fsync(wf.fileno())
+                    except OSError:
+                        pass  # WAL durability is best-effort on filesystems that refuse fsync
             except (OSError, TypeError):
                 pass
         with self._lock:

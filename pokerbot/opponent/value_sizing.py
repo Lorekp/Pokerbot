@@ -47,6 +47,12 @@ _MIN_N = 25.0                              # derived-count sample for full confi
 # Overlay gains (logit units). Comparable to the existing exploit terms (~1.0-1.5); α-capped downstream.
 _K_BIG = 1.2                               # boost to the over-bet buckets (>=1x pot, excl. all-in)
 _K_MID = 0.35                              # smaller boost to mid bets (keeps total betting up)
+# CASH-API-ECON-AUDIT F2 MEDIUM: monotonicity invariant. ``_K_BIG > _K_MID`` ensures the BIG bucket
+# boost always exceeds the MID bucket boost at every ``mag * rake_keep`` in [0,1]. A future tuning
+# that flips this ordering would silently bias against over-bets and lose the value-sizing signal.
+assert _K_BIG > _K_MID > 0, (
+    f"value-sizing monotonicity violated: _K_BIG={_K_BIG} must be > _K_MID={_K_MID} > 0"
+)
 _K_CHECK = 0.5                             # discourage checking back a value hand vs a payoff station
 
 # Bluff-suppression gains: the symmetric (air-hand) overlay — slash our bluff betting vs a non-folder.

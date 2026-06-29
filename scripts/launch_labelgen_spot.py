@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError, ParamValidationError
 
 DEFAULT_BUCKET = os.environ.get("LABELGEN_S3_BUCKET", "video-processing-6789")
 DEFAULT_PREFIX = os.environ.get("LABELGEN_S3_PREFIX", "pokerbot/prod6000")
@@ -377,7 +377,20 @@ def main() -> None:
     hourly_est = sum(_estimate_hourly(t) for t in args.instance_types[: args.max_instances])
     budget_hours = args.budget_usd / max(hourly_est, 0.01)
 
+    # R4 HIGH 1: capacity errors advance silently; non-ClientError (boto core,
+    # network, ParamValidation, KeyError) now re-raise with full traceback so
+    # the user sees a half-launched fleet with a clear "N of M launched,
+    # M-N failed with code X" summary instead of a silent partial success.
+    _CAPACITY_ERROR_CODES = {
+        "InsufficientInstanceCapacity",
+        "SpotMaxPriceTooLow",
+        "InstanceLimitExceeded",
+        "MaxSpotInstanceCountExceeded",
+        "RequestLimitExceeded",
+        "Unsupported",
+    }
     launched: list[dict[str, Any]] = []
+    failed_capacity: list[dict[str, Any]] = []
     for i, itype in enumerate(args.instance_types[: args.max_instances]):
         tag = f"{itype.replace('.', '-')}-{i}"
         try:
@@ -399,7 +412,37 @@ def main() -> None:
             )
             launched.append(rec)
         except ClientError as e:
-            launched.append({"instance_type": itype, "error": e.response.get("Error", {})})
+            err = e.response.get("Error", {}) or {}
+            code = err.get("Code", "")
+            err_payload = {
+                "instance_type": itype,
+                "code": code,
+                "message": err.get("Message", str(e)),
+            }
+            if code in _CAPACITY_ERROR_CODES:
+                # Capacity-style failure: record and continue to next type
+                failed_capacity.append(err_payload)
+                print(
+                    f"  {itype} capacity error: {code} — trying next type",
+                    flush=True,
+                )
+            else:
+                # Non-capacity ClientError: do NOT swallow. Re-raise with
+                # full traceback so misconfigurations surface immediately.
+                raise
+        except (BotoCoreError, ParamValidationError) as e:
+            # Real boto/network/param errors: never swallow — bail with traceback
+            print(
+                f"  {itype} FATAL: boto error {type(e).__name__}: {e}",
+                flush=True,
+            )
+            raise
+    if failed_capacity:
+        print(
+            f"  WARN: {len(failed_capacity)} instance types failed with capacity errors; "
+            f"continuing with the survivors",
+            flush=True,
+        )
 
     report = {
         "launched_at": datetime.now(timezone.utc).isoformat(),

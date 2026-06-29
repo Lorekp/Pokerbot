@@ -382,8 +382,14 @@ class TurboReBeLSolver:
         self._strategy_sum[key] += reach * strategy
         return ev
 
-    def solve(self, root: SubgameRoot, pbs: PBSTracker) -> SolveResult:
-        """Run time-budgeted SSMIG CFR+ from root."""
+    def solve(self, root: SubgameRoot, pbs: PBSTracker, cancel_event=None) -> SolveResult:
+        """Run time-budgeted SSMIG CFR+ from root.
+
+        ``cancel_event`` (optional threading.Event): if set mid-solve (e.g. by a live watchdog or
+        the multitable manager when the table moves on), the iteration loop breaks early and
+        serves the best average so far. Mirrors PluribusReBeLSolver.solve (the live bridge now
+        passes the same event to both). None => only the internal time_budget_ms bounds the solve.
+        """
         t0 = time.perf_counter()
         cfg = self.config
         hero = root.hero_seat
@@ -395,7 +401,16 @@ class TurboReBeLSolver:
         self._traversal_ms = 0.0
         sampled_holes = pbs.sample_opponent_holes(self.rng)
 
+        def _cancelled() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
+
         while iterations < cfg.max_iterations:
+            # B1 fix: cancel_event is now respected on the outer loop. The inner SSMIG loop also
+            # rechecks (line below) so a cancel mid-batch aborts within one or two iterations,
+            # not the full ``ssmig_inner_iters`` count. Same priority order as Pluribus: cancel
+            # wins over time budget (a cancelled solve should return FAST).
+            if _cancelled():
+                break
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             if elapsed_ms >= cfg.time_budget_ms:
                 break
@@ -406,6 +421,8 @@ class TurboReBeLSolver:
                     self._frozen_opp_avg[key] = (sums / sums.sum()).astype(np.float64)
 
             for inner in range(cfg.ssmig_inner_iters):
+                if _cancelled():
+                    break
                 if (time.perf_counter() - t0) * 1000.0 >= cfg.time_budget_ms:
                     break
                 if inner % max(cfg.ssmig_resample_every, 1) == 0:
@@ -426,6 +443,8 @@ class TurboReBeLSolver:
                 if iterations >= cfg.max_iterations:
                     break
 
+            if _cancelled():
+                break
             if (time.perf_counter() - t0) * 1000.0 >= cfg.time_budget_ms * 0.8:
                 break
 

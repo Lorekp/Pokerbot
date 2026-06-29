@@ -460,6 +460,69 @@ def sensitivity_sweep(rng_seed, *, n_spots, n_buckets, n_bins, n_runouts, pot, b
     return out
 
 
+def functional_micro_ev_tasks(
+    rng,
+    *,
+    n_spots: int = 800,
+    n_buckets: int = 30,
+    n_bins: int = 20,
+    n_runouts: int = 200,
+    fit_sample: int = 600,
+    pot: float = 10.0,
+) -> dict[str, dict]:
+    """Multi-task functional EV screen beyond the single thin-value spot.
+
+    Tasks probe draw-continue / semi-bluff, bluff-catcher check-call, and a wide-band continue spot.
+    Each task reuses deliverable2 with task-specific calling bands and bet fractions."""
+    specs = {
+        "draw_continue": {"call_lo": 0.25, "call_hi": 0.80, "bet_frac": 0.66},
+        "semi_bluff": {"call_lo": 0.30, "call_hi": 0.65, "bet_frac": 0.75},
+        "bluff_catcher_check_call": {"call_lo": 0.40, "call_hi": 0.55, "bet_frac": 0.33},
+        "wide_band_continue": {"call_lo": 0.20, "call_hi": 0.85, "bet_frac": 0.50},
+    }
+    out: dict[str, dict] = {}
+    for name, kw in specs.items():
+        task_rng = np.random.default_rng(int(rng.integers(0, 2**31 - 1)))
+        d2 = deliverable2(
+            task_rng,
+            n_spots=n_spots,
+            n_buckets=n_buckets,
+            n_bins=n_bins,
+            n_runouts=n_runouts,
+            call_lo=kw["call_lo"],
+            call_hi=kw["call_hi"],
+            pot=pot,
+            bet_frac=kw["bet_frac"],
+            fit_sample=fit_sample,
+            bootstrap=500,
+        )
+        out[name] = {
+            "gain_bb": d2["gain_bb"],
+            "gain_bb_ci95": d2["gain_bb_ci95"],
+            "EV_emd": d2["EV_emd"],
+            "EV_madehand": d2["EV_madehand"],
+            "frac_gap_closed_by_emd": d2["frac_gap_closed_by_emd"],
+            "n_made_forces_wrong_action": d2["n_made_forces_wrong_action"],
+            "call_band": [kw["call_lo"], kw["call_hi"]],
+            "bet_frac": kw["bet_frac"],
+        }
+    return out
+
+
+def river_fallback_sanity(*, n_bins: int = 20, n_runouts: int = 200, n_buckets: int = 30) -> dict:
+    """River spots have no runouts left; histograms should collapse (no potential spread)."""
+    rng = np.random.default_rng(4242)
+    spots = [sample_legal_spot(rng, streets=(5,)) for _ in range(120)]
+    hists = histograms_for_spots(spots, n_bins=n_bins, n_runouts=n_runouts, seed_base=50_000)
+    peak_mass = hists.max(axis=1)
+    spread = float(np.var(hists, axis=1).mean())
+    return {
+        "river_peak_mass_min": float(peak_mass.min()),
+        "river_hist_variance_mean": spread,
+        "n_spots": len(spots),
+    }
+
+
 # --------------------------------------------------------------------------------------------------
 # Driver.
 # --------------------------------------------------------------------------------------------------

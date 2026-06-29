@@ -42,12 +42,27 @@ class Card:
     @classmethod
     def from_str(cls, text: str) -> Card:
         text = text.strip()
-        if len(text) != 2:
+        # CASH-ENGINE-AUDIT #16 — accept both 2-char ("Ah") and 3-char ("10h") rank forms. The 3-char
+        # form is rare but legal — rejecting it silently would mangle any solver / OCR stream that
+        # outputs the natural decimal-rank form for ten. Cap at 3 chars to refuse garbage.
+        if not (2 <= len(text) <= 3):
             raise ValueError(f"Invalid card: {text!r}")
-        rank_char, suit_char = text[0].upper(), text[1].lower()
-        if rank_char not in RANK_CHARS or suit_char not in SUIT_CHARS:
+        if len(text) == 3:
+            # CASH-ENGINE-AUDIT CRIT-3 fix: "10h" must map to Ten of Hearts, not raise. We special-case
+            # the "10" rank prefix (which isn't in RANK_CHARS) and otherwise require the 2-char prefix
+            # to be a valid single-rank char. Any other 3-char input is rejected as garbage.
+            if text.startswith("10"):
+                rank_str, suit_char = "10", text[2].lower()
+            else:
+                raise ValueError(f"Invalid card: {text!r}")
+        else:
+            rank_str, suit_char = text[0].upper(), text[1].lower()
+        if rank_str not in RANK_CHARS and rank_str != "10":
             raise ValueError(f"Invalid card: {text!r}")
-        return cls(Rank(RANK_CHARS.index(rank_char) + 2), Suit(SUIT_CHARS.index(suit_char)))
+        if suit_char not in SUIT_CHARS:
+            raise ValueError(f"Invalid card: {text!r}")
+        rank_idx = 8 if rank_str == "10" else RANK_CHARS.index(rank_str)
+        return cls(Rank(rank_idx + 2), Suit(SUIT_CHARS.index(suit_char)))
 
     def to_str(self) -> str:
         return f"{RANK_CHARS[self.rank - 2]}{SUIT_CHARS[self.suit]}"
@@ -82,13 +97,24 @@ class Deck:
 
 
 def parse_cards(text: str) -> list[Card]:
-    """Parse board like 'Ks7h2d' or 'Ks 7h 2d'."""
+    """Parse board like 'Ks7h2d' or 'Ks 7h 2d'. Also accepts 3-char '10h' forms mixed with 2-char
+    forms, e.g. '10h10d10s10c' (a board of four tens). Tokenizes on suit-character boundaries so
+    each card is either 2 or 3 chars long."""
     text = text.replace(" ", "").strip()
     if not text:
         return []
-    if len(text) % 2 != 0:
-        raise ValueError(f"Invalid card string: {text!r}")
-    return [Card.from_str(text[i : i + 2]) for i in range(0, len(text), 2)]
+    out: list[Card] = []
+    i = 0
+    while i < len(text):
+        if i + 2 < len(text) and text[i:i+2] == "10" and text[i+2] in SUIT_CHARS:
+            out.append(Card.from_str(text[i:i+3]))
+            i += 3
+        elif i + 1 < len(text) and text[i+1] in SUIT_CHARS:
+            out.append(Card.from_str(text[i:i+2]))
+            i += 2
+        else:
+            raise ValueError(f"Invalid card string: {text!r} (parse error at index {i})")
+    return out
 
 
 def parse_holding(text: str) -> tuple[Card, Card]:

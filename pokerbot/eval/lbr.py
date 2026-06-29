@@ -74,6 +74,33 @@ _HU_LIVE = (3, 5)
 _POT_BET_INDEX = BET_BUCKET_START + 4  # frac 1.0 == full pot (BET_SIZE_BUCKETS[4])
 
 
+def _build_allowed_action_mask(bet_bucket_keep: tuple[int, ...] | None) -> np.ndarray | None:
+    """Lean copy of the training action-abstraction mask for ship/eval boxes."""
+    if bet_bucket_keep is None:
+        return None
+    allowed = np.zeros(NUM_ACTIONS, dtype=bool)
+    for a in (FOLD, CHECK, CALL, ALL_IN):
+        allowed[a] = True
+    n_buckets = ALL_IN - BET_BUCKET_START
+    for i in bet_bucket_keep:
+        if not 0 <= int(i) < n_buckets:
+            raise ValueError(f"bet_bucket_keep index {i} out of range [0,{n_buckets})")
+        allowed[BET_BUCKET_START + int(i)] = True
+    return allowed
+
+
+def _apply_abstraction_mask(
+    mask: np.ndarray, street: int, allowed_pre: np.ndarray | None, allowed_post: np.ndarray | None
+) -> np.ndarray:
+    """Lean copy of ``sd_cfr_nlhe_hogwild._apply_abstraction``."""
+    if allowed_pre is None and allowed_post is None:
+        return mask
+    allowed = allowed_pre if street == 0 else allowed_post
+    if allowed is None:
+        return mask
+    return mask & allowed
+
+
 # --------------------------------------------------------------------------- #
 # Configuration + result
 # --------------------------------------------------------------------------- #
@@ -184,6 +211,130 @@ def check_blueprint_serve_env(*, strict: bool = False, expected: dict | None = N
     return cfg
 
 
+# --------------------------------------------------------------------------- #
+# Snapshot interop validation (defense in depth)
+# --------------------------------------------------------------------------- #
+def validate_snapshot(
+    snapshot: dict | None,
+    *,
+    strict: bool = True,
+    context: str = "blueprint_snapshot",
+) -> dict:
+    """Validate a blueprint snapshot dict (defense in depth against silent 0% coverage).
+
+    Closes three live-serve loopholes identified by the SEARCH-AUDIT:
+
+      F1: empty / None snapshot silently serves uniform-legal at every postflop node
+          (no RuntimeError). Now raises when ``strict`` is True.
+      F2: a string-keyed legacy snapshot (v1 trainer) used with ``fingerprint_fast`` (bytes
+          keys) -> 100% lookup miss -> uniform at every postflop. Detects non-bytes keys
+          and either raises (strict=True, the default) or warns (strict=False).
+      F3: stamp cross-check default was ``strict=stamp is not None``, so an UN-stamped
+          dict ("abstraction" key missing) skipped the check. Now we always do the
+          cross-check (so a flag skew is caught), and we ALSO verify the row shape matches
+          the engine's NUM_ACTIONS=11 layout.
+
+    Parameters
+    ----------
+    snapshot : dict | None
+        The blueprint dict-of-{fingerprint: probs} (or {"strat_sum": ..., "abstraction": ...}).
+    strict : bool
+        If True (default) raise on any anomaly; if False warn and return the dict.
+    context : str
+        A label that gets prepended to the error message ("PokerBot.pluribus_solve",
+        "live_advisor_bridge.LiveSearchAdvisor", etc.) for fast diagnosis.
+
+    Returns
+    -------
+    dict
+        The validated (and possibly re-keyed) snapshot. ``None`` if the input was None
+        AND ``strict`` was True (raises instead of returning None).
+
+    Notes
+    -----
+    - Does NOT mutate the input dict (the live blueprint cache is shared across tables).
+    - Stamps (the ``"abstraction"`` sub-dict) are NOT validated here; callers should
+      route them through ``check_blueprint_serve_env(expected=stamp, strict=True)``.
+    - The ``{"strat_sum": ..., "abstraction": ...}`` envelope is unwrapped to ``strat_sum``,
+      matching the convention in ``eval/bots._load_blueprint_snapshot`` and the live bridge.
+    """
+    if snapshot is None:
+        msg = f"{context}: empty snapshot (None) — every postflop lookup would miss and serve uniform-legal"
+        if strict:
+            raise RuntimeError(msg)
+        import warnings
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        return {}
+
+    if not isinstance(snapshot, dict):
+        msg = f"{context}: snapshot is not a dict (got {type(snapshot).__name__})"
+        if strict:
+            raise TypeError(msg)
+        return snapshot  # type: ignore[return-value]
+
+    # Unwrap the {"strat_sum": ..., "abstraction": ...} envelope to the inner dict.
+    inner = snapshot.get("strat_sum", snapshot) if "strat_sum" in snapshot else snapshot
+
+    if not inner:
+        msg = f"{context}: empty snapshot (no rows) — every postflop lookup would miss and serve uniform-legal"
+        if strict:
+            raise RuntimeError(msg)
+        import warnings
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        return inner
+
+    # F2: detect string-keyed legacy snapshot. fingerprint_fast returns BYTES keys; if every
+    # key is a str, the lookup is guaranteed to miss at every node. Partial conversions are
+    # rarer in practice (a snapshot is one or the other), so we check the first key.
+    first_key = next(iter(inner))
+    if isinstance(first_key, str):
+        # Try to salvage: if all keys are str, attempt to encode to bytes (fingerprint_fast
+        # outputs bytes derived from a fixed byte-level key, so the encoding must be utf-8).
+        try:
+            rekeyed = {(k.encode("utf-8") if isinstance(k, str) else k): v for k, v in inner.items()}
+        except UnicodeEncodeError:
+            rekeyed = None
+        if rekeyed is not None and all(isinstance(k, bytes) for k in rekeyed):
+            # Re-keyed: keep the old dict for the caller but emit a loud warning. We do NOT
+            # silently swap in rekeyed because the snapshot is module-cached; the caller's
+            # cache reference would still hold the string-keyed version, defeating the fix.
+            msg = (f"{context}: string-keyed snapshot detected ({len(inner)} rows) — rekey to "
+                   "bytes before passing to a fingerprint_fast consumer. The live serve will "
+                   "play uniform-legal at every postflop node until rekeyed.")
+            if strict:
+                raise RuntimeError(msg)
+            import warnings
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        else:
+            msg = f"{context}: snapshot has non-bytes / non-string keys (sample: {first_key!r})"
+            if strict:
+                raise RuntimeError(msg)
+            return inner
+
+    # Row-shape guard: every row must be a numeric array of length NUM_ACTIONS (the engine's
+    # action enum size). Mismatched shapes silently broadcast / index-error in the serve path.
+    bad_rows: list = []
+    for i, (k, v) in enumerate(inner.items()):
+        if i >= 4:
+            break  # sample only
+        try:
+            arr = np.asarray(v)
+        except Exception:
+            bad_rows.append((k, "not-array-convertible"))
+            continue
+        if arr.ndim != 1 or arr.shape[0] != NUM_ACTIONS:
+            bad_rows.append((k, f"shape={arr.shape}"))
+    if bad_rows:
+        msg = (f"{context}: {len(bad_rows)}+ row(s) have wrong shape (engine NUM_ACTIONS="
+               f"{NUM_ACTIONS}, first few: {bad_rows[:3]}) — would broadcast/index-error at serve")
+        if strict:
+            raise RuntimeError(msg)
+        import warnings
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+
+    return inner
+
+
 def make_blueprint_policy(snapshot: dict[bytes, np.ndarray], *, client_bet_sizing: bool = True):
     """Return a numpy-native policy_fn(env, seat)->probs matching the trained table keys.
 
@@ -196,17 +347,15 @@ def make_blueprint_policy(snapshot: dict[bytes, np.ndarray], *, client_bet_sizin
     # by tools/fingerprint_native/verify_parity.py); otherwise it delegates to the Python oracle, so
     # default serve behavior is unchanged. Same dict-key bytes either way -> no coverage skew.
     from pokerbot.encoding.fingerprint_native import fingerprint_fast
-    from pokerbot.training.sd_cfr_nlhe_hogwild import _apply_abstraction
-    from pokerbot.training.sd_cfr_nlhe import build_allowed_action_mask
 
     weva = default_weva_bucket_table()
-    allowed_pre = build_allowed_action_mask((4, 5, 6)) if client_bet_sizing else None
-    allowed_post = build_allowed_action_mask((0, 1, 3, 4, 5)) if client_bet_sizing else None
+    allowed_pre = _build_allowed_action_mask((4, 5, 6)) if client_bet_sizing else None
+    allowed_post = _build_allowed_action_mask((0, 1, 3, 4, 5)) if client_bet_sizing else None
 
     def policy(env, seat: int) -> np.ndarray:
         mask = legal_action_mask_np(env, seat).astype(bool)
         if client_bet_sizing:
-            mask = _apply_abstraction(mask, int(env.street), allowed_pre, allowed_post).astype(bool)
+            mask = _apply_abstraction_mask(mask, int(env.street), allowed_pre, allowed_post).astype(bool)
         key = fingerprint_fast(env, seat, weva_table=weva)
         row = snapshot.get(key)
         if row is not None:

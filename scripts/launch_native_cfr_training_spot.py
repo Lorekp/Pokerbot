@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""
+Launch a SINGLE EC2 spot instance to train the NATIVE 6-max NLHE CFR+ blueprint (Workstream F).
+
+Mirrors scripts/launch_sd_cfr_training_spot.py (spot launch + babysitter/resume pattern), but the
+workload is the Rust ``NlheCFRTrainer`` (tools/battery_native/src/trainer.rs) rather than the JAX SD-CFR
+stack. The box:
+  1. installs Rust + a Python with PyO3 headers,
+  2. pulls the repo tarball from S3 and ``cargo build --release --features python --lib`` the crate
+     (the .so is the importable ``battery_native`` extension exposing ``NlheCFRTrainer``),
+  3. runs a tiny embedded driver that constructs ``NlheCFRTrainer(num_buckets, depth_edges,
+     n_deals_per_iter)``, RESUMES from the latest S3 checkpoint if one exists, then trains to
+     ``--iters`` total, calling ``save_bytes()`` -> boto3 upload every ``--checkpoint-every`` iters,
+  4. on spot preemption (or normal exit) the latest checkpoint is on S3, so a replacement box resumes.
+
+Default is CPU-heavy (c6i.32xlarge, 128 vCPU) — the trainer is rayon-parallel across deals. Cost target
+(plan): 5000 iters x ~200 deals ~ $12-40 spot, well under the Pluribus blueprint's <$150.
+
+Reuses the same AWS identity + S3 prefix conventions as the SD-CFR launcher.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import io
+import sys
+import tarfile
+import time
+from pathlib import Path
+
+import boto3
+from botocore.exceptions import ClientError
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_BUCKET = "video-processing-6789"
+DEFAULT_PREFIX = "pokerbot/prod6000/native_cfr"  # within the IAM-allowed prod6000/* prefix
+DEFAULT_REGION = "eu-central-1"
+DEFAULT_PROFILE = "pokerbot-labelgen-worker"
+
+# Ship the crate (its only build inputs) + the python serve/eval chain needed for offline validation.
+# The trainer builds ON core.rs's public API; no JAX needed to TRAIN (only to LBR-validate, optional).
+_INCLUDE = [
+    "tools/battery_native",
+    "pokerbot/search/native_solver.py",
+    "pokerbot/search/tabular_blueprint_adapter.py",
+]
+_EXCLUDE_DIRS = ("__pycache__", ".git", "target")  # never ship the local Rust build dir (huge + stale)
+
+
+def _tar_filter(ti: tarfile.TarInfo):
+    parts = ti.name.split("/")
+    if any(p in _EXCLUDE_DIRS for p in parts) or ti.name.endswith(".pyc"):
+        return None
+    return ti
+
+
+def build_and_upload_code(s3, bucket: str, prefix: str, crate_src: str = "tools/battery_native",
+                          emd_frozen: str = "") -> str:
+    # (src, arcname) pairs. The crate may come from a FROZEN COPY (``crate_src``) but is ALWAYS uploaded
+    # under "tools/battery_native" so the box builds it at the expected manifest path — this isolates a
+    # running blueprint job from concurrent edits to the live crate (e.g. a parallel search optimization).
+    includes = [
+        (crate_src, "tools/battery_native"),
+        ("pokerbot/search/native_solver.py", "pokerbot/search/native_solver.py"),
+        ("pokerbot/search/tabular_blueprint_adapter.py", "pokerbot/search/tabular_blueprint_adapter.py"),
+    ]
+    # Ship the shared frozen EMD lookup so the box's trainer keys postflop buckets from the SAME bytes the
+    # serve encoder will read (bit-identical train/serve). Uploaded under its given relative path.
+    if emd_frozen:
+        includes.append((emd_frozen, emd_frozen))
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for src, arc in includes:
+            p = ROOT / src
+            if p.exists():
+                tar.add(p, arcname=arc, filter=_tar_filter)
+    buf.seek(0)
+    key = f"{prefix}/code/native_cfr_code.tar.gz"
+    s3.put_object(Bucket=bucket, Key=key, Body=buf.read())
+    print(f"Uploaded code tarball -> s3://{bucket}/{key} ({buf.tell()} bytes; crate_src={crate_src})", flush=True)
+    return key
+
+
+def resolve_ubuntu_ami(ec2, arch: str) -> str:
+    name_arch = "amd64" if arch == "x86_64" else "arm64"
+    resp = ec2.describe_images(
+        Owners=["099720109477"],  # Canonical
+        Filters=[
+            {"Name": "name", "Values": [f"ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-{name_arch}-server-*"]},
+            {"Name": "state", "Values": ["available"]},
+            {"Name": "architecture", "Values": [arch]},
+        ],
+    )
+    imgs = sorted(resp["Images"], key=lambda i: i["CreationDate"], reverse=True)
+    if not imgs:
+        raise SystemExit(f"no {arch} Ubuntu 22.04 AMI found in region")
+    return imgs[0]["ImageId"]
+
+
+# Spot-capacity errors worth trying the NEXT instance type for (vs a hard config/quota error, which
+# every type shares, so retrying down the chain is pointless).
+_CAPACITY_ERROR_CODES = frozenset({
+    "InsufficientInstanceCapacity",
+    "SpotMaxPriceTooLow",
+    "InstanceLimitExceeded",
+    "MaxSpotInstanceCountExceeded",
+    "Unsupported",  # instance type not offered in this AZ/region
+})
+
+
+def _spotpick_chain(instance_type: str, arch: str, n: int) -> list[str]:
+    """Build a capacity-diverse fallback chain (one type per family) starting at the requested type's
+    vCPU count, via the shared spotpick lib (.). Returns [instance_type] alone if
+    spotpick or the catalog is unavailable, so --spotpick degrades gracefully to single-type behavior.
+    The head of the chain is forced to be the explicitly-requested ``instance_type`` (so the default
+    c6i.32xlarge is still tried FIRST), with the spotpick alternatives appended de-duplicated."""
+    try:
+        sys.path.insert(0, r".")
+        import spotpick  # noqa: E402
+    except Exception as e:  # noqa: BLE001
+        print(f"[spotpick] unavailable ({e!r}) — falling back to single type {instance_type}", flush=True)
+        return [instance_type]
+    # Derive the vCPU target from the requested type via the catalog (so the chain matches its size).
+    try:
+        cat = {it.name: it for it in spotpick.load()}
+        vcpus = cat[instance_type].vcpus if instance_type in cat else None
+        if vcpus is None:
+            print(f"[spotpick] {instance_type} not in catalog — single type only", flush=True)
+            return [instance_type]
+        alts = spotpick.chain(vcpus=vcpus, arch=arch, n=max(n, 1))
+    except Exception as e:  # noqa: BLE001
+        print(f"[spotpick] chain() failed ({e!r}) — single type {instance_type}", flush=True)
+        return [instance_type]
+    chain = [instance_type] + [a for a in alts if a != instance_type]
+    return chain[:max(n, 1)]
+
+
+def _launch_with_fallback(ec2, run_kwargs: dict, *, instance_types: list[str], spot: bool):
+    """Try ``run_instances`` down ``instance_types`` until one succeeds (capacity errors advance to the
+    next type; any other error is fatal). Returns (instance_id, instance_type_used). The caller bakes
+    UserData/tags BEFORE this — only ``InstanceType`` changes per attempt, so a fallback box is otherwise
+    byte-identical (same run-subdir => resumes the same S3 checkpoint)."""
+    last_err = None
+    for it in instance_types:
+        kw = dict(run_kwargs, InstanceType=it)
+        try:
+            resp = ec2.run_instances(**kw)
+            return resp["Instances"][0]["InstanceId"], it
+        except ClientError as e:  # noqa: PERF203
+            code = e.response.get("Error", {}).get("Code", "")
+            last_err = e
+            if code in _CAPACITY_ERROR_CODES and len(instance_types) > 1:
+                print(f"[spotpick] {it}: {code} — trying next type", flush=True)
+                continue
+            raise
+    raise SystemExit(f"all instance types exhausted ({instance_types}); last error: {last_err}")
+
+
+def user_data(*, bucket, prefix, region, code_key, run_subdir, iters, n_deals, num_buckets,
+              depth_edges, checkpoint_every, keep_alive=False, emd_frozen_rel="") -> str:
+    run_prefix = f"{prefix}/{run_subdir}"
+    final = "echo BOOTSTRAP_DONE_KEEP_ALIVE" if keep_alive else "shutdown -h now"
+    depth_csv = ",".join(str(float(x)) for x in (depth_edges or []))
+    # No output redirect (cloud-init captures stdout to /var/log/cloud-init-output.log, visible via
+    # get-console-output) — same lesson the SD-CFR launcher documents.
+    return f"""#!/bin/bash
+set -uxo pipefail
+export HOME="${{HOME:-/root}}"   # cloud-init runs as root with HOME UNSET; under set -u a bare $HOME (rustup/cargo PATH) is FATAL and aborts the whole script
+export DEBIAN_FRONTEND=noninteractive AWS_DEFAULT_REGION={region}
+
+apt-get update -qq
+apt-get install -y -qq python3-pip python3-dev awscli gzip curl build-essential
+aws --version
+# Rust toolchain (rustup, stable) for the native build.
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+export PATH="$HOME/.cargo/bin:$PATH"
+rustc --version
+
+mkdir -p /opt/pokerbot
+aws s3 cp s3://{bucket}/{code_key} /tmp/code.tar.gz --region {region}
+tar -xzf /tmp/code.tar.gz -C /opt/pokerbot
+cd /opt/pokerbot
+
+# boto3 for S3 checkpoint up/download from the driver.
+python3 -m pip install --disable-pip-version-check --no-input boto3 numpy
+# Build the native extension (.so) exposing NlheCFRTrainer. PyO3 abi3 -> one .so for the box's python.
+export PYO3_PYTHON=$(python3 -c 'import sys;print(sys.executable)')
+# target-cpu=x86-64-v3 (AVX2 + FMA, NO AVX512): autovectorizes the CFR+ [f64;11]/[bool;11] hot-loop
+# kernels (regret_match, EV dot-product, strat_sum AXPY, CFR+ floor, side-pot award) to 4-wide and lets
+# the hand-written SIMD emit FMA instead of SSE2-baseline scalar. It is NOT -ffast-math (no float
+# reassociation), so the exact-int byte-identity goldens stay green. We deliberately do NOT use
+# target-cpu=native: on an AVX512 box `native` enables AVX512, whose license-based downclock is a NET
+# REGRESSION for this pointer-chasing/hashmap-bound hot path (~-30% it/s measured). v3 = AVX2+FMA with
+# no AVX512 => no downclock, measured small net gain. The .so is built AND run on this same box and
+# never ships to a different-CPU host, so AVX2/FMA is always present (no SIGILL). Set via RUSTFLAGS on
+# the build line so it applies even though the tarball include-list omits tools/battery_native/.cargo/.
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --features python --lib --manifest-path tools/battery_native/Cargo.toml
+# The cdylib is target/release/libbattery_native.so; import it as `battery_native`.
+SO=$(ls tools/battery_native/target/release/libbattery_native.so 2>/dev/null || ls tools/battery_native/target/release/battery_native.so 2>/dev/null)
+cp "$SO" /opt/pokerbot/battery_native.so
+ls -la /opt/pokerbot/battery_native.so
+
+# RAYON FANOUT: pin to PHYSICAL cores, NOT logical (SMT). The cpu128 probe (2026-06-28,
+# artifacts/cpu128_probe_verdict_20260628.md) measured the trainer is memory-latency-bound — cores sit ~69%
+# idle inside the parallel traverse — so the 2nd hyperthread per core CONTENDS for shared L1/L2/load-store
+# ports rather than adding compute. At identical fanout, 64 threads (1/phys core) beat 128 logical by
+# +12.6% deals/s / +18.5% nodes/s at LOWER CPU. PHYS_CORES = unique (socket,core) pairs (correct on 2-socket
+# boxes where core ids repeat per socket). Override by exporting RAYON_NUM_THREADS before launch.
+PHYS_CORES=$(lscpu -p=SOCKET,CORE | grep -v '^#' | sort -u | wc -l)
+if [ -z "$RAYON_NUM_THREADS" ]; then export RAYON_NUM_THREADS=$PHYS_CORES; fi
+echo "RAYON_NUM_THREADS=$RAYON_NUM_THREADS (physical cores=$PHYS_CORES, nproc=$(nproc); SMT-off per cpu128 probe verdict)"
+export PYTHONPATH=/opt/pokerbot RUST_BACKTRACE=1
+
+cat > /opt/pokerbot/drive_native_cfr.py <<'PYEOF'
+import os, sys, time, traceback
+import boto3
+import battery_native as bn
+
+BUCKET = "{bucket}"
+RUN_PREFIX = "{run_prefix}"
+REGION = "{region}"
+ITERS = {iters}
+N_DEALS = {n_deals}
+NUM_BUCKETS = {num_buckets}
+CKPT_EVERY = {checkpoint_every}
+DEPTH_EDGES = [float(x) for x in "{depth_csv}".split(",") if x]
+# Optional shared frozen EMD (hole,board)->bucket lookup (relative to /opt/pokerbot). When set, the
+# trainer keys postflop flop/turn buckets from this table (river/preflop stay made-hand) — the SAME blob
+# the serve encoder reads, so train==serve is bit-identical. Empty => the deployed made-hand path.
+EMD_FROZEN_REL = "{emd_frozen_rel}"
+EMD_FROZEN_PATH = ("/opt/pokerbot/" + EMD_FROZEN_REL) if EMD_FROZEN_REL else None
+
+s3 = boto3.client("s3", region_name=REGION)
+LATEST_KEY = RUN_PREFIX + "/checkpoints/latest.nlcfr"
+
+def _download_latest():
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key=LATEST_KEY)
+        return obj["Body"].read()
+    except Exception:
+        return None
+
+def _upload(blob, iters_done):
+    # versioned per-iter checkpoint + a `latest` pointer (atomic on S3: a single PutObject).
+    key = RUN_PREFIX + f"/checkpoints/iter_{{iters_done:06d}}.nlcfr"
+    s3.put_object(Bucket=BUCKET, Key=key, Body=blob)
+    s3.put_object(Bucket=BUCKET, Key=LATEST_KEY, Body=blob)
+    print(f"CKPT iters_done={{iters_done}} -> s3://{{BUCKET}}/{{key}} ({{len(blob)}} bytes)", flush=True)
+
+def main():
+    if EMD_FROZEN_PATH:
+        # signature: (num_buckets, depth_edges, n_deals, n_seats=6, prune=-inf, fast_merge=False, emd_frozen_path=None)
+        t = bn.NlheCFRTrainer(NUM_BUCKETS, DEPTH_EDGES, N_DEALS, 6, float("-inf"), False, EMD_FROZEN_PATH)
+        print(f"EMD frozen lookup ACTIVE: {{EMD_FROZEN_PATH}} stamp={{t.emd_stamp()}}", flush=True)
+    else:
+        t = bn.NlheCFRTrainer(NUM_BUCKETS, DEPTH_EDGES, N_DEALS)
+    blob = _download_latest()
+    if blob is not None and t.load_bytes(blob):
+        print(f"RESUMED from latest checkpoint at iters_done={{t.iters_done()}}", flush=True)
+    else:
+        print("FRESH start (no resumable checkpoint)", flush=True)
+    start = t.iters_done()
+    print(f"TRAIN target={{ITERS}} from={{start}} n_deals={{N_DEALS}} num_buckets={{NUM_BUCKETS}} "
+          f"depth_edges={{DEPTH_EDGES}}", flush=True)
+    t0 = time.time()
+    while t.iters_done() < ITERS:
+        nxt = min(t.iters_done() + CKPT_EVERY, ITERS)
+        step = nxt - t.iters_done()
+        t.train(step)
+        _upload(t.save_bytes(), t.iters_done())
+        el = time.time() - t0
+        done = t.iters_done() - start
+        rate = done / el if el > 0 else 0.0
+        print(f"PROGRESS iters_done={{t.iters_done()}}/{{ITERS}} infosets={{t.n_infosets()}} "
+              f"elapsed={{el:.0f}}s rate={{rate:.3f}} it/s", flush=True)
+    print(f"DONE iters_done={{t.iters_done()}} infosets={{t.n_infosets()}}", flush=True)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)
+PYEOF
+
+# Background SPOT-INTERRUPT handler: poll IMDSv2 (token required) for the reclaim notice; on notice send
+# SIGTERM so the driver's last checkpoint is already on S3 (it checkpoints every {checkpoint_every} iters).
+cat > /tmp/spot_watch.sh <<'SWEOF'
+TOK=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+while true; do
+  C=$(curl -s -o /dev/null -w "%{{http_code}}" -H "X-aws-ec2-metadata-token: $TOK" http://169.254.169.254/latest/meta-data/spot/instance-action)
+  if [ "$C" = "200" ]; then echo "SPOT_RECLAIM_NOTICE"; pkill -TERM -f drive_native_cfr.py; break; fi
+  sleep 5
+done
+SWEOF
+nohup bash /tmp/spot_watch.sh >/var/log/spot_watch.log 2>&1 &
+
+python3 /opt/pokerbot/drive_native_cfr.py 2>&1 | tee /var/log/native-cfr-train.log
+echo "train exit ${{PIPESTATUS[0]}}"
+
+# Upload logs via boto3.
+python3 - <<'LOGEOF'
+import boto3
+s3 = boto3.client("s3", region_name="{region}")
+for src, key in [("/var/log/cloud-init-output.log", "{run_prefix}/logs/cloud-init-output.log"),
+                 ("/var/log/native-cfr-train.log", "{run_prefix}/logs/train.log")]:
+    try:
+        s3.upload_file(src, "{bucket}", key); print("uploaded", key)
+    except Exception as e:
+        print("log upload fail", src, e)
+LOGEOF
+{final}
+"""
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--instance-type", default="c6i.32xlarge",
+                   help="c6i.32xlarge=full (128 vCPU); c6i.4xlarge=cheap validate")
+    p.add_argument("--arch", default="x86_64", choices=["x86_64", "arm64"])
+    p.add_argument("--iters", type=int, default=5000, help="total CFR+ iterations (target)")
+    p.add_argument("--n-deals", type=int, default=200, help="deals fanned out per iteration (rayon)")
+    p.add_argument("--num-buckets", type=int, default=200,
+                   help="postflop card-abstraction buckets (MUST equal serve's num_buckets)")
+    p.add_argument("--depth-edges", default="",
+                   help="comma-sep depth-bucket edges for a depth-aware preflop key (e.g. '50,90,140'); "
+                        "empty = non-depth blueprint")
+    p.add_argument("--checkpoint-every", type=int, default=500,
+                   help="checkpoint to S3 every N iters (preemption-bounded loss)")
+    p.add_argument("--run-subdir", default=None, help="S3 subdir for this run (default: run_<ts>)")
+    p.add_argument("--bucket", default=DEFAULT_BUCKET)
+    p.add_argument("--prefix", default=DEFAULT_PREFIX)
+    p.add_argument("--region", default=DEFAULT_REGION)
+    p.add_argument("--instance-profile", default=DEFAULT_PROFILE)
+    p.add_argument("--on-demand", action="store_true", help="use on-demand instead of spot")
+    p.add_argument("--spotpick", action="store_true",
+                   help="on a spot-capacity error, retry down a capacity-diverse fallback chain "
+                        "(spotpick.chain at the same vCPU count) instead of hard-failing. Default OFF = "
+                        "single --instance-type only (unchanged behavior).")
+    p.add_argument("--spotpick-n", type=int, default=5,
+                   help="max instance types in the --spotpick fallback chain (incl. the primary)")
+    p.add_argument("--keep-alive", action="store_true",
+                   help="don't shut down on finish (keep box for get-console-output inspection)")
+    p.add_argument("--reuse-code", action="store_true",
+                   help="skip the code upload; REUSE the existing S3 code tarball. The babysitter passes "
+                        "this on RELAUNCHES so a locally-changing working tree (e.g. a concurrent crate "
+                        "optimization) never re-uploads mid-edit and breaks a resumed box.")
+    p.add_argument("--crate-src", default="tools/battery_native",
+                   help="path to the crate source to upload (always as tools/battery_native). Point at a "
+                        "FROZEN COPY to isolate a running job from concurrent edits to the live crate; "
+                        "falls back to tools/battery_native if the path is missing.")
+    p.add_argument("--emd-frozen", default="",
+                   help="path (repo-relative) to a SHARED frozen EMD (hole,board)->bucket lookup "
+                        "(precompute_emd_frozen_lookup.py output). When set, the trainer keys postflop "
+                        "flop/turn buckets from it (river/preflop stay made-hand) — the SAME blob the serve "
+                        "encoder reads (POKERBOT_POSTFLOP_EMD_FROZEN), so train==serve is bit-identical. "
+                        "Empty = the deployed made-hand path. NUM_BUCKETS must equal the table's K.")
+    args = p.parse_args()
+
+    if args.num_buckets <= 0:
+        p.error("--num-buckets must be > 0 (serve uses 200)")
+    if args.emd_frozen and not (ROOT / args.emd_frozen).exists():
+        p.error(f"--emd-frozen {args.emd_frozen} not found (run precompute_emd_frozen_lookup.py first)")
+    depth_edges = [float(x) for x in args.depth_edges.split(",") if x.strip()]
+
+    s3 = boto3.client("s3", region_name=args.region)
+    ec2 = boto3.client("ec2", region_name=args.region)
+
+    run_subdir = args.run_subdir or f"run_{int(time.time())}"
+    crate_src = args.crate_src if (ROOT / args.crate_src).exists() else "tools/battery_native"
+    if crate_src != args.crate_src:
+        print(f"WARN: --crate-src {args.crate_src} not found; falling back to {crate_src}", flush=True)
+    if args.reuse_code:
+        code_key = f"{args.prefix}/code/native_cfr_code.tar.gz"
+        print(f"Reusing existing code tarball -> s3://{args.bucket}/{code_key} (--reuse-code)", flush=True)
+    else:
+        code_key = build_and_upload_code(s3, args.bucket, args.prefix, crate_src=crate_src,
+                                         emd_frozen=args.emd_frozen)
+    ami = resolve_ubuntu_ami(ec2, args.arch)
+    print(f"AMI: {ami}  instance: {args.instance_type}  arch: {args.arch}  region: {args.region}",
+          flush=True)
+
+    ud = user_data(
+        bucket=args.bucket, prefix=args.prefix, region=args.region, code_key=code_key,
+        run_subdir=run_subdir, iters=args.iters, n_deals=args.n_deals,
+        num_buckets=args.num_buckets, depth_edges=depth_edges,
+        checkpoint_every=args.checkpoint_every, keep_alive=args.keep_alive,
+        emd_frozen_rel=args.emd_frozen,
+    )
+    run_kwargs = dict(
+        ImageId=ami,
+        InstanceType=args.instance_type,
+        MinCount=1,
+        MaxCount=1,
+        UserData=base64.b64encode(ud.encode()).decode(),
+        IamInstanceProfile={"Name": args.instance_profile},
+        MetadataOptions={"HttpTokens": "required", "HttpPutResponseHopLimit": 2},
+        TagSpecifications=[{
+            "ResourceType": "instance",
+            "Tags": [
+                {"Key": "Name", "Value": f"native-cfr-train-{run_subdir}"},
+                {"Key": "Project", "Value": "pokerbot-native-cfr"},
+                {"Key": "Run", "Value": run_subdir},
+            ],
+        }],
+        InstanceInitiatedShutdownBehavior="terminate",
+    )
+    if not args.on_demand:
+        run_kwargs["InstanceMarketOptions"] = {
+            "MarketType": "spot",
+            "SpotOptions": {"SpotInstanceType": "one-time", "InstanceInterruptionBehavior": "terminate"},
+        }
+
+    # InstanceType is set per-attempt by _launch_with_fallback; drop the static key so the helper owns it.
+    run_kwargs.pop("InstanceType", None)
+    instance_types = (
+        _spotpick_chain(args.instance_type, args.arch, args.spotpick_n)
+        if args.spotpick else [args.instance_type]
+    )
+    if len(instance_types) > 1:
+        print(f"spotpick fallback chain: {instance_types}", flush=True)
+    iid, used_type = _launch_with_fallback(
+        ec2, run_kwargs, instance_types=instance_types, spot=not args.on_demand
+    )
+    print(f"Launched {iid} as {used_type} ({'spot' if not args.on_demand else 'on-demand'})", flush=True)
+    print(f"Run S3: s3://{args.bucket}/{args.prefix}/{run_subdir}/", flush=True)
+    print(f"  checkpoints: .../{run_subdir}/checkpoints/  | logs: .../{run_subdir}/logs/", flush=True)
+    print(f"Monitor console: aws ec2 get-console-output --instance-id {iid} --region {args.region} --latest",
+          flush=True)
+    print(f"Terminate: aws ec2 terminate-instances --instance-ids {iid} --region {args.region}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

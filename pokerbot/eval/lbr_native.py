@@ -32,7 +32,15 @@ import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 
 from pokerbot.engine.jax_engine import CHIP_UNIT, NUM_PLAYERS, init_hand  # noqa: E402
-from pokerbot.engine.np_engine import ALL_IN, BET_BUCKET_START, to_numpy_state  # noqa: E402
+from pokerbot.engine.np_engine import (  # noqa: E402
+    ALL_IN,
+    BET_BUCKET_START,
+    CALL,
+    CHECK,
+    FOLD,
+    NUM_ACTIONS,
+    to_numpy_state,
+)
 from pokerbot.eval.lbr import LBRConfig, LBRResult  # noqa: E402
 from pokerbot.eval.lbr6 import LBR6Config, LBR6Result  # noqa: E402
 from pokerbot.search import native_solver  # noqa: E402  (reuse the .dll->.pyd loader + _to_flat)
@@ -47,6 +55,21 @@ MODE_FOLD = 1
 MODE_NIT = 2
 MODE_UNIFORM = 3
 MODE_STATION = 4
+
+
+def _build_allowed_action_mask(bet_bucket_keep: tuple[int, ...] | None) -> np.ndarray | None:
+    """Lean copy of the training action-abstraction mask for native LBR."""
+    if bet_bucket_keep is None:
+        return None
+    allowed = np.zeros(NUM_ACTIONS, dtype=bool)
+    for a in (FOLD, CHECK, CALL, ALL_IN):
+        allowed[a] = True
+    n_buckets = ALL_IN - BET_BUCKET_START
+    for i in bet_bucket_keep:
+        if not 0 <= int(i) < n_buckets:
+            raise ValueError(f"bet_bucket_keep index {i} out of range [0,{n_buckets})")
+        allowed[BET_BUCKET_START + int(i)] = True
+    return allowed
 
 
 # --------------------------------------------------------------------------- #
@@ -74,11 +97,13 @@ def available() -> bool:
 
 
 def _allowed_masks():
-    from pokerbot.training.sd_cfr_nlhe import build_allowed_action_mask
-
-    pre = build_allowed_action_mask((4, 5, 6))
-    post = build_allowed_action_mask((0, 1, 3, 4, 5))
+    pre = _build_allowed_action_mask((4, 5, 6))
+    post = _build_allowed_action_mask((0, 1, 3, 4, 5))
     return [bool(x) for x in pre], [bool(x) for x in post]
+
+
+def _num_buckets() -> int:
+    return int(os.environ.get("POKERBOT_POSTFLOP_NUM_BUCKETS", "200"))
 
 
 def build_neural_harness(checkpoint: str):
@@ -170,16 +195,26 @@ def _build_roots(*, hands, seed, n_seats, occ, button_fn, seat_fn, stack_bb, ant
 
 
 def _run(ext, snapshot_dict, *, blob, seats, seeds, n_seats, cfg, policy_mode, bet_candidates,
-         depth_edges=None):
+         depth_edges=None, emd_frozen_path: str | None = None):
     pre, post = _allowed_masks()
-    harness = ext.Lbr6Harness(snapshot_dict, pre, post, 200,
+    num_buckets = _num_buckets()
+    harness = ext.Lbr6Harness(snapshot_dict, pre, post, num_buckets,
                               [float(x) for x in (depth_edges or [])])
+    emd_meta = None
+    if emd_frozen_path:
+        if not hasattr(harness, "set_emd_frozen"):
+            raise AttributeError("native Lbr6Harness lacks set_emd_frozen; rebuild battery_native")
+        emd_meta = harness.set_emd_frozen(str(emd_frozen_path))
+        if int(emd_meta[0]) != int(num_buckets):
+            raise RuntimeError(
+                f"EMD frozen num_buckets={emd_meta[0]} != active num_buckets={num_buckets}"
+            )
     out = harness.lbr_tabular(
         blob, seats, seeds, int(n_seats),
         bool(cfg.track_ranges), int(cfg.range_cap),
         int(cfg.eq_samples), int(cfg.eq_runouts), int(cfg.settle_samples), int(cfg.max_depth),
         [int(a) for a in bet_candidates], bool(cfg.value_only_raises), int(policy_mode))
-    return out
+    return out, emd_meta
 
 
 def _per_seat_dict(out) -> dict:
@@ -193,7 +228,8 @@ def _per_seat_dict(out) -> dict:
 # 6-max blueprint (the Pluribus validator)
 # --------------------------------------------------------------------------- #
 def lbr6_exploitability_native(snapshot, cfg: LBR6Config | None = None, *,
-                               policy: str = "blueprint", depth_edges=None) -> LBR6Result:
+                               policy: str = "blueprint", depth_edges=None,
+                               emd_frozen_path: str | None = None) -> LBR6Result:
     """Native 6-max LBR lower bound. `policy`: 'blueprint' (real) or a calibration ref
     ('fold' ~ +128 bb/100, 'station' ~ +1400 bb/100, 'nit', 'uniform'). Mirrors
     `lbr6_exploitability`'s 6-max convention
@@ -210,8 +246,11 @@ def lbr6_exploitability_native(snapshot, cfg: LBR6Config | None = None, *,
         hands=cfg.hands, seed=cfg.seed, n_seats=cfg.n_seats, occ=occ,
         button_fn=lambda h: None, seat_fn=lambda h: h % cfg.n_seats,
         stack_bb=cfg.stack_bb, ante_bb=cfg.ante_bb)
-    out = _run(ext, snap, blob=blob, seats=seats, seeds=seeds, n_seats=cfg.n_seats, cfg=cfg,
-               policy_mode=mode, bet_candidates=cfg.bet_candidates, depth_edges=depth_edges)
+    out, emd_meta = _run(
+        ext, snap, blob=blob, seats=seats, seeds=seeds, n_seats=cfg.n_seats, cfg=cfg,
+        policy_mode=mode, bet_candidates=cfg.bet_candidates, depth_edges=depth_edges,
+        emd_frozen_path=emd_frozen_path,
+    )
     ev = float(out.ev_bb_per_hand)
     return LBR6Result(
         ev_bb_per_hand=ev, mbb_per_g=ev * 1000.0, bb_per_100=ev * 100.0,
@@ -221,6 +260,8 @@ def lbr6_exploitability_native(snapshot, cfg: LBR6Config | None = None, *,
             "eq_samples": cfg.eq_samples, "track_ranges": cfg.track_ranges, "range_cap": cfg.range_cap,
             "per_seat": _per_seat_dict(out), "bet_candidates": list(cfg.bet_candidates),
             "stack_bb": cfg.stack_bb, "ante_bb": cfg.ante_bb, "native": True,
+            "num_buckets": _num_buckets(), "emd_frozen_path": emd_frozen_path,
+            "emd_frozen_meta": tuple(emd_meta) if emd_meta is not None else None,
         })
 
 
@@ -228,7 +269,8 @@ def lbr6_exploitability_native(snapshot, cfg: LBR6Config | None = None, *,
 # Heads-up (tabular) -- shared root convention with the HU net (seats 3,5)
 # --------------------------------------------------------------------------- #
 def lbr_hu_tabular_native(snapshot, cfg: LBRConfig | None = None, *,
-                          policy: str = "blueprint", depth_edges=None) -> LBRResult:
+                          policy: str = "blueprint", depth_edges=None,
+                          emd_frozen_path: str | None = None) -> LBRResult:
     """Native HU LBR over a tabular snapshot (or a calibration policy). Uses the trained HU occupancy
     (seats 3,5, button in {3,5}) so the served info-state matches training, exactly like `lbr.py`."""
     cfg = cfg or LBRConfig()
@@ -245,8 +287,11 @@ def lbr_hu_tabular_native(snapshot, cfg: LBRConfig | None = None, *,
         button_fn=lambda h: jnp.int32(_HU_LIVE[(h // 2) % 2]),
         seat_fn=lambda h: _HU_LIVE[h % 2],
         stack_bb=cfg.stack_bb, ante_bb=cfg.ante_bb)
-    out = _run(ext, snap, blob=blob, seats=seats, seeds=seeds, n_seats=NUM_PLAYERS, cfg=lcfg,
-               policy_mode=mode, bet_candidates=cfg.bet_candidates, depth_edges=depth_edges)
+    out, emd_meta = _run(
+        ext, snap, blob=blob, seats=seats, seeds=seeds, n_seats=NUM_PLAYERS, cfg=lcfg,
+        policy_mode=mode, bet_candidates=cfg.bet_candidates, depth_edges=depth_edges,
+        emd_frozen_path=emd_frozen_path,
+    )
     ev = float(out.ev_bb_per_hand)
     return LBRResult(
         ev_bb_per_hand=ev, mbb_per_g=ev * 1000.0, bb_per_100=ev * 100.0,
@@ -254,5 +299,6 @@ def lbr_hu_tabular_native(snapshot, cfg: LBRConfig | None = None, *,
         detail={
             "method": "native_analytic_1ply_lbr_hu", "policy": policy,
             "per_seat": _per_seat_dict(out), "stack_bb": cfg.stack_bb, "ante_bb": cfg.ante_bb,
-            "native": True,
+            "native": True, "num_buckets": _num_buckets(), "emd_frozen_path": emd_frozen_path,
+            "emd_frozen_meta": tuple(emd_meta) if emd_meta is not None else None,
         })

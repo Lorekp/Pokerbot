@@ -99,7 +99,7 @@ require porting the CFR recursion + gadget RNG into Rust, which would forfeit th
    that dominated the first cut is gone.
 3. **Flat `Copy` EnvState struct** in Rust (fixed-size arrays, no heap), `#[inline]` hot leaves,
    `lto="fat"`, `codegen-units=1`, `opt-level=3`, `panic="abort"`.
-4. **abi3-py314** stable ABI — one `.pyd` works across CPython 3.14+.
+4. **abi3-py310** stable ABI — one native module works on the EC2 Python 3.10 runtime and newer CPython.
 
 ## Build
 

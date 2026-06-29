@@ -75,7 +75,11 @@ fn abstracted_legal<const N: usize>(
     pcfg: &PlayoutConfig,
 ) -> [bool; NUM_ACTIONS] {
     let full = core::legal_action_mask(s, seat as i32);
-    let allowed = if s.street == 0 { &pcfg.allowed_pre } else { &pcfg.allowed_post };
+    let allowed = if s.street == 0 {
+        &pcfg.allowed_pre
+    } else {
+        &pcfg.allowed_post
+    };
     let mut m = [false; NUM_ACTIONS];
     for a in 0..NUM_ACTIONS {
         m[a] = full[a] && allowed[a];
@@ -446,7 +450,11 @@ fn cfv<const N: usize>(
     }
     tab.regrets.insert(key.clone(), newr);
     // CFR+ linear averaging: weight iteration t's strategy by (t+1) (matches the Python solver).
-    let w = if ctx.scfg.linear_averaging { (t + 1) as f64 } else { 1.0 };
+    let w = if ctx.scfg.linear_averaging {
+        (t + 1) as f64
+    } else {
+        1.0
+    };
     let ss = tab.strat_sum.entry(key).or_insert([0.0; NUM_ACTIONS]);
     for a in 0..NUM_ACTIONS {
         ss[a] += w * strat[a];
@@ -468,7 +476,12 @@ pub fn solve<const N: usize>(
     if !any_legal(&legal_root) {
         return probs;
     }
-    let ctx = Ctx { bp, pcfg, scfg, public_seed };
+    let ctx = Ctx {
+        bp,
+        pcfg,
+        scfg,
+        public_seed,
+    };
     let mut tab = Tables {
         regrets: HashMap::new(),
         strat_sum: HashMap::new(),

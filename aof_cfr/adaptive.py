@@ -306,8 +306,19 @@ class AdaptiveOpponentModel:
                 self.load_dict(raw.get("duals", {}))
                 with self._mu:
                     self._instab.update({k: float(v) for k, v in (raw.get("instab", {}) or {}).items()})
-            except (OSError, ValueError):
-                pass
+            except (OSError, ValueError) as e:
+                # adaptive model is the start-up bootstrap; a transient read failure (e.g. AV lock on
+                # Windows) must NOT silently zero the model. Mirror opponent_db's corrupt-snapshot
+                # hygiene: warn + back up + start fresh.
+                if self.path and Path(self.path).exists():
+                    try:
+                        bad = Path(self.path).with_suffix(".json.corrupt")
+                        os.replace(self.path, bad)
+                        print(f"AdaptiveOpponentModel: failed to read {self.path} ({e!r}); "
+                              f"backed up to {bad}, starting fresh")
+                    except OSError:
+                        print(f"AdaptiveOpponentModel: failed to read {self.path} ({e!r}); "
+                              f"starting fresh (could not back up)")
         return self
 
     def save(self) -> None:

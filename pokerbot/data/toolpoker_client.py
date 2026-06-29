@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,8 +33,22 @@ class ToolPokerClient:
     def fetch_spot(self, spot_id: str, *, use_cache: bool = True) -> dict[str, Any]:
         cache = self._cache_path(spot_id)
         if use_cache and cache.exists():
-            line = cache.read_text(encoding="utf-8").strip().splitlines()[0]
-            return json.loads(line)
+            # CRASH-RESUME-AUDIT #7 + recovery: read is now tolerant of a torn first line (the
+            # previous crash mode was a single in-place write_text that left a partial JSON).
+            # We skip empty / unparseable lines and fall through to a network re-fetch.
+            try:
+                text = cache.read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    return json.loads(line)
+                except (ValueError, json.JSONDecodeError):
+                    # torn first line — fall through to re-fetch
+                    break
 
         url = f"{self.config.base_url.rstrip('/')}/spots/{spot_id}"
         headers = {"Accept": "application/json"}
@@ -46,7 +61,27 @@ class ToolPokerClient:
         except URLError as exc:
             raise ConnectionError(f"ToolPoker API unavailable: {exc}") from exc
 
-        cache.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        # CRASH-RESUME-AUDIT #7: write the cache atomically (tmp + fsync + os.replace + dir-fsync).
+        # Previously ``cache.write_text`` was in-place; a power cut mid-write left a torn JSON file
+        # and every subsequent fetch_spot() call raised json.loads. The atomic rewrite protects the
+        # $ + rate-limit cost of an unnecessary re-fetch.
+        tmp = cache.with_name(cache.name + ".atomic.tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload) + "\n")
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, cache)
+        try:
+            dir_fd = os.open(str(cache.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
         return payload
 
     def append_jsonl(self, records: list[dict[str, Any]], output: Path) -> Path:

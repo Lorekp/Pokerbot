@@ -15,9 +15,7 @@
 
 use std::collections::HashMap;
 
-use crate::core::{
-    self, EnvStateN, BET_BUCKET_START, CALL, CHECK, FOLD, NUM_ACTIONS,
-};
+use crate::core::{self, EnvStateN, BET_BUCKET_START, CALL, CHECK, FOLD, NUM_ACTIONS};
 use crate::fingerprint::{fingerprint_fast, CHIP_UNIT};
 
 pub const NUM_CONTINUATIONS: usize = 4;
@@ -70,10 +68,7 @@ impl Rng {
 
     #[inline]
     fn next_u64(&mut self) -> u64 {
-        let result = self.s[1]
-            .wrapping_mul(5)
-            .rotate_left(7)
-            .wrapping_mul(9);
+        let result = self.s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
         let t = self.s[1] << 17;
         self.s[2] ^= self.s[0];
         self.s[3] ^= self.s[1];

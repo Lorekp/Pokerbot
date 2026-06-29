@@ -150,3 +150,36 @@ def test_module_runs_fast(d1, d2):
     assert np.isfinite(d1["A1_separation_fraction"])
     assert np.isfinite(d2["gain_bb"])
     assert time.perf_counter() - t0 < 1.0
+
+
+@pytest.fixture(scope="module")
+def functional_tasks():
+    rng = np.random.default_rng(SEED + 99)
+    return emdq.functional_micro_ev_tasks(
+        rng,
+        n_spots=400,
+        n_buckets=D2_BUCKETS,
+        n_bins=N_BINS,
+        n_runouts=N_RUNOUTS,
+        fit_sample=400,
+    )
+
+
+def test_functional_micro_ev_tasks_no_large_regression(functional_tasks):
+    """EMD should not materially regress made-hand on functional micro-EV tasks."""
+    for name, row in functional_tasks.items():
+        assert row["gain_bb"] >= -0.01, f"{name} gain {row['gain_bb']}"
+
+
+def test_functional_at_least_one_task_closes_gap(functional_tasks):
+    closed = [
+        name for name, row in functional_tasks.items()
+        if row.get("frac_gap_closed_by_emd") is not None and row["frac_gap_closed_by_emd"] > 0.05
+    ]
+    assert closed, "expected at least one functional task to close >5% of made-hand gap"
+
+
+def test_river_fallback_sanity():
+    sanity = emdq.river_fallback_sanity(n_bins=N_BINS, n_runouts=N_RUNOUTS, n_buckets=D2_BUCKETS)
+    assert sanity["river_peak_mass_min"] >= 0.90
+    assert sanity["river_hist_variance_mean"] < 0.08

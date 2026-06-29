@@ -126,10 +126,14 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NPY_NUM_THREAD
 export XLA_FLAGS="--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1 inter_op_parallelism_threads=1"
 # Background syncer: push newly-compiled XLA executables to S3 every 90s for reclaim resilience.
 cat > /tmp/jc_sync.py <<'JCEOF'
-import time, os, boto3
+import time, os, sys, boto3
 s3 = boto3.client("s3", region_name="{region}")
 B, P, base = "{bucket}", "{prefix}/jax_cache_{arch}", "/tmp/jax_cache"
 sent = set()
+last_err = ""
+last_err_at = 0.0
+last_heartbeat = 0.0
+consec = 0
 while True:
     time.sleep(90)
     for root, _, files in os.walk(base):
@@ -145,10 +149,27 @@ while True:
             try:
                 s3.upload_file(p, B, P + "/" + rel)
                 sent.add((rel, mt))
-            except Exception:
-                pass
+            except Exception as e:  # R4 HIGH 2: track last_err, abort on N consecutive failures
+                last_err = repr(e)
+                last_err_at = time.time()
+                consec += 1
+                print(f"  jc_sync upload failed: {last_err} (consec={consec})", flush=True)
+                if consec >= 10:
+                    print(f"  jc_sync ABORT: {consec} consecutive upload failures; "
+                          f"last_err={last_err}", flush=True)
+                    sys.exit(1)
+                continue
+            consec = 0  # success resets the counter
+            print(f"  jc_sync ok {rel}", flush=True)
+    if time.time() - last_heartbeat >= 60.0:
+        last_heartbeat = time.time()
+        print(f"  jc_sync heartbeat: sent={len(sent)} last_err={last_err}", flush=True)
+    time.sleep(2)
 JCEOF
 nohup python3 /tmp/jc_sync.py >/var/log/jc_sync.log 2>&1 &
+# R4 LOW 2: trap script exit to kill the nohup'd jc_sync (was surviving
+# shutdown -h and being SIGKILLed mid-upload, losing the final batch).
+trap 'pkill -f /tmp/jc_sync.py || true' EXIT
 mkdir -p /tmp/out
 python3 scripts/train_neural_cfr.py \
   --vcpus {vcpus} --sat-topology single \

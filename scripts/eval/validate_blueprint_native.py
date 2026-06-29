@@ -74,7 +74,22 @@ def main() -> int:
 
     snap, edges = load_blueprint(args.checkpoint)
     print(f"blueprint: {len(snap):,} infosets  depth_edges={edges or 'none'}")
-    seeds = list(range(args.seeds))
+
+    # CRN reseed per replication (SCRIPTS-EVAL-AUDIT HIGH). The previous
+    # ``seeds = list(range(args.seeds))`` lets the table_id + deck sequence
+    # COLLIDE across replications (same shape as the eval_emd_vs_iter62000
+    # hypothesis B bug — the k500 verdict was produced by exactly this
+    # pattern). Reuse the documented XOR-with-base-seed pattern from
+    # ``scripts/eval/eval_emd_vs_iter62000.py:90-109`` so all readers agree
+    # on the stream. We duplicate the 8 lines here rather than import
+    # because that module is heavy (it pulls JAX / battery_native) and
+    # validate_blueprint_native is a smoke-gate.
+    BASE_SEED = 0x5EEDBAB0  # mirror scripts/eval/eval_emd_vs_iter62000.py
+    seeds = [BASE_SEED ^ i for i in range(args.seeds)]
+    # CRN-collision assertion — belt-and-suspenders (the XOR trivially
+    # gives N distinct non-zero values; asserting it forces a runtime
+    # check the day someone changes BASE_SEED to 0 or breaks the XOR).
+    assert len(set(seeds)) == args.seeds, f"CRN reseed produced collisions: {seeds}"
 
     def cfg(seed):
         return LBR6Config(hands=args.hands, seed=seed, n_seats=args.n_seats,
@@ -108,11 +123,18 @@ def main() -> int:
           ", ".join(f"s{k}={v['bb_per_100']:+.0f}" for k, v in sorted(last.detail["per_seat"].items())))
 
     if args.output:
-        with open(args.output, "w") as f:
-            json.dump({"infosets": len(snap), "depth_edges": edges, "hands_per_seed": args.hands,
-                       "seeds": args.seeds, "value_only": args.value_only,
-                       "bb_per_100": mean, "ci95": [lo, hi], "per_seed": vals,
-                       "verdict": verdict, "wall_s": wall}, f, indent=2)
+        # Atomic JSON write (SCRIPTS-EVAL-AUDIT CRIT) — torn-tail-safe.
+        # Import lazily so a smoke run without --output doesn't pay the cost.
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+        from _atomic_io import write_json_atomic  # noqa: PLC0415
+        write_json_atomic(args.output, {
+            "infosets": len(snap), "depth_edges": edges, "hands_per_seed": args.hands,
+            "seeds": args.seeds, "value_only": args.value_only,
+            "bb_per_100": mean, "ci95": [lo, hi], "per_seed": vals,
+            "verdict": verdict, "wall_s": wall,
+        }, indent=2)
         print(f"  wrote {args.output}")
     return 0
 

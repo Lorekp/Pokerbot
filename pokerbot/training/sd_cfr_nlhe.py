@@ -521,6 +521,16 @@ class SDCFRNLHETrainer:
         iteration_num = int(iteration_weight)
         from pokerbot.training.sd_cfr_nlhe_distributed import run_traversal_phase_single_threaded
 
+        # 1.1/1.4 fix (CFR-AUDIT): wire ``self._iter_weight = iteration_weight`` DEFENSIVELY in the
+        # parent train_iteration. The distributed single-thread path (``run_traversal_phase_single_
+        # threaded``) ALSO sets it on line 310 of sd_cfr_nlhe_distributed.py, so the production
+        # path is already correct; this assignment here is the backstop for any caller that uses
+        # ``train_iteration`` directly without going through the distributed path (a unit test,
+        # a future experimental harness, etc.). The strategy-sum update on line 432 multiplies
+        # by ``self._iter_weight``; without this assignment it would silently stay at the
+        # ``__init__`` value 1.0 (legacy uniform averaging) instead of the CFR+ linear weight
+        # ``t``. Cheap to do; closes a silent regression.
+        self._iter_weight = float(iteration_weight)
         self._iter_samples = []
         run_traversal_phase_single_threaded(
             self,
@@ -705,6 +715,14 @@ class SDCFRNLHETrainer:
         return (min(evs) if evs else 0.0, max(evs) if evs else 0.0)
 
 
+def _iter_num_from_path(p: Path) -> int:
+    """Extract the iteration number from a checkpoint path like ``sd_cfr_nlhe_iter_0042.pkl``.
+    Returns -1 for files that don't match (e.g. ``latest.pkl``) so they sort last."""
+    import re
+    m = re.search(r"iter_(\d+)", p.stem)
+    return int(m.group(1)) if m else -1
+
+
 def save_nlhe_checkpoint(trainer: SDCFRNLHETrainer, path: Path, *, worker_base: bool = False) -> None:
     """Pickle the trainer state. ``worker_base=True`` writes a SLIM base for pool workers.
 
@@ -724,7 +742,15 @@ def save_nlhe_checkpoint(trainer: SDCFRNLHETrainer, path: Path, *, worker_base: 
     require_potential_aware_buckets(context="saving NLHE blueprint checkpoint")
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as f:
+    # CRASH-RESUME-AUDIT #4: wrap the pickle in tmp + fsync + os.replace + dir-fsync. The 2026-06-23
+    # power-cut that zeroed seven_v1_full.pkl is the documented precedent — without atomicity, a kill -9
+    # mid-pickle truncates the file and resume picks up a torn pickle that fails to load → forced to
+    # re-start from iter 0. The fix follows the reference pattern in pokerbot/training/neural_cfr.py
+    # (_atomic_save_trainer_checkpoint) and player_profiles.save. Same code path for all callers; the
+    # `worker_base` flag only affects the payload (above), not the durability wrapper.
+    import os
+    tmp = path.with_name(path.name + ".atomic.tmp")
+    with tmp.open("wb") as f:
         pickle.dump(
             {
                 "trainer_type": "nlhe",
@@ -751,13 +777,72 @@ def save_nlhe_checkpoint(trainer: SDCFRNLHETrainer, path: Path, *, worker_base: 
             },
             f,
         )
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            # Some filesystems (rare) refuse fsync — best-effort, since the tmp→replace still
+            # gives atomicity on platforms that DON'T journal the rename away.
+            pass
+    os.replace(tmp, path)
+    # CRASH-RESUME-AUDIT cross-cutting A: parent-dir fsync after the rename so the directory
+    # entry change survives a power cut. NTFS is journaled so this is mostly belt-and-braces;
+    # POSIX without this loses the rename from the inode table on power cut.
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def load_nlhe_checkpoint(trainer: SDCFRNLHETrainer, path: Path) -> int:
+    """Restore trainer state from a checkpoint pickle; returns completed iteration count.
+
+    CRASH-RESUME-AUDIT cross-cutting E: torn-pickle recovery. The original code raised on a
+    torn file and forced the caller to re-run from iter 0. Now: if ``path`` is unreadable as
+    a pickle, scan the parent directory for sibling ``iter_NNNN.pkl`` files (written every
+    ``checkpoint_every`` iters during training) and try them in descending order. This means
+    a torn ``latest.pkl`` falls back to the previous good iter — losing at most
+    ``checkpoint_every`` iterations of compute instead of the whole run.
+
+    The atomic-write side (save_nlhe_checkpoint, CRASH-RESUME-AUDIT #4) means a torn file
+    is now rare, but this wrapper is the safety net for the older checkpoints already on disk.
+    """
+    import logging
     import pickle
 
-    with Path(path).open("rb") as f:
-        data = pickle.load(f)
+    target = Path(path)
+    try:
+        with target.open("rb") as f:
+            data = pickle.load(f)
+    except (OSError, pickle.UnpicklingError, EOFError, ValueError, ImportError) as primary_exc:
+        # Try the sibling ``iter_NNNN.pkl`` files in the same dir, highest first.
+        parent = target.parent
+        try:
+            siblings = sorted(
+                parent.glob("sd_cfr_nlhe_iter_*.pkl"),
+                key=lambda p: _iter_num_from_path(p),
+                reverse=True,
+            )
+        except OSError:
+            siblings = []
+        for sib in siblings:
+            try:
+                with sib.open("rb") as f:
+                    data = pickle.load(f)
+                logging.getLogger(__name__).warning(
+                    "load_nlhe_checkpoint: primary %s torn (%s), recovered from %s",
+                    target, primary_exc, sib,
+                )
+                break
+            except (OSError, pickle.UnpicklingError, EOFError, ValueError, ImportError):
+                continue
+        else:
+            # Nothing recoverable — re-raise the original failure so the caller sees the real cause.
+            raise
     replace_kw: dict = {"params": data["params"]}
     if "opt_state" in data and data["opt_state"] is not None:
         replace_kw["opt_state"] = data["opt_state"]

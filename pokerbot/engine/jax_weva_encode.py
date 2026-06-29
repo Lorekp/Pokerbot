@@ -54,6 +54,79 @@ def _get_bucketer() -> Any:
 
 
 _GLOBAL_EMD_BUCKETER: Any = None
+_GLOBAL_EMD_FROZEN: Any = None
+_GLOBAL_EMD_FROZEN_PATH: str | None = None
+_EMD_FROZEN_MISS_COUNT: int = 0
+
+
+def _emd_fail_on_miss() -> bool:
+    """When frozen lookup misses, return -1 instead of silently degrading to made-hand buckets."""
+    return os.environ.get("POKERBOT_EMD_FROZEN_FAIL_ON_MISS", "1").lower() not in (
+        "0",
+        "",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _emd_mirror_fallback() -> bool:
+    """Explicit train/serve mirrored fallback to made-hand bucket on frozen miss (observable)."""
+    return os.environ.get("POKERBOT_EMD_FROZEN_MIRROR_FALLBACK", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _emd_allow_silent_fallback() -> bool:
+    """Legacy smoke-only path: silent made-hand fallback (discouraged for pilots/eval)."""
+    return os.environ.get("POKERBOT_EMD_FROZEN_ALLOW_SILENT_FALLBACK", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def reset_emd_frozen_miss_count() -> int:
+    """Reset miss counter (tests); returns previous count."""
+    global _EMD_FROZEN_MISS_COUNT
+    prev = _EMD_FROZEN_MISS_COUNT
+    _EMD_FROZEN_MISS_COUNT = 0
+    return prev
+
+
+def emd_frozen_miss_count() -> int:
+    return int(_EMD_FROZEN_MISS_COUNT)
+
+
+def _get_emd_frozen_lookup() -> Any | None:
+    """Load the native frozen EMD flop/turn lookup when the serve env provides it."""
+    global _GLOBAL_EMD_FROZEN, _GLOBAL_EMD_FROZEN_PATH
+    path = os.environ.get("POKERBOT_POSTFLOP_EMD_FROZEN")
+    if not path:
+        return None
+    if _GLOBAL_EMD_FROZEN is None or _GLOBAL_EMD_FROZEN_PATH != path:
+        try:
+            import battery_native as bn  # noqa: PLC0415
+        except Exception as e:  # noqa: BLE001
+            try:
+                from pokerbot.search import native_solver  # noqa: PLC0415
+
+                bn = native_solver._try_load()
+            except Exception:  # noqa: BLE001
+                bn = None
+            if bn is None:
+                raise RuntimeError(
+                    "POKERBOT_POSTFLOP_EMD_FROZEN is set, but battery_native could not be imported"
+                ) from e
+        if not hasattr(bn, "EmdFrozenLookup"):
+            raise RuntimeError("battery_native.EmdFrozenLookup missing; rebuild the native EMD crate")
+        _GLOBAL_EMD_FROZEN = bn.EmdFrozenLookup.load(path)
+        _GLOBAL_EMD_FROZEN_PATH = path
+    return _GLOBAL_EMD_FROZEN
 
 
 def _get_emd_bucketer() -> Any:
@@ -111,6 +184,22 @@ def compute_postflop_bucket(hole_ids: Any, board_ids: Any) -> int:
 
         return fast_made_hand_bucket((h[0], h[1]), tuple(board), _POSTFLOP_NUM_BUCKETS)
     if _POSTFLOP_MODE == "emd":
+        frozen = _get_emd_frozen_lookup()
+        if frozen is not None:
+            bucket = int(frozen.bucket([h[0], h[1]], list(board)))
+            if bucket >= 0:
+                return bucket
+            global _EMD_FROZEN_MISS_COUNT
+            _EMD_FROZEN_MISS_COUNT += 1
+            if _emd_mirror_fallback() or _emd_allow_silent_fallback():
+                from pokerbot.encoding.postflop_bucketer import fast_made_hand_bucket
+
+                return fast_made_hand_bucket((h[0], h[1]), tuple(board), _POSTFLOP_NUM_BUCKETS)
+            if _emd_fail_on_miss():
+                return -1
+            from pokerbot.encoding.postflop_bucketer import fast_made_hand_bucket
+
+            return fast_made_hand_bucket((h[0], h[1]), tuple(board), _POSTFLOP_NUM_BUCKETS)
         return _get_emd_bucketer().bucket((h[0], h[1]), tuple(board))
     return _get_bucketer().bucket((h[0], h[1]), tuple(board))
 
@@ -135,6 +224,18 @@ def active_abstraction_config() -> dict:
         "preflop_lossless": bool(weva_encoder._PREFLOP_LOSSLESS),
         "preflop_lossless_betting": bool(weva_encoder._PREFLOP_LOSSLESS_BETTING),
     }
+    if _POSTFLOP_MODE == "emd":
+        frozen_path = os.environ.get("POKERBOT_POSTFLOP_EMD_FROZEN", "")
+        cfg["postflop_emd_frozen_path"] = frozen_path
+        cfg["postflop_emd_frozen_s3"] = os.environ.get("POKERBOT_POSTFLOP_EMD_FROZEN_S3", "")
+        cfg["postflop_emd_table_id"] = os.environ.get("POKERBOT_POSTFLOP_EMD_TABLE_ID", "")
+        cfg["postflop_emd_frozen_sha256"] = ""
+        if frozen_path and os.path.exists(frozen_path):
+            with open(frozen_path, "rb") as f:
+                cfg["postflop_emd_frozen_sha256"] = hashlib.sha256(f.read()).hexdigest()
+        cfg["postflop_emd_frozen_miss_count"] = int(_EMD_FROZEN_MISS_COUNT)
+        cfg["postflop_emd_frozen_fail_on_miss"] = bool(_emd_fail_on_miss())
+        cfg["postflop_emd_frozen_mirror_fallback"] = bool(_emd_mirror_fallback())
     # Depth-aware blueprint (A2): emit the stamp fields ONLY when enabled, so the default (off) stamp stays
     # byte-identical to legacy non-depth checkpoints (and the golden config). The serve guard
     # (check_blueprint_serve_env) compares these with a `.get(default=False)` so a missing key reads as off.

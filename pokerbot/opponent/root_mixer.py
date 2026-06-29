@@ -178,7 +178,9 @@ def _table_too_aggressive(profiles: dict | None, k: int = AGG_KILL_COUNT) -> boo
 
 
 def apply_root_exploit_mixer(state, seat: int, probs: np.ndarray, profiles: dict | None,
-                             *, unopened: bool = False, solver_best_responds: bool = False) -> np.ndarray:
+                             *, unopened: bool = False, solver_best_responds: bool = False,
+                             stability_tracker=None, gift_register=None, villain_key=None,
+                             n_players: int | None = None) -> np.ndarray:
     """Tilt the hero's own policy ``probs`` at ``state``/``seat`` by the villain read.
 
     Reads the villain's RESPONSE context (how they react to a bet when we can bet; how often
@@ -192,12 +194,23 @@ def apply_root_exploit_mixer(state, seat: int, probs: np.ndarray, profiles: dict
     over-exploit (the measured negative lean on a homogeneous station table) — so under this flag the
     value branch DEFERS to the solver, mirroring the facing branch's existing defer-to-search-policy.
     The heuristic / HybridAgent vehicle has NO solver response (solver_best_responds=False) and keeps
-    the full tilt (its battery-validated +EV path is unchanged)."""
+    the full tilt (its battery-validated +EV path is unchanged).
+
+    F1 wiring (F1 audit note, 2026-06-26): when ``stability_tracker`` AND ``villain_key`` are
+    supplied, the FACING branch's alpha ceiling is composed with ``effective_alpha(confidence,
+    n_players, stability)`` (the same shape as ``apply_live_value_sizing``). A villain the tracker
+    has caught ADAPTING clamps the ceiling toward CAP_FLOOR — closes the structural uncapping the
+    audit flagged. Without a tracker wired, stability defaults to 1.0 (commit fully, bounded only
+    by the N-ceiling). ``gift_register`` BEFEWP relaxes the BASE ceiling UP TO — but never past —
+    the RNR ceiling. ``n_players`` overrides the ``n_live_players(state, hero=seat)`` computation
+    when the caller knows better (testing, custom simulators)."""
     from pokerbot.agent import _hero_hand_strength
     from pokerbot.opponent.bayes_exploit import (DEFAULT_MAX_ALPHA, aggregate_read, bluff_read,
                                                  context_read)
     from pokerbot.opponent.context import context_key, is_aggressive_type
     from pokerbot.opponent.mixer import safe_mix_policies
+    from pokerbot.opponent.rnr_cap import (CAP_FLOOR, default_exploit_cap, effective_alpha,
+                                           n_live_players)
     from pokerbot.training.self_play import _legal_mask
 
     if profiles is None or probs.sum() <= 0:
@@ -350,6 +363,39 @@ def apply_root_exploit_mixer(state, seat: int, probs: np.ndarray, profiles: dict
     # (-1.13 bb/hand, bet_shift -0.185) on the search base, which the heuristic hero's cruder
     # base had masked. tv~0 => alpha~0 => the control stays clean by construction.
     alpha = DEFAULT_MAX_ALPHA * read.conf * min(1.0, read.tv / 0.25)
+    # F1 wire-up: compose with the N-dependent RNR ceiling + (optional) stability_tracker clamp.
+    # Mirrors apply_live_value_sizing (root_mixer.py:602-632): the FACING branch now respects the
+    # same N- and stability-dependent cap the value-sizing overlay already enforces, so a 6-max
+    # counter-adapter can no longer over-exploit. Stability defaults to 1.0 (commit fully when
+    # no tracker is wired) — backward-compatible with the existing battery tests.
+    try:
+        if n_players is None:
+            n_players = int(n_live_players(state, hero=seat))
+        rnr_ceiling = float(default_exploit_cap(max(2, n_players)))
+        stability = 1.0
+        if stability_tracker is not None and villain_key is not None:
+            try:
+                stability = float(stability_tracker.opponent_stability(villain_key))
+            except Exception:  # noqa: BLE001 — a broken tracker MUST NOT break the serve
+                stability = 1.0
+        # Compose: the FACING-branch alpha may not exceed min(ceiling_after_stab, alpha).
+        # When stability=1.0 the ceiling relaxes to rnr_ceiling (no tracker = commit fully,
+        # bounded only by N). When stability=0 the cap collapses to CAP_FLOOR for any N.
+        capped_alpha = min(effective_alpha(confidence=float(read.conf),
+                                           n_players=max(2, n_players),
+                                           stability=stability),
+                            rnr_ceiling)
+        # BEFEWP: gift_register may raise the BASE ceiling UP TO the rnr_ceiling (clamped above).
+        if gift_register is not None and villain_key is not None:
+            try:
+                capped_alpha = min(max(capped_alpha,
+                                       float(gift_register.capped_max_alpha(villain_key, capped_alpha))),
+                                   rnr_ceiling)
+            except Exception:  # noqa: BLE001
+                pass
+        alpha = min(alpha, capped_alpha)
+    except Exception:  # noqa: BLE001 — never let the RNR wire break the legacy path
+        pass
     if alpha <= 1e-3:
         return probs
     # Steal shaping: a fold-equity bluff-boost wins the pot whatever the size but loses ~size

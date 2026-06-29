@@ -31,13 +31,23 @@ impl Net {
     /// Build from flat layer arrays. `w[l]` is `din[l]*dout[l]` row-major (element (i,j) at i*dout+j),
     /// `b[l]` is len `dout[l]`. `info_suits` must match the checkpoint's POKERBOT_INFO_SUITS.
     pub fn new(
-        w0: Vec<f32>, b0: Vec<f32>,
-        w1: Vec<f32>, b1: Vec<f32>,
-        w2: Vec<f32>, b2: Vec<f32>,
-        din: [usize; 3], dout: [usize; 3],
+        w0: Vec<f32>,
+        b0: Vec<f32>,
+        w1: Vec<f32>,
+        b1: Vec<f32>,
+        w2: Vec<f32>,
+        b2: Vec<f32>,
+        din: [usize; 3],
+        dout: [usize; 3],
         info_suits: bool,
     ) -> Net {
-        Net { w: [w0, w1, w2], b: [b0, b1, b2], din, dout, info_suits }
+        Net {
+            w: [w0, w1, w2],
+            b: [b0, b1, b2],
+            din,
+            dout,
+            info_suits,
+        }
     }
 }
 
@@ -71,7 +81,7 @@ fn dense_relu(x: &[f32], w: &[f32], b: &[f32], din: usize, dout: usize, relu: bo
 pub fn encode_info_state(s: &EnvState, seat: usize) -> [f32; INFO_DIM] {
     let mut f = [0.0f32; INFO_DIM];
     let mut k = 0usize;
-    let mut push = |f: &mut [f32; INFO_DIM], k: &mut usize, v: f32| {
+    let push = |f: &mut [f32; INFO_DIM], k: &mut usize, v: f32| {
         if *k < INFO_DIM {
             f[*k] = v;
         }
@@ -104,11 +114,27 @@ pub fn encode_info_state(s: &EnvState, seat: usize) -> [f32; INFO_DIM] {
     }
     // 7. folded mask
     for i in 0..NUM_PLAYERS {
-        push(&mut f, &mut k, if s.seat_status[i] == SEAT_FOLDED { 1.0 } else { 0.0 });
+        push(
+            &mut f,
+            &mut k,
+            if s.seat_status[i] == SEAT_FOLDED {
+                1.0
+            } else {
+                0.0
+            },
+        );
     }
     // 8. all-in mask
     for i in 0..NUM_PLAYERS {
-        push(&mut f, &mut k, if s.seat_status[i] == SEAT_ALLIN { 1.0 } else { 0.0 });
+        push(
+            &mut f,
+            &mut k,
+            if s.seat_status[i] == SEAT_ALLIN {
+                1.0
+            } else {
+                0.0
+            },
+        );
     }
     // 9. [pot_live/scale, current_bet/scale]
     let mut pot_live = s.pot_dead;
@@ -120,13 +146,21 @@ pub fn encode_info_state(s: &EnvState, seat: usize) -> [f32; INFO_DIM] {
     // 10. hole rank features (present * rank/14)
     for kk in 0..2 {
         let c = s.holes[seat][kk];
-        let v = if c >= 0 { core::card_rank(c) as f32 / 14.0 } else { 0.0 };
+        let v = if c >= 0 {
+            core::card_rank(c) as f32 / 14.0
+        } else {
+            0.0
+        };
         push(&mut f, &mut k, v);
     }
     // 11. board rank features (present * rank/14)
     for i in 0..5 {
         let c = s.board[i];
-        let v = if c >= 0 { core::card_rank(c) as f32 / 14.0 } else { 0.0 };
+        let v = if c >= 0 {
+            core::card_rank(c) as f32 / 14.0
+        } else {
+            0.0
+        };
         push(&mut f, &mut k, v);
     }
     debug_assert_eq!(k, BASE_FEATURE_LEN);
@@ -142,9 +176,11 @@ fn write_suit_features(s: &EnvState, seat: usize, f: &mut [f32; INFO_DIM], k0: u
     for i in 0..5 {
         b_present[i] = (s.board[i] >= 0) as i32 as f32;
     }
-    let h_suit = [core::card_suit(holes[0].max(0)), core::card_suit(holes[1].max(0))];
-    let suited = h_present[0] * h_present[1]
-        * (if h_suit[0] == h_suit[1] { 1.0 } else { 0.0 });
+    let h_suit = [
+        core::card_suit(holes[0].max(0)),
+        core::card_suit(holes[1].max(0)),
+    ];
+    let suited = h_present[0] * h_present[1] * (if h_suit[0] == h_suit[1] { 1.0 } else { 0.0 });
     let mut h_counts = [0.0f32; 4];
     for kk in 0..2 {
         let suit = core::card_suit(holes[kk].max(0)) as usize;
@@ -191,9 +227,23 @@ impl crate::lbr::LbrPolicy for Net {
             write_suit_features(s, seat, &mut info, BASE_FEATURE_LEN);
         }
         // forward
-        let h0 = dense_relu(&info, &self.w[0], &self.b[0], self.din[0], self.dout[0], true);
+        let h0 = dense_relu(
+            &info,
+            &self.w[0],
+            &self.b[0],
+            self.din[0],
+            self.dout[0],
+            true,
+        );
         let h1 = dense_relu(&h0, &self.w[1], &self.b[1], self.din[1], self.dout[1], true);
-        let logits = dense_relu(&h1, &self.w[2], &self.b[2], self.din[2], self.dout[2], false);
+        let logits = dense_relu(
+            &h1,
+            &self.w[2],
+            &self.b[2],
+            self.din[2],
+            self.dout[2],
+            false,
+        );
         // masked softmax over legal, then *mask renorm (matches make_neural_policy serve).
         let mask = core::legal_action_mask(s, seat as i32);
         let mut maxl = f32::NEG_INFINITY;

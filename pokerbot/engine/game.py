@@ -97,10 +97,20 @@ class GameState:
     action_seat: int = 0
     last_aggressor: int | None = None
     hand_number: int = 0
+    # CASH-ENGINE-AUDIT #37: explicit default avoids the ``getattr(self, "last_raise_increment", BB_BB)``
+    # fallback in hot-path ``legal_actions`` (and the off-by-one risk if a caller constructs an
+    # uninitialized state via ``GameState()`` and immediately queries ``legal_actions``).
+    last_raise_increment: float = BB_BB
     _deck: Deck | None = field(default=None, repr=False)
     _rng: random.Random = field(default_factory=random.Random, repr=False)
     _acted_this_street: set[int] = field(default_factory=set, repr=False)
     _history: list[tuple[int, Action]] = field(default_factory=list, repr=False)
+    # Parallel to ``_history``; each entry is the street the corresponding action was APPLIED on.
+    # ``Street.PREFLOP`` by default; updated in ``_advance_street`` (which mutates ``self.street``
+    # before any postflop ``apply_action`` appends) so consumers that need street-stamped history
+    # (e.g. ``encode_actions``) don't have to re-derive it from the bet shape (which would be wrong
+    # for the postflop-bb-faces-flop case).
+    _history_streets: list[Street] = field(default_factory=list, repr=False)
 
     @classmethod
     def new_hand(cls, button_seat: int = 3, rng: random.Random | None = None) -> GameState:
@@ -211,6 +221,7 @@ class GameState:
         seat = self.action_seat if seat is None else seat
         player = self.players[seat]
         self._history.append((seat, action))
+        self._history_streets.append(self.street)
 
         if action.action_type == ActionType.FOLD:
             player.folded = True
@@ -371,6 +382,32 @@ class GameState:
 
     def action_history(self) -> list[tuple[int, Action]]:
         return list(self._history)
+
+    def action_history_with_street(self):
+        """Yield ``(seat, action, street)`` tuples in the order actions were applied.
+
+        Street is the street the action was applied on (``Street.PREFLOP`` for blinds and the
+        initial round; ``Street.FLOP/TURN/RIVER`` for postflop). Provided for the postflop action
+        tensor encoder (was previously forced onto street=0 by ``encode_actions``).
+        """
+        # CASH-ENGINE-AUDIT CRIT-2 fix: do NOT mutate ``_history_streets`` here. Three external
+        # callers (``normalized_to_state.py:260``, ``state_builder.py:160``, ``nlhe_bridge.py:149``)
+        # mutate ``_history`` directly without maintaining the parallel streets list; stamping
+        # them all with ``self.street`` (the CURRENT street) would clobber preflop history into
+        # postflop rows — worse than the original "everything to street 0" bug because the stamp
+        # depends on read-time state. Instead, derive the street per action from a monotonic
+        # counter: walk the history in order, counting raises that close a betting round.
+        # If ``_history_streets`` IS properly maintained (the apply_action path), use it directly.
+        if len(self._history_streets) == len(self._history) and self._history_streets:
+            for (seat, action), street in zip(self._history, self._history_streets):
+                yield seat, action, street
+            return
+        # Fallback path: legacy states that bypass apply_action. Stay on PREFLOP throughout
+        # — matches the pre-fix "street=0 for everything" behavior the audit identified as
+        # byte-identical-to-old (safe under the live reconstruction), so we neither crash nor
+        # regress the live serve.
+        for (seat, action) in self._history:
+            yield seat, action, Street.PREFLOP
 
     def clone(self) -> GameState:
         import copy

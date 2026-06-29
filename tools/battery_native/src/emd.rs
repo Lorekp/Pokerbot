@@ -20,6 +20,37 @@
 use crate::fingerprint::evaluate_cards;
 use crate::playout::Rng;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap as HashMap;
+use std::fs;
+use std::path::Path;
+
+const EMDFRZN_MAGIC: &[u8; 8] = b"EMDFRZN1";
+const SUIT_PERMS: [[i32; 4]; 24] = [
+    [0, 1, 2, 3],
+    [0, 1, 3, 2],
+    [0, 2, 1, 3],
+    [0, 2, 3, 1],
+    [0, 3, 1, 2],
+    [0, 3, 2, 1],
+    [1, 0, 2, 3],
+    [1, 0, 3, 2],
+    [1, 2, 0, 3],
+    [1, 2, 3, 0],
+    [1, 3, 0, 2],
+    [1, 3, 2, 0],
+    [2, 0, 1, 3],
+    [2, 0, 3, 1],
+    [2, 1, 0, 3],
+    [2, 1, 3, 0],
+    [2, 3, 0, 1],
+    [2, 3, 1, 0],
+    [3, 0, 1, 2],
+    [3, 0, 2, 1],
+    [3, 1, 0, 2],
+    [3, 1, 2, 0],
+    [3, 2, 0, 1],
+    [3, 2, 1, 0],
+];
 
 /// Percentile-of-made-hand-strength histogram (length `n_bins`) over sampled river completions.
 ///
@@ -196,7 +227,9 @@ pub fn emd_fit(
         let j = i + rng.next_below((n - i) as u64) as usize;
         idx.swap(i, j);
     }
-    let mut cent: Vec<Vec<f64>> = (0..num_buckets).map(|k| histograms[idx[k]].clone()).collect();
+    let mut cent: Vec<Vec<f64>> = (0..num_buckets)
+        .map(|k| histograms[idx[k]].clone())
+        .collect();
 
     for _ in 0..iters {
         // Assign every row to its nearest centroid.
@@ -264,6 +297,216 @@ pub fn strength_histograms_batch(
         .collect()
 }
 
+#[inline]
+fn map_suit(card: i32, perm: &[i32; 4]) -> i32 {
+    let rank = card / 4;
+    let suit = card % 4;
+    rank * 4 + perm[suit as usize]
+}
+
+fn pack_cards(hole: &[i32; 2], board: &[i32; 5]) -> u64 {
+    let pack = |c: i32| -> u64 {
+        if c < 0 {
+            0x3F
+        } else {
+            (c as u64) & 0x3F
+        }
+    };
+    pack(hole[0])
+        | (pack(hole[1]) << 6)
+        | (pack(board[0]) << 12)
+        | (pack(board[1]) << 18)
+        | (pack(board[2]) << 24)
+        | (pack(board[3]) << 30)
+        | (pack(board[4]) << 36)
+}
+
+/// Suit-isomorphic canonical key for flop/turn EMD frozen lookup rows.
+///
+/// The key is the lexicographically-minimal packed `(sorted hole, sorted board)`
+/// over all 24 suit relabelings. Board length must be 3 or 4; river is made-hand
+/// equivalent and intentionally not stored in the frozen table.
+pub fn canonical_frozen_key(hole: &[i32], board: &[i32]) -> Option<u64> {
+    if hole.len() < 2 {
+        return None;
+    }
+    let bcards: Vec<i32> = board.iter().copied().filter(|&c| c >= 0).collect();
+    if !(bcards.len() == 3 || bcards.len() == 4) {
+        return None;
+    }
+    if hole[0] < 0 || hole[1] < 0 {
+        return None;
+    }
+    let mut best = u64::MAX;
+    for perm in SUIT_PERMS.iter() {
+        let mut h = [map_suit(hole[0], perm), map_suit(hole[1], perm)];
+        if h[1] < h[0] {
+            h.swap(0, 1);
+        }
+        let mut b = [-1i32; 5];
+        for (i, &c) in bcards.iter().enumerate() {
+            b[i] = map_suit(c, perm);
+        }
+        b[..bcards.len()].sort_unstable();
+        let key = pack_cards(&h, &b);
+        if key < best {
+            best = key;
+        }
+    }
+    Some(best)
+}
+
+#[derive(Clone)]
+pub struct FrozenEMDLookup {
+    pub n_buckets: usize,
+    pub n_bins: usize,
+    pub n_runouts: usize,
+    pub rows: HashMap<u64, u16>,
+}
+
+impl FrozenEMDLookup {
+    pub fn load_path(path: &str) -> Result<Self, String> {
+        let blob = fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+        if blob.len() < 28 || &blob[0..8] != EMDFRZN_MAGIC {
+            return Err(format!("bad EMDFRZN1 header: {path}"));
+        }
+        let u32_at = |off: usize| -> u32 {
+            u32::from_le_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]])
+        };
+        let u64_at = |off: usize| -> u64 {
+            u64::from_le_bytes([
+                blob[off],
+                blob[off + 1],
+                blob[off + 2],
+                blob[off + 3],
+                blob[off + 4],
+                blob[off + 5],
+                blob[off + 6],
+                blob[off + 7],
+            ])
+        };
+        let n_buckets = u32_at(8) as usize;
+        let n_bins = u32_at(12) as usize;
+        let n_runouts = u32_at(16) as usize;
+        let n_rows = u64_at(20) as usize;
+        let expected = 28usize
+            .checked_add(n_rows.checked_mul(10).ok_or("row byte count overflow")?)
+            .ok_or("blob byte count overflow")?;
+        if blob.len() != expected {
+            return Err(format!(
+                "bad EMDFRZN1 length: got {}, expected {}",
+                blob.len(),
+                expected
+            ));
+        }
+        let mut rows = HashMap::with_capacity_and_hasher(n_rows, Default::default());
+        let mut off = 28usize;
+        for _ in 0..n_rows {
+            let key = u64_at(off);
+            let bucket = u16::from_le_bytes([blob[off + 8], blob[off + 9]]);
+            rows.insert(key, bucket);
+            off += 10;
+        }
+        Ok(Self {
+            n_buckets,
+            n_bins,
+            n_runouts,
+            rows,
+        })
+    }
+
+    pub fn bucket(&self, hole: &[i32], board: &[i32]) -> Option<i32> {
+        let key = canonical_frozen_key(hole, board)?;
+        self.rows.get(&key).map(|&b| b as i32)
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn push_spot(
+    map: &mut HashMap<u64, u16>,
+    centroids: &[Vec<f64>],
+    hole: [i32; 2],
+    board: &[i32],
+    n_bins: usize,
+    n_runouts: usize,
+) {
+    if let Some(key) = canonical_frozen_key(&hole, board) {
+        if map.contains_key(&key) {
+            return;
+        }
+        let hist = strength_histogram(&hole, board, n_bins, n_runouts, key);
+        let bucket = emd_bucket_from_hist(&hist, centroids) as u16;
+        map.insert(key, bucket);
+    }
+}
+
+/// Build an EMDFRZN1 blob for every canonical flop+turn `(hole, board)` spot.
+///
+/// Heavy by design; Python calls this only from `scripts/precompute_emd_frozen_lookup.py`.
+pub fn build_frozen_lookup(
+    centroids: &[Vec<f64>],
+    out_path: &str,
+    n_bins: usize,
+    n_runouts: usize,
+) -> Result<(u64, String), String> {
+    let n_buckets = centroids.len();
+    if n_buckets == 0 {
+        return Err("centroids must not be empty".to_string());
+    }
+    let mut map: HashMap<u64, u16> = HashMap::default();
+    for h0 in 0..52i32 {
+        for h1 in (h0 + 1)..52i32 {
+            let hole = [h0, h1];
+            let mut dead = [false; 52];
+            dead[h0 as usize] = true;
+            dead[h1 as usize] = true;
+            let deck: Vec<i32> = (0..52i32).filter(|&c| !dead[c as usize]).collect();
+            let dn = deck.len();
+            for a in 0..dn {
+                for b in (a + 1)..dn {
+                    for c in (b + 1)..dn {
+                        let flop = [deck[a], deck[b], deck[c]];
+                        push_spot(&mut map, centroids, hole, &flop, n_bins, n_runouts);
+                        for d in (c + 1)..dn {
+                            let turn = [deck[a], deck[b], deck[c], deck[d]];
+                            push_spot(&mut map, centroids, hole, &turn, n_bins, n_runouts);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut rows: Vec<(u64, u16)> = map.into_iter().collect();
+    rows.sort_unstable_by_key(|&(k, _)| k);
+    let mut blob: Vec<u8> = Vec::with_capacity(28 + rows.len() * 10);
+    blob.extend_from_slice(EMDFRZN_MAGIC);
+    blob.extend_from_slice(&(n_buckets as u32).to_le_bytes());
+    blob.extend_from_slice(&(n_bins as u32).to_le_bytes());
+    blob.extend_from_slice(&(n_runouts as u32).to_le_bytes());
+    blob.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+    for (key, bucket) in rows {
+        blob.extend_from_slice(&key.to_le_bytes());
+        blob.extend_from_slice(&bucket.to_le_bytes());
+    }
+    if let Some(parent) = Path::new(out_path).parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create parent for {out_path}: {e}"))?;
+    }
+    fs::write(out_path, &blob).map_err(|e| format!("write {out_path}: {e}"))?;
+    Ok((
+        (blob.len() - 28) as u64 / 10,
+        format!("{:016x}", fnv1a64(&blob[8..])),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Pure-Rust unit tests (no Python). Bit-identity vs Python is proven by the
 // cross-check in tests/test_native_emd_equiv.py.
@@ -283,11 +526,22 @@ mod tests {
         let hole = [card(12, 2), card(11, 2)]; // A=12, K=11 (rank index 0..12), suit hearts=2
         let board = vec![card(10, 2), card(9, 2), card(8, 2)]; // Q,J,T hearts
         let h = strength_histogram(&hole, &board, 20, 200, 0);
-        let nonzero: Vec<(usize, f64)> =
-            h.iter().enumerate().filter(|(_, &v)| v != 0.0).map(|(i, &v)| (i, v)).collect();
-        assert_eq!(nonzero.len(), 1, "river must be exactly one nonzero bin, got {nonzero:?}");
+        let nonzero: Vec<(usize, f64)> = h
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v != 0.0)
+            .map(|(i, &v)| (i, v))
+            .collect();
+        assert_eq!(
+            nonzero.len(),
+            1,
+            "river must be exactly one nonzero bin, got {nonzero:?}"
+        );
         let s: f64 = h.iter().sum();
-        assert!((s - 1.0).abs() < 1e-12, "river spike must sum to 1, got {s}");
+        assert!(
+            (s - 1.0).abs() < 1e-12,
+            "river spike must sum to 1, got {s}"
+        );
         // Best possible hand => percentile ~1.0 => top bin (index 19 for n_bins=20).
         assert_eq!(nonzero[0].0, 19, "royal flush should land in the top bin");
     }
@@ -299,7 +553,10 @@ mod tests {
         let board = vec![card(10, 1), card(2, 2), card(5, 3)]; // Qd 4h 7s
         let h = strength_histogram(&hole, &board, 20, 500, 12345);
         let s: f64 = h.iter().sum();
-        assert!((s - 1.0).abs() < 1e-9, "flop histogram must normalize to 1, got {s}");
+        assert!(
+            (s - 1.0).abs() < 1e-9,
+            "flop histogram must normalize to 1, got {s}"
+        );
         // All bins non-negative, none exceeds 1.
         for &v in &h {
             assert!((0.0..=1.0).contains(&v), "bin out of [0,1]: {v}");
@@ -312,7 +569,10 @@ mod tests {
         let hole = [card(12, 0), card(11, 0)];
         let board = vec![card(10, 1), -1, -1]; // only 1 valid board card
         let h = strength_histogram(&hole, &board, 20, 100, 0);
-        assert!(h.iter().all(|&v| v == 0.0), "malformed board must give zero vector");
+        assert!(
+            h.iter().all(|&v| v == 0.0),
+            "malformed board must give zero vector"
+        );
         assert_eq!(h.len(), 20);
     }
 
@@ -382,14 +642,23 @@ mod tests {
         // A different seed should (almost surely) give a different init/result.
         let c3 = emd_fit(&hists, 5, 8, 1000);
         let same = c1 == c3;
-        assert!(!same, "different seed should change the fit (statistically)");
+        assert!(
+            !same,
+            "different seed should change the fit (statistically)"
+        );
     }
 
     #[test]
     fn batch_matches_per_spot_determinism() {
         let spots = vec![
-            ([card(12, 0), card(11, 0)], vec![card(10, 1), card(2, 2), card(5, 3)]),
-            ([card(8, 0), card(8, 1)], vec![card(3, 2), card(3, 3), card(9, 0), card(1, 1)]),
+            (
+                [card(12, 0), card(11, 0)],
+                vec![card(10, 1), card(2, 2), card(5, 3)],
+            ),
+            (
+                [card(8, 0), card(8, 1)],
+                vec![card(3, 2), card(3, 3), card(9, 0), card(1, 1)],
+            ),
         ];
         let b1 = strength_histograms_batch(&spots, 20, 300, 42);
         let b2 = strength_histograms_batch(&spots, 20, 300, 42);

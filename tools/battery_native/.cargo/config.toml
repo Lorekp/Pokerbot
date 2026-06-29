@@ -1,0 +1,31 @@
+# TRAINER-LOCAL build flags. This config applies ONLY to cargo invocations whose working directory is
+# tools/battery_native (cargo walks up from CWD to find .cargo/config.toml), i.e. the native CFR+
+# trainer build + its dev benches/examples. It does NOT affect builds invoked from the repo root or
+# elsewhere.
+#
+# WHY target-cpu=x86-64-v3 (AVX2 + FMA, NO AVX512): the CFR+ hot loop has many branch-free [f64;11] /
+# [bool;11] kernels (regret_match, the EV dot-product, strat_sum AXPY, the CFR+ floor, snapshot
+# row-normalization, side-pot award). Without an explicit target-cpu the release build is the x86-64
+# SSE2 baseline (2-wide f64), so those loops autovectorize at best 2-wide and the explicit-SIMD kernels
+# below get scalarized. `x86-64-v3` lets rustc target AVX2/FMA, autovectorizing the [f64;11] loops to
+# 4-wide and emitting FMA for the hand-written SIMD.
+#
+# WHY NOT target-cpu=native: measured. On an AVX512-capable host, `native` enables AVX512, which
+# triggers AVX-512 license-based frequency downclocking. The trainer hot path is dominated by hashmap
+# probes + the EnvState Copy + the showdown eval (pointer-chasing / branchy), NOT wide float math, so
+# the wide-SIMD upside is small while the whole process pays the downclock — a NET REGRESSION (~-30%
+# it/s locally with `native`). `x86-64-v3` gives the AVX2+FMA the SIMD levers need with no AVX512, so
+# no downclock: measured small NET GAIN (+5-6% at n_deals=400) and a clean floor for the SIMD levers.
+#
+# FIREWALL / SAFETY: this is NOT -ffast-math — it does NOT enable float reassociation, so the
+# autovectorized exact-int loops stay bit-identical and all byte-identity goldens (dispatch_n6,
+# fingerprint, side_pot, leduc) remain green. AVX2/FMA is universal on the deploy/build boxes; the
+# .dll/.so is built AND run on the same box and never ships to a different-CPU host, so no SIGILL risk.
+#
+# NOTE: the spot-box build (scripts/launch_native_cfr_training_spot.py) does NOT rely on this file
+# being in the tarball — it sets RUSTFLAGS="-C target-cpu=x86-64-v3" on its `cargo build` line directly,
+# so the flag is applied even if the tarball include-list omits this dotfile. This file is the
+# equivalent flag for LOCAL trainer builds/benches (so the local equivalence + perf benches measure
+# the same codegen the spot box runs).
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

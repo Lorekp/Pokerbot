@@ -85,6 +85,10 @@ def _solve(env, hero, root, *, blend, budget_ms, max_iters, single_table=None,
         single_table_iter_floor=(40 if single_table is not None else None),
         single_table_budget_ms=(10 ** 9 if single_table is not None else None),
         leaf=ContinuationLeafConfig(select="uniform", rollout_samples=2),
+        # The blueprint is intentionally empty for these unit tests (the test
+        # exercises the blend math, not blueprint coverage). Opt out of the
+        # production fail-closed snapshot validator.
+        validate_snapshot_at_init=False,
     )
     set_blueprint_blend(blend)
     sol = PluribusReBeLSolver({}, cfg, rng=np.random.default_rng(seed))
@@ -97,7 +101,7 @@ def test_budget_bound_blends_toward_blueprint():
     moves the served policy CLOSER to the blueprint (here uniform-legal) than the noisy raw average."""
     env = _postflop_env()
     hero, root = _root(env)
-    legal = PluribusReBeLSolver({}, PluribusReBeLConfig())._legal(env, hero)
+    legal = PluribusReBeLSolver({}, PluribusReBeLConfig(validate_snapshot_at_init=False))._legal(env, hero)
 
     # Raw average after a few CFR iterations is PEAKED (concentrated on the +EV action). Budget-bind it
     # with a small wall clock so only a HANDFUL of iterations run before the bound (this IS the live spot:
@@ -112,7 +116,7 @@ def test_budget_bound_blends_toward_blueprint():
     assert 0.0 < w <= 1.0, f"budget-bound blend weight should be in (0,1], got {w}"
 
     # The root blueprint at this spot (empty snapshot => uniform over the legal mask).
-    bp = PluribusReBeLSolver({}, PluribusReBeLConfig())._root_blueprint(env, hero, legal)
+    bp = PluribusReBeLSolver({}, PluribusReBeLConfig(validate_snapshot_at_init=False))._root_blueprint(env, hero, legal)
 
     d_raw = float(np.abs(raw.action_probs - bp).sum())
     d_blend = float(np.abs(blended.action_probs - bp).sum())
@@ -147,7 +151,8 @@ def test_default_off_eval_byte_identical_to_no_blend():
     set_blueprint_blend(False)
     cfg = PluribusReBeLConfig(
         max_iterations=200, time_budget_ms=5, blueprint_blend=None,
-        leaf=ContinuationLeafConfig(select="uniform", rollout_samples=2))
+        leaf=ContinuationLeafConfig(select="uniform", rollout_samples=2),
+        validate_snapshot_at_init=False)
     env_off = PluribusReBeLSolver({}, cfg, rng=np.random.default_rng(0)).solve(root, _StubPBS(env, hero))
     assert env_off.metadata["budget_bound"]
     assert env_off.metadata["blueprint_blend_weight"] == 0.0
@@ -185,7 +190,7 @@ def test_budget_bound_argmax_stable_with_blend():
 def test_blend_preserves_legal_mask_and_is_convex():
     env = _postflop_env(seed=21)
     hero, root = _root(env)
-    legal = PluribusReBeLSolver({}, PluribusReBeLConfig())._legal(env, hero)
+    legal = PluribusReBeLSolver({}, PluribusReBeLConfig(validate_snapshot_at_init=False))._legal(env, hero)
 
     raw = _solve(env, hero, root, blend=False, budget_ms=5, max_iters=200, seed=0)
     blended = _solve(env, hero, root, blend=True, budget_ms=5, max_iters=200, seed=0)
@@ -198,7 +203,7 @@ def test_blend_preserves_legal_mask_and_is_convex():
     assert np.all(blended.action_probs >= -1e-12)
 
     # (2) the served policy is EXACTLY the convex combination (1-w)*raw + w*bp, renormalized over legal.
-    bp = PluribusReBeLSolver({}, PluribusReBeLConfig())._root_blueprint(env, hero, legal)
+    bp = PluribusReBeLSolver({}, PluribusReBeLConfig(validate_snapshot_at_init=False))._root_blueprint(env, hero, legal)
     expect = (1.0 - w) * raw.action_probs.astype(np.float64) + w * bp
     expect = expect * legal
     expect = expect / max(expect.sum(), 1e-12)

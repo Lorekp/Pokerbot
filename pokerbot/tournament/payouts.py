@@ -361,6 +361,83 @@ def bounty_pool(
     return buyin_split(fmt, buy_in, rake=rake)["bounty_contrib"] * n
 
 
+# --------------------------------------------------------------------------------------------------
+# Overlay detection (ECON-27) — the parimutuel signal the live coach was missing
+# --------------------------------------------------------------------------------------------------
+
+
+def overlay_fraction(
+    collected: float,
+    guarantee: float,
+    *,
+    rake: float = 0.08,
+) -> float:
+    """Overlay ratio of a tournament's PRIZE pool: ``(guarantee - collected*(1-rake)) / guarantee``.
+
+    A tournament with a guarantee > the collected-after-rake pool is **overlaid** by the operator —
+    they are paying out more than the field generated. The signal is the fraction of the pool that
+    comes from the operator's pocket, e.g.:
+
+      * ``overlay_fraction(500, 5_000)  = 0.90`` -> a $500-collected $5k-guaranteed satellite is 90%
+        overlaid. Effectively free EV at the hero's level (the prize pool is 10x what the field funded).
+      * ``overlay_fraction(5_000, 5_000)  = 0.00`` -> exactly covered, no overlay.
+      * ``overlay_fraction(10_000, 5_000) = -1.00`` -> UNDERLAY: the field generated 2x the guarantee
+        (common in late-registering fields where the operator caps the prize at the guarantee).
+
+    A negative value means the field over-funded the guarantee; a positive value means the operator
+    is paying overlay. The function takes the rake-discounted COLLECTED pool, so the caller should
+    pass ``collected * (1 - rake)`` if the lobby reports gross collected.
+
+    ECON-27: this was the missing design gap in the live coach's tournament advisory — without this
+    helper, a 10x-overlay satellite read identically to a no-overlay satellite, so a hero who would
+    enter the no-overlay one was never told about the free-EV overlay one.
+    """
+    collected = float(collected)
+    guarantee = float(guarantee)
+    if guarantee <= 0.0:
+        # No guarantee posted: there is no overlay by definition (the operator isn't promising a
+        # floor). Return 0.0 (neutral) so the caller can treat "no guarantee" as the baseline.
+        return 0.0
+    if collected < 0.0:
+        raise ValueError(
+            f"overlay_fraction: collected={collected} is negative (caller bug)"
+        )
+    net_collected = collected * (1.0 - float(rake))
+    return (guarantee - net_collected) / guarantee
+
+
+def overlay_signal(
+    collected: float,
+    guarantee: float,
+    *,
+    rake: float = 0.08,
+) -> dict:
+    """Operator-overlay signal for the live tournament advisory: returns the overlay fraction and
+    qualitative tag (overlay / underlay / neutral) so the live coach can surface a JOIN/SKIP signal
+    on tournaments with a large operator overlay.
+
+    Fields:
+      * ``overlay_frac``: ``(guarantee - collected*(1-rake)) / guarantee`` (negative = underlay)
+      * ``tag``: ``"overlay" | "underlay" | "neutral"``
+      * ``join_recommended``: True iff overlay_frac >= 0.50 (operator is paying >= 50% of the prize pool).
+    """
+    frac = overlay_fraction(collected, guarantee, rake=rake)
+    if frac >= 0.50:
+        tag = "overlay"
+        join = True
+    elif frac <= -0.10:
+        tag = "underlay"
+        join = False
+    else:
+        tag = "neutral"
+        join = False
+    return {
+        "overlay_frac": frac,
+        "tag": tag,
+        "join_recommended": join,
+    }
+
+
 def prize_pool(
     fmt: TournamentFormat,
     entrants: int,

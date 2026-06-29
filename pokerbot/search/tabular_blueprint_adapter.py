@@ -53,6 +53,33 @@ _BIAS_GROUPS = (None, _FOLD_IDX, _PASSIVE_IDX, _AGGRO_IDX)
 DEFAULT_BIAS_MULT = 10.0  # Pluribus: fold-prob multiplied by ~10 then renormalized.
 
 
+def _build_allowed_action_mask(bet_bucket_keep: tuple[int, ...] | None) -> np.ndarray | None:
+    """Lean copy of the training action-abstraction mask."""
+    if bet_bucket_keep is None:
+        return None
+    allowed = np.zeros(NUM_ACTIONS, dtype=bool)
+    for a in (FOLD, CHECK, CALL, ALL_IN):
+        allowed[a] = True
+    n_buckets = ALL_IN - BET_BUCKET_START
+    for i in bet_bucket_keep:
+        if not 0 <= int(i) < n_buckets:
+            raise ValueError(f"bet_bucket_keep index {i} out of range [0,{n_buckets})")
+        allowed[BET_BUCKET_START + int(i)] = True
+    return allowed
+
+
+def _apply_abstraction_mask(
+    mask: np.ndarray, street: int, allowed_pre: np.ndarray | None, allowed_post: np.ndarray | None
+) -> np.ndarray:
+    """Lean copy of ``sd_cfr_nlhe_hogwild._apply_abstraction``."""
+    if allowed_pre is None and allowed_post is None:
+        return mask
+    allowed = allowed_pre if street == 0 else allowed_post
+    if allowed is None:
+        return mask
+    return mask & allowed
+
+
 def _renorm_legal(p: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Zero illegal actions and renormalize; uniform-legal fallback if all mass vanished."""
     q = np.asarray(p, dtype=np.float64) * mask
@@ -117,10 +144,8 @@ class TabularBlueprintAdapter:
         self._policy = make_blueprint_policy(self.snapshot, client_bet_sizing=self.client_bet_sizing)
         # Precompute the street action-abstraction masks ONCE (rebuilding per-leaf is wasteful).
         if self.client_bet_sizing:
-            from pokerbot.training.sd_cfr_nlhe import build_allowed_action_mask
-
-            self._allowed_pre = build_allowed_action_mask((4, 5, 6))
-            self._allowed_post = build_allowed_action_mask((0, 1, 3, 4, 5))
+            self._allowed_pre = _build_allowed_action_mask((4, 5, 6))
+            self._allowed_post = _build_allowed_action_mask((0, 1, 3, 4, 5))
         else:
             self._allowed_pre = None
             self._allowed_post = None
@@ -141,9 +166,7 @@ class TabularBlueprintAdapter:
         """
         mask = legal_action_mask_np(env, seat).astype(bool)
         if self.client_bet_sizing:
-            from pokerbot.training.sd_cfr_nlhe_hogwild import _apply_abstraction
-
-            mask = _apply_abstraction(
+            mask = _apply_abstraction_mask(
                 mask, int(env.street), self._allowed_pre, self._allowed_post
             ).astype(bool)
         bp = self.blueprint(env, seat)

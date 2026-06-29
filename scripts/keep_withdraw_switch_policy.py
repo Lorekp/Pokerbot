@@ -116,9 +116,14 @@ def switch_cost_usd(t_cur: Tier, t_next: Tier) -> float:
 
 
 # --- Planning horizon --------------------------------------------------------------------------------
-# 30 sessions x ~250 hands = 7,500 hands. Long enough to amortize a one-time switch cost
-# against fractions of a bb/100; short enough to be a credible "this season" planning unit.
-H_HANDS = 7500
+# 40 sessions x ~250 hands = 10,000 hands. Long enough to amortize a one-time switch cost against
+# fractions of a bb/100; short enough to be a credible "this season" planning unit.
+#
+# ECON-13: SYNCED with mc_validate_keep_withdraw_switch.py:55 N_HANDS=10000. The previous 7,500/10,000
+# mismatch meant the MC validation ran a 33% LONGER horizon than the policy's planning horizon, so the
+# MC's T2T (time-to-target) verdict over-rated the policy's effectiveness. Keeping them in lock-step
+# means MC gates match the policy they certify.
+H_HANDS = 10000
 
 
 # --- Policy ------------------------------------------------------------------------------------------

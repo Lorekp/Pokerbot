@@ -654,7 +654,8 @@ def _play_hand(env, lbr_seat: int, br_active: bool, policy_fn, cfg: LBR6Config,
     if hand_sink is not None:
         hand_sink({"reward": reward, "last_call_street": last_call_street,
                    "end_street": int(np.asarray(env.street)), "folded": lbr_folded,
-                   "saw_through": not lbr_folded})   # LBR stayed to the end (won at showdown or others folded)
+                   "saw_through": not lbr_folded,
+                   "lbr_decisions": int(lbr_decisions)})
     return reward, lbr_decisions
 
 
@@ -662,7 +663,8 @@ def _play_hand(env, lbr_seat: int, br_active: bool, policy_fn, cfg: LBR6Config,
 # Main driver
 # --------------------------------------------------------------------------- #
 def lbr6_exploitability(policy_fn, cfg: LBR6Config | None = None, model_fn=None,
-                        observe_fn=None, on_hand_start=None, hand_sink=None) -> LBR6Result:
+                        observe_fn=None, on_hand_start=None, hand_sink=None,
+                        progress_fn=None, **_unused) -> LBR6Result:
     """Monte-Carlo 6-max LBR lower bound on the exploitability of ``policy_fn``.
 
     ``policy_fn(env, seat) -> probs`` (shape NUM_ACTIONS, sums to 1 over legal) is played by all non-LBR
@@ -708,6 +710,13 @@ def lbr6_exploitability(policy_fn, cfg: LBR6Config | None = None, model_fn=None,
             results[h] = r_br - r_base
         else:
             results[h] = r_br
+
+        if progress_fn is not None:
+            # progress_fn(done, total, lbr_seat, reward, lbr_decisions) — match eval driver's _make_hand_progress signature.
+            try:
+                progress_fn(h + 1, cfg.hands, lbr_seat, float(results[h]), int(lbr_decisions))
+            except Exception:  # noqa: BLE001 - never let progress callback break the LBR loop
+                pass
 
     ev = float(results.mean())
     stderr = float(results.std(ddof=1) / np.sqrt(cfg.hands)) if cfg.hands > 1 else 0.0

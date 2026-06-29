@@ -11,6 +11,12 @@ The net-rake floor is a HUMP: ~0 at micro (CoinRewards returns ~100% of fees), a
 across the low/mid stakes (fat BB cap, promos ended), ~3 at high (tiny cap). So the SAME gross edge nets
 very differently by stake — which is exactly why a rake-aware table/stake decision needs this curve, not
 a fixed softness cutoff (memory: coinpoker-cash-rake-floor).
+
+ECON-4 / docstring drift (clarified): the "~8.5 bb/100 valley" is the **FLOOR-mode** figure × (1 − 0.15)
+**at $0.01/0.02 specifically** = 9.89 × 0.85 = 8.41 ≈ 8.5. It is NOT a generic floor across all stakes;
+the actual floor varies by stake (e.g. $0.25/0.50 floor ≈ 8.6, $2/5 ≈ 7.6, $5/10 ≈ 3.0). A reader
+running ``floor_bb100("0.01/0.02", mode="floor")`` sees 9.89 (raw floor) and may think the docstring
+is wrong — the headline figure is the *after-rakeback* number, not the raw floor.
 """
 
 from __future__ import annotations

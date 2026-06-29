@@ -8,16 +8,18 @@
 //! (`native_solver.py`) builds the flat buffer from a numpy EnvState once per call; everything between
 //! is native.
 
+pub mod cfr_table;
 pub mod core;
 pub mod emd;
 pub mod fingerprint;
 pub mod icm;
-pub mod leduc;
 pub mod lbr;
+pub mod leduc;
 pub mod nnet;
 pub mod phe_tables;
 pub mod playout;
 pub mod subgame;
+pub mod trainer;
 
 #[cfg(test)]
 mod tests;
@@ -170,9 +172,12 @@ mod py {
     use crate::nnet::Net;
     use crate::playout::{self, Blueprint, PlayoutConfig};
     use crate::subgame::{self, SubgameConfig};
+    use crate::trainer as nlhe_trainer;
     use pyo3::prelude::*;
     use pyo3::types::{PyBytes, PyDict};
     use std::collections::HashMap;
+    use std::fmt::Write as _;
+    use std::sync::Arc;
 
     // The state buffer is marshaled as raw little-endian i64 bytes (numpy `arr.tobytes()` -> here,
     // and a returned `bytes` -> `np.frombuffer(..., np.int64)` on the Python side). This is a single
@@ -234,10 +239,14 @@ mod py {
             ));
         }
         if deck.len() != 52 {
-            return Err(pyo3::exceptions::PyValueError::new_err("deck must have length 52"));
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "deck must have length 52",
+            ));
         }
         if rng_key.len() != 2 {
-            return Err(pyo3::exceptions::PyValueError::new_err("rng_key must have length 2"));
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rng_key must have length 2",
+            ));
         }
         let mut st = [0i32; NUM_PLAYERS];
         let mut occ = [false; NUM_PLAYERS];
@@ -559,7 +568,9 @@ mod py {
                 let nf = a.n as f64;
                 let bb100 = a.sum / nf * 100.0;
                 let std = if a.n > 1 {
-                    ((a.sumsq - a.sum * a.sum / nf) / (nf - 1.0)).max(0.0).sqrt()
+                    ((a.sumsq - a.sum * a.sum / nf) / (nf - 1.0))
+                        .max(0.0)
+                        .sqrt()
                 } else {
                     0.0
                 };
@@ -728,20 +739,30 @@ mod py {
         #[allow(clippy::too_many_arguments)]
         #[new]
         fn new(
-            w0: Vec<f32>, b0: Vec<f32>,
-            w1: Vec<f32>, b1: Vec<f32>,
-            w2: Vec<f32>, b2: Vec<f32>,
-            din: Vec<usize>, dout: Vec<usize>,
+            w0: Vec<f32>,
+            b0: Vec<f32>,
+            w1: Vec<f32>,
+            b1: Vec<f32>,
+            w2: Vec<f32>,
+            b2: Vec<f32>,
+            din: Vec<usize>,
+            dout: Vec<usize>,
             info_suits: bool,
         ) -> PyResult<Self> {
             if din.len() != 3 || dout.len() != 3 {
-                return Err(pyo3::exceptions::PyValueError::new_err("din/dout must have length 3"));
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "din/dout must have length 3",
+                ));
             }
             let check = |w: &[f32], b: &[f32], i: usize, o: usize, l: usize| -> PyResult<()> {
                 if w.len() != i * o || b.len() != o {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!(
                         "layer {l}: expected w={}*{}, b={}; got w={}, b={}",
-                        i, o, o, w.len(), b.len()
+                        i,
+                        o,
+                        o,
+                        w.len(),
+                        b.len()
                     )));
                 }
                 Ok(())
@@ -750,8 +771,17 @@ mod py {
             check(&w1, &b1, din[1], dout[1], 1)?;
             check(&w2, &b2, din[2], dout[2], 2)?;
             Ok(LbrNeuralHarness {
-                net: Net::new(w0, b0, w1, b1, w2, b2, [din[0], din[1], din[2]],
-                              [dout[0], dout[1], dout[2]], info_suits),
+                net: Net::new(
+                    w0,
+                    b0,
+                    w1,
+                    b1,
+                    w2,
+                    b2,
+                    [din[0], din[1], din[2]],
+                    [dout[0], dout[1], dout[2]],
+                    info_suits,
+                ),
             })
         }
 
@@ -785,12 +815,193 @@ mod py {
                 ));
             }
             let cfg = LbrCfg {
-                n_seats, track_ranges, range_cap, eq_samples, eq_runouts, settle_samples,
-                max_depth, bet_candidates, value_only_raises,
+                n_seats,
+                track_ranges,
+                range_cap,
+                eq_samples,
+                eq_runouts,
+                settle_samples,
+                max_depth,
+                bet_candidates,
+                value_only_raises,
             };
             let states = roots_from_blob(roots, n);
             let outcome = py.detach(|| lbr::run(&states, &lbr_seats, &seeds, &self.net, &cfg));
             Ok(pack_outcome(outcome))
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Native NLHE CFR+ trainer used by the cloud checkpoint/serve pipeline.
+    // -----------------------------------------------------------------------
+    #[pyclass]
+    struct NlheCFRTrainer {
+        tab: nlhe_trainer::NlheTables,
+        cfg: nlhe_trainer::TrainerCfg,
+        emd_stamp: String,
+    }
+
+    #[pymethods]
+    impl NlheCFRTrainer {
+        #[new]
+        #[pyo3(signature = (num_buckets, depth_edges, n_deals_per_iter, n_seats=6, prune_threshold=f64::NEG_INFINITY, fast_merge=false, emd_frozen_path=None))]
+        fn new(
+            num_buckets: i32,
+            depth_edges: Vec<f64>,
+            n_deals_per_iter: usize,
+            n_seats: usize,
+            prune_threshold: f64,
+            fast_merge: bool,
+            emd_frozen_path: Option<String>,
+        ) -> PyResult<Self> {
+            let (emd_frozen, emd_stamp) = match emd_frozen_path {
+                Some(path) => {
+                    let lookup = crate::emd::FrozenEMDLookup::load_path(&path)
+                        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+                    if lookup.n_buckets as i32 != num_buckets {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "EMD frozen K mismatch: lookup has {}, trainer requested {}",
+                            lookup.n_buckets, num_buckets
+                        )));
+                    }
+                    let stamp = format!(
+                        "path={} k={} n_bins={} n_runouts={} rows={}",
+                        path,
+                        lookup.n_buckets,
+                        lookup.n_bins,
+                        lookup.n_runouts,
+                        lookup.rows.len()
+                    );
+                    (Some(Arc::new(lookup)), stamp)
+                }
+                None => (None, "none".to_string()),
+            };
+            Ok(Self {
+                tab: nlhe_trainer::NlheTables::new(),
+                cfg: nlhe_trainer::TrainerCfg {
+                    num_buckets,
+                    depth_edges,
+                    allowed_pre: nlhe_trainer::allowed_mask(&[4, 5, 6]),
+                    allowed_post: nlhe_trainer::allowed_mask(&[0, 1, 3, 4, 5]),
+                    n_deals_per_iter,
+                    base_seed: 0xC0FFEE,
+                    n_seats,
+                    prune_threshold,
+                    fast_merge,
+                    emd_frozen,
+                },
+                emd_stamp,
+            })
+        }
+
+        fn iters_done(&self) -> u64 {
+            self.tab.iters_done
+        }
+
+        fn n_infosets(&self) -> usize {
+            self.tab.n_strat_infosets()
+        }
+
+        fn emd_stamp(&self) -> String {
+            self.emd_stamp.clone()
+        }
+
+        fn train(&mut self, py: Python<'_>, iterations: u64) {
+            py.detach(|| {
+                for _ in 0..iterations {
+                    self.tab.train_iteration(&self.cfg);
+                }
+            });
+        }
+
+        /// Train for `iterations` and return JSON phase timings for each iteration.
+        ///
+        /// Profiling is intentionally coarse and opt-in so normal training keeps the same code path and
+        /// output semantics. Each element reports traversal/collect, merge, and CFR+ floor wall time.
+        fn train_profile_json(&mut self, py: Python<'_>, iterations: u64) -> String {
+            py.detach(|| {
+                let mut out = String::from("[");
+                for i in 0..iterations {
+                    let p = self.tab.train_iteration_profile(&self.cfg);
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    let _ = write!(
+                        out,
+                        "{{\"iters_done\":{},\"n_deals\":{},\"rayon_threads\":{},\"fast_merge\":{},\
+                          \"partials\":{},\"partial_cum_rows\":{},\"partial_strat_rows\":{},\
+                          \"cum_regret_rows\":{},\"strat_sum_rows\":{},\"traverse_ms\":{:.6},\
+                          \"merge_ms\":{:.6},\"floor_ms\":{:.6},\"total_ms\":{:.6},\
+                          \"nodes\":{},\"terminal_nodes\":{},\"chance_nodes\":{},\
+                          \"decision_nodes\":{},\"hero_nodes\":{},\"opponent_nodes\":{},\
+                          \"no_legal_nodes\":{},\"legal_actions_total\":{},\
+                          \"hero_branches\":{},\"opponent_samples\":{},\"apply_calls\":{},\
+                          \"terminal_settles\":{},\"fingerprint_calls\":{},\
+                          \"fp_memo_new_entries\":{},\"emd_bucket_queries\":{},\
+                          \"emd_bucket_hits\":{},\"emd_bucket_misses\":{},\
+                          \"emd_bucket_fallbacks\":{},\"emd_fp_memo_hits\":{},\
+                          \"emd_fp_memo_misses\":{},\"max_depth\":{}}}",
+                        p.iters_done,
+                        p.n_deals,
+                        p.rayon_threads,
+                        p.fast_merge,
+                        p.partials,
+                        p.partial_cum_rows,
+                        p.partial_strat_rows,
+                        p.cum_regret_rows,
+                        p.strat_sum_rows,
+                        p.traverse_ms,
+                        p.merge_ms,
+                        p.floor_ms,
+                        p.total_ms,
+                        p.stats.nodes,
+                        p.stats.terminal_nodes,
+                        p.stats.chance_nodes,
+                        p.stats.decision_nodes,
+                        p.stats.hero_nodes,
+                        p.stats.opponent_nodes,
+                        p.stats.no_legal_nodes,
+                        p.stats.legal_actions_total,
+                        p.stats.hero_branches,
+                        p.stats.opponent_samples,
+                        p.stats.apply_calls,
+                        p.stats.terminal_settles,
+                        p.stats.fingerprint_calls,
+                        p.stats.fp_memo_new_entries,
+                        p.stats.emd_bucket_queries,
+                        p.stats.emd_bucket_hits,
+                        p.stats.emd_bucket_misses,
+                        p.stats.emd_bucket_fallbacks,
+                        p.stats.emd_fp_memo_hits,
+                        p.stats.emd_fp_memo_misses,
+                        p.stats.max_depth,
+                    );
+                }
+                out.push(']');
+                out
+            })
+        }
+
+        fn save_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+            PyBytes::new(py, &nlhe_trainer::serialize(&self.tab))
+        }
+
+        fn load_bytes(&mut self, blob: &[u8]) -> bool {
+            match nlhe_trainer::deserialize(blob) {
+                Some(tab) => {
+                    self.tab = tab;
+                    true
+                }
+                None => false,
+            }
+        }
+
+        fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+            let out = PyDict::new(py);
+            for (key, row) in nlhe_trainer::snapshot(&self.tab) {
+                out.set_item(PyBytes::new(py, &key), row.to_vec())?;
+            }
+            Ok(out)
         }
     }
 
@@ -813,7 +1024,9 @@ mod py {
     impl LeducCFRTrainer {
         #[new]
         fn new() -> Self {
-            LeducCFRTrainer { tab: leduc::Tables::default() }
+            LeducCFRTrainer {
+                tab: leduc::Tables::default(),
+            }
         }
 
         /// Run `iterations` CFR+ sweeps (continuing from where the trainer left off).
@@ -849,8 +1062,15 @@ mod py {
             raises: i64,
             hist: Vec<i64>,
         ) -> Vec<f64> {
-            let mut key: Vec<i64> =
-                vec![seat, own_card, public, round, to_call, raises, hist.len() as i64];
+            let mut key: Vec<i64> = vec![
+                seat,
+                own_card,
+                public,
+                round,
+                to_call,
+                raises,
+                hist.len() as i64,
+            ];
             key.extend_from_slice(&hist);
             let avg = leduc::average_strategy(&self.tab);
             match avg.get(&key) {
@@ -927,10 +1147,14 @@ mod py {
         seed: u64,
     ) -> PyResult<Vec<f64>> {
         if hole.len() < 2 {
-            return Err(pyo3::exceptions::PyValueError::new_err("hole must have 2 cards"));
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "hole must have 2 cards",
+            ));
         }
         let h = [hole[0], hole[1]];
-        Ok(crate::emd::strength_histogram(&h, &board, n_bins, n_runouts, seed))
+        Ok(crate::emd::strength_histogram(
+            &h, &board, n_bins, n_runouts, seed,
+        ))
     }
 
     /// `emd_bucket_from_hist(hist, centroids)` -> argmin centroid index (numpy-identical keep-first).
@@ -969,14 +1193,65 @@ mod py {
         let mut conv: Vec<([i32; 2], Vec<i32>)> = Vec::with_capacity(spots.len());
         for (hole, board) in spots {
             if hole.len() < 2 {
-                return Err(pyo3::exceptions::PyValueError::new_err("each spot hole must have 2 cards"));
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "each spot hole must have 2 cards",
+                ));
             }
             conv.push(([hole[0], hole[1]], board));
         }
-        let out = py.detach(|| {
-            crate::emd::strength_histograms_batch(&conv, n_bins, n_runouts, seed_base)
-        });
+        let out = py
+            .detach(|| crate::emd::strength_histograms_batch(&conv, n_bins, n_runouts, seed_base));
         Ok(out)
+    }
+
+    /// Frozen flop/turn `(hole,board)->EMD bucket` lookup loaded from an EMDFRZN1 blob.
+    #[pyclass]
+    struct EmdFrozenLookup {
+        inner: crate::emd::FrozenEMDLookup,
+    }
+
+    #[pymethods]
+    impl EmdFrozenLookup {
+        #[staticmethod]
+        fn load(path: String) -> PyResult<Self> {
+            let inner = crate::emd::FrozenEMDLookup::load_path(&path)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok(Self { inner })
+        }
+
+        fn bucket(&self, hole: Vec<i32>, board: Vec<i32>) -> i32 {
+            self.inner.bucket(&hole, &board).unwrap_or(-1)
+        }
+
+        fn meta(&self) -> (usize, usize, usize, usize) {
+            (
+                self.inner.n_buckets,
+                self.inner.n_bins,
+                self.inner.n_runouts,
+                self.inner.rows.len(),
+            )
+        }
+    }
+
+    /// `emd_frozen_key(hole, board)` -> canonical u64 key for tiny lookup smoke tests.
+    #[pyfunction]
+    fn emd_frozen_key(hole: Vec<i32>, board: Vec<i32>) -> Option<u64> {
+        crate::emd::canonical_frozen_key(&hole, &board)
+    }
+
+    /// Build the full EMDFRZN1 frozen lookup. Heavy; callers should run this only on approved hardware.
+    #[pyfunction]
+    fn emd_frozen_build(
+        py: Python<'_>,
+        centroids: Vec<Vec<f64>>,
+        out_path: String,
+        n_bins: usize,
+        n_runouts: usize,
+    ) -> PyResult<(u64, String)> {
+        py.detach(|| {
+            crate::emd::build_frozen_lookup(&centroids, &out_path, n_bins, n_runouts)
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+        })
     }
 
     /// Flat buffer length + engine dims, for the wrapper's startup self-check.
@@ -991,6 +1266,11 @@ mod py {
         )
     }
 
+    #[pyfunction]
+    fn rayon_num_threads() -> usize {
+        rayon::current_num_threads()
+    }
+
     #[pymodule]
     fn battery_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(apply_action, m)?)?;
@@ -1001,6 +1281,7 @@ mod py {
         m.add_function(wrap_pyfunction!(evaluate_seven, m)?)?;
         m.add_function(wrap_pyfunction!(compute_returns, m)?)?;
         m.add_function(wrap_pyfunction!(engine_dims, m)?)?;
+        m.add_function(wrap_pyfunction!(rayon_num_threads, m)?)?;
         m.add_function(wrap_pyfunction!(fingerprint_fast, m)?)?;
         m.add_function(wrap_pyfunction!(fingerprint_fast_depth, m)?)?;
         m.add_function(wrap_pyfunction!(eval_seven_phe, m)?)?;
@@ -1014,11 +1295,15 @@ mod py {
         m.add_function(wrap_pyfunction!(emd_fit, m)?)?;
         m.add_function(wrap_pyfunction!(emd_mean_inertia, m)?)?;
         m.add_function(wrap_pyfunction!(emd_strength_histograms_batch, m)?)?;
+        m.add_function(wrap_pyfunction!(emd_frozen_key, m)?)?;
+        m.add_function(wrap_pyfunction!(emd_frozen_build, m)?)?;
+        m.add_class::<EmdFrozenLookup>()?;
         m.add_class::<PlayoutEngine>()?;
         m.add_class::<SubgameSolver>()?;
         m.add_class::<Lbr6Harness>()?;
         m.add_class::<LbrNeuralHarness>()?;
         m.add_class::<Lbr6Out>()?;
+        m.add_class::<NlheCFRTrainer>()?;
         m.add_class::<LeducCFRTrainer>()?;
         Ok(())
     }

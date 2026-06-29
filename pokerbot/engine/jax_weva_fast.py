@@ -79,7 +79,7 @@ def build_weva_bucket_table(mapper: WEVAMapper | None = None) -> np.ndarray:
 
 @lru_cache(maxsize=1)
 def default_weva_bucket_table() -> np.ndarray:
-    return build_weva_bucket_table(WEVAMapper.default())
+    return build_weva_bucket_table()
 
 
 @lru_cache(maxsize=8)

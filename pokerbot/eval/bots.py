@@ -652,6 +652,71 @@ class HSProAggroBot(_HSBotBase):
 _BLUEPRINT_SNAPSHOT_CACHE: dict = {}
 
 
+class ThreeBetHappyBot:
+    """Caricature 3-bet-happy villain — re-raises ~60% of opens preflop.
+
+    Closes the explicit battery coverage gap from the OPPONENT-EVAL audit: with NO villain in the
+    league exercising the 3-bet frequency that real regs use, the value-overlay + RNR cap path was
+    unable to certify its ceiling compliance. This bot is intentionally unballanced (worse than any
+    real reg) so a properly-capped exploit should still extract value without over-shooting.
+    """
+
+    def __init__(self, rng: random.Random | None = None) -> None:
+        self.rng = rng or random.Random()
+
+    def __call__(self, state: GameState) -> Action:
+        legal = state.legal_actions()
+        if state.street.name == "PREFLOP":
+            # If facing a single open (no further raise this street), 3-bet 60% of the time.
+            n_raises = sum(1 for a in state.action_history()
+                           if a[1].action_type in (ActionType.RAISE, ActionType.ALL_IN))
+            if n_raises == 1 and self.rng.random() < 0.60:
+                three_bet = next((a for a in legal if a.action_type in (ActionType.RAISE, ActionType.ALL_IN)), None)
+                if three_bet is not None:
+                    return three_bet
+        # Postflop: standard tag-like play — half the time bet, otherwise check/call.
+        if self.rng.random() < 0.45:
+            bet = next((a for a in legal if a.action_type in (ActionType.BET, ActionType.RAISE, ActionType.ALL_IN)), None)
+            if bet is not None:
+                return bet
+        return next((a for a in legal if a.action_type in (ActionType.CHECK, ActionType.CALL)), legal[0])
+
+
+class FoldTo3BetBot:
+    """Caricature 3-bet folder — folds ~75% of the time when facing a 3-bet preflop.
+
+    Closes the explicit battery coverage gap from the OPPONENT-EVAL audit. A real nit reg folds
+    near 100% of 3-bets to a 4-bet, but a profile that mis-reads this villain as a LAG (because
+    their open frequency is high) would over-bluff at 4-bet sizing. This bot isolates the failure
+    mode so the RNR / value-overlay / search path can be certified against it.
+    """
+
+    def __init__(self, rng: random.Random | None = None) -> None:
+        self.rng = rng or random.Random()
+
+    def __call__(self, state: GameState) -> Action:
+        legal = state.legal_actions()
+        if state.street.name == "PREFLOP":
+            n_raises = sum(1 for a in state.action_history()
+                           if a[1].action_type in (ActionType.RAISE, ActionType.ALL_IN))
+            if n_raises >= 2 and self.rng.random() < 0.75:
+                # Facing a 3-bet (or higher) — fold 75% of the time.
+                fold = next((a for a in legal if a.action_type == ActionType.FOLD), None)
+                if fold is not None:
+                    return fold
+            # Otherwise, open wide (loose-passive opener).
+            if n_raises == 0 and self.rng.random() < 0.55:
+                open_bet = next((a for a in legal if a.action_type in (ActionType.RAISE, ActionType.ALL_IN)), None)
+                if open_bet is not None:
+                    return open_bet
+        # Postflop: call/check almost always — calling-station tendency.
+        if self.rng.random() < 0.20:
+            bet = next((a for a in legal if a.action_type in (ActionType.BET, ActionType.RAISE, ActionType.ALL_IN)), None)
+            if bet is not None:
+                return bet
+        return next((a for a in legal if a.action_type in (ActionType.CHECK, ActionType.CALL)), legal[0])
+
+
 def _load_blueprint_snapshot():
     """Lazy module-level snapshot for BlueprintBot (env POKERBOT_BLUEPRINT_SNAPSHOT or the default).
     Loaded once per process; per-hand bot construction stays cheap.
@@ -738,6 +803,10 @@ def build_bot(name: str, rng: random.Random | None = None, model=None, device: s
         return TagBot(rng)
     if name == "donk":
         return DonkBot(rng)
+    if name == "three_bet_happy":
+        return ThreeBetHappyBot(rng)
+    if name == "fold_to_3bet":
+        return FoldTo3BetBot(rng)
     if name == "random":
         return RandomBot(rng)
     if name == "human_like":
@@ -769,6 +838,8 @@ BOT_REGISTRY = {
     "calling_station": CallingStationBot,
     "tag": TagBot,
     "donk": DonkBot,
+    "three_bet_happy": ThreeBetHappyBot,
+    "fold_to_3bet": FoldTo3BetBot,
     "random": RandomBot,
     "human_like": HumanLikeBot,
 }

@@ -167,6 +167,16 @@ class PluribusReBeLConfig:
     # difference measured is the blend itself. None => off (production: starvation is detected by the real
     # wall clock). Requires blueprint_blend active; never set in live serve.
     force_budget_bound: int | None = None
+    # SNAPSHOT INTEROP VALIDATION (defense in depth vs SEARCH-AUDIT F1/F2/F3).
+    # ``validate_snapshot_at_init`` (default True): call ``eval.lbr.validate_snapshot`` on the
+    # blueprint snapshot at construction time. Catches empty dicts (F1) and string-keyed legacy
+    # snapshots (F2) before the solver starts serving uniform-legal at every postflop node.
+    # ``strict_snapshot`` (default True): if True the validator raises on any anomaly; if False
+    # it warns and returns. Live serve wants strict=True (fail closed). Battery / dev paths can
+    # set strict=False to run a no-snapshot smoke without code changes. Both flags default ON; an
+    # empty snapshot is NEVER silently accepted in production.
+    validate_snapshot_at_init: bool = True
+    strict_snapshot: bool = True
 
 
 # POKERBOT_NATIVE_SUBGAME: when truthy AND the native SubgameSolver is built AND opponent_model is None
@@ -276,6 +286,29 @@ class PluribusReBeLSolver:
             blueprint_snapshot, client_bet_sizing=self.config.client_bet_sizing
         )
         self._allowed_pre, self._allowed_post = _abstraction_masks(self.config.client_bet_sizing)
+        # F1/F2 defense in depth: an empty or string-keyed blueprint snapshot silently serves
+        # uniform-legal at every postflop node (the LBR fingerprint lookup returns None, and the
+        # adapter falls back to ``mask / max(mask.sum(), 1)``). Fail closed in production; the
+        # toy / dev / battery paths can opt out by passing ``validate_snapshot_at_init=False``
+        # on the config if they genuinely need an empty prior.
+        # TEST_MODE bypass: when POKERBOT_TEST_MODE=1 (set by tests/conftest.py) the validator
+        # logs a warning instead of raising, so the many unit tests that pass an empty {} snapshot
+        # continue to run. Production never sets this env var; the bypass is unreachable there.
+        if getattr(self.config, "validate_snapshot_at_init", True):
+            from pokerbot.eval.lbr import validate_snapshot
+            _test_mode = os.environ.get("POKERBOT_TEST_MODE", "").lower() in ("1", "true", "yes")
+            # When POKERBOT_TEST_MODE=1, default to PERMISSIVE validation (warn instead of raise) so
+            # the dozens of unit tests that pass an empty {} blueprint snapshot continue to run.
+            # Production never sets this env var; the bypass is unreachable there.
+            if _test_mode:
+                _strict = False
+            else:
+                _strict = bool(getattr(self.config, "strict_snapshot", True))
+            validate_snapshot(
+                blueprint_snapshot,
+                strict=_strict,
+                context="PluribusReBeLSolver.__init__",
+            )
         # Per-solve off-tree augmentation: when POKERBOT_OFFTREE_RESOLVE fires, this holds the post mask
         # to use AT THE ROOT INFOSET ONLY (the static _allowed_post + one extra bet bucket matching the
         # observed off-tree villain size). None => no augmentation (default / interior nodes), so _abstract
@@ -606,7 +639,17 @@ class PluribusReBeLSolver:
             return self._leaf_value(env, hero)
         legal = self._legal(env, actor)
         if not legal.any():
-            return float(env.rewards[hero]) / CHIP_UNIT
+            # E1 fix: an empty legal mask at a non-terminal street is an engine-state invariant
+            # violation (legal_action_mask always returns at least one action at a non-terminal
+            # street). Returning a terminal reward here silently substituted a wrong leaf for a
+            # live solve; raise so the caller sees the corruption immediately and the LBR / eval
+            # harness never silently reports a metric on a corrupt branch.
+            street = int(env.street)
+            raise RuntimeError(
+                f"PluribusReBeLSolver._cfv: empty legal mask at non-terminal street={street} "
+                f"actor={actor} hero={hero} — engine invariant violated. "
+                "Aborting solve to avoid a corrupt CFR update."
+            )
 
         key = self._infoset_key(env, actor)
         regrets = self._get_regrets(key)

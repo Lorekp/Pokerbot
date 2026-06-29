@@ -164,13 +164,23 @@ class SharedHogwildTable:
         return None if self.base is None else self.base[slot]
 
     def apply_dcfr_discount(self, t: float, *, alpha: float = 1.5, beta: float = 0.0,
-                            gamma: float = 2.0) -> None:
+                            gamma: float = 2.0, reg_clip: float = 1.0e9,
+                            strat_clip: float = 1.0e9) -> None:
         """Discount the WHOLE accumulated regret/strategy in place by the DCFR factors for iteration ``t``
         (Discounted CFR via periodic discounting — the lock-free analog of per-iteration DCFR, applied by
         the parent at each snapshot tick / round boundary). Positive vs negative regret get separate
         factors; the strategy sum is down-weighted. Racy vs concurrent worker writes = accepted hogwild
         noise (same posture as ``snapshot_*``). With DCFR the per-node ``add_regret`` must run with
-        ``cfr_plus=False`` (DCFR keeps signed regret and discounts it, rather than flooring at 0)."""
+        ``cfr_plus=False`` (DCFR keeps signed regret and discounts it, rather than flooring at 0).
+
+        2.2 fix (CFR-AUDIT): the discount is applied as a multiplicative factor on the per-row
+        accumulated regret. For very large ``t`` the discount factors approach zero; floating-point
+        noise in the tail can flip the sign of a regret across zero, after which
+        ``np.where(r > 0.0, pos, neg)`` applies the WRONG factor on every subsequent discount. We
+        therefore clamp post-discount regret to ``[-reg_clip, reg_clip]`` (default ±1e9) to
+        bound the explosion risk and the noise-induced sign flips; same on the strategy sum
+        (down-weighting is conservative — no information loss from a clip). Clamp values are
+        industry-standard sentinel magnitudes that no realistic CFR row approaches without a bug."""
         if t is None or float(t) <= 0:
             return
         pos, neg, strat = dcfr_weights(t, alpha, beta, gamma)
@@ -180,7 +190,15 @@ class SharedHogwildTable:
         # Vectorized over the full table: positive*pos, negative*neg (one extra (cap,A) temp — fine at
         # bounded capacity). Only the occupied rows hold nonzero values, so untouched rows stay 0.
         np.multiply(reg, np.where(reg > 0.0, pos, neg), out=reg)
+        # Defensive clamp: bound the post-discount regret row magnitude to a sentinel ceiling so a
+        # bug / runaway iteration never blows up the dynamic range. Also bound the strategy sum
+        # (down-weighting shrinks it, but if a future discount ever UPs the factor for any reason
+        # the clip still applies). Cheap (O(cap*A) element-wise min/max).
+        if reg_clip > 0.0:
+            np.clip(reg, -reg_clip, reg_clip, out=reg)
         self.strat *= strat
+        if strat_clip > 0.0:
+            np.clip(self.strat, -strat_clip, strat_clip, out=self.strat)
 
     # ---- introspection / output ----
     def n_occupied(self) -> int:

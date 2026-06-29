@@ -330,7 +330,10 @@ fn cfr(
     // counterfactual reach = product of every reach except the acting player's (opp reach * chance).
     let cf_reach = reach[1 - seat] * reach[NUM_PLAYERS];
     let reach_prob = reach[seat];
-    let regret = tab.cum_regret.entry(key.clone()).or_insert([0.0; NUM_ACTIONS]);
+    let regret = tab
+        .cum_regret
+        .entry(key.clone())
+        .or_insert([0.0; NUM_ACTIONS]);
     for a in 0..NUM_ACTIONS {
         if mask[a] {
             regret[a] += cf_reach * (child_value[a][seat] - value[seat]);
@@ -448,11 +451,7 @@ fn policy_for_key(
 }
 
 /// Profile value for `player` under the fixed average strategy (full tree expectation).
-fn profile_value(
-    s: &State,
-    player: usize,
-    avg: &HashMap<InfoKey, [f64; NUM_ACTIONS]>,
-) -> f64 {
+fn profile_value(s: &State, player: usize, avg: &HashMap<InfoKey, [f64; NUM_ACTIONS]>) -> f64 {
     if s.done {
         return s.rewards[player] as f64;
     }
@@ -480,7 +479,12 @@ struct InfosetBR<'a> {
 
 impl<'a> InfosetBR<'a> {
     fn new(br_seat: usize, avg: &'a HashMap<InfoKey, [f64; NUM_ACTIONS]>) -> Self {
-        InfosetBR { br_seat, avg, infosets: HashMap::new(), br_action: HashMap::new() }
+        InfosetBR {
+            br_seat,
+            avg,
+            infosets: HashMap::new(),
+            br_action: HashMap::new(),
+        }
     }
 
     fn collect(&mut self, s: &State, cf_prob: f64) {
@@ -738,14 +742,20 @@ mod tests {
         // The OpenSpiel-validated anchor: tabular CFR+ on Leduc is < ~1 mbb @ 1000 iters.
         let (expl, u0, u1, _, _) = solve_and_exploitability(1000);
         assert!((u0 + u1).abs() < 1e-6, "profile not zero-sum: {u0} {u1}");
-        assert!(expl < 1.0, "exploitability {expl} mbb not below the 1.0 mbb gate @1000 iters");
+        assert!(
+            expl < 1.0,
+            "exploitability {expl} mbb not below the 1.0 mbb gate @1000 iters"
+        );
     }
 
     #[test]
     fn exploitability_monotone_decreasing() {
         let (e100, ..) = solve_and_exploitability(100);
         let (e1000, ..) = solve_and_exploitability(1000);
-        assert!(e1000 < e100, "more iters must not increase exploitability: {e100} -> {e1000}");
+        assert!(
+            e1000 < e100,
+            "more iters must not increase exploitability: {e100} -> {e1000}"
+        );
     }
 
     #[test]
@@ -770,18 +780,31 @@ mod tests {
         // exact reproduction: the resumed tables must equal the straight-through tables.
         assert_eq!(resumed.cum_regret.len(), straight.cum_regret.len());
         for (k, v) in &straight.cum_regret {
-            let r = resumed.cum_regret.get(k).expect("missing regret key after resume");
+            let r = resumed
+                .cum_regret
+                .get(k)
+                .expect("missing regret key after resume");
             for a in 0..NUM_ACTIONS {
-                assert!((r[a] - v[a]).abs() < 1e-9, "regret mismatch at {k:?}[{a}]: {} vs {}", r[a], v[a]);
+                assert!(
+                    (r[a] - v[a]).abs() < 1e-9,
+                    "regret mismatch at {k:?}[{a}]: {} vs {}",
+                    r[a],
+                    v[a]
+                );
             }
         }
         for (k, v) in &straight.cum_policy {
-            let r = resumed.cum_policy.get(k).expect("missing policy key after resume");
+            let r = resumed
+                .cum_policy
+                .get(k)
+                .expect("missing policy key after resume");
             for a in 0..NUM_ACTIONS {
                 assert!((r[a] - v[a]).abs() < 1e-9, "policy mismatch at {k:?}[{a}]");
             }
         }
-        assert!((expl_straight - expl_resumed).abs() < 1e-9,
-                "resume changed exploitability: {expl_straight} vs {expl_resumed}");
+        assert!(
+            (expl_straight - expl_resumed).abs() < 1e-9,
+            "resume changed exploitability: {expl_straight} vs {expl_resumed}"
+        );
     }
 }

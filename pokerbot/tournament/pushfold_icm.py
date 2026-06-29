@@ -30,7 +30,10 @@ from typing import Sequence
 
 import numpy as np
 
-_HU_EQ_PATH = Path("data/aof/cfr_base/hu_eq_matrix.npz")
+# Resolve the HU equity grid relative to THIS module so cwd-fragility (R4 P1 §4.2) does not
+# surface as a confusing "no equity grid" when the process is launched from a different dir.
+_HERE = Path(__file__).resolve().parent
+_HU_EQ_PATH = _HERE.parent.parent / "data" / "aof" / "cfr_base" / "hu_eq_matrix.npz"
 
 
 @lru_cache(maxsize=1)

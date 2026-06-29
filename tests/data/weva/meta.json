@@ -1,0 +1,29 @@
+{
+  "W": 10,
+  "K": 64,
+  "gamma": 0.85,
+  "feature_mode": "hole_only",
+  "num_roots": 64,
+  "max_roots": 64,
+  "build_scope": "dev",
+  "build_fingerprint": "e07eb19f1a0009fb",
+  "build_config": {
+    "k": 100,
+    "warmup_iterations": 10,
+    "gamma": 0.85,
+    "feature_mode": "hole_only",
+    "num_rollouts": 8,
+    "cfr_seed": 42,
+    "rollout_seed": 42,
+    "max_nodes": 4,
+    "max_roots": 64
+  },
+  "feature_dim": 4,
+  "num_actions_policy": 11,
+  "num_rollouts": 8,
+  "cfr_seed": 42,
+  "rollout_seed": 42,
+  "max_nodes": 4,
+  "cfr_backend": "preflop_cfr_mc_rollout",
+  "mean_rollout_stderr": 0.9331493576308065
+}

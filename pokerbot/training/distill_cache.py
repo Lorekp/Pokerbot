@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -99,12 +100,53 @@ def build_label_cache(config: CacheConfig | None = None) -> Path:
     try:
         import pandas as pd
 
-        pd.DataFrame(records).to_parquet(out_path, index=False)
+        # CRASH-RESUME-AUDIT #6: write the parquet ATOMICALLY. Parquet is columnar and a torn
+        # write is unreadable — pandas refuses to read a partial footer. Writing to ``out.tmp``
+        # and os.replace'ing into place is the standard fix; without it a kill -9 mid-write
+        # loses the entire label cache (every label must be re-fetched from the LLM, $$ + rate
+        # limits). The parent-dir fsync makes the rename durable on power cut.
+        tmp = out_path.with_name(out_path.name + ".atomic.tmp")
+        pd.DataFrame(records).to_parquet(tmp, index=False)
+        # Parquet writers may not flush their internal state with an explicit fsync; open+fsync
+        # the tmp file as a no-op durability belt-and-braces (it has zero effect on the parquet
+        # content but ensures the OS page cache holds the new bytes before the rename).
+        try:
+            fd = os.open(str(tmp), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+        os.replace(tmp, out_path)
+        try:
+            dir_fd = os.open(str(out_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
     except ImportError:
         out_path = config.output_dir / "llm_labels.jsonl"
-        with out_path.open("w", encoding="utf-8") as f:
+        tmp = out_path.with_name(out_path.name + ".atomic.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
             for rec in records:
                 f.write(json.dumps(rec) + "\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, out_path)
+        try:
+            dir_fd = os.open(str(out_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
 
     agree = sum(1 for r in records if r["agreement"]) / max(len(records), 1)
     print(f"Cached {len(records)} labels to {out_path} (LLM-GTO agreement={agree:.2%})")
@@ -120,6 +162,11 @@ def _restore_tensor(val: object, dtype: type = np.float32) -> np.ndarray:
 
 
 def load_label_cache(path: Path) -> list[dict]:
+    # CRASH-RESUME-AUDIT cross-cutting E: torn-tail-tolerant load. The previous code did
+    # ``json.loads(line)`` on EVERY line and raised on a single torn tail — same crash mode as the
+    # CompletionLedger bootstrap. Parquet is columnar and pd.read_parquet already raises clearly
+    # (which is correct — there is no JSONL recovery path for parquet), but the JSONL fallback path
+    # is now line-tolerant: malformed lines are skipped with a warning, not a raise.
     if path.suffix == ".parquet":
         import pandas as pd
 
@@ -127,9 +174,25 @@ def load_label_cache(path: Path) -> list[dict]:
         records = df.to_dict(orient="records")
     else:
         records = []
-        with path.open(encoding="utf-8") as f:
-            for line in f:
+        malformed = 0
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
                 records.append(json.loads(line))
+            except (ValueError, json.JSONDecodeError):
+                malformed += 1
+                continue
+        if malformed:
+            import logging
+            logging.getLogger(__name__).warning(
+                "load_label_cache: skipped %d malformed tail line(s) in %s", malformed, path,
+            )
 
     for r in records:
         for key in ("cards", "actions", "position"):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -403,17 +404,39 @@ class CompletionLedger:
 
     @classmethod
     def load(cls, path: Path) -> CompletionLedger:
+        # CRASH-RESUME-AUDIT cross-cutting E: torn-tail-tolerant load. The original code did
+        # ``path.read_text(...).splitlines()`` then json.loads(line) on EVERY line — a single torn
+        # tail line raised json.JSONDecodeError and the WHOLE bootstrap died, requiring manual
+        # ``rebuild_from_shards``. JSONL is line-oriented by design: skip the malformed tail and
+        # log loudly. The dedup ledger is recoverable (lines already in memory); the bootstrap
+        # proceeds with N-1 entries. The trailing `.atomic.tmp` file from a crashed write_atomic
+        # is also ignored on load — only the renamed ``path`` is consumed.
         ledger = cls(path=path)
         if not path.is_file():
             return ledger
-        for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return ledger
+        malformed = 0
+        for line in text.splitlines():
             line = line.strip()
             if not line:
                 continue
-            rec = json.loads(line)
+            try:
+                rec = json.loads(line)
+            except (ValueError, json.JSONDecodeError):
+                malformed += 1
+                continue
             key = str(rec.get("spot_key", ""))
             if key:
                 ledger.completed[key] = rec
+        if malformed:
+            import logging
+            logging.getLogger(__name__).warning(
+                "CompletionLedger.load: skipped %d malformed tail line(s) in %s "
+                "(torn write, recovery = rebuild_from_shards)", malformed, path,
+            )
         return ledger
 
     def contains(self, spot_key: str) -> bool:
@@ -489,13 +512,38 @@ class CompletionLedger:
         return ledger
 
     def write_atomic(self) -> None:
-        """Rewrite ledger file from in-memory completed dict (deduplicated)."""
+        """Rewrite ledger file from in-memory completed dict (deduplicated).
+
+        CRASH-RESUME-AUDIT #1: this method was named ``write_atomic`` but was NOT atomic — it called
+        ``write_text`` directly. A power cut mid-write truncated the prod6000 bootstrap ledger and
+        forced a full ``rebuild_from_shards``. Now: tmp + fsync + os.replace + parent-dir fsync,
+        matching the reference in pokerbot/training/leduc_tabular_cfr.py:618-636 (the in-tree
+        exemplar the original author already knew). The function name is preserved.
+        """
+        import os
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lines = [
             json.dumps(self.completed[k], sort_keys=True)
             for k in sorted(self.completed)
         ]
-        self.path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        payload = "\n".join(lines) + ("\n" if lines else "")
+        tmp = self.path.with_name(self.path.name + ".atomic.tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, self.path)
+        try:
+            dir_fd = os.open(str(self.path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
 
 
 def bootstrap_and_validate(

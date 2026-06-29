@@ -21,6 +21,7 @@ Card-id convention matches the encoder: ``card_id = rank*4 + suit`` (rank 0-12, 
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -169,9 +170,20 @@ class EMDBucketer:
                  n_runouts: int = 200, centroids: np.ndarray | None = None) -> None:
         self.num_buckets = int(num_buckets)
         self.n_bins = int(n_bins)
+        # CASH-ENGINE-AUDIT F-ENC-BUCKETER-3: n_runouts=0 silently breaks the abstraction
+        # (every query buckets to centroid 0 via the all-zero histogram path). Refuse loudly.
+        if int(n_runouts) <= 0:
+            raise ValueError(
+                f"EMDBucketer.n_runouts must be > 0 (got {n_runouts!r}) — 0 silently collapses "
+                f"every histogram to centroid 0."
+            )
         self.n_runouts = int(n_runouts)
         self.centroids = None if centroids is None else np.asarray(centroids, dtype=np.float64)
         self._cache: dict[tuple, int] = {}
+        # Lock for the per-instance cache (the module-level _FAST_BUCKET_CACHE has its own lock).
+        # Multiple threads invoking bucket() concurrently on the same bucketer need serialization
+        # on the cache write — read is lock-free (``dict.get`` is GIL-safe on existing keys).
+        self._cache_lock = threading.Lock()
 
     def fit(self, histograms, *, iters: int = 12, seed: int = 0) -> "EMDBucketer":
         """k-means under EMD over a (N, n_bins) array of pre-computed strength histograms. Centroid
@@ -198,15 +210,21 @@ class EMDBucketer:
         if self.centroids is None:
             raise RuntimeError("EMDBucketer not fitted/loaded — call fit() or load() first")
         key = _canonical_key(hole_ids, board_ids)
+        # Lock-free fast path on cache hit (GIL-protected dict.get on existing key).
         hit = self._cache.get(key)
         if hit is not None:
             return hit
-        hist = strength_histogram(key[0], key[1], n_bins=self.n_bins, n_runouts=self.n_runouts)
-        cc = np.cumsum(self.centroids, axis=1)
-        d = np.abs(np.cumsum(hist)[None, :] - cc).sum(axis=1)
-        b = int(d.argmin())
-        self._cache[key] = b
-        return b
+        with self._cache_lock:
+            # Re-check under lock to avoid duplicate histogram computation under concurrent misses.
+            hit = self._cache.get(key)
+            if hit is not None:
+                return hit
+            hist = strength_histogram(key[0], key[1], n_bins=self.n_bins, n_runouts=self.n_runouts)
+            cc = np.cumsum(self.centroids, axis=1)
+            d = np.abs(np.cumsum(hist)[None, :] - cc).sum(axis=1)
+            b = int(d.argmin())
+            self._cache[key] = b
+            return b
 
     def save(self, path: str | Path) -> None:
         p = Path(path)

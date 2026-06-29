@@ -625,6 +625,11 @@ def _equilibrium_floor_cached(iterations: int) -> float:
                     {"expl_mbb": val, "iterations": int(iterations), "key": key},
                     fh,
                 )
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass  # best-effort; cache is recomputable
             os.replace(tmp, path)
         except OSError:
             pass

@@ -80,11 +80,19 @@ def encode_actions(state: GameState, hero_seat: int) -> np.ndarray:
     packed into 12 dims via history indexing.
     """
     tensor = np.zeros(SPEC.action_shape, dtype=np.float32)
-    street_actions: dict[int, list] = {0: [], 1: [], 2: [], 3: []}
-    current_street = 0
+    # CASH-ENC-A HIGH: stamp actions on the STREET on which they occurred (was street=0 always,
+    # which corrupted any state that reached postflop — postflop actions overwrote the preflop
+    # row via np.maximum and produced [fold AND raise AND call] feat masks on the same cell).
+    street_idx_map = {
+        Street.PREFLOP: 0,
+        Street.FLOP: 1,
+        Street.TURN: 2,
+        Street.RIVER: 3,
+    }
+    current_street_idx = 0
 
-    for seat, action in state.action_history():
-        idx = min(len(street_actions[current_street]), MAX_ACTIONS_PER_STREET - 1)
+    for seat, action, _street in state.action_history_with_street():
+        current_street_idx = street_idx_map.get(_street, 0)
         feat = np.zeros(MAX_ACTIONS_PER_STREET, dtype=np.float32)
         feat[0] = 1.0  # marker
         if action.action_type == ActionType.FOLD:
@@ -95,21 +103,26 @@ def encode_actions(state: GameState, hero_seat: int) -> np.ndarray:
             feat[3] = 1.0
         feat[4] = min(action.amount_bb / 100.0, 1.0)
         feat[5] = 1.0 if seat == hero_seat else 0.0
+        # feat[6] is per-seat label — preserved on the per-street row; pot context broadcast
+        # (formerly line 112) was overwriting this on ALL streets, losing seat info entirely.
         feat[6] = seat / NUM_PLAYERS
-        tensor[seat, current_street, :] = np.maximum(tensor[seat, current_street, :], feat)
+        tensor[seat, current_street_idx, :] = np.maximum(
+            tensor[seat, current_street_idx, :], feat
+        )
 
-        if action.action_type in (ActionType.BET, ActionType.RAISE) and current_street < 3:
-            pass  # stay on street
-
-    # Encode per-player stack and pot context in row slices
+    # Per-player stack/pot context lives on EACH street row independently (was street 0 only,
+    # which silently bled preflop stack info into postflop rows).
     for seat, player in enumerate(state.players):
-        tensor[seat, 0, 7] = player.stack_bb / 100.0
-        tensor[seat, 0, 8] = 1.0 if player.folded else 0.0
-        tensor[seat, 0, 9] = 1.0 if player.all_in else 0.0
-        tensor[seat, 0, 10] = player.committed_street_bb / max(state.current_bet_bb, 1.0)
-        tensor[seat, 0, 11] = float(int(player.position))
+        for s in range(NUM_STREETS):
+            tensor[seat, s, 7] = player.stack_bb / 100.0
+            tensor[seat, s, 8] = 1.0 if player.folded else 0.0
+            tensor[seat, s, 9] = 1.0 if player.all_in else 0.0
+            tensor[seat, s, 10] = player.committed_street_bb / max(state.current_bet_bb, 1.0)
+            tensor[seat, s, 11] = float(int(player.position))
 
-    tensor[:, :, 6] = state.pot_bb / 200.0
+    # Pot broadcast now goes to the CURRENT street only (was all streets, which produced the
+    # same pot value on every row and doubled the pot feature weight).
+    tensor[:, current_street_idx, 6] = state.pot_bb / 200.0
     return tensor
 
 

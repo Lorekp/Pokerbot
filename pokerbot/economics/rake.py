@@ -1,4 +1,4 @@
-"""CoinPoker NLHE cash-game rake + CoinRewards rakeback model.
+"""CoinPoker NLHE cash-game rake + CoinRewards rakeback model + Kelly bankroll advisory.
 
 Pure, dependency-light, certifiable in isolation. The chip-EV engine terminal stays untouched; this
 module is what eval (and later the raked-equilibrium retrain) calls to turn a chip-EV pot into a *net*
@@ -25,7 +25,10 @@ That is unbiased, lower-variance than winner-pays, and makes the rakeback comput
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+
+_log = logging.getLogger(__name__)
 
 RAKE_PCT = 0.05  # 5% flat, all stakes, all formats (Hold'em cash).
 
@@ -80,7 +83,15 @@ def coinpoker_rake_bb(pot_bb: float, n_dealt: int, ended_preflop: bool, stake_ke
 
     NLNFD: a hand that ends preflop (no flop dealt) pays zero. Otherwise 5% of the pot, capped at the
     stake's BB cap for the dealt-count tier.
+
+    Defensive (ECON-1): ``pot_bb`` MUST be >= 0 — a negative pot is a caller bug (chips-vs-BB confusion)
+    that would silently return a NEGATIVE rake (a "rake credit") in production. We raise ValueError
+    instead of returning a silent-negative so a deploy catches the unit-confusion bug.
     """
+    if pot_bb < 0.0:
+        raise ValueError(
+            f"coinpoker_rake_bb: pot_bb={pot_bb} is negative (chips-vs-BB confusion?)"
+        )
     if ended_preflop:
         return 0.0  # no flop, no drop
     cap = STAKES[stake_key].cap_bb[cap_tier(n_dealt)]
@@ -117,9 +128,23 @@ def contributed_rake_bb(
     """Hero's share of the pot's rake, contributed method = rake x (hero_committed / pot).
 
     This is the unbiased, low-variance attribution and matches CoinRaces' "Coins = rake generated".
+
+    Defensive (ECON-2): ``hero_committed_bb`` MUST satisfy ``0 <= h <= pot_bb``. An over-committed hero
+    (h > pot) is a caller bug that silently over-pays rake by a factor of ``h/pot``. A negative
+    ``hero_committed_bb`` is also rejected — a negative share is impossible. We raise ValueError
+    so the bug is caught at the call site instead of silently leaking extra rake attribution.
     """
     if pot_bb <= 0.0:
         return 0.0
+    if hero_committed_bb < 0.0:
+        raise ValueError(
+            f"contributed_rake_bb: hero_committed_bb={hero_committed_bb} is negative"
+        )
+    if hero_committed_bb > pot_bb:
+        raise ValueError(
+            f"contributed_rake_bb: hero_committed_bb={hero_committed_bb} > pot_bb={pot_bb} "
+            f"(impossible — caller bug?)"
+        )
     rake = coinpoker_rake_bb(pot_bb, n_dealt, ended_preflop, stake_key)
     return rake * (hero_committed_bb / pot_bb)
 
@@ -198,8 +223,21 @@ def splash_fee_bb(pot_bb: float, hero_committed_bb: float, stake_key: str) -> fl
     Charged on EVERY dealt hand at eligible stakes, INCLUDING hands that end preflop (no NLNFD). On a
     preflop fold the 'pot' is just the posted blinds, so contributed attribution gives the hero their
     blind share of the 0.1 BB. 0 at micro/mid/high (no splash fee taken).
+
+    Defensive (ECON-3): when ``splash_eligible(stake_key)`` is True and ``pot_bb > 0`` BUT
+    ``hero_committed_bb == 0``, the caller has likely forgotten to track the posted blind. The
+    splash fee is then silently ZERO (instead of the hero's BB share), which over-states net win-rate
+    in the eval pipeline at low stakes. We log a WARNING so the silent zero is observable in
+    operator logs.
     """
     if not splash_eligible(stake_key) or pot_bb <= 0.0:
+        return 0.0
+    if hero_committed_bb == 0.0:
+        _log.warning(
+            "splash_fee_bb: hero_committed_bb=0 at eligible stake %s (pot_bb=%s) "
+            "— caller forgot to track posted blind? Splash fee silently dropped.",
+            stake_key, pot_bb,
+        )
         return 0.0
     return SPLASH_FEE_BB * (hero_committed_bb / pot_bb)
 
@@ -222,3 +260,103 @@ def net_cost_bb(
         pot_bb, hero_committed_bb, n_dealt, ended_preflop, stake_key, rakeback_mode=rakeback_mode
     )
     return rake + splash_fee_bb(pot_bb, hero_committed_bb, stake_key)
+
+
+# ---------------------------------------------------------------------------------------------------
+# Kelly criterion (bankroll fraction, advisory only)
+# ---------------------------------------------------------------------------------------------------
+# ECONOMICS-AUDIT (Top 5 design upgrades, item 1): add a Kelly helper for the live table-select
+# advisory so it can stop using the conservative 30-buyin heuristic at the extremes. Pure, dependency-
+# light, certified in isolation. The Kelly fraction is *advisory only* — the live decision still
+# consults the comfortable-bankroll gate (a multi-buyin minimum), but the Kelly output tells the
+# player WHAT FRACTION of bankroll to put at risk at a given edge/variance.
+#
+# Banker (no-loss) Kelly: f* = edge / (odds^2) where odds = sigma/edge. Equivalent form f* = edge /
+# sigma^2. Output is bankroll FRACTION in [0, 1] (1.0 = "all-in at this edge"). The clamp at 0 (no
+# negative bet) and 1 (no leverage) is a safety: a formula blow-up (e.g. zero sigma, edge>0) is
+# downgraded to 1.0 (full-Kelly, the most aggressive the math ever recommends) instead of NaN/Inf.
+#
+# ECONOMICS-AUDIT note: We use a slightly conservative fractional-Kelly ceiling of 1.0 (full Kelly)
+# to keep the test properties clean (the bound is "0..1"); live callers can multiply by an
+# additional fractional-Kelly factor (e.g. 0.5 for half-Kelly) at the call site.
+KELLY_MAX = 1.0  # clamp the advisory at full-Kelly (no leverage)
+
+
+def kelly_fraction_banker(edge_bb: float, sigma_bb: float) -> float:
+    """Kelly criterion (banker / no-loss form) as a bankroll fraction in [0, KELLY_MAX].
+
+    Parameters
+    ----------
+    edge_bb  : per-hand expected edge in BB (positive = advantage, negative = disadvantage).
+    sigma_bb : per-hand standard deviation in BB (>= 0). A non-positive sigma is degenerate and is
+               treated as "no variance" -> Kelly is undefined; the helper returns KELLY_MAX
+               (conservatively full-Kelly) for edge > 0 and 0.0 for edge <= 0.
+
+    Returns
+    -------
+    f* in [0, KELLY_MAX] : the bankroll fraction to wager. 0 means "do not play this edge".
+    A negative-edge + finite-sigma game returns exactly 0 (you don't bet on a -EV game). The result
+    is finite for every (edge, sigma) in the live decision space.
+
+    Defensive: a non-finite or NaN input -> returns 0.0 (do not play). A negative sigma -> 0.0.
+    """
+    import math as _math
+    for v in (edge_bb, sigma_bb):
+        if v is None or not _math.isfinite(float(v)):
+            return 0.0
+    if sigma_bb < 0.0:
+        return 0.0
+    if sigma_bb == 0.0:
+        # Degenerate: zero variance. If edge > 0, the bet is a "lock" -> max Kelly; if edge <= 0,
+        # no bet. Matches the limit-from-the-right of f* as sigma -> 0+.
+        return KELLY_MAX if edge_bb > 0.0 else 0.0
+    if edge_bb <= 0.0:
+        return 0.0  # no wagering on a -EV game (full Kelly is non-negative for a bankroll bet)
+    f = edge_bb / (sigma_bb * sigma_bb)
+    if f > KELLY_MAX:
+        return KELLY_MAX
+    return float(f)
+
+
+# ---------------------------------------------------------------------------------------------------
+# Play-money guard (fail-closed action override)
+# ---------------------------------------------------------------------------------------------------
+# The live stack's play-money guard is the LAST line of defense against sending actions to a real-
+# money table. The contract: a "refuse" verdict from the guard wins over ANY bot decision, including
+# an apparently +EV one. The economics layer models this as a tiny pure function that maps
+# (is_practice, bot_action) -> (allowed_action) so it can be property-tested in isolation — the
+# actual live send path is a different module, but the GUARANTEE is the same.
+#
+# The live frida bridge returns None for "unknown" (the coin-type RPC failed) or False for "real
+# money"; only True (verified play-money) clears the guard. Anything else blocks the action.
+#
+# We model bot decisions as opaque strings ("FOLD" / "CALL" / "RAISE_3" / etc.). The guard's job is
+# to either pass the decision through unchanged or replace it with the sentinel "REFUSE".
+
+PLAY_MONEY_REFUSE = "REFUSE"  # sentinel: the action the live sender must NEVER transmit
+
+
+def play_money_guard(is_practice, bot_action: str) -> str:
+    """Pure, fail-closed play-money guard. Returns bot_action iff is_practice is True, else REFUSE.
+
+    Parameters
+    ----------
+    is_practice : bool | None
+        The verified coin-type verdict from the live capture. None = unknown (RPC failed) or
+        False = real money; the only cleared value is True (confirmed play-money).
+    bot_action : str
+        The bot's chosen action (opaque string). Ignored unless the guard passes.
+
+    Returns
+    -------
+    str
+        bot_action verbatim if is_practice is True (play-money confirmed); the sentinel
+        ``PLAY_MONEY_REFUSE`` otherwise. The caller must treat ``PLAY_MONEY_REFUSE`` as a hard
+        block — i.e. do not transmit the action to the table.
+
+    The guard is symmetric: any non-True is_practice value (False, None, the integer 0, the empty
+    string) blocks. This is the documented "is_practice() is not True -> block" contract.
+    """
+    if is_practice is True:
+        return bot_action
+    return PLAY_MONEY_REFUSE

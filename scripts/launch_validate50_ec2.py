@@ -81,15 +81,29 @@ def _user_data(
     image_tag: str,
     creds: dict[str, str] | None,
 ) -> str:
+    """Build the bootstrap script that runs on the EC2 instance.
+
+    SECURITY: if `creds` is non-None, launcher AWS credentials are embedded in
+    the user-data (which is exposed via EC2 instance metadata and cloud-init
+    output logs). The caller is responsible for gating this path behind
+    `LABELGEN_ALLOW_USERDATA_CREDS=1` and stripping/redacting the secret
+    values from any S3 log upload or console output capture. The bash
+    injection vector is mitigated by `shlex.quote()` on each value.
+    """
     slice_arg = f"--manifest-slice {slice_spec}" if slice_spec else ""
     cred_block = ""
     docker_cred_env = ""
     if creds:
-        cred_block = f"""export AWS_ACCESS_KEY_ID='{creds["access_key"]}'
-export AWS_SECRET_ACCESS_KEY='{creds["secret_key"]}'
-"""
+        # shlex.quote -> single-quoted, single-quote-escaped; safe for bash
+        import shlex
+        access = shlex.quote(creds["access_key"])
+        secret = shlex.quote(creds["secret_key"])
+        cred_block = f"export AWS_ACCESS_KEY_ID={access}\nexport AWS_SECRET_ACCESS_KEY={secret}\n"
         if creds.get("token"):
-            cred_block += f"export AWS_SESSION_TOKEN='{creds['token']}'\n"
+            token = shlex.quote(creds["token"])
+            cred_block += f"export AWS_SESSION_TOKEN={token}\n"
+        # docker_cred_env uses unquoted shell-var refs ($-expansion happens in
+        # the same shell); no bash injection via secret VALUES here
         docker_cred_env = (
             "  -e AWS_ACCESS_KEY_ID \\\n  -e AWS_SECRET_ACCESS_KEY \\\n"
             + ("  -e AWS_SESSION_TOKEN \\\n" if creds.get("token") else "")
@@ -176,10 +190,27 @@ def _fetch_console_output(ec2, instance_id: str, *, timeout_sec: int = 180) -> s
 
 
 def _save_console_output(instance_id: str, output: str) -> Path:
+    """Atomic write: tmp + fsync + os.replace. Power-cut safe (R4 MEDIUM 3)."""
     log_dir = ROOT / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / f"validate50_ec2_console_{instance_id}.log"
-    path.write_text(output or "(no console output available)", encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(output or "(no console output available)")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    # fsync the parent dir so the rename is durable (POSIX only; Windows has
+    # no O_DIRECTORY constant; OSError is also caught as a best-effort)
+    if hasattr(os, "O_DIRECTORY"):
+        try:
+            dfd = os.open(str(log_dir), os.O_DIRECTORY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
     return path
 
 
@@ -244,7 +275,22 @@ def _report_failure(
     }
     failure_path = ROOT / "logs" / "validate50_ec2_failure.json"
     failure_path.parent.mkdir(parents=True, exist_ok=True)
-    failure_path.write_text(json.dumps(failure, indent=2), encoding="utf-8")
+    # Atomic write (R4 MEDIUM 3): tmp + fsync + os.replace + dir fsync
+    fp_tmp = failure_path.with_suffix(failure_path.suffix + ".tmp")
+    with open(fp_tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(json.dumps(failure, indent=2))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(fp_tmp, failure_path)
+    if hasattr(os, "O_DIRECTORY"):
+        try:
+            dfd = os.open(str(failure_path.parent), os.O_DIRECTORY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
     print(json.dumps(failure, indent=2), file=sys.stderr)
     sys.exit(1)
 
@@ -318,14 +364,43 @@ def main() -> None:
                 json.dumps(
                     {
                         "error": "missing_instance_profile",
-                        "message": "Set LABELGEN_INSTANCE_PROFILE or pass --use-launcher-credentials",
+                        "message": "Set LABELGEN_INSTANCE_PROFILE or pass --use-launcher-credentials "
+                        "(requires LABELGEN_ALLOW_USERDATA_CREDS=1)",
+                    }
+                ),
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        # SECURITY: --use-launcher-credentials bakes the launcher's long-lived
+        # AWS credentials into user_data, which is exposed via EC2 metadata
+        # service and cloud-init-output.log. The latter is uploaded to S3 at
+        # line 139 and is also visible to any co-tenant on the host's network
+        # in many AMI configurations. Require an explicit env-var gate so a
+        # misconfigured babysitter pass cannot fall through to this path.
+        if os.environ.get("LABELGEN_ALLOW_USERDATA_CREDS") != "1":
+            print(
+                json.dumps(
+                    {
+                        "error": "userdata_creds_blocked",
+                        "message": "Refusing to embed launcher AWS credentials in user_data "
+                        "without LABELGEN_ALLOW_USERDATA_CREDS=1 (see security review R4 "
+                        "CRITICAL 1). Pass --instance-profile with a valid role instead.",
                     }
                 ),
                 file=sys.stderr,
             )
             sys.exit(2)
         creds = _launcher_creds()
-        print(json.dumps({"warning": "using_launcher_credentials_in_user_data", "validate50_bootstrap_only": True}))
+        print(
+            json.dumps(
+                {
+                    "warning": "using_launcher_credentials_in_user_data",
+                    "validate50_bootstrap_only": True,
+                    "note": "LABELGEN_ALLOW_USERDATA_CREDS=1 acknowledged. Strip secret values "
+                    "from any S3 log upload and rotate the key after this run.",
+                }
+            )
+        )
 
     ud = base64.b64encode(
         _user_data(

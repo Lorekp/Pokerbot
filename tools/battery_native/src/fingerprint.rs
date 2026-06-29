@@ -14,9 +14,11 @@
 
 use crate::core::{EnvStateN, NUM_PLAYERS};
 use crate::phe_tables;
+use rustc_hash::FxHashMap as HashMap;
 
 pub const PREFLOP_NUM_CLASSES: i32 = 169;
 pub const CHIP_UNIT: f64 = 100.0; // matches jax_engine.CHIP_UNIT (BB_CHIPS)
+pub type FpMemo = HashMap<Vec<u8>, [u8; 16]>;
 
 // Seat-status sentinels (np_engine): 0 empty, 1 folded, 2 live, 3 all-in.
 const SEAT_EMPTY: i8 = 0;
@@ -369,7 +371,11 @@ pub fn blake2b(out_len: usize, person: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// Byte-identical `fingerprint_fast(state, seat)` for the bounded eval config (16-byte key).
 /// Generic over seat count `N` (N=6 monomorphization byte-identical to the pre-generic code).
-pub fn fingerprint_fast<const N: usize>(s: &EnvStateN<N>, seat: usize, num_buckets: i32) -> [u8; 16] {
+pub fn fingerprint_fast<const N: usize>(
+    s: &EnvStateN<N>,
+    seat: usize,
+    num_buckets: i32,
+) -> [u8; 16] {
     fingerprint_fast_depth(s, seat, num_buckets, &[])
 }
 
@@ -451,4 +457,82 @@ pub fn fingerprint_fast_depth<const N: usize>(
     let mut out = [0u8; 16];
     out.copy_from_slice(&d);
     out
+}
+
+#[inline]
+fn digest_msg_memoed(msg: Vec<u8>, memo: &mut FpMemo) -> [u8; 16] {
+    if let Some(digest) = memo.get(&msg) {
+        return *digest;
+    }
+    let d = blake2b(16, b"", &msg);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&d);
+    memo.insert(msg, out);
+    out
+}
+
+pub fn fingerprint_fast_depth_memo<const N: usize>(
+    s: &EnvStateN<N>,
+    seat: usize,
+    num_buckets: i32,
+    depth_edges: &[f64],
+    memo: &mut FpMemo,
+) -> [u8; 16] {
+    let button = s.button;
+    let offset = (((seat as i32 - button) % N as i32 + N as i32) % N as i32) as usize;
+    let pos_enum = pos_by_offset::<N>(offset);
+    let h0 = s.holes[seat][0];
+    let h1 = s.holes[seat][1];
+    let weva_id = weva_id_lossless(h0, h1, pos_enum);
+    let bucket = compute_postflop_bucket(h0, h1, &s.board, num_buckets);
+    let betting_state = betting_abstraction_key(s, seat);
+
+    let mut msg: Vec<u8> = Vec::with_capacity(1 + 4 + 2 + 1 + 6);
+    if bucket >= 0 {
+        msg.push(b'B');
+        msg.extend_from_slice(&bucket.to_le_bytes());
+    } else {
+        msg.push(b'w');
+        msg.extend_from_slice(&weva_id.to_le_bytes());
+        if !depth_edges.is_empty() {
+            let dbucket = bucket_edge(effective_depth_bb(s), depth_edges);
+            msg.push(b'D');
+            msg.push(dbucket);
+        }
+    }
+    msg.push(b'S');
+    msg.extend_from_slice(&betting_state);
+    digest_msg_memoed(msg, memo)
+}
+
+pub fn fingerprint_fast_depth_postflop_bucket<const N: usize>(
+    s: &EnvStateN<N>,
+    seat: usize,
+    bucket: i32,
+) -> [u8; 16] {
+    let betting_state = betting_abstraction_key(s, seat);
+    let mut msg: Vec<u8> = Vec::with_capacity(1 + 4 + 1 + 6);
+    msg.push(b'B');
+    msg.extend_from_slice(&bucket.to_le_bytes());
+    msg.push(b'S');
+    msg.extend_from_slice(&betting_state);
+    let d = blake2b(16, b"", &msg);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&d);
+    out
+}
+
+pub fn fingerprint_fast_depth_postflop_bucket_memo<const N: usize>(
+    s: &EnvStateN<N>,
+    seat: usize,
+    bucket: i32,
+    memo: &mut FpMemo,
+) -> [u8; 16] {
+    let betting_state = betting_abstraction_key(s, seat);
+    let mut msg: Vec<u8> = Vec::with_capacity(1 + 4 + 1 + 6);
+    msg.push(b'B');
+    msg.extend_from_slice(&bucket.to_le_bytes());
+    msg.push(b'S');
+    msg.extend_from_slice(&betting_state);
+    digest_msg_memoed(msg, memo)
 }

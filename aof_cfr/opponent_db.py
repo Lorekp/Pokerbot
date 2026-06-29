@@ -299,6 +299,11 @@ class AoFOpponentDB:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.wal_path, "a", encoding="utf-8") as wf:
                 wf.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                wf.flush()
+                try:
+                    os.fsync(wf.fileno())
+                except OSError:
+                    pass  # journaling is best-effort on filesystems that refuse fsync
         except (OSError, TypeError):
             pass  # journaling is best-effort; the snapshot is still the source of truth
 
@@ -332,6 +337,11 @@ class AoFOpponentDB:
                 data = fp.read_text(encoding="utf-8")
                 with open(self.wal_path, "a", encoding="utf-8") as wf:
                     wf.write(data)
+                    wf.flush()
+                    try:
+                        os.fsync(wf.fileno())
+                    except OSError:
+                        pass
                 fp.unlink()
             except OSError:
                 pass

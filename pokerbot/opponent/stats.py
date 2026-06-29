@@ -152,6 +152,47 @@ class OpponentStats:
     def fold_to_cbet_pct(self) -> float:
         return self.fold_to_cbet / max(self.cbet_faced, 1)
 
+    @property
+    def aggression_frequency(self) -> float | None:
+        """Postflop aggression frequency: (bets+raises) / (bets+raises + calls), in [0, 1].
+        Returns ``None`` when the denominator is zero (UNDEFINED — a fresh profile with no
+        postflop actions). Bug B1 fix: previously returned a silent 0.0 here which the
+        archetype path read as "passive" — a station with zero observations was being mis-tagged
+        as a NIT (the inverse). Tests cover this asymmetry at ``tests/test_opponent_property.py``.
+        """
+        b = int(self.aggression_bets_raises)
+        c = int(self.aggression_calls)
+        if (b + c) <= 0:
+            return None
+        return float(b) / float(b + c)
+
+    @property
+    def aggression_ratio(self) -> float:
+        """Legacy "aggression ratio" (B+R / calls) — kept distinct from ``aggression_frequency``
+        which is a normalized percentage. The two are equivalent when denominator > 0 but
+        the ratio diverges as calls→0; downstream callers can pick whichever fits their math."""
+        return self.aggression_bets_raises / max(self.aggression_calls, 1)
+
+    @property
+    def three_bet_pct(self) -> float | None:
+        """3-bet percentage: three_bet / pfr, in [0, 1]. Returns ``None`` when the villain has not
+        PFR'd at all (no opportunities ⇒ denominator zero). Bug B3 fix: previously returned a
+        silent 0.0 which a zero-PFR villain carried forever."""
+        pf = int(self.pfr)
+        if pf <= 0:
+            return None
+        return min(1.0, float(self.three_bet) / float(pf))
+
+    @property
+    def wtsd_pct(self) -> float | None:
+        """Went-to-showdown percentage: wtsd / saw_flop, in [0, 1]. Returns ``None`` when the
+        villain has not seen a flop yet (no opportunities ⇒ denominator zero). Bug B5 fix:
+        previously returned a silent 0.0 which made every cold profile read as "never saw showdown"."""
+        sf = int(self.saw_flop)
+        if sf <= 0:
+            return None
+        return min(1.0, float(self.wtsd) / float(sf))
+
     def archetype(self) -> str:
         # FIX B1 (table-toughness read): the 5-hand window let 1/5 VPIP tag a villain and 0/5 brand a
         # NIT, so a fresh play-money table read "tough" hand-one. Require a real local sample (>=12)

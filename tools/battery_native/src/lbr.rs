@@ -639,7 +639,15 @@ fn lbr_action_analytic<P: LbrPolicy>(
     let asked = (s.current_bet as f64 - s.committed_street[lbr_seat] as f64).max(0.0);
 
     let all_opps = in_hand_opponents(s, lbr_seat);
-    let wp = wp_vs_beliefs(s, lbr_seat, beliefs, &all_opps, cfg.eq_samples, cfg.eq_runouts, rng);
+    let wp = wp_vs_beliefs(
+        s,
+        lbr_seat,
+        beliefs,
+        &all_opps,
+        cfg.eq_samples,
+        cfg.eq_runouts,
+        rng,
+    );
 
     let mut best_a: Option<usize> = None;
     let mut best_v = -1e18f64;
@@ -667,9 +675,8 @@ fn lbr_action_analytic<P: LbrPolicy>(
         }
         let env_r = core::apply_action(s, a);
         let invest = env_r.committed_total[lbr_seat] as f64 - ct[lbr_seat];
-        let bp_to_act = !env_r.done
-            && !core::is_chance_node(&env_r)
-            && env_r.action_seat != lbr_seat as i32;
+        let bp_to_act =
+            !env_r.done && !core::is_chance_node(&env_r) && env_r.action_seat != lbr_seat as i32;
         let (fp, wp_called) = if cfg.value_only_raises {
             (0.0, wp)
         } else if bp_to_act {
@@ -935,7 +942,11 @@ mod tests {
             mode: MODE_FOLD,
         };
         let p = pol.probs(&s, 0);
-        assert!(p[FOLD] > 0.99, "fold policy should fold facing a bet: {:?}", p);
+        assert!(
+            p[FOLD] > 0.99,
+            "fold policy should fold facing a bet: {:?}",
+            p
+        );
     }
 
     #[test]
