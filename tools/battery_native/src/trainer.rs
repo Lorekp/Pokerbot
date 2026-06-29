@@ -39,6 +39,7 @@ use rayon::prelude::*;
 // sorts keys). It carries zero transitive deps. `FxHashMap<K,V>` is a `HashMap<K,V,FxBuildHasher>`; we
 // alias it locally so the rest of the module reads exactly as before.
 use rustc_hash::FxHashMap as HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::core::{self, EnvStateN, MAX_BOARD, NUM_ACTIONS, NUM_PLAYERS, SEAT_FOLDED, SEAT_LIVE};
@@ -62,6 +63,58 @@ use std::cell::RefCell;
 use std::time::Instant;
 
 const ZEROS: [f64; NUM_ACTIONS] = [0.0; NUM_ACTIONS];
+
+/// TEST-ONLY observability for the DCFR/RBP prune hook (CHANGE B). Records, across a traversal, how many
+/// actions were actually PRUNED and on which streets, plus how many prune-ELIGIBLE candidates were instead
+/// EXPLORED because they led directly to a terminal (Pluribus RULE 1b). Used by the prune-rule unit tests
+/// to assert: (1a) no prune ever fires on the river or later; (1b) a terminal-leading action is never
+/// pruned; (3) only warmed deeply-negative actions are pruned. Compiled out entirely in non-test builds
+/// (the `record_prune_*` calls are `#[cfg(test)]` no-ops), so the production hot path is unchanged.
+#[cfg(test)]
+#[derive(Default, Clone, Copy)]
+struct PruneProbe {
+    pruned_total: u64,
+    pruned_on_river_or_later: u64,
+    terminal_leading_explored: u64,
+    terminal_leading_pruned: u64,
+}
+#[cfg(test)]
+thread_local! {
+    static PRUNE_PROBE: RefCell<PruneProbe> = RefCell::new(PruneProbe::default());
+}
+#[cfg(test)]
+#[inline]
+fn prune_probe_reset() {
+    PRUNE_PROBE.with(|p| *p.borrow_mut() = PruneProbe::default());
+}
+#[cfg(test)]
+#[inline]
+fn prune_probe_get() -> PruneProbe {
+    PRUNE_PROBE.with(|p| *p.borrow())
+}
+/// Record a prune-eligible action's disposition at a hero node on `street`: `pruned` = it was skipped,
+/// `terminal_leading` = its child was terminal (RULE 1b applies). Test-only.
+#[cfg(test)]
+#[inline]
+fn record_prune_event(street: i32, pruned: bool, terminal_leading: bool) {
+    PRUNE_PROBE.with(|p| {
+        let mut pp = p.borrow_mut();
+        if pruned {
+            pp.pruned_total += 1;
+            if street >= core::STREET_RIVER {
+                pp.pruned_on_river_or_later += 1;
+            }
+            if terminal_leading {
+                pp.terminal_leading_pruned += 1;
+            }
+        } else if terminal_leading {
+            pp.terminal_leading_explored += 1;
+        }
+    });
+}
+#[cfg(not(test))]
+#[inline(always)]
+fn record_prune_event(_street: i32, _pruned: bool, _terminal_leading: bool) {}
 
 /// Number of shards the global `NlheTables` is partitioned into (write-time partition / sharded-self
 /// refactor, WF5 2026-06-28). Fixed compile-time power-of-two so `shard_of` is a cheap mask. This is a
@@ -226,6 +279,52 @@ pub struct TrainerCfg {
     /// write) verbatim. RBP (a finite `prune_threshold`) is NOT supported batched and FALLS BACK to the
     /// recursive path. Default `0` so every shipped path is unchanged.
     pub batch_deals: usize,
+    /// CHANGE A — DYNAMIC WORK-STEALING deal scheduler (throughput; quality-SAFE). `false` (the default,
+    /// also overridable to ON via env `POKERBOT_WORKSTEAL=1`) keeps the static
+    /// `into_par_iter().with_min_len().fold()` rayon chunking — BYTE-IDENTICAL to today. `true` replaces
+    /// that with a persistent `AtomicUsize` deal counter: exactly `rayon::current_num_threads()` workers
+    /// are spawned (one per physical core; honors RAYON_NUM_THREADS) and each loops
+    /// `d = next.fetch_add(1)` pulling deals DYNAMICALLY, so the measured ~100x per-deal work variance
+    /// (preflop fold vs deep multi-street) and the ~8x mean-nodes-per-deal growth during training
+    /// rebalance — fixing the load imbalance the static `~1.5 tasks/thread` chunking leaves on the table
+    /// (rayon cannot steal mid-chunk once a deep deal starts). Each worker accumulates into its OWN
+    /// per-worker sharded `NlheTables` (exactly like the static fold's per-task `acc`), and the per-deal
+    /// RNG seed stays a PURE function of `(iter_seed, deal_index d)` — INDEPENDENT of which worker claims
+    /// the deal or the claim order — so deal `d` produces an IDENTICAL traversal regardless of scheduling.
+    /// The ONLY thing that differs vs the default path is the deal->worker assignment and therefore the
+    /// cross-partial merge order (float non-associativity) => STATISTICALLY EQUIVALENT (gate by
+    /// LBR/self-play CI-overlap, NOT a byte gate — the same standard as `fast_merge`). `merge_partials` /
+    /// `floor_cum_regret` are UNCHANGED. RBP and the batched MLP path compose with it; the profile twin
+    /// keeps the static path (work_steal is a pure-throughput scheduler, not a measurement change).
+    pub work_steal: bool,
+    /// CHANGE B — DISCOUNTED-CFR (DCFR, Brown & Sandholm 2019) signed-regret mode that ACTIVATES the
+    /// otherwise-inert `prune_threshold` Regret-Based Pruning hook. `false` (the default, also overridable
+    /// to ON via env `POKERBOT_DCFR=1`) keeps the shipped CFR+ positive-floor path (`floor_cum_regret`
+    /// clamps regret >= 0 each iteration) — BYTE-IDENTICAL to today, and the prune hook stays INERT (no
+    /// read-regret is ever < 0 so a finite `prune_threshold` prunes zero subtrees). `true` keeps SIGNED
+    /// regret (negatives allowed) and applies the DCFR discount in the per-iteration pass that the CFR+
+    /// path uses for `floor_cum_regret`: positive cum_regret *= t^alpha/(t^alpha+1), negative cum_regret
+    /// *= t^beta/(t^beta+1), strat_sum *= (t/(t+1))^gamma — with (alpha,beta,gamma)=(1.5,0,2), matching
+    /// `pokerbot/training/shared_hogwild_table.dcfr_weights`. `regret_match` already reads `max(0,.)` so
+    /// the strategy naturally uses only positive regret. With signed regret the `prune_threshold` hook
+    /// becomes ACTIVE; the trainer applies the 3 Pluribus correctness rules (never prune the last betting
+    /// round / terminal-leading actions; decide prune-vs-explore PER-ITERATION with ~5% explore so a
+    /// deeply-negative action can REVIVE; only prune a WARMED action whose regret actually fell below the
+    /// floor). This is a CANDIDATE that must pass an LBR-at-convergence cert before it could replace CFR+;
+    /// no default is flipped. `dcfr_prune_threshold` supplies the (deeply-negative) RBP floor when this is
+    /// ON; `dcfr_explore_frac` the fraction of iterations that explore all actions (no pruning).
+    pub dcfr: bool,
+    /// Regret-Based-Pruning floor used by the DCFR mode (the value handed to the `prune_threshold` hook
+    /// when `dcfr` is ON, in bb regret units). Ignored when `dcfr` is OFF (then `prune_threshold` governs
+    /// directly, and stays inert under the CFR+ floor). Pluribus used a deeply-negative bound relative to
+    /// the regret scale; the default `-300_000.0` bb is ~Pluribus's −300M chip floor at this trainer's
+    /// 100-chip CHIP_UNIT (the showdown chip-delta divided by CHIP_UNIT lands regret in bb units).
+    pub dcfr_prune_threshold: f64,
+    /// Fraction of iterations (in `[0,1]`) the DCFR mode EXPLORES every action (NO pruning) so a
+    /// deeply-negative action can revive (Pluribus rule 2). The per-iteration prune/explore decision is a
+    /// DETERMINISTIC function of the iteration seed (reproducible across resume), NOT a fresh RNG. Default
+    /// `0.05` (Pluribus's ~5%). Ignored when `dcfr` is OFF.
+    pub dcfr_explore_frac: f64,
 }
 
 /// The persistent, durable trainer state — the genuine gap #1. Survives every traversal; merged
@@ -394,6 +493,55 @@ impl NlheTables {
     fn iter_all_strat(&self) -> impl Iterator<Item = (&[u8; 16], &[f64; NUM_ACTIONS])> {
         self.shards.iter().flat_map(|s| s.strat_sum.iter())
     }
+}
+
+/// Insert a (cum_regret, strat_sum) pair for `key` into the correct shard of `shards`. Used by the hogwild
+/// table's `snapshot_tables` to materialize a shared table into the fork-merge `NlheTables` shape (the
+/// regret row narrows f64 -> RegretT exactly as `read_map_into_shards` does on deserialize, so the produced
+/// table is byte-format-identical to a fork-merge / checkpoint one). `pub(crate)` so the `hogwild` module
+/// can reach it without exposing the shard internals publicly. Available unconditionally (so the f64 build
+/// without the hogwild feature still compiles it as dead-but-valid code is undesirable — gate it on the
+/// feature to avoid an unused-fn warning in the default build).
+#[cfg(feature = "hogwild")]
+pub(crate) fn shard_insert_snapshot_filtered(
+    shards: &mut [Shard; N_SHARDS],
+    key: &[u8; 16],
+    reg: Option<&[f64; NUM_ACTIONS]>,
+    strat: Option<&[f64; NUM_ACTIONS]>,
+) {
+    let s = shard_of(key);
+    if let Some(reg) = reg {
+        shards[s].cum_regret.insert(*key, narrow_r(reg));
+    }
+    if let Some(strat) = strat {
+        shards[s].strat_sum.insert(*key, *strat);
+    }
+}
+
+/// Visit every (key, cum_regret-widened-to-f64, strat_sum) row of `tab` in shard order, calling `f`. Used
+/// by the hogwild table's `load_from_tables` to seed the shared table from a resumed checkpoint. The cum
+/// row is widened to f64 (identity in the f64 build) so the hogwild table — which stores f64 cells — gets
+/// the on-disk-equivalent value. `pub(crate)`; gated on the feature to avoid an unused-fn warning.
+#[cfg(feature = "hogwild")]
+pub(crate) fn for_each_table_row<F>(tab: &NlheTables, mut f: F) -> Result<(), String>
+where
+    F: FnMut(&[u8; 16], &[f64; NUM_ACTIONS], &[f64; NUM_ACTIONS]) -> Result<(), String>,
+{
+    for sh in tab.shards.iter() {
+        for (key, reg) in sh.cum_regret.iter() {
+            let widened = widen_r(reg);
+            let strat = sh.strat_sum.get(key).copied().unwrap_or(ZEROS);
+            f(key, &widened, &strat)?;
+        }
+        // A strat_sum row whose key has NO cum_regret row (possible after CFR+ flooring drops a regret row
+        // — though in practice they co-occur) still needs to be loaded so the average strategy is complete.
+        for (key, strat) in sh.strat_sum.iter() {
+            if !sh.cum_regret.contains_key(key) {
+                f(key, &ZEROS, strat)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Fold `src` shard into `dst` shard by `+=` on co-keyed rows (cum_regret AND strat_sum). The CFR+ floor
@@ -661,6 +809,116 @@ fn ab_stub_mode() -> u8 {
 #[inline(always)]
 fn ab_stub_mode() -> u8 {
     0
+}
+
+/// CHANGE A runtime toggle: `cfg.work_steal` OR env `POKERBOT_WORKSTEAL=1` (matching the env-var toggle
+/// convention used by `POKERBOT_HOGWILD` / `POKERBOT_AB_STUB`). Read ONCE per process (the scheduler choice
+/// is a whole-run property; an `OnceLock` keeps the per-iteration check free and stable across resume).
+/// Default `cfg.work_steal=false` + unset env => `false` => the static `par_iter().fold()` path (byte-
+/// identical to today). The env override is OR-ed with the cfg field so either enables it.
+fn work_steal_enabled(cfg: &TrainerCfg) -> bool {
+    use std::sync::OnceLock;
+    static ENV: OnceLock<bool> = OnceLock::new();
+    let env_on = *ENV.get_or_init(|| {
+        std::env::var("POKERBOT_WORKSTEAL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    });
+    cfg.work_steal || env_on
+}
+
+/// CHANGE B runtime toggle: `cfg.dcfr` OR env `POKERBOT_DCFR=1` (same convention as above). Read once per
+/// process. Default OFF => the CFR+ positive-floor path is unchanged (byte-identical) and the prune hook
+/// stays inert.
+fn dcfr_enabled(cfg: &TrainerCfg) -> bool {
+    use std::sync::OnceLock;
+    static ENV: OnceLock<bool> = OnceLock::new();
+    let env_on = *ENV.get_or_init(|| {
+        std::env::var("POKERBOT_DCFR")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    });
+    cfg.dcfr || env_on
+}
+
+/// DCFR (Discounted CFR, Brown & Sandholm 2019) discount factors for iteration `t` (>= 1). Returns
+/// `(pos, neg, strat)`: positive cum_regret is multiplied by `t^alpha/(t^alpha+1)`, negative by
+/// `t^beta/(t^beta+1)`, and strat_sum by `(t/(t+1))^gamma`. (alpha,beta,gamma)=(1.5,0,2) — the
+/// empirically-best Pluribus setting; BIT-for-BIT the same arithmetic as
+/// `pokerbot/training/shared_hogwild_table.dcfr_weights` so the native DCFR mode and the Python reference
+/// agree. `beta=0` => `t^0=1` => `neg = 1/2` (negative regret is halved each step). Only invoked when
+/// `dcfr` is ON, so the CFR+ default path never touches this.
+#[inline]
+fn dcfr_weights(t: u64) -> (f64, f64, f64) {
+    const ALPHA: f64 = 1.5;
+    const BETA: f64 = 0.0;
+    const GAMMA: f64 = 2.0;
+    let tf = (t as f64).max(1.0);
+    let ta = tf.powf(ALPHA);
+    let tb = tf.powf(BETA);
+    let pos = ta / (ta + 1.0);
+    let neg = tb / (tb + 1.0);
+    let strat = (tf / (tf + 1.0)).powf(GAMMA);
+    (pos, neg, strat)
+}
+
+/// Pluribus RULE 2 (per-iteration prune-vs-explore decision): explore ALL actions (NO pruning) in
+/// ~`explore_frac` of iterations so a deeply-negative action can revive; prune in the rest. The decision
+/// is a DETERMINISTIC function of `iter_seed` (so it is reproducible and resume-stable — NOT a fresh RNG
+/// that would diverge after a checkpoint restore). We mix the seed with a fixed odd constant and compare
+/// the top-53-bit mantissa-scaled fraction against `explore_frac`. Returns `true` when this iteration
+/// should EXPLORE (no pruning). `explore_frac <= 0` => never explore (always prune-eligible);
+/// `explore_frac >= 1` => always explore (never prune).
+#[inline]
+fn dcfr_is_explore_iter(iter_seed: u64, explore_frac: f64) -> bool {
+    if explore_frac <= 0.0 {
+        return false;
+    }
+    if explore_frac >= 1.0 {
+        return true;
+    }
+    // SplitMix64-style finalizer on the iteration seed -> a well-distributed u64, then the top 53 bits
+    // map to a uniform f64 in [0,1). Deterministic given iter_seed.
+    let mut z = iter_seed.wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^= z >> 31;
+    let u = ((z >> 11) as f64) * (1.0 / ((1u64 << 53) as f64));
+    u < explore_frac
+}
+
+/// Pluribus RULE 1a (never prune the LAST betting round) as a shared predicate used by BOTH the
+/// `one_traversal` and `one_traversal_profile` hero hooks (so the production guard and its test are the
+/// same code). Returns `true` iff a hero node on `street` may be a prune SITE this iteration: pruning is
+/// enabled (`eff_prune` finite) AND the node is BEFORE the river (`street < STREET_RIVER` — street 3 is the
+/// final betting round, whose values feed every upstream regret and must always be exact). The further
+/// per-action RULE 1b (never prune a TERMINAL-leading action) and RULE 3 (only prune a WARMED, deeply-
+/// negative action) are applied inside the loop at each candidate.
+#[inline]
+fn dcfr_prune_node_allowed(street: i32, eff_prune: f64) -> bool {
+    eff_prune.is_finite() && street < core::STREET_RIVER
+}
+
+/// The EFFECTIVE Regret-Based-Pruning threshold to use for the iteration with seed `iter_seed`.
+///
+/// CFR+ default (`dcfr` OFF): returns `cfg.prune_threshold` UNCHANGED — NEG_INFINITY in every shipped cfg
+/// (disabling pruning) and inert even if finite (the positive floor keeps read-regret >= 0). The whole
+/// function reduces to the identity for the byte-identical default path.
+///
+/// DCFR mode (`dcfr` ON): on a ~5% explore-iteration (Pluribus rule 2, decided deterministically from the
+/// seed) returns NEG_INFINITY so EVERY action is re-explored (a deeply-negative action can revive); on the
+/// other ~95% returns the deeply-negative `cfg.dcfr_prune_threshold` so RBP fires. Decided ONCE per
+/// iteration (not per action).
+#[inline]
+fn effective_prune_threshold(cfg: &TrainerCfg, iter_seed: u64) -> f64 {
+    if !dcfr_enabled(cfg) {
+        return cfg.prune_threshold;
+    }
+    if dcfr_is_explore_iter(iter_seed, cfg.dcfr_explore_frac) {
+        f64::NEG_INFINITY
+    } else {
+        cfg.dcfr_prune_threshold
+    }
 }
 
 #[inline]
@@ -1102,6 +1360,12 @@ fn terminal_return<const N: usize>(env: &EnvStateN<N>, hero: usize) -> f64 {
 /// strategy is frozen at the start-of-iteration table); reading from the immutable `read` snapshot here
 /// restores that. The convergence / LBR-exploitability / checkpoint-resume gates all hold under the new
 /// (correct) read semantics. Returns hero's counterfactual value (in bb).
+///
+/// `eff_prune` is the EFFECTIVE Regret-Based-Pruning threshold for THIS iteration. The default (CFR+) path
+/// passes `cfg.prune_threshold` verbatim, so the shipped behavior is BYTE-IDENTICAL (the prune hook is
+/// inert under the positive floor — no read-regret is ever < 0). DCFR mode passes `cfg.dcfr_prune_threshold`
+/// on prune-iterations and `NEG_INFINITY` on the ~5% explore-iterations (Pluribus rule 2), so the prune
+/// decision is made PER ITERATION (not per action) by the caller.
 fn one_traversal<const N: usize>(
     env: &EnvStateN<N>,
     hero: usize,
@@ -1111,13 +1375,14 @@ fn one_traversal<const N: usize>(
     rng: &mut Rng,
     t: u64,
     memo: &mut FpMemo,
+    eff_prune: f64,
 ) -> f64 {
     if env.done {
         return env.rewards[hero] as f64 / CHIP_UNIT;
     }
     if core::is_chance_node(env) {
         let child = core::sample_chance(env);
-        return one_traversal(&child, hero, cfg, read, local, rng, t, memo);
+        return one_traversal(&child, hero, cfg, read, local, rng, t, memo, eff_prune);
     }
     // Post-chance terminal: `sample_chance` advances a checked/called river to STREET_TERMINAL with
     // action_seat=-1, done=FALSE, and STALE rewards=[0,...] (the engine fills `rewards` only on the
@@ -1184,41 +1449,60 @@ fn one_traversal<const N: usize>(
         let u = rng.next_f64();
         let a = sample_action_compact(&strat, &lidx, ln, u);
         let child = trainer_apply(env, a);
-        return one_traversal(&child, hero, cfg, read, local, rng, t, memo);
+        return one_traversal(&child, hero, cfg, read, local, rng, t, memo, eff_prune);
     }
 
     // Hero node: branch ALL abstracted-legal actions, CFR+ regret update. Regrets are read from the
     // IMMUTABLE iteration snapshot `read` (start-of-iteration strategy, read once above), never `local`.
     let strat = regret_match(&regrets, &legal);
     let mut av = [0.0f64; NUM_ACTIONS];
-    // LEVER 7 — Regret-Based Pruning (Brown-Sandholm). An action whose start-of-iteration cumulative
-    // regret is `<= prune_threshold` (and which therefore carries 0 strategy mass) would have its entire
+    // LEVER 7 — Regret-Based Pruning (Brown & Sandholm 2019), ACTIVATED by DCFR mode (CHANGE B). An
+    // action whose start-of-iteration cumulative regret is `<= eff_prune` (deeply negative) AND which
+    // carries 0 strategy mass (`strat[a] == 0.0`, i.e. regret-match already zeroed it) has its entire
     // subtree — and that subtree's dominant showdown evals — skipped; its `av[a]` is backfilled to `ev`
-    // (regret delta 0 => frozen => stays pruned). `prune_threshold = NEG_INFINITY` (the default + every
-    // shipped cfg) DISABLES it: the `prune.is_finite()` gate below makes that path BYTE-IDENTICAL to the
-    // no-RBP trainer (no `pruned` array, no extra checks).
+    // (regret delta 0 => frozen => stays pruned this iteration). `eff_prune = NEG_INFINITY` DISABLES it:
+    // the `eff_prune.is_finite()` gate below makes that path BYTE-IDENTICAL to the no-RBP trainer (no
+    // `pruned` array, no extra checks). The CFR+ default path passes `cfg.prune_threshold` (NEG_INFINITY
+    // in every shipped cfg, AND inert even if finite because the positive floor keeps read-regret >= 0);
+    // DCFR mode keeps SIGNED regret so a finite `eff_prune` actually fires.
     //
-    // ARCHITECTURAL NOTE (why RBP is shipped present-but-OFF): textbook RBP keys on DEEPLY NEGATIVE
-    // cumulative regret. This trainer applies the CFR+ positive floor `max(r,0)` to the PERSISTENT
-    // `cum_regret` table once per iteration (FIX 3, mirrors leduc.rs — load-bearing, prevents regret
-    // over-inflation). So `read.cum_regret[key][a]` is ALWAYS `>= 0` at read time: the negative-regret
-    // signal RBP needs is destroyed by the floor, and a measured threshold sweep (C from -1e6 down to
-    // -10 bb) prunes ZERO subtrees (no read-regret is ever < 0). Making RBP fire would require either
-    // removing the load-bearing CFR+ floor or maintaining a separate un-floored shadow-regret signal —
-    // both larger, fixed-point-risk changes outside this pass's safe scope. The mechanism is verified
-    // correct (disabled == byte-identical; the gate + backfill are sound) and left wired for a future
-    // shadow-regret variant, but is NOT enabled because it cannot deliver speedup against the CFR+ floor.
-    let prune = cfg.prune_threshold;
-    if prune.is_finite() {
+    // PLURIBUS CORRECTNESS RULES enforced here:
+    //   RULE 1a (never prune the LAST betting round): when `env.street >= STREET_RIVER` (street 3 = the
+    //     final betting round) pruning is disabled for THIS node (`prune_here`), so river values — which
+    //     feed every upstream regret — are always computed exactly.
+    //   RULE 1b (never prune an action that leads DIRECTLY to a terminal payoff): a candidate is applied
+    //     and only pruned if its child is NON-terminal. A terminal-leading action has no deep subtree to
+    //     skip (its value is one cheap settle), so this loses no speed while protecting the value estimate
+    //     that Pruning-at-a-terminal would corrupt.
+    //   RULE 2 (per-ITERATION prune/explore decision): the caller already chose prune-vs-explore for the
+    //     whole iteration via `dcfr_is_explore_iter` (explore-iters pass NEG_INFINITY here), so a
+    //     deeply-negative action is fully re-explored ~5% of iterations and can REVIVE. (Not decided
+    //     per-action — cheaper, Pluribus.)
+    //   RULE 3 (only prune a WARMED action): `strat[a] == 0.0 && regrets[a] <= eff_prune` requires the
+    //     action's accumulated regret to have actually fallen below the (deeply-negative) floor — i.e. it
+    //     warmed up and lost — before it is pruned (the hook's original note).
+    let prune_here = dcfr_prune_node_allowed(env.street, eff_prune); // RULE 1a
+    if prune_here {
         let mut pruned = [false; NUM_ACTIONS];
         for i in 0..ln {
             let a = lidx[i];
-            if strat[a] == 0.0 && regrets[a] <= prune {
-                pruned[a] = true;
-                continue; // skip the subtree (and its showdowns); av[a] backfilled to ev below.
+            if strat[a] == 0.0 && regrets[a] <= eff_prune {
+                // RULE 3 warmed + deeply-negative. Apply the action to check RULE 1b before committing to
+                // the prune (a terminal child is cheap and must NOT be pruned).
+                let child = trainer_apply(env, a);
+                let terminal_leading = child.done || child.street >= core::STREET_TERMINAL;
+                if terminal_leading {
+                    // RULE 1b: action leads DIRECTLY to a terminal — never prune; evaluate its cheap leaf.
+                    record_prune_event(env.street, false, true);
+                    av[a] = one_traversal(&child, hero, cfg, read, local, rng, t, memo, eff_prune);
+                } else {
+                    record_prune_event(env.street, true, false);
+                    pruned[a] = true; // skip the (non-terminal) subtree + its showdowns; backfilled below.
+                }
+                continue;
             }
             let child = trainer_apply(env, a);
-            av[a] = one_traversal(&child, hero, cfg, read, local, rng, t, memo);
+            av[a] = one_traversal(&child, hero, cfg, read, local, rng, t, memo, eff_prune);
         }
         // ev over the explored actions (pruned lanes have strat==0 so contribute nothing yet). Scalar
         // form, matching the main (RBP-off) path's byte-identical math.
@@ -1241,11 +1525,12 @@ fn one_traversal<const N: usize>(
         }
         return ev;
     }
-    // RBP disabled (default) — the zero-overhead path: branch all legal actions, no prune machinery.
+    // RBP disabled (default, or river under DCFR per RULE 1a) — the zero-overhead path: branch all legal
+    // actions, no prune machinery.
     for i in 0..ln {
         let a = lidx[i];
         let child = trainer_apply(env, a);
-        av[a] = one_traversal(&child, hero, cfg, read, local, rng, t, memo);
+        av[a] = one_traversal(&child, hero, cfg, read, local, rng, t, memo, eff_prune);
     }
     // LEVER 6(a) (FMA hero EV dot-product + regret delta) — TRIED AND REVERTED with lever 5: the
     // `mul_add`/masked-11-wide form was statistically equivalent but tipped the same marginal LBR
@@ -1271,6 +1556,109 @@ fn one_traversal<const N: usize>(
     // the current player's strategy at the OPPONENT's node (see the `actor != hero` branch above, FIX 2)
     // — accumulating only in the hero branch biases the fixed point at every non-root infoset.
     ev
+}
+
+// --------------------------------------------------------------------------------------------------
+// HOGWILD traversal (feature `hogwild`) — the SAME ES-MCCFR recursion as `one_traversal`, but reading
+// regret-matching strategy from, and writing regret/strat deltas DIRECTLY INTO, the ONE shared
+// open-addressing table (`hogwild::SharedHogwildTable`) in place. No `read` snapshot, no `local` delta, no
+// per-iteration merge or floor barrier: all workers race on the shared table (the accepted hogwild noise)
+// and the CFR+ floor is applied per regret add (`SharedHogwildTable::add_regret` clamps >= 0).
+//
+// DUPLICATION NOTE (intentional, called out in the report): this is a near-mirror of `one_traversal` — the
+// chance/terminal/leaf/legal-mask/fingerprint structure and every float op (regret_match, the opponent
+// strat_sum weight loop, the hero av/ev/regret-delta loops) are identical; the ONLY changes are (a) the
+// strategy is read via `table.slot_for(&key)` -> `table.regret_row(slot)` instead of from `read.shards`,
+// and (b) writes go to `table.add_strat` / `table.add_regret` instead of `local`. A trait seam over the
+// fork-merge `one_traversal` was rejected to keep that hot path provably byte-identical (firewall
+// requirement); the cost is this one duplicated recursion, gated entirely behind `feature = "hogwild"`.
+// RBP (`cfg.prune_threshold` finite) is NOT supported on the hogwild path (it falls through to branching
+// every legal action — same as the default `prune_threshold = NEG_INFINITY`).
+#[cfg(feature = "hogwild")]
+fn one_traversal_hogwild<const N: usize>(
+    env: &EnvStateN<N>,
+    hero: usize,
+    cfg: &TrainerCfg,
+    table: &crate::hogwild::SharedHogwildTable,
+    rng: &mut Rng,
+    t: u64,
+    memo: &mut FpMemo,
+) -> Result<f64, String> {
+    if env.done {
+        return Ok(env.rewards[hero] as f64 / CHIP_UNIT);
+    }
+    if core::is_chance_node(env) {
+        let child = core::sample_chance(env);
+        return one_traversal_hogwild(&child, hero, cfg, table, rng, t, memo);
+    }
+    if env.street >= core::STREET_TERMINAL {
+        return Ok(terminal_return(env, hero));
+    }
+    let actor_i = env.action_seat;
+    if actor_i < 0 {
+        return Ok(terminal_return(env, hero));
+    }
+    let actor = actor_i as usize;
+    let legal = abstracted_legal(env, actor, cfg);
+    if !any_legal(&legal) {
+        return Ok(terminal_return(env, hero));
+    }
+    let key = fingerprint_fast_depth_memo_emd(
+        env,
+        actor,
+        cfg.num_buckets,
+        &cfg.depth_edges,
+        cfg.emd_frozen.as_deref(),
+        memo,
+    );
+    let (lidx, ln) = compact_legal(&legal);
+
+    // Claim (or find) the shared slot for this infoset, then read the (racy) regret row for
+    // regret-matching. `slot_for` is the ONLY place a first-visit claim can fail (capacity overflow) — a
+    // hard Err that propagates all the way out (never silent corruption).
+    let slot = table.slot_for(&key)?;
+    let regrets = table.regret_row(slot);
+
+    if actor != hero {
+        // Opponent node: regret-matching+ strategy, accumulate the linear-weighted strat-sum into the
+        // shared table, then sample ONE action. Same math/order as `one_traversal`'s opponent branch.
+        let strat = regret_match(&regrets, &legal);
+        let w = t as f64;
+        let mut contrib = [0.0f64; NUM_ACTIONS];
+        for a in 0..NUM_ACTIONS {
+            if legal[a] {
+                contrib[a] = w * strat[a];
+            }
+        }
+        table.add_strat(slot, &legal, &contrib);
+        let u = rng.next_f64();
+        let a = sample_action_compact(&strat, &lidx, ln, u);
+        let child = trainer_apply(env, a);
+        return one_traversal_hogwild(&child, hero, cfg, table, rng, t, memo);
+    }
+
+    // Hero node: branch ALL abstracted-legal actions, CFR+ regret update written into the shared table.
+    let strat = regret_match(&regrets, &legal);
+    let mut av = [0.0f64; NUM_ACTIONS];
+    for i in 0..ln {
+        let a = lidx[i];
+        let child = trainer_apply(env, a);
+        av[a] = one_traversal_hogwild(&child, hero, cfg, table, rng, t, memo)?;
+    }
+    let mut ev = 0.0;
+    for a in 0..NUM_ACTIONS {
+        ev += strat[a] * av[a];
+    }
+    // CFR+ regret delta = av - ev on legal lanes; `add_regret` floors the post-add value >= 0 per element
+    // (the per-add floor replaces the fork-merge per-iteration `floor_cum_regret` barrier).
+    let mut delta = [0.0f64; NUM_ACTIONS];
+    for a in 0..NUM_ACTIONS {
+        if legal[a] {
+            delta[a] = av[a] - ev;
+        }
+    }
+    table.add_regret(slot, &legal, &delta);
+    Ok(ev)
 }
 
 // --------------------------------------------------------------------------------------------------
@@ -1627,6 +2015,7 @@ fn one_traversal_profile<const N: usize>(
     memo: &mut FpMemo,
     stats: &mut TraverseStats,
     depth: u64,
+    eff_prune: f64,
 ) -> f64 {
     stats.nodes += 1;
     stats.max_depth = stats.max_depth.max(depth);
@@ -1648,6 +2037,7 @@ fn one_traversal_profile<const N: usize>(
             memo,
             stats,
             depth + 1,
+            eff_prune,
         );
     }
     if env.street >= core::STREET_TERMINAL {
@@ -1716,19 +2106,41 @@ fn one_traversal_profile<const N: usize>(
             memo,
             stats,
             depth + 1,
+            eff_prune,
         );
     }
 
     stats.hero_nodes += 1;
     let strat = regret_match(&regrets, &legal);
     let mut av = [0.0f64; NUM_ACTIONS];
-    let prune = cfg.prune_threshold;
-    if prune.is_finite() {
+    // Same Pluribus-RBP hook as `one_traversal` (rules 1a/1b/2/3) — see that function for the rationale.
+    let prune_here = dcfr_prune_node_allowed(env.street, eff_prune); // RULE 1a
+    if prune_here {
         let mut pruned = [false; NUM_ACTIONS];
         for i in 0..ln {
             let a = lidx[i];
-            if strat[a] == 0.0 && regrets[a] <= prune {
-                pruned[a] = true;
+            if strat[a] == 0.0 && regrets[a] <= eff_prune {
+                // RULE 3 warmed + deeply-negative; apply to check RULE 1b (never prune a terminal child).
+                stats.apply_calls += 1;
+                let child = trainer_apply(env, a);
+                if child.done || child.street >= core::STREET_TERMINAL {
+                    stats.hero_branches += 1;
+                    av[a] = one_traversal_profile(
+                        &child,
+                        hero,
+                        cfg,
+                        read,
+                        local,
+                        rng,
+                        t,
+                        memo,
+                        stats,
+                        depth + 1,
+                        eff_prune,
+                    );
+                } else {
+                    pruned[a] = true;
+                }
                 continue;
             }
             stats.hero_branches += 1;
@@ -1745,6 +2157,7 @@ fn one_traversal_profile<const N: usize>(
                 memo,
                 stats,
                 depth + 1,
+                eff_prune,
             );
         }
         let mut ev = 0.0;
@@ -1782,6 +2195,7 @@ fn one_traversal_profile<const N: usize>(
             memo,
             stats,
             depth + 1,
+            eff_prune,
         );
     }
     let mut ev = 0.0;
@@ -1840,10 +2254,24 @@ impl NlheTables {
     pub fn train_iteration_n<const N: usize>(&mut self, cfg: &TrainerCfg) {
         let t = self.iters_done + 1;
         let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
+        // EFFECTIVE per-iteration prune threshold (CHANGE B / Pluribus rule 2 — the prune/explore choice is
+        // made ONCE per iteration here, not per action). CFR+ default: `cfg.prune_threshold` verbatim
+        // (NEG_INFINITY in every shipped cfg; inert even if finite because the positive floor keeps
+        // read-regret >= 0) => BYTE-IDENTICAL. DCFR: on a ~95% prune-iteration use the deeply-negative
+        // `dcfr_prune_threshold`; on a ~5% explore-iteration use NEG_INFINITY so every action is re-
+        // explored and a pruned action can REVIVE. The explore decision is deterministic in `iter_seed`.
+        let eff_prune = effective_prune_threshold(cfg, iter_seed);
         let read: &NlheTables = self;
-        let partials = Self::collect_partials_n::<N>(cfg, read, t, iter_seed);
+        let partials = Self::collect_partials_n::<N>(cfg, read, t, iter_seed, eff_prune);
         self.merge_partials(cfg, partials);
-        self.floor_cum_regret();
+        if dcfr_enabled(cfg) {
+            // DCFR (CHANGE B): keep SIGNED regret and DISCOUNT it (no positive floor) so the prune hook's
+            // negative-regret signal survives. Replaces `floor_cum_regret` for this iteration.
+            self.apply_dcfr_discount(t);
+        } else {
+            // CFR+ default: positive-regret floor (byte-identical to today).
+            self.floor_cum_regret();
+        }
         self.iters_done = t;
     }
 
@@ -1852,7 +2280,16 @@ impl NlheTables {
         read: &NlheTables,
         t: u64,
         iter_seed: u64,
+        eff_prune: f64,
     ) -> Vec<NlheTables> {
+        // WORK-STEALING PATH (CHANGE A): when enabled (cfg.work_steal OR env POKERBOT_WORKSTEAL=1), pull
+        // deals dynamically off a shared atomic counter across exactly `current_num_threads()` workers so
+        // the deep-deal tail rebalances. Composes with RBP (eff_prune is threaded through). Independent of
+        // the batched MLP path — work-steal uses the recursive `one_traversal`; the two are mutually
+        // exclusive here (work-steal takes precedence; a future merge could batch within a worker).
+        if work_steal_enabled(cfg) {
+            return Self::collect_partials_n_worksteal::<N>(cfg, read, t, iter_seed, eff_prune);
+        }
         // BATCHED MLP PATH: when `cfg.batch_deals >= 2` AND RBP is OFF (the production regime), step
         // `B` independent deals in lockstep so their cum_regret probes overlap (see `run_batch`). The
         // rayon SPLITTING is IDENTICAL to the recursive path (same `into_par_iter().with_min_len()`), so
@@ -1860,9 +2297,9 @@ impl NlheTables {
         // folds — are the same; within each leaf job the deals are buffered into batches of B and each
         // batch's per-deal `LocalDelta`s are folded into the task accumulator in ASCENDING deal order
         // (`run_batch`), exactly as the recursive `.fold` does one deal at a time. Result: BYTE-IDENTICAL
-        // merged table. A finite `prune_threshold` (RBP on) is NOT supported batched and falls through to
-        // the recursive fold below.
-        if cfg.batch_deals >= 2 && !cfg.prune_threshold.is_finite() {
+        // merged table. A finite effective prune threshold (RBP on, e.g. DCFR mode) is NOT supported
+        // batched and falls through to the recursive fold below.
+        if cfg.batch_deals >= 2 && !eff_prune.is_finite() {
             return Self::collect_partials_n_batched::<N>(cfg, read, t, iter_seed);
         }
         // Each rayon worker borrows a PROCESS-PERSISTENT, thread-local blake2b-digest memo (`FP_MEMO`).
@@ -1911,13 +2348,86 @@ impl NlheTables {
                 FP_MEMO.with(|cell| {
                     let memo = &mut *cell.borrow_mut();
                     for hero in 0..N {
-                        one_traversal::<N>(&root, hero, cfg, read, &mut local, &mut rng, t, memo);
+                        one_traversal::<N>(
+                            &root, hero, cfg, read, &mut local, &mut rng, t, memo, eff_prune,
+                        );
                     }
                 });
                 accumulate_local_into(&mut acc, local);
                 acc
             })
             .collect()
+    }
+
+    /// CHANGE A — DYNAMIC WORK-STEALING deal collector. Replaces the static `into_par_iter().fold()`
+    /// chunking with a persistent shared `AtomicUsize` deal counter so threads pull deals DYNAMICALLY and
+    /// the measured ~100x per-deal work-variance + ~8x mean-growth tail rebalances (rayon cannot steal
+    /// mid-chunk once a deep deal starts; here a thread that finishes a cheap deal immediately claims the
+    /// next, so no worker idles while another grinds a deep multi-street deal).
+    ///
+    /// DESIGN:
+    ///   * `next_deal: AtomicUsize` starts at 0. Exactly `rayon::current_num_threads()` workers are spawned
+    ///     via `rayon::broadcast` (one task per rayon worker thread = one per physical core when
+    ///     RAYON_NUM_THREADS is set to the core count, per the SMT-negative verdict — NO hardcoded count).
+    ///   * Each worker loops `let d = next_deal.fetch_add(1, Relaxed); if d >= n_deals { break; }` and
+    ///     traverses deal `d` (ALL N hero seats, exactly the static fold's body) into its OWN per-worker
+    ///     sharded `NlheTables` accumulator (same sharded accumulation as the static path's per-task `acc`).
+    ///   * The per-worker partials are collected (one `NlheTables` per worker) and handed to the UNCHANGED
+    ///     `merge_partials` — same downstream merge + floor/discount.
+    ///
+    /// RNG-SEED-STAYS-PER-DEAL (statistical-equivalence proof): the per-deal seed is
+    /// `iter_seed + d*0x100000001b3 rotl 17` — a PURE function of `(iter_seed, d)`, IDENTICAL to the static
+    /// fold's derivation and INDEPENDENT of which worker claims `d` or the claim order. So deal `d` deals
+    /// the same root, runs the same N-hero traversal, and produces the same `LocalDelta` regardless of
+    /// scheduling. The ONLY difference vs the static path is the deal->worker assignment and therefore the
+    /// CROSS-PARTIAL merge order (IEEE-754 non-associativity) => the result is STATISTICALLY EQUIVALENT,
+    /// NOT byte-identical — the same standard as `fast_merge` (gate by LBR/self-play CI-overlap, not SHA).
+    /// `accumulate_local_into` per deal within a worker keeps the per-worker fold deterministic; only the
+    /// set of deals a given worker accumulates is scheduler-dependent.
+    ///
+    /// DATA-RACE FREEDOM: the only shared mutable state is `next_deal` (an `AtomicUsize`, `fetch_add` is
+    /// atomic — each deal index handed to exactly one worker). The `read` snapshot is shared `&` (read-only).
+    /// Every worker writes ONLY its own owned `NlheTables` (moved out via the returned partial). No `unsafe`,
+    /// no aliased `&mut`.
+    fn collect_partials_n_worksteal<const N: usize>(
+        cfg: &TrainerCfg,
+        read: &NlheTables,
+        t: u64,
+        iter_seed: u64,
+        eff_prune: f64,
+    ) -> Vec<NlheTables> {
+        let n_deals = cfg.n_deals_per_iter;
+        let next_deal = AtomicUsize::new(0);
+        // One task per rayon worker thread; each returns its own per-worker partial. `broadcast` runs the
+        // closure on every thread in the current pool and collects the results in thread-index order.
+        rayon::broadcast(|_ctx| {
+            let mut acc = NlheTables::default();
+            FP_MEMO.with(|cell| {
+                let memo = &mut *cell.borrow_mut();
+                loop {
+                    // Claim the next deal index atomically. Relaxed is sufficient: the only invariant is
+                    // that each index is handed out exactly once (fetch_add guarantees that); there is no
+                    // happens-before dependency on other workers' table writes (each owns its own acc).
+                    let d = next_deal.fetch_add(1, Ordering::Relaxed);
+                    if d >= n_deals {
+                        break;
+                    }
+                    let deal_seed = iter_seed
+                        .wrapping_add((d as u64).wrapping_mul(0x100000001b3))
+                        .rotate_left(17);
+                    let mut rng = Rng::seed_from_u64(deal_seed);
+                    let root = deal_root::<N>(&mut rng, d as u64);
+                    let mut local = LocalDelta::default();
+                    for hero in 0..N {
+                        one_traversal::<N>(
+                            &root, hero, cfg, read, &mut local, &mut rng, t, memo, eff_prune,
+                        );
+                    }
+                    accumulate_local_into(&mut acc, local);
+                }
+            });
+            acc
+        })
     }
 
     /// Batched (MLP) twin of `collect_partials_n`. The rayon pipeline is IDENTICAL
@@ -1975,7 +2485,11 @@ impl NlheTables {
         read: &NlheTables,
         t: u64,
         iter_seed: u64,
+        eff_prune: f64,
     ) -> (Vec<NlheTables>, TraverseStats) {
+        // The profile twin keeps the STATIC scheduler regardless of `work_steal` (the dynamic scheduler is
+        // a pure-throughput change, not a measurement change; the profile counters must reflect a stable,
+        // comparable per-node traversal). DCFR's `eff_prune` IS honored so the profile reflects RBP firing.
         let pairs: Vec<(NlheTables, TraverseStats)> = (0..cfg.n_deals_per_iter)
             .into_par_iter()
             .with_min_len(deal_chunk_min_len(
@@ -1999,7 +2513,7 @@ impl NlheTables {
                         for hero in 0..N {
                             one_traversal_profile::<N>(
                                 &root, hero, cfg, read, &mut local, &mut rng, t, memo, &mut acc_stats,
-                                0,
+                                0, eff_prune,
                             );
                         }
                         acc_stats.fp_memo_new_entries += memo.len().saturating_sub(before) as u64;
@@ -2058,6 +2572,53 @@ impl NlheTables {
         });
     }
 
+    /// CHANGE B — DCFR (Discounted CFR, Brown & Sandholm 2019) per-iteration discount, applied ONCE after
+    /// the merge IN PLACE OF `floor_cum_regret` when `dcfr` is ON. Unlike the CFR+ floor this KEEPS SIGNED
+    /// regret (negatives survive) so the prune hook's deeply-negative signal is real, and DISCOUNTS:
+    ///   * positive cum_regret *= t^alpha/(t^alpha+1)
+    ///   * negative cum_regret *= t^beta/(t^beta+1)   (beta=0 => factor 0.5 => halve negative regret)
+    ///   * strat_sum           *= (t/(t+1))^gamma
+    /// with (alpha,beta,gamma)=(1.5,0,2) (Pluribus), matching `shared_hogwild_table.apply_dcfr_discount`.
+    ///
+    /// Like `floor_cum_regret` the per-element op is the SAME regardless of merge order (each row is scaled
+    /// independently) so it is safe parallel-over-shards. The discount is computed in f64 and narrowed back
+    /// to `RegretT` once (the `radd`/`narrow_r` posture). A defensive clamp to ±`REG_CLIP` mirrors the
+    /// Python reference's 2.2 fix: for very large `t` the factors approach a limit and float noise in the
+    /// tail could flip a regret across zero, after which the wrong (pos vs neg) factor would apply on every
+    /// subsequent discount — the clamp bounds that runaway. `strat_sum` is also clamped (down-weighting is
+    /// conservative; the clamp only ever fires on a bug). NEVER reached on the CFR+ default path.
+    fn apply_dcfr_discount(&mut self, t: u64) {
+        const REG_CLIP: f64 = 1.0e9;
+        const STRAT_CLIP: f64 = 1.0e9;
+        let (pos, neg, strat_f) = dcfr_weights(t);
+        self.shards.par_iter_mut().for_each(|sh| {
+            for row in sh.cum_regret.values_mut() {
+                for a in 0..NUM_ACTIONS {
+                    let r = row[a] as f64;
+                    let factor = if r > 0.0 { pos } else { neg };
+                    let mut v = r * factor;
+                    if v > REG_CLIP {
+                        v = REG_CLIP;
+                    } else if v < -REG_CLIP {
+                        v = -REG_CLIP;
+                    }
+                    row[a] = v as RegretT;
+                }
+            }
+            for row in sh.strat_sum.values_mut() {
+                for a in 0..NUM_ACTIONS {
+                    let mut v = row[a] * strat_f;
+                    if v > STRAT_CLIP {
+                        v = STRAT_CLIP;
+                    } else if v < -STRAT_CLIP {
+                        v = -STRAT_CLIP;
+                    }
+                    row[a] = v;
+                }
+            }
+        });
+    }
+
     fn train_iteration_n_profile<const N: usize>(&mut self, cfg: &TrainerCfg) -> TrainIterProfile {
         let total_start = Instant::now();
         let t = self.iters_done + 1;
@@ -2068,9 +2629,11 @@ impl NlheTables {
         // strategy from this immutable borrow; workers write only their deltas into a fresh empty
         // `local`. Borrow `self` immutably for the snapshot so no per-iteration full clone is needed.
         let read: &NlheTables = self;
+        let eff_prune = effective_prune_threshold(cfg, iter_seed);
 
         let traverse_start = Instant::now();
-        let (partials, stats) = Self::collect_partials_n_profile::<N>(cfg, read, t, iter_seed);
+        let (partials, stats) =
+            Self::collect_partials_n_profile::<N>(cfg, read, t, iter_seed, eff_prune);
         let traverse_ms = traverse_start.elapsed().as_secs_f64() * 1000.0;
 
         let partials_len = partials.len();
@@ -2081,8 +2644,14 @@ impl NlheTables {
         self.merge_partials(cfg, partials);
         let merge_ms = merge_start.elapsed().as_secs_f64() * 1000.0;
 
+        // The `floor_ms` slot times the per-iteration regret pass: the CFR+ floor by default, OR the DCFR
+        // discount when `dcfr` is ON (CHANGE B). Same wall-time accounting either way.
         let floor_start = Instant::now();
-        self.floor_cum_regret();
+        if dcfr_enabled(cfg) {
+            self.apply_dcfr_discount(t);
+        } else {
+            self.floor_cum_regret();
+        }
         let floor_ms = floor_start.elapsed().as_secs_f64() * 1000.0;
 
         self.iters_done = t;
@@ -2102,6 +2671,89 @@ impl NlheTables {
             total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
             stats,
         }
+    }
+}
+
+// --------------------------------------------------------------------------------------------------
+// HOGWILD driver (feature `hogwild`) — the per-iteration loop with NO fork/merge/floor barrier.
+//
+// One iteration = fan `cfg.n_deals_per_iter` deals over rayon; each deal runs `one_traversal_hogwild` for
+// ALL N traverser seats, reading+writing the ONE shared table in place. There is no per-task accumulator,
+// no merge_partials, and no floor_cum_regret — the CFR+ floor is applied on each regret add, and the
+// shared table IS the global table. The only cross-thread synchronization is the per-slot first-visit claim
+// lock inside `slot_for` (untouched after warmup). A capacity-overflow error from any deal is captured and
+// surfaced as the iteration's result (the run must size up `hogwild_capacity`).
+//
+// READ SEMANTICS DIFFERENCE vs fork-merge (documented, expected): the fork-merge path freezes the read-side
+// strategy at the START of the iteration (immutable `read` snapshot). The hogwild path reads the LIVE
+// shared table, so a worker sees other workers' (and its own earlier) deltas mid-iteration. This is the
+// defining property of hogwild MCCFR (Open Pure CFR / Pluribus) and the accepted noise; it is NOT bit-
+// identical to fork-merge and is gated by LBR/self-play CI-overlap, not SHA.
+#[cfg(feature = "hogwild")]
+pub fn train_iteration_hogwild<const N: usize>(
+    table: &crate::hogwild::SharedHogwildTable,
+    cfg: &TrainerCfg,
+    t: u64,
+) -> Result<(), String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
+    // First-error capture: rayon `for_each` cannot early-return a Result, so we stash the first overflow
+    // message in a Mutex and set a flag; remaining deals short-circuit cheaply.
+    let failed = AtomicBool::new(false);
+    let err_msg: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    (0..cfg.n_deals_per_iter)
+        .into_par_iter()
+        .with_min_len(deal_chunk_min_len(
+            cfg.n_deals_per_iter,
+            rayon::current_num_threads(),
+        ))
+        .for_each(|d| {
+            if failed.load(Ordering::Relaxed) {
+                return;
+            }
+            let deal_seed = iter_seed
+                .wrapping_add((d as u64).wrapping_mul(0x100000001b3))
+                .rotate_left(17);
+            let mut rng = Rng::seed_from_u64(deal_seed);
+            let root = deal_root::<N>(&mut rng, d as u64);
+            FP_MEMO.with(|cell| {
+                let memo = &mut *cell.borrow_mut();
+                for hero in 0..N {
+                    if failed.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if let Err(e) =
+                        one_traversal_hogwild::<N>(&root, hero, cfg, table, &mut rng, t, memo)
+                    {
+                        if !failed.swap(true, Ordering::Relaxed) {
+                            *err_msg.lock().unwrap() = Some(e);
+                        }
+                        return;
+                    }
+                }
+            });
+        });
+    if failed.load(Ordering::Relaxed) {
+        return Err(err_msg
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| "hogwild iteration failed".to_string()));
+    }
+    Ok(())
+}
+
+/// Dispatch the hogwild iteration on `cfg.n_seats` (6 default / 7 MTT anchor), mirroring
+/// `train_iteration`'s dispatch. Any other width routes to 6.
+#[cfg(feature = "hogwild")]
+pub fn train_iteration_hogwild_dispatch(
+    table: &crate::hogwild::SharedHogwildTable,
+    cfg: &TrainerCfg,
+    t: u64,
+) -> Result<(), String> {
+    match cfg.n_seats {
+        7 => train_iteration_hogwild::<7>(table, cfg, t),
+        _ => train_iteration_hogwild::<6>(table, cfg, t),
     }
 }
 
@@ -2453,6 +3105,10 @@ mod tests {
             fast_merge: false,
             emd_frozen: None,
             batch_deals: 0,
+            work_steal: false,
+            dcfr: false,
+            dcfr_prune_threshold: -300_000.0,
+            dcfr_explore_frac: 0.05,
         }
     }
 
@@ -2469,6 +3125,10 @@ mod tests {
             fast_merge: false,
             emd_frozen: None,
             batch_deals: 0,
+            work_steal: false,
+            dcfr: false,
+            dcfr_prune_threshold: -300_000.0,
+            dcfr_explore_frac: 0.05,
         }
     }
 
@@ -3005,9 +3665,10 @@ mod tests {
                 let read = NlheTables::new();
                 let t = 1u64;
                 let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
+                let ep = cfg.prune_threshold;
                 let partials = match n_seats {
-                    7 => NlheTables::collect_partials_n::<7>(&cfg, &read, t, iter_seed),
-                    _ => NlheTables::collect_partials_n::<6>(&cfg, &read, t, iter_seed),
+                    7 => NlheTables::collect_partials_n::<7>(&cfg, &read, t, iter_seed, ep),
+                    _ => NlheTables::collect_partials_n::<6>(&cfg, &read, t, iter_seed, ep),
                 };
 
                 // Sharded merge (the real default path).
@@ -3110,14 +3771,16 @@ mod tests {
                 let t = 1u64;
                 let iter_seed = cfg_rec.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
 
+                let ep_rec = cfg_rec.prune_threshold;
+                let ep_bat = cfg_bat.prune_threshold;
                 let (rec_partials, bat_partials) = match n_seats {
                     7 => (
-                        NlheTables::collect_partials_n::<7>(&cfg_rec, &read, t, iter_seed),
-                        NlheTables::collect_partials_n::<7>(&cfg_bat, &read, t, iter_seed),
+                        NlheTables::collect_partials_n::<7>(&cfg_rec, &read, t, iter_seed, ep_rec),
+                        NlheTables::collect_partials_n::<7>(&cfg_bat, &read, t, iter_seed, ep_bat),
                     ),
                     _ => (
-                        NlheTables::collect_partials_n::<6>(&cfg_rec, &read, t, iter_seed),
-                        NlheTables::collect_partials_n::<6>(&cfg_bat, &read, t, iter_seed),
+                        NlheTables::collect_partials_n::<6>(&cfg_rec, &read, t, iter_seed, ep_rec),
+                        NlheTables::collect_partials_n::<6>(&cfg_bat, &read, t, iter_seed, ep_bat),
                     ),
                 };
 
@@ -3182,8 +3845,10 @@ mod tests {
         let read = NlheTables::new();
         let t = 1u64;
         let iter_seed = cfg_rec.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
-        let rec_partials = NlheTables::collect_partials_n::<6>(&cfg_rec, &read, t, iter_seed);
-        let bat_partials = NlheTables::collect_partials_n::<6>(&cfg_bat, &read, t, iter_seed);
+        let ep_rec = cfg_rec.prune_threshold;
+        let ep_bat = cfg_bat.prune_threshold;
+        let rec_partials = NlheTables::collect_partials_n::<6>(&cfg_rec, &read, t, iter_seed, ep_rec);
+        let bat_partials = NlheTables::collect_partials_n::<6>(&cfg_bat, &read, t, iter_seed, ep_bat);
 
         let mut rec = NlheTables::new();
         rec.merge_partials(&cfg_rec, rec_partials);
@@ -3536,6 +4201,455 @@ mod tests {
             "7-max blueprint did not beat fold-all baseline (net {total} chips over {} hands) — \
              served policy is self-defeating at N=7",
             7 * n_deals
+        );
+    }
+
+    // ==============================================================================================
+    // CHANGE A — DYNAMIC WORK-STEALING deal scheduler tests
+    // ==============================================================================================
+
+    /// Mean per-row absolute L1 difference between two row-normalized snapshots over their SHARED key set
+    /// (sum |p-q| over actions, averaged across shared keys). 0 == identical strategies; small == close.
+    fn snapshot_strategy_l1(
+        a: &HashMap<[u8; 16], [f64; NUM_ACTIONS]>,
+        b: &HashMap<[u8; 16], [f64; NUM_ACTIONS]>,
+    ) -> (f64, usize) {
+        let mut total = 0.0;
+        let mut shared = 0usize;
+        for (k, ra) in a {
+            if let Some(rb) = b.get(k) {
+                let mut l1 = 0.0;
+                for x in 0..NUM_ACTIONS {
+                    l1 += (ra[x] - rb[x]).abs();
+                }
+                total += l1;
+                shared += 1;
+            }
+        }
+        if shared == 0 {
+            (0.0, 0)
+        } else {
+            (total / shared as f64, shared)
+        }
+    }
+
+    /// (a) CHANGE A statistical-equivalence: the work-stealing scheduler is NOT byte-identical to the
+    /// static one (the deal->worker assignment changes the cross-partial merge order, IEEE-754 non-
+    /// associative), but it must be STATISTICALLY EQUIVALENT.
+    ///   * At iteration 1 (BEFORE any chaotic divergence) the infoset SET is IDENTICAL — the per-deal RNG
+    ///     seed is a pure function of (iter_seed, d), so the same deals are traversed and the same infosets
+    ///     are reached regardless of which worker runs each deal.
+    ///   * After 12 iterations the set is NEAR-identical (a handful of infosets differ because the last-bit
+    ///     merge-order divergence flips a few sampled opponent actions, reaching slightly different
+    ///     downstream nodes — normal chaotic CFR amplification, the same posture as `fast_merge`) and the
+    ///     mean strategy-L1 over the shared keys is LOW. The authoritative gate is an LBR/self-play
+    ///     CI-overlap at convergence; this is the equivalence sanity.
+    #[test]
+    fn work_steal_matches_static_infoset_set_and_low_l1() {
+        // (1) Iteration-1 infoset SET is IDENTICAL (no divergence yet).
+        {
+            let mut cfg_s = test_cfg(200);
+            cfg_s.work_steal = false;
+            let mut cfg_w = test_cfg(200);
+            cfg_w.work_steal = true;
+            let mut ts = NlheTables::new();
+            let mut tw = NlheTables::new();
+            ts.train_iteration(&cfg_s);
+            tw.train_iteration(&cfg_w);
+            let ss = snapshot(&ts);
+            let sw = snapshot(&tw);
+            assert_eq!(
+                ss.len(),
+                sw.len(),
+                "iter-1 infoset count differs ({} vs {}) — work_steal traverses different deals",
+                ss.len(),
+                sw.len()
+            );
+            for k in ss.keys() {
+                assert!(
+                    sw.contains_key(k),
+                    "iter-1 work_steal missing an infoset present in the static run"
+                );
+            }
+        }
+
+        // (2) After 12 iterations: NEAR-identical set + LOW strategy-L1.
+        let mut cfg_static = test_cfg(200);
+        cfg_static.work_steal = false;
+        let mut cfg_steal = test_cfg(200);
+        cfg_steal.work_steal = true;
+        let mut tab_static = NlheTables::new();
+        let mut tab_steal = NlheTables::new();
+        for _ in 0..12 {
+            tab_static.train_iteration(&cfg_static);
+            tab_steal.train_iteration(&cfg_steal);
+        }
+        let snap_static = snapshot(&tab_static);
+        let snap_steal = snapshot(&tab_steal);
+
+        // Near-identical count: within a tiny fraction (chaotic divergence touches only a few infosets).
+        let dn = (snap_static.len() as i64 - snap_steal.len() as i64).unsigned_abs();
+        let rel = dn as f64 / snap_static.len().max(1) as f64;
+        assert!(
+            rel < 0.005,
+            "work_steal infoset count diverged too far ({} vs {}, rel {rel:.4})",
+            snap_static.len(),
+            snap_steal.len()
+        );
+
+        // LOW strategy-L1 over the shared keys (each row L1 in [0,2]; a tiny mean == essentially the same
+        // strategy after 12 iters).
+        let (mean_l1, shared) = snapshot_strategy_l1(&snap_static, &snap_steal);
+        assert!(shared > 100, "too few shared infosets to be meaningful ({shared})");
+        assert!(
+            mean_l1 < 0.10,
+            "work_steal strategy-L1 too high vs static ({mean_l1:.4} over {shared} infosets) — not \
+             statistically equivalent"
+        );
+    }
+
+    /// CHANGE A: the work-steal collector hands out EVERY deal index exactly once (no skips, no dupes), so
+    /// it covers the same deals as the static fold. We verify via the infoset count being nonzero and the
+    /// iters/count matching a re-run (determinism of the *set*, not the bits). A skipped deal would drop
+    /// infosets; a double-counted deal would (under the atomic) be impossible. Single-iter check keeps it
+    /// before chaotic divergence so the counts are tight.
+    #[test]
+    fn work_steal_covers_all_deals_once() {
+        let read = NlheTables::new();
+        let mut cfg = test_cfg(256);
+        cfg.work_steal = true;
+        let t = 1u64;
+        let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
+        let ep = cfg.prune_threshold;
+        let partials = NlheTables::collect_partials_n_worksteal::<6>(&cfg, &read, t, iter_seed, ep);
+        // One partial per rayon worker thread.
+        assert!(!partials.is_empty(), "work-steal produced no partials");
+        // Sum the strat rows across partials -> at least one infoset trained (deals were actually run).
+        let total_strat: usize = partials.iter().map(|p| p.total_strat_len()).sum();
+        assert!(total_strat > 0, "work-steal trained no infosets (deals not run?)");
+
+        // Re-run: the merged infoset SET is scheduler-order-invariant (deals are a pure fn of the seed), so
+        // a second work-steal collect merges to the same key count.
+        let p2 = NlheTables::collect_partials_n_worksteal::<6>(&cfg, &read, t, iter_seed, ep);
+        let mut m1 = NlheTables::new();
+        m1.merge_partials(&cfg, partials);
+        m1.floor_cum_regret();
+        let mut m2 = NlheTables::new();
+        m2.merge_partials(&cfg, p2);
+        m2.floor_cum_regret();
+        assert_eq!(
+            m1.total_strat_len(),
+            m2.total_strat_len(),
+            "work-steal infoset count not deal-order-invariant across re-runs"
+        );
+    }
+
+    // ==============================================================================================
+    // CHANGE B — DCFR signed-regret + Pluribus-RBP pruning tests
+    // ==============================================================================================
+
+    /// Seed every cum_regret row so RBP actually fires: the "passive" lanes that are legal at most hero
+    /// nodes (CHECK, CALL, ALL_IN) get a strong POSITIVE regret, and the others (FOLD + every bet bucket)
+    /// get a deeply-NEGATIVE regret below any test threshold. regret_match then gives the positive lanes
+    /// all the strategy mass (so the negative lanes have strat==0) while the negative lanes satisfy
+    /// `regrets[a] <= eff_prune` — i.e. they are prune-eligible (RULE 3). At least one positive lane is
+    /// legal at essentially every reachable hero node, so the negative lanes are reached as prune
+    /// candidates. (All-negative seeding does NOT work: regret_match falls back to UNIFORM, giving every
+    /// lane nonzero mass, so nothing is ever pruned.)
+    fn seed_one_positive_rest_negative(tab: &mut NlheTables) {
+        let positive_lanes = [core::CHECK, core::CALL, core::ALL_IN];
+        for sh in tab.shards.iter_mut() {
+            for row in sh.cum_regret.values_mut() {
+                for a in 0..NUM_ACTIONS {
+                    row[a] = if positive_lanes.contains(&a) {
+                        1.0e6 as RegretT
+                    } else {
+                        -1.0e9 as RegretT
+                    };
+                }
+            }
+        }
+    }
+
+    /// CHANGE B (b): DCFR mode keeps SIGNED regret (negatives ALLOWED — the CFR+ positive floor is NOT
+    /// applied) and the discount is applied. We train a few DCFR iterations and assert (1) at least one
+    /// persistent cum_regret cell is NEGATIVE (impossible under the CFR+ floor, which clamps >= 0), and
+    /// (2) the strat_sum is finite/non-NaN and snapshot rows still normalize.
+    #[test]
+    fn dcfr_keeps_signed_regret_and_applies_discount() {
+        let mut cfg = test_cfg(200);
+        cfg.dcfr = true;
+        cfg.dcfr_prune_threshold = -300_000.0;
+        cfg.dcfr_explore_frac = 0.05;
+        let mut tab = NlheTables::new();
+        for _ in 0..15 {
+            tab.train_iteration(&cfg);
+        }
+        // (1) SIGNED regret survives: at least one cum_regret cell is < 0 (the CFR+ floor would forbid it).
+        let mut any_negative = false;
+        let mut all_finite = true;
+        for sh in tab.shards.iter() {
+            for row in sh.cum_regret.values() {
+                for a in 0..NUM_ACTIONS {
+                    let v = row[a] as f64;
+                    if v < 0.0 {
+                        any_negative = true;
+                    }
+                    if !v.is_finite() {
+                        all_finite = false;
+                    }
+                }
+            }
+        }
+        assert!(
+            any_negative,
+            "DCFR produced no negative regret — the signed-regret path is not active (floor still on?)"
+        );
+        assert!(all_finite, "DCFR regret went non-finite (NaN/Inf) — discount/clamp bug");
+
+        // (2) strat_sum finite + snapshot still a valid distribution.
+        let snap = snapshot(&tab);
+        assert!(snap.len() > 0, "DCFR trained no infosets");
+        for (_, row) in &snap {
+            let s: f64 = row.iter().sum();
+            assert!(s.is_finite(), "DCFR snapshot row non-finite");
+            assert!(
+                s == 0.0 || (s - 1.0).abs() < 1e-9,
+                "DCFR snapshot row not normalized: sum={s}"
+            );
+        }
+    }
+
+    /// CHANGE B: the DCFR discount factors match the Pluribus / Python `dcfr_weights` reference exactly
+    /// (alpha=1.5, beta=0, gamma=2): pos = t^1.5/(t^1.5+1), neg = 1/2 (t^0=1), strat = (t/(t+1))^2.
+    #[test]
+    fn dcfr_weights_match_pluribus_reference() {
+        for &t in &[1u64, 2, 10, 100, 62000] {
+            let (pos, neg, strat) = dcfr_weights(t);
+            let tf = t as f64;
+            let ta = tf.powf(1.5);
+            let want_pos = ta / (ta + 1.0);
+            let want_neg = 1.0 / 2.0; // t^0 = 1 -> 1/(1+1)
+            let want_strat = (tf / (tf + 1.0)).powf(2.0);
+            assert!((pos - want_pos).abs() < 1e-12, "pos factor wrong at t={t}");
+            assert!((neg - want_neg).abs() < 1e-12, "neg factor wrong at t={t}");
+            assert!((strat - want_strat).abs() < 1e-12, "strat factor wrong at t={t}");
+            // Sanity: positive discount in (0,1), strat down-weight in (0,1), neg halves.
+            assert!(pos > 0.0 && pos < 1.0);
+            assert!(strat > 0.0 && strat < 1.0);
+        }
+    }
+
+    /// CHANGE B (c) RULE 1a: pruning NEVER fires on the LAST betting round. The shared
+    /// `dcfr_prune_node_allowed` predicate (used by BOTH production hooks) must reject the river and any
+    /// later street regardless of how deeply-negative the threshold is, and accept earlier streets.
+    #[test]
+    fn rbp_never_prunes_last_betting_round() {
+        let ep = -300_000.0; // finite, deeply negative
+        // Preflop/flop/turn (streets 0,1,2) are prune SITES; river (3) and terminal (4) are NOT.
+        assert!(dcfr_prune_node_allowed(core::STREET_PREFLOP, ep));
+        assert!(dcfr_prune_node_allowed(core::STREET_FLOP, ep));
+        assert!(dcfr_prune_node_allowed(2 /* turn */, ep));
+        assert!(
+            !dcfr_prune_node_allowed(core::STREET_RIVER, ep),
+            "RULE 1a violated: river is a prune site"
+        );
+        assert!(
+            !dcfr_prune_node_allowed(core::STREET_TERMINAL, ep),
+            "RULE 1a violated: terminal street is a prune site"
+        );
+        // NEG_INFINITY (pruning disabled) rejects every street (byte-identical no-RBP path).
+        for s in 0..=4 {
+            assert!(!dcfr_prune_node_allowed(s, f64::NEG_INFINITY));
+        }
+    }
+
+    /// CHANGE B (c) end-to-end RULES 1a + 1b: drive a full traversal with a DEEPLY-NEGATIVE seeded regret
+    /// snapshot (every action prune-eligible) and a finite `eff_prune`, then assert via the test prune-probe
+    /// that (1a) ZERO prunes fired on the river or later, and (1b) ZERO terminal-leading actions were
+    /// pruned (they were explored instead). Also asserts pruning DID fire somewhere (the mechanism is live).
+    #[test]
+    fn rbp_pruning_respects_terminal_and_river_guards_e2e() {
+        let cfg = test_cfg(64);
+        // Build a read snapshot whose every cum_regret cell is deeply NEGATIVE so regret_match zeroes the
+        // strategy (strat[a]==0) and regrets[a] <= eff_prune for every action -> all prune-eligible (RULE 3
+        // satisfied) at every hero node. Train a few CFR+ iters to populate the key set, then negate.
+        let mut read = NlheTables::new();
+        for _ in 0..4 {
+            read.train_iteration(&cfg);
+        }
+        // Seed a snapshot that ACTUALLY prunes: regret_match prunes action `a` only when `strat[a]==0`,
+        // which needs SOME positive-regret action to absorb the mass (all-negative -> uniform fallback ->
+        // nothing has 0 mass -> nothing prunes). So set ONE lane (index 0) strongly POSITIVE and every
+        // other lane deeply NEGATIVE: regret_match gives lane 0 all the mass, the rest strat[a]==0 and
+        // regrets[a] <= eff_prune => prune-eligible (RULE 3 met).
+        seed_one_positive_rest_negative(&mut read);
+
+        let eff_prune = -300_000.0_f64; // finite => RBP active on streets < river
+        let t = 5u64;
+        let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
+        prune_probe_reset();
+        // Run a batch of deals single-threaded so the thread-local probe is observed on this thread.
+        FP_MEMO.with(|cell| {
+            let memo = &mut *cell.borrow_mut();
+            for d in 0..64u64 {
+                let deal_seed = iter_seed
+                    .wrapping_add(d.wrapping_mul(0x100000001b3))
+                    .rotate_left(17);
+                let mut rng = Rng::seed_from_u64(deal_seed);
+                let root = deal_root::<6>(&mut rng, d);
+                let mut local = LocalDelta::default();
+                for hero in 0..6 {
+                    one_traversal::<6>(
+                        &root, hero, &cfg, &read, &mut local, &mut rng, t, memo, eff_prune,
+                    );
+                }
+            }
+        });
+        let probe = prune_probe_get();
+        // The mechanism must actually fire (else the guards are vacuously satisfied).
+        assert!(
+            probe.pruned_total > 0,
+            "RBP pruned nothing — cannot validate the guards (seed/threshold too weak?)"
+        );
+        // RULE 1a: not a single prune on the river or later.
+        assert_eq!(
+            probe.pruned_on_river_or_later, 0,
+            "RULE 1a violated: {} prunes fired on the river or later",
+            probe.pruned_on_river_or_later
+        );
+        // RULE 1b: not a single terminal-leading action pruned.
+        assert_eq!(
+            probe.terminal_leading_pruned, 0,
+            "RULE 1b violated: {} terminal-leading actions pruned",
+            probe.terminal_leading_pruned
+        );
+        // RULE 1b positive evidence: terminal-leading actions WERE encountered and explored.
+        assert!(
+            probe.terminal_leading_explored > 0,
+            "no terminal-leading prune-eligible actions exercised — RULE 1b not actually tested"
+        );
+    }
+
+    /// CHANGE B (d) RULE 2: on an EXPLORE iteration (the ~5%) the effective prune threshold is
+    /// NEG_INFINITY so ALL actions are visited (no pruning), letting a deeply-negative action revive; on a
+    /// prune iteration it is the deeply-negative `dcfr_prune_threshold`. The explore decision is a
+    /// DETERMINISTIC function of the iteration seed (reproducible across resume). We assert both the
+    /// per-iteration threshold selection and that, over many iterations, the explore fraction is ~5%.
+    #[test]
+    fn dcfr_explore_iterations_visit_all_actions() {
+        let mut cfg = test_cfg(8);
+        cfg.dcfr = true;
+        cfg.dcfr_prune_threshold = -300_000.0;
+        cfg.dcfr_explore_frac = 0.05;
+
+        // Per-iteration: an explore iter -> NEG_INFINITY (prune disabled, all actions visited); a prune
+        // iter -> the finite deeply-negative threshold. The decision is deterministic in iter_seed.
+        let mut explore_count = 0u64;
+        let n = 20000u64;
+        for t in 1..=n {
+            let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
+            let ep = effective_prune_threshold(&cfg, iter_seed);
+            let is_explore = dcfr_is_explore_iter(iter_seed, cfg.dcfr_explore_frac);
+            if is_explore {
+                explore_count += 1;
+                assert!(
+                    ep == f64::NEG_INFINITY,
+                    "explore iteration must disable pruning (NEG_INFINITY), got {ep}"
+                );
+            } else {
+                assert!(
+                    ep.is_finite() && ep == cfg.dcfr_prune_threshold,
+                    "prune iteration must use the deeply-negative dcfr_prune_threshold, got {ep}"
+                );
+            }
+        }
+        // ~5% explore (Pluribus). Generous band around 0.05 for the finite sample.
+        let frac = explore_count as f64 / n as f64;
+        assert!(
+            (frac - 0.05).abs() < 0.01,
+            "explore fraction {frac:.4} not ~5% over {n} iters (deterministic hash mis-calibrated?)"
+        );
+
+        // DETERMINISM / resume-stability: the same seed yields the same decision every call.
+        for t in [1u64, 7, 42, 1000, 62000] {
+            let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
+            let a = dcfr_is_explore_iter(iter_seed, cfg.dcfr_explore_frac);
+            let b = dcfr_is_explore_iter(iter_seed, cfg.dcfr_explore_frac);
+            assert_eq!(a, b, "explore decision not deterministic for a fixed seed");
+        }
+    }
+
+    /// CHANGE B end-to-end RULE 2: an explore iteration actually visits every action (the prune-probe sees
+    /// ZERO prunes that iteration) while a prune iteration prunes some. Find one of each by seed and run a
+    /// traversal with the deeply-negative seeded regret snapshot.
+    #[test]
+    fn dcfr_explore_iter_prunes_nothing_e2e() {
+        let mut cfg = test_cfg(64);
+        cfg.dcfr = true;
+        cfg.dcfr_prune_threshold = -300_000.0;
+        cfg.dcfr_explore_frac = 0.05;
+
+        let mut read = NlheTables::new();
+        for _ in 0..4 {
+            read.train_iteration(&{
+                let mut c = cfg.clone();
+                c.dcfr = false; // populate keys with a plain CFR+ warmup
+                c
+            });
+        }
+        seed_one_positive_rest_negative(&mut read);
+
+        // Find an explore-iteration t and a prune-iteration t by their deterministic seeds.
+        let mut explore_t = None;
+        let mut prune_t = None;
+        for t in 1u64..5000 {
+            let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
+            if dcfr_is_explore_iter(iter_seed, cfg.dcfr_explore_frac) {
+                explore_t.get_or_insert(t);
+            } else {
+                prune_t.get_or_insert(t);
+            }
+            if explore_t.is_some() && prune_t.is_some() {
+                break;
+            }
+        }
+        let explore_t = explore_t.expect("found no explore iteration in 5000");
+        let prune_t = prune_t.expect("found no prune iteration in 5000");
+
+        let run = |t: u64| -> PruneProbe {
+            let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
+            let eff_prune = effective_prune_threshold(&cfg, iter_seed);
+            prune_probe_reset();
+            FP_MEMO.with(|cell| {
+                let memo = &mut *cell.borrow_mut();
+                for d in 0..64u64 {
+                    let deal_seed = iter_seed
+                        .wrapping_add(d.wrapping_mul(0x100000001b3))
+                        .rotate_left(17);
+                    let mut rng = Rng::seed_from_u64(deal_seed);
+                    let root = deal_root::<6>(&mut rng, d);
+                    let mut local = LocalDelta::default();
+                    for hero in 0..6 {
+                        one_traversal::<6>(
+                            &root, hero, &cfg, &read, &mut local, &mut rng, t, memo, eff_prune,
+                        );
+                    }
+                }
+            });
+            prune_probe_get()
+        };
+
+        let explore_probe = run(explore_t);
+        let prune_probe = run(prune_t);
+        assert_eq!(
+            explore_probe.pruned_total, 0,
+            "RULE 2 violated: explore iteration t={explore_t} pruned {} actions (must visit all)",
+            explore_probe.pruned_total
+        );
+        assert!(
+            prune_probe.pruned_total > 0,
+            "prune iteration t={prune_t} pruned nothing — cannot contrast with explore"
         );
     }
 }

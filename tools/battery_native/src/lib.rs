@@ -12,6 +12,10 @@ pub mod cfr_table;
 pub mod core;
 pub mod emd;
 pub mod fingerprint;
+// Lock-free (hogwild) shared regret/strategy table for the NLHE CFR+ trainer. Gated entirely behind
+// `feature = "hogwild"` (default OFF) so the default build is byte-identical to the fork-merge trainer.
+#[cfg(feature = "hogwild")]
+pub mod hogwild;
 pub mod icm;
 pub mod lbr;
 pub mod leduc;
@@ -839,12 +843,26 @@ mod py {
         tab: nlhe_trainer::NlheTables,
         cfg: nlhe_trainer::TrainerCfg,
         emd_stamp: String,
+        // HOGWILD runtime state (feature `hogwild`). `Some` when the trainer was constructed with the
+        // hogwild path enabled (constructor `hogwild=True` OR env `POKERBOT_HOGWILD=1`): all `train` calls
+        // then read+write the shared lock-free table in place (no fork/merge/floor barrier). When `None`
+        // (the default), the trainer is the unchanged fork-merge path on `tab`. `iters_done` is tracked on
+        // the shared state because the durable `tab` is only materialized on save/snapshot.
+        #[cfg(feature = "hogwild")]
+        hog: Option<HogState>,
+    }
+
+    #[cfg(feature = "hogwild")]
+    struct HogState {
+        table: crate::hogwild::SharedHogwildTable,
+        iters_done: u64,
     }
 
     #[pymethods]
     impl NlheCFRTrainer {
         #[new]
-        #[pyo3(signature = (num_buckets, depth_edges, n_deals_per_iter, n_seats=6, prune_threshold=f64::NEG_INFINITY, fast_merge=false, emd_frozen_path=None, batch_deals=0))]
+        #[pyo3(signature = (num_buckets, depth_edges, n_deals_per_iter, n_seats=6, prune_threshold=f64::NEG_INFINITY, fast_merge=false, emd_frozen_path=None, batch_deals=0, hogwild=false, hogwild_capacity=1_048_576, work_steal=false, dcfr=false, dcfr_prune_threshold=-300_000.0, dcfr_explore_frac=0.05))]
+        #[allow(clippy::too_many_arguments)]
         fn new(
             num_buckets: i32,
             depth_edges: Vec<f64>,
@@ -854,6 +872,14 @@ mod py {
             fast_merge: bool,
             emd_frozen_path: Option<String>,
             batch_deals: usize,
+            hogwild: bool,
+            hogwild_capacity: usize,
+            // CHANGE A — dynamic work-stealing deal scheduler (default OFF; also env POKERBOT_WORKSTEAL=1).
+            work_steal: bool,
+            // CHANGE B — DCFR signed-regret + active RBP pruning (default OFF; also env POKERBOT_DCFR=1).
+            dcfr: bool,
+            dcfr_prune_threshold: f64,
+            dcfr_explore_frac: f64,
         ) -> PyResult<Self> {
             let (emd_frozen, emd_stamp) = match emd_frozen_path {
                 Some(path) => {
@@ -877,6 +903,22 @@ mod py {
                 }
                 None => (None, "none".to_string()),
             };
+            // HOGWILD enable = explicit constructor flag OR env `POKERBOT_HOGWILD=1` (matching the env-var
+            // toggle convention used elsewhere, e.g. POKERBOT_AB_STUB). Only honored when the crate was
+            // built with `--features hogwild`; without the feature the path does not exist and the flag is
+            // a hard error (so a caller never silently gets the fork-merge path when they asked for hogwild).
+            let _hogwild_requested = hogwild
+                || std::env::var("POKERBOT_HOGWILD")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+            #[cfg(not(feature = "hogwild"))]
+            if _hogwild_requested {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "hogwild requested but battery_native was not built with --features hogwild",
+                ));
+            }
+            let _ = hogwild_capacity; // silence unused warning when the feature is off
+
             Ok(Self {
                 tab: nlhe_trainer::NlheTables::new(),
                 cfg: nlhe_trainer::TrainerCfg {
@@ -891,29 +933,84 @@ mod py {
                     fast_merge,
                     emd_frozen,
                     batch_deals,
+                    work_steal,
+                    dcfr,
+                    dcfr_prune_threshold,
+                    dcfr_explore_frac,
                 },
                 emd_stamp,
+                #[cfg(feature = "hogwild")]
+                hog: if _hogwild_requested {
+                    Some(HogState {
+                        table: crate::hogwild::SharedHogwildTable::new(hogwild_capacity),
+                        iters_done: 0,
+                    })
+                } else {
+                    None
+                },
             })
         }
 
         fn iters_done(&self) -> u64 {
+            #[cfg(feature = "hogwild")]
+            if let Some(h) = &self.hog {
+                return h.iters_done;
+            }
             self.tab.iters_done
         }
 
         fn n_infosets(&self) -> usize {
+            #[cfg(feature = "hogwild")]
+            if let Some(h) = &self.hog {
+                // O(capacity) scan of the shared table's occupancy — matches the served blueprint size
+                // (one strat row per claimed infoset). Cheap relative to a train step; only called for
+                // telemetry.
+                return h.table.n_occupied();
+            }
             self.tab.n_strat_infosets()
+        }
+
+        /// True if this trainer instance is running the hogwild (shared-table) path. False = fork-merge.
+        fn is_hogwild(&self) -> bool {
+            #[cfg(feature = "hogwild")]
+            {
+                return self.hog.is_some();
+            }
+            #[cfg(not(feature = "hogwild"))]
+            false
         }
 
         fn emd_stamp(&self) -> String {
             self.emd_stamp.clone()
         }
 
-        fn train(&mut self, py: Python<'_>, iterations: u64) {
+        fn train(&mut self, py: Python<'_>, iterations: u64) -> PyResult<()> {
+            #[cfg(feature = "hogwild")]
+            if let Some(h) = &mut self.hog {
+                let cfg = &self.cfg;
+                let table = &h.table;
+                let start = h.iters_done;
+                let res = py.detach(|| {
+                    for k in 0..iterations {
+                        let t = start + k + 1;
+                        nlhe_trainer::train_iteration_hogwild_dispatch(table, cfg, t)?;
+                    }
+                    Ok::<(), String>(())
+                });
+                match res {
+                    Ok(()) => {
+                        h.iters_done += iterations;
+                        return Ok(());
+                    }
+                    Err(e) => return Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+                }
+            }
             py.detach(|| {
                 for _ in 0..iterations {
                     self.tab.train_iteration(&self.cfg);
                 }
             });
+            Ok(())
         }
 
         /// Train for `iterations` and return JSON phase timings for each iteration.
@@ -985,21 +1082,50 @@ mod py {
         }
 
         fn save_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+            // Hogwild: materialize the shared table into the fork-merge `NlheTables` shape FIRST, then use
+            // the UNCHANGED `serialize` — so a hogwild checkpoint is byte-format-identical to a fork-merge
+            // one (same NLCFR001 blob layout) and resumes on either path / serves identically.
+            #[cfg(feature = "hogwild")]
+            if let Some(h) = &self.hog {
+                let tab = h.table.snapshot_tables(h.iters_done);
+                return PyBytes::new(py, &nlhe_trainer::serialize(&tab));
+            }
             PyBytes::new(py, &nlhe_trainer::serialize(&self.tab))
         }
 
-        fn load_bytes(&mut self, blob: &[u8]) -> bool {
+        fn load_bytes(&mut self, blob: &[u8]) -> PyResult<bool> {
             match nlhe_trainer::deserialize(blob) {
                 Some(tab) => {
+                    #[cfg(feature = "hogwild")]
+                    if let Some(h) = &mut self.hog {
+                        // Resume a hogwild run from a checkpoint: rebuild a fresh shared table (capacity
+                        // preserved) and load every row into it. A capacity-overflow here is a hard error.
+                        let cap = h.table.capacity();
+                        let table = crate::hogwild::SharedHogwildTable::new(cap);
+                        table
+                            .load_from_tables(&tab)
+                            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+                        h.table = table;
+                        h.iters_done = tab.iters_done;
+                        return Ok(true);
+                    }
                     self.tab = tab;
-                    true
+                    Ok(true)
                 }
-                None => false,
+                None => Ok(false),
             }
         }
 
         fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
             let out = PyDict::new(py);
+            #[cfg(feature = "hogwild")]
+            if let Some(h) = &self.hog {
+                let tab = h.table.snapshot_tables(h.iters_done);
+                for (key, row) in nlhe_trainer::snapshot(&tab) {
+                    out.set_item(PyBytes::new(py, &key), row.to_vec())?;
+                }
+                return Ok(out);
+            }
             for (key, row) in nlhe_trainer::snapshot(&self.tab) {
                 out.set_item(PyBytes::new(py, &key), row.to_vec())?;
             }
