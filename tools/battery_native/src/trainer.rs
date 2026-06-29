@@ -76,6 +76,57 @@ const N_SHARDS: usize = 128;
 
 type ShardMap = HashMap<[u8; 16], [f64; NUM_ACTIONS]>;
 
+/// Persistent-table precision for the cum_regret rows (feature `f32_regret`). f32 halves the regret-row
+/// footprint (88B -> 44B) to relieve the 128-thread memory-traffic contention the metal attribution cert
+/// identified, WITHOUT touching strat_sum (which stays f64: under Linear-CFR its O(T^2) growth to ~1.3e13
+/// at 62k iters would swamp an f32 accumulator and floor exploitability — the one demonstrated failure
+/// mode per the f32-quality-gate verdict). cum_regret is bounded + CFR+ floored (max abs ~2.2e7 projected
+/// at 62k, 9 orders below f32 limits) so f32 is safe here. The within-iteration accumulation still happens
+/// in f64 (see `radd`) and the on-disk NLCFR001 blob stays f64 (`widen_r` on serialize / `narrow_r` on
+/// deserialize) so checkpoints are cross-precision-portable. Default OFF => `RegretT = f64` => the whole
+/// module is BYTE-IDENTICAL to the shipped f64 trainer (radd/widen_r/narrow_r reduce to exact identities).
+#[cfg(feature = "f32_regret")]
+type RegretT = f32;
+#[cfg(not(feature = "f32_regret"))]
+type RegretT = f64;
+
+/// Persistent cum_regret map (value precision = `RegretT`). Distinct from `ShardMap` (f64) which still
+/// holds strat_sum and every within-iteration `LocalDelta`.
+type RegretMap = HashMap<[u8; 16], [RegretT; NUM_ACTIONS]>;
+const ZEROS_R: [RegretT; NUM_ACTIONS] = [0.0; NUM_ACTIONS];
+
+/// Widen a persistent regret row to f64 for regret-matching / serialization. Identity (plain copy) when
+/// `RegretT = f64`, so the f64 build is byte-identical at every read site.
+#[inline]
+fn widen_r(r: &[RegretT; NUM_ACTIONS]) -> [f64; NUM_ACTIONS] {
+    let mut o = [0.0f64; NUM_ACTIONS];
+    for a in 0..NUM_ACTIONS {
+        o[a] = r[a] as f64;
+    }
+    o
+}
+
+/// Narrow an f64 (on-disk) regret row to the persistent precision on deserialize. Identity when
+/// `RegretT = f64`; lossless for an f64 that was itself produced by widening an f32 (round-trip exact).
+#[inline]
+fn narrow_r(r: &[f64; NUM_ACTIONS]) -> [RegretT; NUM_ACTIONS] {
+    let mut o: [RegretT; NUM_ACTIONS] = ZEROS_R;
+    for a in 0..NUM_ACTIONS {
+        o[a] = r[a] as RegretT;
+    }
+    o
+}
+
+/// f64-accumulate-then-round-store: add an f64 increment to a persistent regret cell, summing in f64 and
+/// narrowing to `RegretT` ONCE. When `RegretT = f64` this is exactly `acc + x` (byte-identical f64 build);
+/// under f32 it removes intra-accumulation error so only the single store rounds (the verdict's mitigated
+/// design). Used by BOTH merge paths AND the serial-fold reference test so the sharded merge and the
+/// serial fold stay BIT-IDENTICAL to each other at either precision (same operand order, same narrowing).
+#[inline]
+fn radd(acc: RegretT, x: f64) -> RegretT {
+    ((acc as f64) + x) as RegretT
+}
+
 /// Deterministic, portable shard index for a 16-byte fingerprint key. Uses `FxHasher` with explicit
 /// `write(&key[..])` (NOT `key.hash()`, whose `Hash for [u8;16]` impl may emit a length prefix and is
 /// std-version-dependent) so the byte stream hashed is stable across builds/machines. FxHasher has fixed
@@ -181,7 +232,9 @@ pub struct TrainerCfg {
 /// One shard of the global table: the cum_regret + strat_sum rows whose key hashes to this shard.
 #[derive(Default, Clone)]
 pub struct Shard {
-    pub cum_regret: ShardMap,
+    /// cum_regret precision is `RegretT` (f64 by default; f32 under feature `f32_regret`). strat_sum
+    /// stays f64 unconditionally (swamping-safety, see `RegretT`).
+    pub cum_regret: RegretMap,
     pub strat_sum: ShardMap,
 }
 
@@ -191,6 +244,9 @@ pub struct Shard {
 /// `one_traversal` write sites need zero textual change.
 #[derive(Default)]
 struct LocalDelta {
+    // f64 (ShardMap), NOT RegretT: the within-iteration regret accumulation stays f64. Only the
+    // PERSISTENT `Shard.cum_regret` narrows to RegretT, rounded ONCE at the `accumulate_local_into`
+    // store (radd). This is the verdict's "accumulate in f64, round-store at the persistent write".
     cum_regret: ShardMap,
     strat_sum: ShardMap,
 }
@@ -319,7 +375,7 @@ impl NlheTables {
 
     /// Iterate every cum_regret (key, row) across all shards (order = shard order then per-shard hash
     /// order; callers that need determinism must sort — `serialize` does).
-    fn iter_all_cum(&self) -> impl Iterator<Item = (&[u8; 16], &[f64; NUM_ACTIONS])> {
+    fn iter_all_cum(&self) -> impl Iterator<Item = (&[u8; 16], &[RegretT; NUM_ACTIONS])> {
         self.shards.iter().flat_map(|s| s.cum_regret.iter())
     }
 
@@ -336,9 +392,9 @@ impl NlheTables {
 /// the per-key `+=` sum order is identical to the pre-refactor serial fold (bit-identical).
 fn merge_shard(dst: &mut Shard, src: &Shard) {
     for (k, dr) in &src.cum_regret {
-        let e = dst.cum_regret.entry(*k).or_insert(ZEROS);
+        let e = dst.cum_regret.entry(*k).or_insert(ZEROS_R);
         for a in 0..NUM_ACTIONS {
-            e[a] += dr[a];
+            e[a] = radd(e[a], dr[a] as f64);
         }
     }
     for (k, ds) in &src.strat_sum {
@@ -368,9 +424,9 @@ fn merge_shard(dst: &mut Shard, src: &Shard) {
 #[inline]
 fn accumulate_local_into(acc: &mut NlheTables, local: LocalDelta) {
     for (k, row) in local.cum_regret {
-        let e = acc.shards[shard_of(&k)].cum_regret.entry(k).or_insert(ZEROS);
+        let e = acc.shards[shard_of(&k)].cum_regret.entry(k).or_insert(ZEROS_R);
         for a in 0..NUM_ACTIONS {
-            e[a] += row[a];
+            e[a] = radd(e[a], row[a]);
         }
     }
     for (k, row) in local.strat_sum {
@@ -1086,9 +1142,11 @@ fn one_traversal<const N: usize>(
     // each of those call sites. (Lever 4: exact-int loop restructure; same ascending legal order.)
     let (lidx, ln) = compact_legal(&legal);
 
-    // Read the start-of-iteration regret row from the IMMUTABLE shared `read` snapshot (`ZEROS` if
-    // absent). Read once and reused by both branches below.
-    let regrets = *read.shards[shard_of(&key)].cum_regret.get(&key).unwrap_or(&ZEROS);
+    // Read the start-of-iteration regret row from the IMMUTABLE shared `read` snapshot (`ZEROS_R` if
+    // absent), widening to f64 for regret-matching. Read once and reused by both branches below. The
+    // probe loads `RegretT`-width bytes (44B under f32_regret vs 88B f64) — this halved read is the
+    // memory-traffic relief; `widen_r` is a no-op copy in the f64 build.
+    let regrets = widen_r(read.shards[shard_of(&key)].cum_regret.get(&key).unwrap_or(&ZEROS_R));
 
     if actor != hero {
         // Opponent node: regret-matching+ strategy, sample ONE action (external sampling). Regrets are
@@ -1277,7 +1335,7 @@ fn one_traversal_profile<const N: usize>(
     let regrets = if ab_stub_mode() == 2 {
         ZEROS // regret_zero: skip the cum_regret hashmap probe (subtractive attribution stub)
     } else {
-        *read.shards[shard_of(&key)].cum_regret.get(&key).unwrap_or(&ZEROS)
+        widen_r(read.shards[shard_of(&key)].cum_regret.get(&key).unwrap_or(&ZEROS_R))
     };
 
     if actor != hero {
@@ -1681,8 +1739,20 @@ pub fn serialize(tab: &NlheTables) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"NLCFR001");
     out.extend_from_slice(&tab.iters_done.to_le_bytes());
-    write_map_sharded(&mut out, tab.total_cum_len(), tab.iter_all_cum());
-    write_map_sharded(&mut out, tab.total_strat_len(), tab.iter_all_strat());
+    // cum_regret rows WIDEN to f64 on the wire so the NLCFR001 blob is f64-width regardless of the
+    // `f32_regret` feature: an f32-trained checkpoint is byte-format-compatible with the f64 build, and
+    // the served strategy comes from strat_sum (f64) — the on-disk cum is only used to RESUME training,
+    // where the f32->f64->f32 round-trip is exact. iter_all_strat is already f64.
+    write_map_sharded(
+        &mut out,
+        tab.total_cum_len(),
+        tab.iter_all_cum().map(|(k, r)| (k, widen_r(r))),
+    );
+    write_map_sharded(
+        &mut out,
+        tab.total_strat_len(),
+        tab.iter_all_strat().map(|(k, r)| (k, *r)),
+    );
     out
 }
 
@@ -1694,15 +1764,17 @@ pub fn serialize(tab: &NlheTables) -> Vec<u8> {
 fn write_map_sharded<'a>(
     out: &mut Vec<u8>,
     total_len: usize,
-    all: impl Iterator<Item = (&'a [u8; 16], &'a [f64; NUM_ACTIONS])>,
+    all: impl Iterator<Item = (&'a [u8; 16], [f64; NUM_ACTIONS])>,
 ) {
     out.extend_from_slice(&(total_len as u64).to_le_bytes());
-    let mut pairs: Vec<(&[u8; 16], &[f64; NUM_ACTIONS])> = all.collect();
+    // Owned f64 rows (cum_regret is widened by the caller; strat_sum copied) so the on-disk form is
+    // f64-width for BOTH maps regardless of the in-memory cum precision.
+    let mut pairs: Vec<(&[u8; 16], [f64; NUM_ACTIONS])> = all.collect();
     debug_assert_eq!(pairs.len(), total_len);
     pairs.sort_by(|a, b| a.0.cmp(b.0));
     for (key, row) in pairs {
         out.extend_from_slice(&key[..]); // fixed 16-byte key (no length prefix needed)
-        for &v in row {
+        for &v in &row {
             out.extend_from_slice(&v.to_le_bytes());
         }
     }
@@ -1756,8 +1828,13 @@ fn read_map_into_shards(
         }
         let s = shard_of(&key);
         match which {
-            MapKind::Regret => shards[s].cum_regret.insert(key, row),
-            MapKind::Strat => shards[s].strat_sum.insert(key, row),
+            // cum_regret narrows f64 (on-disk) -> RegretT (in-memory); strat_sum stays f64.
+            MapKind::Regret => {
+                shards[s].cum_regret.insert(key, narrow_r(&row));
+            }
+            MapKind::Strat => {
+                shards[s].strat_sum.insert(key, row);
+            }
         };
     }
     Some(())
@@ -2525,14 +2602,17 @@ mod tests {
                 sharded.floor_cum_regret();
 
                 // Independent serial reference: flat FxHashMap, deal-order +=, then floor.
-                let mut ref_cum: ShardMap = HashMap::default();
+                let mut ref_cum: RegretMap = HashMap::default();
                 let mut ref_strat: ShardMap = HashMap::default();
                 for p in &partials {
                     for sh in p.shards.iter() {
                         for (k, row) in &sh.cum_regret {
-                            let e = ref_cum.entry(*k).or_insert(ZEROS);
+                            let e = ref_cum.entry(*k).or_insert(ZEROS_R);
                             for a in 0..NUM_ACTIONS {
-                                e[a] += row[a];
+                                // SAME f64-accumulate-then-round-store (radd) as the merge paths, so the
+                                // serial reference stays BIT-IDENTICAL to the sharded merge at EITHER
+                                // precision (both fold partials in deal order, narrowing identically).
+                                e[a] = radd(e[a], row[a] as f64);
                             }
                         }
                         for (k, row) in &sh.strat_sum {
@@ -2561,15 +2641,18 @@ mod tests {
                     ref_strat.len(),
                     "strat key-count n_deals={n_deals} n_seats={n_seats}"
                 );
-                let bits = |r: &[f64; NUM_ACTIONS]| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                // Separate closures: RegretT::to_bits is u32 under f32_regret, u64 otherwise; strat is
+                // always f64 (u64). Each is only compared against its own kind.
+                let cbits = |r: &[RegretT; NUM_ACTIONS]| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                let sbits = |r: &[f64; NUM_ACTIONS]| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
                 for (k, row) in &ref_cum {
                     let got = sharded.shards[shard_of(k)]
                         .cum_regret
                         .get(k)
                         .expect("sharded missing cum key");
                     assert_eq!(
-                        bits(got),
-                        bits(row),
+                        cbits(got),
+                        cbits(row),
                         "cum row bits differ n_deals={n_deals} n_seats={n_seats}"
                     );
                 }
@@ -2579,8 +2662,8 @@ mod tests {
                         .get(k)
                         .expect("sharded missing strat key");
                     assert_eq!(
-                        bits(got),
-                        bits(row),
+                        sbits(got),
+                        sbits(row),
                         "strat row bits differ n_deals={n_deals} n_seats={n_seats}"
                     );
                 }
@@ -2608,6 +2691,60 @@ mod tests {
             }
             for k in sh.strat_sum.keys() {
                 assert_eq!(shard_of(k), s, "strat key in wrong shard after deserialize");
+            }
+        }
+    }
+
+    /// On-disk NLCFR001 row width is f64 (8 bytes/elem) for BOTH maps regardless of the in-memory
+    /// cum_regret precision. Guarantees an f32_regret-trained checkpoint is byte-format-compatible with
+    /// the f64 build (cross-precision-portable resume). Passes in both builds.
+    #[test]
+    fn on_disk_blob_width_is_f64_regardless_of_regret_precision() {
+        let cfg = test_cfg(64);
+        let mut a = NlheTables::new();
+        for _ in 0..3 {
+            a.train_iteration(&cfg);
+        }
+        let n_cum = a.total_cum_len();
+        let n_strat = a.total_strat_len();
+        let blob = serialize(&a);
+        // magic(8) + iters_done(8) + cum[len(8) + n*(16 key + 11*8)] + strat[len(8) + n*(16 + 11*8)]
+        let row_bytes = 16 + NUM_ACTIONS * 8;
+        let expect = 8 + 8 + (8 + n_cum * row_bytes) + (8 + n_strat * row_bytes);
+        assert_eq!(
+            blob.len(),
+            expect,
+            "on-disk row width must be f64 (cross-precision-portable blob)"
+        );
+    }
+
+    /// f32_regret build only: RegretT really is 4 bytes, and the persistent cum rows survive a
+    /// serialize(f64 on disk) -> deserialize(narrow to f32) round trip exactly (the on-disk f64 was made
+    /// by widening an f32, so narrowing back is lossless), with the re-serialized blob byte-stable.
+    #[cfg(feature = "f32_regret")]
+    #[test]
+    fn f32_regret_rows_are_f32_and_roundtrip_through_f64_disk() {
+        assert_eq!(
+            std::mem::size_of::<RegretT>(),
+            4,
+            "f32_regret feature must make RegretT f32"
+        );
+        let cfg = test_cfg(64);
+        let mut a = NlheTables::new();
+        for _ in 0..4 {
+            a.train_iteration(&cfg);
+        }
+        let blob = serialize(&a);
+        let b = deserialize(&blob).expect("deserialize");
+        assert_eq!(serialize(&b), blob, "re-serialized f32 checkpoint not byte-stable");
+        // Every persistent f32 cum row equals its own widen->narrow image (f32 idempotent).
+        for sh in b.shards.iter() {
+            for row in sh.cum_regret.values() {
+                assert_eq!(
+                    *row,
+                    narrow_r(&widen_r(row)),
+                    "f32 regret row not narrow/widen-stable"
+                );
             }
         }
     }

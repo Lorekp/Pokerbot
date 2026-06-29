@@ -35,6 +35,17 @@ phe_showdown = []
 # `apply_action_with_phe_matches_scalar_byte_for_byte`); compounds with `phe_showdown` (site 2). Default ON;
 # build with `phe_showdown` but WITHOUT `phe_site1` for the site-1-isolated A/B (site-2 phe, site-1 scalar).
 phe_site1 = []
+# f32 PERSISTENT REGRET ROWS (feature f32_regret, default OFF -> byte-identical to the shipped f64
+# trainer). Narrows ONLY the persistent `Shard.cum_regret` rows to [f32;11] (88B -> 44B/row) to relieve
+# the 128-thread memory-traffic contention the metal attribution cert measured. strat_sum STAYS f64
+# (its Linear-CFR O(T^2) growth to ~1.3e13 at 62k iters would swamp an f32 accumulator and floor
+# exploitability — the one demonstrated failure mode; see the f32-quality-gate verdict). cum_regret is
+# bounded + CFR+ floored (max abs ~2.2e7 projected at 62k, 9 orders below f32 limits) so f32 is safe.
+# Within-iteration accumulation stays f64 (radd) and the on-disk NLCFR001 blob stays f64 (widen on
+# serialize / narrow on deserialize) -> checkpoints are cross-precision-portable. SHIP-GATE before
+# flipping the default: a matched-seed T=62000 6-max A/B must pass BOTH per-infoset strategy-delta
+# (median<=1e-4, max<=1e-2, no edge-bearing line collapse) AND native LBR (lbr6) CI-overlap vs f64.
+f32_regret = []
 # ATTRIBUTION HARNESS (feature ab_stub, default OFF -> zero production overhead). When ON, env var
 # POKERBOT_AB_STUB neutralizes ONE phase of the PROFILE-twin traverse so the per-node ns/node delta vs the
 # unstubbed baseline attributes that phase (the big-box attribution protocol's STEP-2 subtractive harness):
