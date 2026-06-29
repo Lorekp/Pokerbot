@@ -46,6 +46,7 @@ fn main() {
         prune_threshold: f64::NEG_INFINITY,
         fast_merge: false,
         emd_frozen: emd_frozen.clone(),
+        batch_deals: 0,
     };
 
     // Warm-up

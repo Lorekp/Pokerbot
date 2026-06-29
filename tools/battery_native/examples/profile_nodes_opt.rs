@@ -425,6 +425,7 @@ fn main() {
         prune_threshold: f64::NEG_INFINITY,
         fast_merge: false,
         emd_frozen: None,
+        batch_deals: 0,
     };
 
     let mut read = NlheTables::new();

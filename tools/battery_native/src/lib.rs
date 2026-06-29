@@ -844,7 +844,7 @@ mod py {
     #[pymethods]
     impl NlheCFRTrainer {
         #[new]
-        #[pyo3(signature = (num_buckets, depth_edges, n_deals_per_iter, n_seats=6, prune_threshold=f64::NEG_INFINITY, fast_merge=false, emd_frozen_path=None))]
+        #[pyo3(signature = (num_buckets, depth_edges, n_deals_per_iter, n_seats=6, prune_threshold=f64::NEG_INFINITY, fast_merge=false, emd_frozen_path=None, batch_deals=0))]
         fn new(
             num_buckets: i32,
             depth_edges: Vec<f64>,
@@ -853,6 +853,7 @@ mod py {
             prune_threshold: f64,
             fast_merge: bool,
             emd_frozen_path: Option<String>,
+            batch_deals: usize,
         ) -> PyResult<Self> {
             let (emd_frozen, emd_stamp) = match emd_frozen_path {
                 Some(path) => {
@@ -889,6 +890,7 @@ mod py {
                     prune_threshold,
                     fast_merge,
                     emd_frozen,
+                    batch_deals,
                 },
                 emd_stamp,
             })

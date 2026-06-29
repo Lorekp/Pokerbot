@@ -215,6 +215,17 @@ pub struct TrainerCfg {
     /// closes the train↔serve postflop key skew when the EMD pipeline is active. The lookup is wrapped
     /// in `Arc` so rayon workers share a single read-only map (cheap: hash probe, no copy on clone).
     pub emd_frozen: Option<Arc<FrozenEMDLookup>>,
+    /// Batched, memory-level-parallel (MLP) traversal width. `0` or `1` => the BYTE-IDENTICAL recursive
+    /// `one_traversal` fold (the shipped default). `>= 2` => step `B = batch_deals` independent
+    /// deal-traversals in lockstep so their `cum_regret.get()` probes issue back-to-back and the CPU's
+    /// out-of-order engine overlaps the (DRAM-bound) hashmap-probe latencies — a microbench measured
+    /// ~1.4-2.2x per-thread recovery in the 128-thread contention regime. The batched path is
+    /// BYTE-IDENTICAL to the recursive path: it only interleaves across DIFFERENT deals (independent rng),
+    /// never the N heroes of one deal, folds each deal's `LocalDelta` into the task accumulator in
+    /// ASCENDING deal-index order, and replicates every float op (regret_match, strat_sum, hero EV, regret
+    /// write) verbatim. RBP (a finite `prune_threshold`) is NOT supported batched and FALLS BACK to the
+    /// recursive path. Default `0` so every shipped path is unchanged.
+    pub batch_deals: usize,
 }
 
 /// The persistent, durable trainer state — the genuine gap #1. Survives every traversal; merged
@@ -1263,6 +1274,345 @@ fn one_traversal<const N: usize>(
 }
 
 // --------------------------------------------------------------------------------------------------
+// BATCHED, memory-level-parallel (MLP) traversal — BYTE-IDENTICAL to the recursive `one_traversal`.
+//
+// MECHANISM (NOT prefetch — explicit `_mm_prefetch` was measured INERT): the recursion is converted to an
+// explicit frame stack so a single deal-traversal can be SUSPENDED at each actor-node regret read and
+// RESUMED. `B = cfg.batch_deals` INDEPENDENT deals are stepped in lockstep: every round, all B traversals
+// advance to their next regret-read (Phase A), then their B `cum_regret.get()` probes issue back-to-back
+// in a tight loop (Phase B, the MLP — the CPU's out-of-order engine overlaps the DRAM-bound hashmap
+// latencies), then each consumes its regret row and advances one step (Phase C).
+//
+// BYTE-IDENTITY: only DIFFERENT deals (independent rng) are interleaved — within ONE deal the N heroes
+// run strictly sequentially (hero h finishes ALL its rng draws in DFS order before hero h+1 starts), the
+// single per-deal `rng` is shared across heroes exactly as the sequential loop does, every float op
+// (`regret_match`, the opponent strat_sum write loop, the hero `av`/`ev`/regret-write loops) is the SAME
+// code with the SAME iteration bounds/order, and each deal's `LocalDelta` is folded into the task
+// accumulator via `accumulate_local_into` in ASCENDING deal-index order. RBP (finite `prune_threshold`)
+// is NOT implemented here — `collect_partials_n` routes finite-threshold cfgs to the recursive fold.
+// --------------------------------------------------------------------------------------------------
+
+/// An explicit-stack frame for one steppable deal-traversal. `Node` carries an env to (re)process from
+/// scratch (exactly the head of `one_traversal`); `Hero` is the suspended state of a hero decision node
+/// that is branching its abstracted-legal actions one child at a time.
+enum Frame<const N: usize> {
+    /// Process this env: terminal/chance/leaf produce a `ret`; an actor node yields a pending regret read.
+    Node(EnvStateN<N>),
+    /// A hero decision node mid-branch. `env` is the node, `key` its fingerprint, `strat` the
+    /// regret-matched strategy (frozen at node entry), `legal`/`lidx`/`ln` the abstracted-legal set,
+    /// `av` the per-action counterfactual values accumulated so far, `i` the index of the NEXT child to
+    /// launch (so the child just completed is action `lidx[i]`).
+    Hero {
+        env: EnvStateN<N>,
+        key: [u8; 16],
+        strat: [f64; NUM_ACTIONS],
+        legal: [bool; NUM_ACTIONS],
+        lidx: [usize; NUM_ACTIONS],
+        ln: usize,
+        av: [f64; NUM_ACTIONS],
+        i: usize,
+    },
+}
+
+/// One in-flight deal-traversal: owns its rng, per-deal `LocalDelta`, the current `hero` seat being
+/// traversed, the explicit frame stack, the last child's return value `ret`, the deal root (re-pushed
+/// when advancing to the next hero), the pending fingerprint key awaiting a regret read, and a `done`
+/// flag (set once all N heroes' traversals have completed).
+struct DealTrav<const N: usize> {
+    rng: Rng,
+    local: LocalDelta,
+    hero: usize,
+    stack: Vec<Frame<N>>,
+    ret: f64,
+    root: EnvStateN<N>,
+    /// Some(key) when the trav is SUSPENDED at an actor node awaiting `cum_regret.get(&key)`.
+    pending_key: Option<[u8; 16]>,
+    done: bool,
+}
+
+impl<const N: usize> DealTrav<N> {
+    /// Initialize a traversal for deal `d`: derive the deal seed EXACTLY as `collect_partials_n` does
+    /// (`iter_seed + d*0x100000001b3 rotl 17`), seed the rng, deal the root (the FIRST rng draws —
+    /// Fisher-Yates + init, with the button rotating on `d`), and start hero 0.
+    fn new(d: u64, iter_seed: u64) -> Self {
+        let deal_seed = iter_seed
+            .wrapping_add(d.wrapping_mul(0x100000001b3))
+            .rotate_left(17);
+        let mut rng = Rng::seed_from_u64(deal_seed);
+        let root = deal_root::<N>(&mut rng, d);
+        DealTrav {
+            rng,
+            local: LocalDelta::default(),
+            hero: 0,
+            stack: vec![Frame::Node(root)],
+            ret: 0.0,
+            root,
+            pending_key: None,
+            done: false,
+        }
+    }
+}
+
+/// PHASE A — advance one trav until it either (a) suspends at an actor node awaiting a regret read
+/// (`pending_key` set), or (b) finishes (all N heroes done -> `done`). Processes every frame that does
+/// NOT need a fresh regret read: terminal / chance / no-actor leaves, chance sampling, and Hero RESUME
+/// (consuming a completed child, launching the next, or finalizing). Mirrors `one_traversal` exactly.
+#[inline]
+fn advance_to_probe<const N: usize>(
+    trav: &mut DealTrav<N>,
+    cfg: &TrainerCfg,
+    memo: &mut FpMemo,
+) {
+    loop {
+        let frame = match trav.stack.last() {
+            Some(f) => f,
+            None => {
+                // Hero `trav.hero`'s traversal is complete (its root frame produced `trav.ret`). Advance
+                // to the next hero with the SAME rng (do NOT reseed) — exactly the sequential
+                // `for hero in 0..N` loop, which threads one rng through all heroes of a deal.
+                trav.hero += 1;
+                if trav.hero < N {
+                    trav.stack.push(Frame::Node(trav.root));
+                    continue;
+                } else {
+                    trav.done = true;
+                    return;
+                }
+            }
+        };
+        match frame {
+            Frame::Node(env) => {
+                // Head of `one_traversal`: resolve the cheap (no-regret-read) cases here; an actor node
+                // computes its fingerprint key, sets pending_key and YIELDS.
+                if env.done {
+                    trav.ret = env.rewards[trav.hero] as f64 / CHIP_UNIT;
+                    trav.stack.pop();
+                    continue;
+                }
+                if core::is_chance_node(env) {
+                    let child = core::sample_chance(env);
+                    // Tail recursion into the chance child: replace this frame.
+                    *trav.stack.last_mut().unwrap() = Frame::Node(child);
+                    continue;
+                }
+                if env.street >= core::STREET_TERMINAL {
+                    trav.ret = terminal_return(env, trav.hero);
+                    trav.stack.pop();
+                    continue;
+                }
+                let actor_i = env.action_seat;
+                if actor_i < 0 {
+                    trav.ret = terminal_return(env, trav.hero);
+                    trav.stack.pop();
+                    continue;
+                }
+                let actor = actor_i as usize;
+                let legal = abstracted_legal(env, actor, cfg);
+                if !any_legal(&legal) {
+                    trav.ret = terminal_return(env, trav.hero);
+                    trav.stack.pop();
+                    continue;
+                }
+                let key = fingerprint_fast_depth_memo_emd(
+                    env,
+                    actor,
+                    cfg.num_buckets,
+                    &cfg.depth_edges,
+                    cfg.emd_frozen.as_deref(),
+                    memo,
+                );
+                // Suspend: the regret read for `key` is issued in Phase B (the MLP), consumed in Phase C.
+                trav.pending_key = Some(key);
+                return;
+            }
+            Frame::Hero { .. } => {
+                // RESUME a hero node after the child for action `lidx[i]` returned `trav.ret`. Mutate the
+                // top frame in place: store av[lidx[i]], advance i. Take the action to launch next (if any)
+                // OR the finalize inputs (strat/av/legal/key) by value so the `&mut` borrow ends before we
+                // push/pop.
+                let ret_child = trav.ret;
+                enum Step {
+                    Launch(usize), // push Node(child) for action id
+                    Finalize {
+                        strat: [f64; NUM_ACTIONS],
+                        av: [f64; NUM_ACTIONS],
+                        legal: [bool; NUM_ACTIONS],
+                        key: [u8; 16],
+                    },
+                }
+                let env_for_apply;
+                let step;
+                {
+                    let top = trav.stack.last_mut().unwrap();
+                    let Frame::Hero { env, key, strat, legal, lidx, ln, av, i } = top else {
+                        unreachable!("Frame::Hero")
+                    };
+                    let a_done = lidx[*i];
+                    av[a_done] = ret_child;
+                    *i += 1;
+                    if *i < *ln {
+                        let a_next = lidx[*i];
+                        env_for_apply = *env;
+                        step = Step::Launch(a_next);
+                    } else {
+                        env_for_apply = *env;
+                        step = Step::Finalize {
+                            strat: *strat,
+                            av: *av,
+                            legal: *legal,
+                            key: *key,
+                        };
+                    }
+                }
+                match step {
+                    Step::Launch(a_next) => {
+                        // Launch the next child branch (same ascending legal order as the recursion's
+                        // `for i in 0..ln { let a=lidx[i]; ... }`).
+                        let child = trainer_apply(&env_for_apply, a_next);
+                        trav.stack.push(Frame::Node(child));
+                        continue;
+                    }
+                    Step::Finalize { strat, av, legal, key } => {
+                        // ev = sum_a strat[a]*av[a] over a=0..NUM_ACTIONS — VERBATIM from one_traversal.
+                        let mut ev = 0.0;
+                        for a in 0..NUM_ACTIONS {
+                            ev += strat[a] * av[a];
+                        }
+                        {
+                            let r = trav.local.cum_regret.entry(key).or_insert(ZEROS);
+                            for a in 0..NUM_ACTIONS {
+                                if legal[a] {
+                                    r[a] += av[a] - ev;
+                                }
+                            }
+                        }
+                        trav.ret = ev;
+                        trav.stack.pop();
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// PHASE C — consume the regret row read for the suspended trav and advance ONE step past the actor node.
+/// The trav's top frame is `Node(env)` at the actor node whose key was stashed in `pending_key`. The key
+/// is REUSED (not recomputed) so there is no extra fingerprint/memo touch. Replicates the opponent / hero
+/// branches of `one_traversal` EXACTLY (recomputing legal/lidx from `env` exactly as the recursion does,
+/// same strat_sum write, same rng draw + sample for opponents, same Hero-frame launch for the hero).
+#[inline]
+fn consume<const N: usize>(
+    trav: &mut DealTrav<N>,
+    regrets: &[f64; NUM_ACTIONS],
+    cfg: &TrainerCfg,
+    t: u64,
+) {
+    let key = trav.pending_key.take().expect("consume without a pending key");
+    // The actor node env is on top.
+    let env = match trav.stack.last() {
+        Some(Frame::Node(env)) => *env,
+        _ => unreachable!("consume expects a Node actor on top"),
+    };
+    let actor = env.action_seat as usize;
+    let legal = abstracted_legal(&env, actor, cfg);
+    let (lidx, ln) = compact_legal(&legal);
+
+    if actor != trav.hero {
+        // Opponent node — VERBATIM from one_traversal's `actor != hero` branch (strat_sum write loop
+        // BEFORE the rng draw, same w = t as f64, same sample).
+        let strat = regret_match(regrets, &legal);
+        let w = t as f64;
+        {
+            let ss = trav.local.strat_sum.entry(key).or_insert(ZEROS);
+            for a in 0..NUM_ACTIONS {
+                if legal[a] {
+                    ss[a] += w * strat[a];
+                }
+            }
+        }
+        let u = trav.rng.next_f64();
+        let a = sample_action_compact(&strat, &lidx, ln, u);
+        let child = trainer_apply(&env, a);
+        // Tail recursion: replace the actor Node with the child Node.
+        *trav.stack.last_mut().unwrap() = Frame::Node(child);
+        return;
+    }
+
+    // Hero node — VERBATIM from one_traversal's hero branch (RBP-off path; finite prune falls back to the
+    // recursive scheduler upstream). Build the Hero frame and launch the first child branch (lidx[0]).
+    let strat = regret_match(regrets, &legal);
+    // ln >= 1 here (any_legal was true at suspend), so lidx[0] is valid.
+    let a0 = lidx[0];
+    let child0 = trainer_apply(&env, a0);
+    *trav.stack.last_mut().unwrap() = Frame::Hero {
+        env,
+        key,
+        strat,
+        legal,
+        lidx,
+        ln,
+        av: [0.0f64; NUM_ACTIONS],
+        i: 0,
+    };
+    trav.stack.push(Frame::Node(child0));
+}
+
+/// BATCH DRIVER — run a contiguous batch of `travs` (one `DealTrav` per deal, ascending deal index) in
+/// lockstep until ALL are `done`, then fold each deal's `LocalDelta` into `acc` via `accumulate_local_into`
+/// in ASCENDING deal-index order (the `travs` slice is already in deal order). Per round: Phase A advances
+/// every not-done trav to its next regret probe; Phase B gathers the B `cum_regret.get()` reads back-to-
+/// back (the MLP); Phase C consumes each read and steps one node past the actor.
+#[inline]
+fn run_batch<const N: usize>(
+    mut travs: Vec<DealTrav<N>>,
+    cfg: &TrainerCfg,
+    read: &NlheTables,
+    t: u64,
+    memo: &mut FpMemo,
+    acc: &mut NlheTables,
+) {
+    let b = travs.len();
+    // Scratch for the gathered regret rows (one per active trav this round), reused across rounds.
+    let mut regrets: Vec<[f64; NUM_ACTIONS]> = vec![ZEROS; b];
+    loop {
+        // PHASE A: advance every not-yet-done trav to its next regret probe (or to done).
+        let mut any_active = false;
+        for trav in travs.iter_mut() {
+            if trav.done {
+                continue;
+            }
+            advance_to_probe::<N>(trav, cfg, memo);
+            if trav.pending_key.is_some() {
+                any_active = true;
+            }
+        }
+        if !any_active {
+            // No trav has a pending probe: all are done.
+            break;
+        }
+        // PHASE B: issue the B independent cum_regret reads back-to-back (the memory-level parallelism).
+        for (j, trav) in travs.iter().enumerate() {
+            if let Some(key) = trav.pending_key {
+                regrets[j] =
+                    widen_r(read.shards[shard_of(&key)].cum_regret.get(&key).unwrap_or(&ZEROS_R));
+            }
+        }
+        // PHASE C: consume each read and step one node past the actor.
+        for (j, trav) in travs.iter_mut().enumerate() {
+            if trav.pending_key.is_some() {
+                consume::<N>(trav, &regrets[j], cfg, t);
+            }
+        }
+    }
+    // Fold each deal's LocalDelta into the task accumulator in ASCENDING deal-index order (travs is in
+    // deal order) — IDENTICAL fold order to the sequential `accumulate_local_into` per deal.
+    for trav in travs.into_iter() {
+        accumulate_local_into(acc, trav.local);
+    }
+}
+
+// --------------------------------------------------------------------------------------------------
 // train_iteration — genuine gap #2: rayon deal-sampling outer loop with thread-local accumulation
 // --------------------------------------------------------------------------------------------------
 
@@ -1503,6 +1853,18 @@ impl NlheTables {
         t: u64,
         iter_seed: u64,
     ) -> Vec<NlheTables> {
+        // BATCHED MLP PATH: when `cfg.batch_deals >= 2` AND RBP is OFF (the production regime), step
+        // `B` independent deals in lockstep so their cum_regret probes overlap (see `run_batch`). The
+        // rayon SPLITTING is IDENTICAL to the recursive path (same `into_par_iter().with_min_len()`), so
+        // the leaf-job boundaries — and therefore the per-task partial grouping that `merge_partials`
+        // folds — are the same; within each leaf job the deals are buffered into batches of B and each
+        // batch's per-deal `LocalDelta`s are folded into the task accumulator in ASCENDING deal order
+        // (`run_batch`), exactly as the recursive `.fold` does one deal at a time. Result: BYTE-IDENTICAL
+        // merged table. A finite `prune_threshold` (RBP on) is NOT supported batched and falls through to
+        // the recursive fold below.
+        if cfg.batch_deals >= 2 && !cfg.prune_threshold.is_finite() {
+            return Self::collect_partials_n_batched::<N>(cfg, read, t, iter_seed);
+        }
         // Each rayon worker borrows a PROCESS-PERSISTENT, thread-local blake2b-digest memo (`FP_MEMO`).
         // Unlike a `map_init` cache (which resets every `par_iter`, i.e. every iteration), the
         // thread-local persists across ALL iterations of the whole run, so after a brief warmup the hit
@@ -1553,6 +1915,56 @@ impl NlheTables {
                     }
                 });
                 accumulate_local_into(&mut acc, local);
+                acc
+            })
+            .collect()
+    }
+
+    /// Batched (MLP) twin of `collect_partials_n`. The rayon pipeline is IDENTICAL
+    /// (`into_par_iter().with_min_len().fold(...).collect()`) so leaf-job boundaries match the recursive
+    /// path exactly. Each leaf job's fold accumulator carries `(NlheTables, Vec<DealTrav<N>>)`: deals are
+    /// buffered into the Vec and flushed in batches of B (`run_batch`, which folds each deal's LocalDelta
+    /// into the NlheTables in ASCENDING deal order); a post-fold `.map` flushes the leaf job's tail batch.
+    /// Same `deal_seed` derivation, same per-deal traversal, same ascending-order `accumulate_local_into`
+    /// — so the per-task partial (and the merged table) is BYTE-IDENTICAL to the recursive fold.
+    fn collect_partials_n_batched<const N: usize>(
+        cfg: &TrainerCfg,
+        read: &NlheTables,
+        t: u64,
+        iter_seed: u64,
+    ) -> Vec<NlheTables> {
+        let b = cfg.batch_deals.max(2);
+        (0..cfg.n_deals_per_iter)
+            .into_par_iter()
+            .with_min_len(deal_chunk_min_len(
+                cfg.n_deals_per_iter,
+                rayon::current_num_threads(),
+            ))
+            // Accumulator: (per-task partial, pending-deal buffer). The buffer collects up to B deals
+            // (ASCENDING within a leaf job, since the fold visits deal indices in order) and flushes a
+            // full batch through `run_batch`.
+            .fold(
+                || (NlheTables::default(), Vec::<DealTrav<N>>::with_capacity(b)),
+                |(mut acc, mut buf), d| {
+                    buf.push(DealTrav::<N>::new(d as u64, iter_seed));
+                    if buf.len() >= b {
+                        let batch = std::mem::take(&mut buf);
+                        FP_MEMO.with(|cell| {
+                            let memo = &mut *cell.borrow_mut();
+                            run_batch::<N>(batch, cfg, read, t, memo, &mut acc);
+                        });
+                    }
+                    (acc, buf)
+                },
+            )
+            // Flush each leaf job's tail (the <B remaining deals) into its partial, then drop the buffer.
+            .map(|(mut acc, buf)| {
+                if !buf.is_empty() {
+                    FP_MEMO.with(|cell| {
+                        let memo = &mut *cell.borrow_mut();
+                        run_batch::<N>(buf, cfg, read, t, memo, &mut acc);
+                    });
+                }
                 acc
             })
             .collect()
@@ -2040,6 +2452,7 @@ mod tests {
             prune_threshold: f64::NEG_INFINITY,
             fast_merge: false,
             emd_frozen: None,
+            batch_deals: 0,
         }
     }
 
@@ -2055,6 +2468,7 @@ mod tests {
             prune_threshold: f64::NEG_INFINITY,
             fast_merge: false,
             emd_frozen: None,
+            batch_deals: 0,
         }
     }
 
@@ -2669,6 +3083,119 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// BATCHED-MLP BYTE-IDENTITY gate. The lockstep batched traversal (`batch_deals=8`) must produce a
+    /// merged table BYTE-IDENTICAL (f64.to_bits / RegretT::to_bits equality, every cum_regret AND
+    /// strat_sum row) to the recursive path (`batch_deals=1`), for the SAME iter_seed/t. The batched path
+    /// only interleaves DIFFERENT deals (independent rng), runs the N heroes of a deal strictly
+    /// sequentially, folds each deal's LocalDelta in ascending deal order, and replicates every float op
+    /// verbatim — so the only thing it changes is the ORDER memory probes issue, never a value. Exercises
+    /// n_deals ∈ {4,64,200} × NUM_PLAYERS ∈ {6,7}. Mirrors `sharded_merge_bit_identical_to_serial_fold`'s
+    /// to_bits row comparison.
+    #[test]
+    fn batched_traversal_byte_identical_to_recursive() {
+        for &n_deals in &[4usize, 64, 200] {
+            for n_seats in [6usize, 7] {
+                // Recursive reference (batch_deals=1).
+                let mut cfg_rec = test_cfg(n_deals);
+                cfg_rec.n_seats = n_seats;
+                cfg_rec.batch_deals = 1;
+                // Batched (batch_deals=8).
+                let mut cfg_bat = test_cfg(n_deals);
+                cfg_bat.n_seats = n_seats;
+                cfg_bat.batch_deals = 8;
+
+                let read = NlheTables::new();
+                let t = 1u64;
+                let iter_seed = cfg_rec.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
+
+                let (rec_partials, bat_partials) = match n_seats {
+                    7 => (
+                        NlheTables::collect_partials_n::<7>(&cfg_rec, &read, t, iter_seed),
+                        NlheTables::collect_partials_n::<7>(&cfg_bat, &read, t, iter_seed),
+                    ),
+                    _ => (
+                        NlheTables::collect_partials_n::<6>(&cfg_rec, &read, t, iter_seed),
+                        NlheTables::collect_partials_n::<6>(&cfg_bat, &read, t, iter_seed),
+                    ),
+                };
+
+                let mut rec = NlheTables::new();
+                rec.merge_partials(&cfg_rec, rec_partials);
+                rec.floor_cum_regret();
+                let mut bat = NlheTables::new();
+                bat.merge_partials(&cfg_bat, bat_partials);
+                bat.floor_cum_regret();
+
+                assert_eq!(
+                    bat.total_cum_len(),
+                    rec.total_cum_len(),
+                    "cum key-count n_deals={n_deals} n_seats={n_seats}"
+                );
+                assert_eq!(
+                    bat.total_strat_len(),
+                    rec.total_strat_len(),
+                    "strat key-count n_deals={n_deals} n_seats={n_seats}"
+                );
+                let cbits =
+                    |r: &[RegretT; NUM_ACTIONS]| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                let sbits = |r: &[f64; NUM_ACTIONS]| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                for (k, row) in rec.iter_all_cum() {
+                    let got = bat.shards[shard_of(k)]
+                        .cum_regret
+                        .get(k)
+                        .expect("batched missing cum key");
+                    assert_eq!(
+                        cbits(got),
+                        cbits(row),
+                        "cum row bits differ n_deals={n_deals} n_seats={n_seats}"
+                    );
+                }
+                for (k, row) in rec.iter_all_strat() {
+                    let got = bat.shards[shard_of(k)]
+                        .strat_sum
+                        .get(k)
+                        .expect("batched missing strat key");
+                    assert_eq!(
+                        sbits(got),
+                        sbits(row),
+                        "strat row bits differ n_deals={n_deals} n_seats={n_seats}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A finite `prune_threshold` (RBP on) MUST route batched cfgs back to the recursive fold (batched RBP
+    /// is intentionally unimplemented). Proves the fallback: with RBP on, batch_deals=8 and the recursive
+    /// path produce a byte-identical merged table (because the batched scheduler is bypassed entirely).
+    #[test]
+    fn batched_with_rbp_falls_back_to_recursive() {
+        let n_deals = 64usize;
+        let mut cfg_rec = test_cfg(n_deals);
+        cfg_rec.prune_threshold = -1e6; // finite => RBP "on" (prunes nothing under the CFR+ floor, but the gate fires)
+        cfg_rec.batch_deals = 1;
+        let mut cfg_bat = cfg_rec.clone();
+        cfg_bat.batch_deals = 8; // must be IGNORED because prune_threshold.is_finite()
+
+        let read = NlheTables::new();
+        let t = 1u64;
+        let iter_seed = cfg_rec.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
+        let rec_partials = NlheTables::collect_partials_n::<6>(&cfg_rec, &read, t, iter_seed);
+        let bat_partials = NlheTables::collect_partials_n::<6>(&cfg_bat, &read, t, iter_seed);
+
+        let mut rec = NlheTables::new();
+        rec.merge_partials(&cfg_rec, rec_partials);
+        rec.floor_cum_regret();
+        let mut bat = NlheTables::new();
+        bat.merge_partials(&cfg_bat, bat_partials);
+        bat.floor_cum_regret();
+        assert_eq!(
+            serialize(&rec),
+            serialize(&bat),
+            "RBP-on batch_deals=8 must equal recursive (fallback failed)"
+        );
     }
 
     /// WF5 deserialize-routing + serialize-determinism gate. A trained table's blob, after a

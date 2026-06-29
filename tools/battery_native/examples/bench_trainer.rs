@@ -40,6 +40,7 @@ fn main() {
         prune_threshold,
         fast_merge,
         emd_frozen: None,
+        batch_deals: 0,
     };
 
     // Warm-up iteration excluded from timing (allocator / table growth transient).

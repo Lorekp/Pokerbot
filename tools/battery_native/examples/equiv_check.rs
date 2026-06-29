@@ -130,6 +130,7 @@ fn main() {
         prune_threshold,
         fast_merge,
         emd_frozen: None,
+        batch_deals: 0,
     };
 
     let mut tab = NlheTables::new();

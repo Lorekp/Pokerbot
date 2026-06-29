@@ -16,6 +16,13 @@ fn main() {
     let out_path = args.get(1).map(|s| s.as_str()).unwrap_or("ab_train_out.bin");
     let iters: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4000);
     let n_deals: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
+    // argv[4] (or env POKERBOT_BATCH_DEALS): batched-MLP traversal width. 0/1 = recursive (default);
+    // >=2 = lockstep batched. Used for the local nodes/s A/B (batch_deals 8 vs 1).
+    let batch_deals: usize = args
+        .get(4)
+        .and_then(|s| s.parse().ok())
+        .or_else(|| std::env::var("POKERBOT_BATCH_DEALS").ok().and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
 
     // Representative deployed cfg (mirrors trainer::tests::test_cfg) — made-hand bucketer (emd_frozen
     // None) for speed; the regret-precision A/B is abstraction-agnostic (both arms use the identical cfg).
@@ -30,6 +37,7 @@ fn main() {
         prune_threshold: f64::NEG_INFINITY,
         fast_merge: false,
         emd_frozen: None,
+        batch_deals,
     };
 
     let precision = if cfg!(feature = "f32_regret") {
@@ -38,7 +46,7 @@ fn main() {
         "f64"
     };
     eprintln!(
-        "[ab_train] precision={precision} iters={iters} n_deals={n_deals} -> {out_path}",
+        "[ab_train] precision={precision} iters={iters} n_deals={n_deals} batch_deals={batch_deals} -> {out_path}",
     );
 
     let mut tab = NlheTables::new();
