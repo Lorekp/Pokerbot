@@ -61,47 +61,35 @@ printf 'kernel.perf_event_paranoid=-1\nkernel.kptr_restrict=0\n' > /etc/sysctl.d
 sysctl --system || true
 sysctl -w kernel.perf_event_max_sample_rate=10000 || true
 
-# ---------------------------------------------------------------------------- BUILD (debug-symbol'd v3) — TWO .so for the f32_regret A/B
+# ---------------------------------------------------------------------------- BUILD (debug-symbol'd v3) — ONE .so for the MLP runtime A/B
 # KEEP -C target-cpu=x86-64-v3 (must match production codegen — the profiled binary IS the shipping
 # binary). debuginfo=2 -> DWARF symbol names for inlined leaves; force-frame-pointers -> cheap --call
 # -graph fp unwind; strip=none -> keep the symtab. Cargo.toml is NOT edited (firewall-clean; lto=fat /
 # codegen-units=1 / panic=abort stay production).
 #
-# The f32_regret A/B needs TWO binaries from the SAME crate via the `f32_regret` feature gate, both with the
-# production-default features (phe_showdown + phe_site1) so ONLY the persistent regret-row precision differs:
-#   f64 (baseline) = DEFAULT features              -> persistent cum_regret rows are [f64;11]
-#   f32 (lever)    = --features python,f32_regret  -> persistent cum_regret rows are [f32;11] (strat_sum stays f64)
-# Both keep target-cpu=x86-64-v3 + debuginfo. The driver imports a FIXED /opt/pokerbot/battery_native.so, so
-# the A/B is done by building BOTH once and per-shape COPYING the chosen flavor over that fixed path before
-# launching the (fresh-process) driver — NO driver change. This measures whether halving the cum_regret read/
-# write bytes relieves the 128t memory-contention the prior attribution probe (probe_1782704164) certified.
+# The MLP A/B is a RUNTIME flag (cfg.batch_deals via POKERBOT_BATCH_DEALS), so ONE binary suffices: the
+# default-feature production cdylib. Each shape sets POKERBOT_BATCH_DEALS in the (fresh-process) driver env
+# (1=recursive baseline, 8=batched lockstep). batch_deals is byte-identical to recursive (proven 91/91 +
+# end-to-end identical NLCFR001 checkpoints), so this is a CLEAN throughput + PMU A/B on a single binary:
+# the ONLY difference between B1 and BMLP is the execution schedule (lockstep interleave of B deals' regret
+# get()s), which is exactly what should raise memory-level parallelism under the 128t contention regime.
 export PYO3_PYTHON="$(python3 -c 'import sys;print(sys.executable)')"
 export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
 RF='-C target-cpu=x86-64-v3 -C force-frame-pointers=yes -C debuginfo=2 -C strip=none'
-# f64 baseline (DEFAULT features) — the production regret precision; the REGIME-GATE binary (perf-statted 128t).
-RUSTFLAGS="$RF" cargo build --release --features python --lib --manifest-path tools/battery_native/Cargo.toml || { echo "BUILD_FAIL_F64"; marker BUILD_FAIL "f64 cargo build failed"; exit 1; }
-SO_ON="$(ls tools/battery_native/target/release/libbattery_native.so 2>/dev/null || ls tools/battery_native/target/release/battery_native.so 2>/dev/null)"
-cp "$SO_ON" /opt/pokerbot/battery_native_phe_on.so
-# f32 lever (--features python,f32_regret keeps DEFAULT features = phe ON, ADDS the f32 cum_regret rows).
-RUSTFLAGS="$RF" cargo build --release --features python,f32_regret --lib --manifest-path tools/battery_native/Cargo.toml || { echo "BUILD_FAIL_F32"; marker BUILD_FAIL "f32 cargo build failed"; exit 1; }
-SO_F32="$(ls tools/battery_native/target/release/libbattery_native.so 2>/dev/null || ls tools/battery_native/target/release/battery_native.so 2>/dev/null)"
-cp "$SO_F32" /opt/pokerbot/battery_native_f32.so
-ls -la /opt/pokerbot/battery_native_phe_on.so /opt/pokerbot/battery_native_f32.so
-# Default the live import to the f64 baseline until the per-shape cp overrides it.
-cp /opt/pokerbot/battery_native_phe_on.so /opt/pokerbot/battery_native.so
-# BUILD_OK verify: debug_info present, PyInit resolves, AND f64 vs f32 DIFFER (cmp -s non-zero = differ).
-# If byte-identical the f32_regret feature gate did nothing -> the A/B would be void, so DIFFER is required.
-AB_DIFFER=0; cmp -s /opt/pokerbot/battery_native_phe_on.so /opt/pokerbot/battery_native_f32.so || AB_DIFFER=1
-if file /opt/pokerbot/battery_native_phe_on.so | grep -q 'debug_info' \
-   && nm /opt/pokerbot/battery_native_f32.so 2>/dev/null | grep -q 'PyInit_battery_native' \
-   && nm /opt/pokerbot/battery_native_phe_on.so 2>/dev/null | grep -q 'PyInit_battery_native' \
-   && [ "$AB_DIFFER" = 1 ]; then
-  marker BUILD_OK "f64 baseline + f32 lever built; debug_info + PyInit_battery_native resolved + binaries DIFFER (f32 A/B valid)"
+RUSTFLAGS="$RF" cargo build --release --features python --lib --manifest-path tools/battery_native/Cargo.toml || { echo "BUILD_FAIL"; marker BUILD_FAIL "cargo build failed"; exit 1; }
+SO="$(ls tools/battery_native/target/release/libbattery_native.so 2>/dev/null || ls tools/battery_native/target/release/battery_native.so 2>/dev/null)"
+cp "$SO" /opt/pokerbot/battery_native_prod.so
+cp /opt/pokerbot/battery_native_prod.so /opt/pokerbot/battery_native.so
+ls -la /opt/pokerbot/battery_native_prod.so
+# BUILD_OK verify: debug_info present + PyInit resolves (single-binary; the A/B is runtime, no DIFFER needed).
+if file /opt/pokerbot/battery_native_prod.so | grep -q 'debug_info' \
+   && nm /opt/pokerbot/battery_native_prod.so 2>/dev/null | grep -q 'PyInit_battery_native'; then
+  marker BUILD_OK "prod cdylib built; debug_info + PyInit_battery_native resolved (single-binary runtime batch_deals A/B)"
 else
-  echo "BUILD_VERIFY_WARN: missing debug_info / PyInit symbol, or f64==f32 byte-identical (AB_DIFFER=$AB_DIFFER -> f32 A/B void)"
-  marker BUILD_OK "WARN: verify weak — AB_DIFFER=$AB_DIFFER; file/nm did not match"
+  echo "BUILD_VERIFY_WARN: missing debug_info / PyInit symbol"
+  marker BUILD_OK "WARN: verify weak — file/nm did not match"
 fi
-marker AB_BUILD "f64 + f32 built; AB_DIFFER=$AB_DIFFER (1=valid; f32_regret feature flipped codegen)"
+marker AB_BUILD "single prod cdylib; MLP A/B via runtime POKERBOT_BATCH_DEALS (1=recursive, 8=batched)"
 
 # ---------------------------------------------------------------------------- FLAMEGRAPH TOOLCHAINS (both)
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -244,18 +232,19 @@ for SHAPE in "${SHAPE_ARR[@]}"; do
   N=1024
   WRAP=()
   unset RAYON_NUM_THREADS || true
-  unset POKERBOT_AB_STUB || true
-  SO_SEL=/opt/pokerbot/battery_native_phe_on.so
-  # f32_regret A/B shapes (a 2x2: f64/f32 x rayon 128t/64t, all at the production EMD-K160 fanout N=1024). P1 =
-  # the STEP-1 REGIME GATE (f64 128t + the WINDOW-B perf-stat reads memory_bound=stalls_mem_any/cycles, IPC,
-  # L3-miss local/remote DRAM). PF32 = the SAME at 128t on the f32 build = THE A/B vs P1 (does halving cum_regret
-  # bytes lower stalls + raise nodes/s under 128t contention?). P3/PF32_64 = the 64t SMT cross-check pair. No
-  # POKERBOT_AB_STUB here (the attribution stubs were the prior probe; this run isolates the f32 precision lever).
+  unset POKERBOT_BATCH_DEALS || true
+  SO_SEL=/opt/pokerbot/battery_native_prod.so
+  # MLP A/B shapes (a 2x2: batch_deals 1/8 x rayon 128t/64t, all at the production EMD-K160 fanout N=1024).
+  # ONE binary; each shape sets POKERBOT_BATCH_DEALS in the (fresh-process) driver env. B1 = the REGIME-GATE
+  # baseline (recursive 128t; WINDOW-B perf-stat reads memory_bound=stalls_mem_any/cycles, L3-miss DRAM, AND
+  # the NEW MLP counters offcore_requests_outstanding.all_data_rd / cycles = the EFFECTIVE MLP). BMLP = the
+  # SAME at 128t with batched lockstep = THE A/B vs B1 (does interleaving B deals' regret get()s raise the
+  # outstanding-reads/cycle AND nodes/s AND cpu% under 128t contention?). B1_64/BMLP_64 = the 64t cross-check.
   case "$SHAPE" in
-    P1)      N=1024; SO_SEL=/opt/pokerbot/battery_native_phe_on.so ;;                                       # REGIME GATE: f64 baseline 128t + perf-stat
-    PF32)    N=1024; SO_SEL=/opt/pokerbot/battery_native_f32.so ;;                                          # THE A/B vs P1: f32 cum_regret 128t + perf-stat
-    P3)      N=1024; SO_SEL=/opt/pokerbot/battery_native_phe_on.so; export RAYON_NUM_THREADS=64 ;;          # SMT cross-check: f64 baseline 64t (vs P1 128t)
-    PF32_64) N=1024; SO_SEL=/opt/pokerbot/battery_native_f32.so;    export RAYON_NUM_THREADS=64 ;;          # THE A/B vs P3: f32 cum_regret 64t
+    B1)      N=1024; export POKERBOT_BATCH_DEALS=1 ;;                                       # recursive baseline, 128t + perf
+    BMLP)    N=1024; export POKERBOT_BATCH_DEALS=8 ;;                                       # batched MLP, 128t + perf (THE A/B vs B1)
+    B1_64)   N=1024; export POKERBOT_BATCH_DEALS=1; export RAYON_NUM_THREADS=64 ;;          # recursive baseline, 64t
+    BMLP_64) N=1024; export POKERBOT_BATCH_DEALS=8; export RAYON_NUM_THREADS=64 ;;          # batched MLP, 64t (vs B1_64)
     *) echo "UNKNOWN SHAPE $SHAPE — skip"; continue ;;
   esac
   CAP="$WARMUP_CAP"; [ "$N" = 200 ] && CAP=600   # per-N cap (cosmetic; the driver's steady-detect is primary)
@@ -266,10 +255,11 @@ for SHAPE in "${SHAPE_ARR[@]}"; do
 
   rm -f "/var/log/probe/$SHAPE.STEADY_BEGIN" "/var/log/probe/$SHAPE.STEADY_BEGIN_PERF" "/var/log/probe/$SHAPE.WINDOW_DONE"
 
-  # PHE A/B select: copy the chosen flavor over the FIXED import path BEFORE the fresh-process driver loads it.
+  # Single prod binary at the FIXED import path; the A/B mechanism is the POKERBOT_BATCH_DEALS env (exported
+  # above into THIS shell, inherited by the fresh-process driver launched below).
   cp "$SO_SEL" /opt/pokerbot/battery_native.so
-  echo "$SHAPE using $(basename "$SO_SEL") -> /opt/pokerbot/battery_native.so (rayon=${RAYON_NUM_THREADS:-default})"
-  marker "${SHAPE}_SO" "$(basename "$SO_SEL") rayon=${RAYON_NUM_THREADS:-default} N=$N"
+  echo "$SHAPE batch_deals=${POKERBOT_BATCH_DEALS:-0} rayon=${RAYON_NUM_THREADS:-default} N=$N"
+  marker "${SHAPE}_SO" "batch_deals=${POKERBOT_BATCH_DEALS:-0} rayon=${RAYON_NUM_THREADS:-default} N=$N"
 
   # Launch the driver in the background under the shape wrapper (P3/P4: RAYON_NUM_THREADS=64).
   "${WRAP[@]}" python3 /opt/pokerbot/drive_cpu128_probe.py \
@@ -389,6 +379,20 @@ for SHAPE in "${SHAPE_ARR[@]}"; do
             -o "/var/log/probe/${SHAPE}_perfstat_vendor.txt" 2>&1 || echo "no fills_from_sys events" > "/var/log/probe/${SHAPE}_perfstat_vendor.txt"
         fi
         upload_one "/var/log/probe/${SHAPE}_perfstat_vendor.txt" "$SHAPE/${SHAPE}_perfstat_vendor.txt"
+        # (d) MLP + IPC counters (Intel) — THE headline read for this run. offcore_requests_outstanding.
+        # all_data_rd accumulates the NUMBER of outstanding demand data-read requests EACH cycle; / cycles
+        # = the AVG outstanding reads per cycle = the EFFECTIVE memory-level parallelism. B1 gives the
+        # CURRENT MLP (the reviewer's missing denominator -> decides if the rewrite is worth it); BMLP
+        # should RAISE it (the direct proof the lockstep interleave issued more concurrent probes).
+        # cycles_with_data_rd = cycles with >=1 outstanding (all_data_rd/cycles_with_data_rd = avg-when-busy).
+        # instructions/cycles = IPC (the next-bottleneck read; this SMALL 4-event group schedules, unlike
+        # the 13-event portable group that returned EMPTY last run).
+        if [ "$VENDOR" = "GenuineIntel" ]; then
+          timeout 15 perf stat -p "$PID" \
+            -e cycles,instructions,offcore_requests_outstanding.all_data_rd,offcore_requests_outstanding.cycles_with_data_rd \
+            -o "/var/log/probe/${SHAPE}_perfstat_mlp.txt" 2>&1 || true
+          upload_one "/var/log/probe/${SHAPE}_perfstat_mlp.txt" "$SHAPE/${SHAPE}_perfstat_mlp.txt"
+        fi
       else
         echo "$SHAPE: PERF_STAT_OK=0 — skipping perf stat counters (no PMU counting)"
         marker "${SHAPE}_PERFSTAT_SKIPPED" "PERF_STAT_OK=0 (cycles not countable)"
@@ -456,20 +460,19 @@ upload_one /var/log/probe/probe_env.txt probe_env.txt
   echo "--- per-shape ---"
   cat "$PROBE_SUMMARY"
   echo "--- per-decoder answerability ---"
-  echo "F32_DIFFER=${AB_DIFFER:-?} (1=f32_regret feature flipped codegen -> A/B valid; 0=void)"
-  echo "--- f32_regret memory-traffic-relief certification ---"
-  echo "THE CLINCHER A/B (f64 vs f32 cum_regret)  : ANSWERABLE (nodes/s + deals/s, P1-vs-PF32 @128t, P3-vs-PF32_64 @64t; PMU-immune). 128t pair = the contention-regime read; 64t pair = the SMT cross-check."
-  echo "A/B SIGNIFICANCE (n=1 between-run noise)   : ANSWERABLE-FROM-DATA — the decoder MUST compute a within-window bootstrap CI on per-iter nodes/s (nodes / total_ms*1000) from the ~180 P1/PF32 (and P3/PF32_64) profileB.jsonl rows, and REQUIRE the f32 delta to EXCEED that CI before calling a speedup. EXPECT LOW-SINGLE-DIGIT (the f32 verdict: ~0-8%; the 152MB frozen EMD lookup is the bigger >L3 hog), so a null/marginal result is the EXPECTED outcome, not a failure."
-  echo "MEMORY-CONTENTION RELIEF (the mechanism)   : ANSWERABLE if PERF — does f32 LOWER cycle_activity.stalls_mem_any/cycle AND RAISE IPC AND RAISE nodes/s at 128t (P1 vs PF32 perfstat_vendor+portable)? Direct test of 'halving cum_regret bytes relieves the infoset-table memory traffic'. A bigger 128t gain than 64t (PF32_64 vs P3) corroborates a CONTENTION mechanism (the relief amplifies with thread count)."
+  echo "--- MLP batched-traversal certification (batch_deals 1 vs 8, byte-identical paths) ---"
+  echo "EFFECTIVE MLP (the denominator + proof)    : ANSWERABLE (perf) — from perfstat_mlp.txt compute offcore_requests_outstanding.all_data_rd / cycles = AVG outstanding demand reads/cycle = effective MLP. B1 (batch_deals=1) value = the CURRENT MLP the reviewer needed (if already >=3 the rewrite has little headroom); BMLP (batch_deals=8) MUST be HIGHER or the lockstep interleave did not issue more concurrent probes (then the rewrite is inert)."
+  echo "THE CLINCHER A/B (recursive vs batched)    : ANSWERABLE (nodes/s, B1-vs-BMLP @128t, B1_64-vs-BMLP_64 @64t; PMU-immune). Compute per-iter nodes/s (nodes/total_ms*1000) from the ~180 profileB.jsonl rows of EACH; the BMLP delta MUST EXCEED a within-window bootstrap CI before claiming a speedup. EXPECT ~1.4-2.2x IF current MLP is low; null if current MLP already high."
+  echo "NEXT BOTTLENECK (the user's ask)           : ANSWERABLE (perf) — after BMLP, read cpu%_mean (did it rise from ~30% toward saturation?), IPC=instructions/cycles (rose?), and cycle_activity.stalls_mem_any/cycle (fell?). If cpu% still low + stalls still high + nodes/s flat -> MLP did NOT capture it (next lever = frozen-lookup MPHF / fewer probes). If cpu% rose but plateaus -> name the new limiter from the residual stall split (DRAM-bound vs L3-bound via mem_load_l3_miss_retired.{local,remote}_dram per node)."
   if [ "$PERF_AVAILABLE" = 1 ]; then
     echo "memory-latency-bound (IPC/backend-stall) : ANSWERABLE (perf: IPC + cycle_activity.stalls_mem_any + mem_load_l3_miss_retired.{local,remote}_dram)"
-    echo "compute-hidden-under-L3-stall test       : ANSWERABLE (did f32 LOWER stalls_mem_any AND RAISE nodes/s, or was it hidden? P1 vs PF32 perf delta)"
+    echo "compute-hidden-under-L3-stall test       : ANSWERABLE (did BMLP RAISE outstanding-reads/cycle + IPC + nodes/s vs B1, or was the latency-hide swallowed by contention? B1 vs BMLP perfstat_mlp delta)"
     echo "NEXT hot kernel (flamegraph)             : ANSWERABLE (P1 perf_top.txt + flame.svg widest non-showdown frame; expect EnvStateN copy or fingerprint probe). CHECK P1_PERF_RECORD_LIVE_SECS end=live before trusting the flamegraph (record runs FIRST in WINDOW B on a guaranteed-live steady process)."
   else
-    echo "memory-latency-bound (IPC/backend-stall) : NOT (perf unavailable on this box) -> f32 A/B clincher (nodes/s) still ANSWERABLE PMU-free; mechanism test N/A"
+    echo "memory-latency-bound (IPC/backend-stall) : NOT (perf unavailable on this box) -> MLP A/B clincher (nodes/s B1-vs-BMLP) still ANSWERABLE PMU-free; effective-MLP + next-bottleneck reads N/A"
     echo "NEXT hot kernel (flamegraph)             : NOT (perf unavailable) -> flamegraph N/A"
   fi
-  echo "SMT-sibling contention (rayon 64 vs 128)  : ANSWERABLE (P3-vs-P1 + PF32_64-vs-PF32 deals/s, no PMU)"
+  echo "SMT-sibling contention (rayon 64 vs 128)  : ANSWERABLE (B1_64-vs-B1 + BMLP_64-vs-BMLP nodes/s, no PMU)"
   echo "traverse collect-barrier imbalance       : ANSWERABLE (mpstat/pidstat, no PMU)"
   echo "128-thread allocator/atomic contention   : $([ "$PERF_AVAILABLE" = 1 ] && echo 'ANSWERABLE (flamegraph+%sys)' || echo 'PARTIAL (mpstat %sys + P3-vs-P1)')"
   echo "CloudWatch wall-average contamination    : ANSWERABLE (mpstat %idle/%steal vs in-process)"

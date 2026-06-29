@@ -44,6 +44,10 @@ BUCKET = os.environ.get("BUCKET", "")
 RUN_PREFIX = os.environ.get("RUN_PREFIX", "")
 REGION = os.environ.get("REGION", "eu-central-1")
 NUM_BUCKETS = int(os.environ.get("NUM_BUCKETS", "160"))
+# Batched-MLP traversal width (runtime cfg.batch_deals). 0/1 = recursive (the shipped path); >=2 steps B
+# independent deals in lockstep so their cum_regret get()s overlap (the MLP A/B). Set per shape by the
+# onbox loop. Byte-identical to recursive (proven) -> a clean throughput/PMU A/B on the SAME binary.
+BATCH_DEALS = int(os.environ.get("POKERBOT_BATCH_DEALS", "0"))
 
 _s3 = None
 
@@ -94,10 +98,11 @@ def verify_frozen() -> None:
 
 
 def make_trainer(ndeals: int):
-    # signature: (num_buckets, depth_edges, n_deals, n_seats=6, prune=-inf, fast_merge=False, emd_frozen_path)
-    t = bn.NlheCFRTrainer(NUM_BUCKETS, [], ndeals, 6, float("-inf"), False, FROZEN_PATH)
+    # signature: (num_buckets, depth_edges, n_deals, n_seats=6, prune=-inf, fast_merge=False,
+    #             emd_frozen_path=None, batch_deals=0)
+    t = bn.NlheCFRTrainer(NUM_BUCKETS, [], ndeals, 6, float("-inf"), False, FROZEN_PATH, BATCH_DEALS)
     stamp = t.emd_stamp()
-    print(f"emd_stamp={stamp}", flush=True)
+    print(f"emd_stamp={stamp} batch_deals={BATCH_DEALS}", flush=True)
     if "k=160" not in stamp or "n_runouts=400" not in stamp:
         raise SystemExit(f"EMD_STAMP guard FAILED (expected k=160 + n_runouts=400): {stamp} — ABORT")
     return t

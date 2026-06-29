@@ -220,10 +220,10 @@ def _shape_table(shapes: list[str]) -> str:
     """Human-readable per-shape config table for --dry-run (the on-box driver owns the canonical mapping;
     this mirrors it for the operator's go/no-go read)."""
     cfg = {
-        "P1": "N=1024, f64 cum_regret, 128t (default rayon)   [baseline + canonical PMU + flamegraph (next hot kernel)]",
-        "PF32": "N=1024, f32 cum_regret, 128t (default rayon)  [THE A/B vs P1 — does halving regret bytes relieve 128t memory contention?]",
-        "P3": "N=1024, f64 cum_regret, RAYON_NUM_THREADS=64    [SMT cross-check vs P1]",
-        "PF32_64": "N=1024, f32 cum_regret, RAYON_NUM_THREADS=64 [THE A/B vs P3 — f32 at 64t, completes the 2x2]",
+        "B1": "N=1024, batch_deals=1 (recursive), 128t   [REGIME-GATE baseline + effective-MLP (offcore_requests_outstanding/cycles) + IPC]",
+        "BMLP": "N=1024, batch_deals=8 (batched lockstep), 128t [THE A/B vs B1 — does interleaving B deals' regret get()s raise MLP+nodes/s+cpu%?]",
+        "B1_64": "N=1024, batch_deals=1, RAYON_NUM_THREADS=64 [SMT cross-check vs B1]",
+        "BMLP_64": "N=1024, batch_deals=8, RAYON_NUM_THREADS=64 [THE A/B vs B1_64 — batched at 64t, completes the 2x2]",
     }
     lines = []
     for s in shapes:
@@ -248,10 +248,10 @@ def main() -> None:
                         "S3, NOT tarred). The .sha256 sidecar IS tarred for on-box integrity verify.")
     p.add_argument("--n-runouts", type=int, default=400, help="table_id param (frozen blob's n_runouts)")
     p.add_argument("--n-bins", type=int, default=20, help="table_id param (frozen blob's n_bins)")
-    p.add_argument("--shapes", default="P1,PF32,P3,PF32_64",
-                   help="f32_regret A/B shapes (all N=1024, EMD-K160 prod path): P1(f64,128t) PF32(f32,128t) "
-                        "P3(f64,64t) PF32_64(f32,64t). The f64/f32 .so are both built on-box; each shape copies "
-                        "the chosen flavor to the fixed import path.")
+    p.add_argument("--shapes", default="B1,BMLP,B1_64,BMLP_64",
+                   help="MLP batched-traversal A/B shapes (all N=1024, EMD-K160 prod path): B1(recursive,128t) "
+                        "BMLP(batched,128t) B1_64(recursive,64t) BMLP_64(batched,64t). ONE binary; each shape "
+                        "sets POKERBOT_BATCH_DEALS (1 or 8) in the driver env. byte-identical paths -> clean A/B.")
     p.add_argument("--warmup-iters", type=int, default=800,
                    help="WARMUP_CAP backstop (the driver's own steady-detect is the primary stop)")
     p.add_argument("--window-iters", type=int, default=200, help="measured iters per shape (per window)")
