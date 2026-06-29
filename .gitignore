@@ -29,6 +29,7 @@ _vendor/
 trend.txt
 $OUT
 *.err
+cargo-flamegraph.stacks
 
 # model blobs / scratch artifacts (sourced externally; cf. checkpoints/)
 models/
@@ -62,3 +63,12 @@ data/validate50_ec2/
 external/AlphaNLHoldem/
 external/pokerbench/
 external/*/target/
+# ---- regenerable native build dirs / profile+checkpoint blobs / frozen tables / flamegraphs ----
+target_*/
+tools/*/target_*/
+*.bin
+*.emdfrzn
+artifacts/*.svg
+data/io_bench_tmp/
+artifacts/probe_watch_*.log
+_rendered_ud.sh

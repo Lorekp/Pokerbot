@@ -11,15 +11,37 @@ name = "battery_native"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-# PyO3 with abi3 (stable ABI) so a single .pyd works across CPython 3.14+ without re-linking.
-pyo3 = { version = "0.28", features = ["abi3-py314", "extension-module"], optional = true }
+# PyO3 with abi3 (stable ABI) targeting the EC2 Ubuntu 22.04 Python 3.10 runtime.
+# A py310 ABI extension remains importable on newer CPython (including local 3.14).
+pyo3 = { version = "0.28", features = ["abi3-py310", "extension-module"], optional = true }
 # Data-parallelism for the native LBR harness (one independent hand per rayon task). NOTE: with
 # `panic = "abort"` a worker panic aborts the process (acceptable for an offline validator).
 rayon = "1"
+# FxHashMap (compiler-internal hash function exposed as a crate). The AoSoA `cfr_table` uses it
+# for its scalar-u64 infoset index (5-8 cycle probes vs 20-40 cycles for std HashMap on i64 keys).
+rustc-hash = "2"
 
 [features]
-default = []
+default = ["phe_showdown", "phe_site1"]
 python = ["dep:pyo3"]
+# Route the trainer's multiway showdown settle through the perfect-hash `fingerprint::evaluate_cards`
+# (phevaluator port) instead of the 21-combo brute-force `core::evaluate_seven`. CHIP-IDENTICAL to
+# `core::compute_returns` (gate: `showdown_returns_matches_compute_returns`); trainer-local (core stays
+# byte-identical for serve/LBR/AIVAT). Default ON; build `--no-default-features` for the scalar A/B baseline.
+phe_showdown = []
+# SITE 1: route the IN-APPLY terminal settle (the multiway all-in run-out terminals reached inside
+# `core::apply_action`) through the perfect-hash `compute_returns_phe` via `core::apply_action_with`,
+# instead of the scalar in-apply `core::compute_returns`. Chip-identical (gate:
+# `apply_action_with_phe_matches_scalar_byte_for_byte`); compounds with `phe_showdown` (site 2). Default ON;
+# build with `phe_showdown` but WITHOUT `phe_site1` for the site-1-isolated A/B (site-2 phe, site-1 scalar).
+phe_site1 = []
+# ATTRIBUTION HARNESS (feature ab_stub, default OFF -> zero production overhead). When ON, env var
+# POKERBOT_AB_STUB neutralizes ONE phase of the PROFILE-twin traverse so the per-node ns/node delta vs the
+# unstubbed baseline attributes that phase (the big-box attribution protocol's STEP-2 subtractive harness):
+# emd_const (skip the 152MB frozen-lookup probe), emd_nomemo (force a real lookup every postflop node, ZERO
+# drift), regret_zero (skip the cum_regret probe), showdown_const (skip the terminal showdown eval). Driven by
+# scripts/ab_stub_probe.py. NEVER ship the ab_stub cdylib to serve (it lives in the *_profile twins only).
+ab_stub = []
 
 [profile.release]
 opt-level = 3

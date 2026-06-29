@@ -110,10 +110,26 @@ const STRAIGHT_WINDOWS: [[i32; 5]; 10] = [
 ];
 
 const COMBOS: [[usize; 5]; 21] = [
-    [0, 1, 2, 3, 4], [0, 1, 2, 3, 5], [0, 1, 2, 3, 6], [0, 1, 2, 4, 5], [0, 1, 2, 4, 6],
-    [0, 1, 2, 5, 6], [0, 1, 3, 4, 5], [0, 1, 3, 4, 6], [0, 1, 3, 5, 6], [0, 1, 4, 5, 6],
-    [0, 2, 3, 4, 5], [0, 2, 3, 4, 6], [0, 2, 3, 5, 6], [0, 2, 4, 5, 6], [0, 3, 4, 5, 6],
-    [1, 2, 3, 4, 5], [1, 2, 3, 4, 6], [1, 2, 3, 5, 6], [1, 2, 4, 5, 6], [1, 3, 4, 5, 6],
+    [0, 1, 2, 3, 4],
+    [0, 1, 2, 3, 5],
+    [0, 1, 2, 3, 6],
+    [0, 1, 2, 4, 5],
+    [0, 1, 2, 4, 6],
+    [0, 1, 2, 5, 6],
+    [0, 1, 3, 4, 5],
+    [0, 1, 3, 4, 6],
+    [0, 1, 3, 5, 6],
+    [0, 1, 4, 5, 6],
+    [0, 2, 3, 4, 5],
+    [0, 2, 3, 4, 6],
+    [0, 2, 3, 5, 6],
+    [0, 2, 4, 5, 6],
+    [0, 3, 4, 5, 6],
+    [1, 2, 3, 4, 5],
+    [1, 2, 3, 4, 6],
+    [1, 2, 3, 5, 6],
+    [1, 2, 4, 5, 6],
+    [1, 3, 4, 5, 6],
     [2, 3, 4, 5, 6],
 ];
 
@@ -225,7 +241,7 @@ pub fn score_five(ranks_in: &[i32; 5], suits: &[i32; 5]) -> i32 {
     ];
     // stable ascending sort of indices by key
     idx.sort_by(|&a, &b| key[a].cmp(&key[b])); // sort_by is stable
-    // reversed -> descending; ties keep reversed-original order, matching np.argsort(stable)[::-1].
+                                               // reversed -> descending; ties keep reversed-original order, matching np.argsort(stable)[::-1].
     let mut hist: i64 = 0;
     for (w, &ii) in idx.iter().rev().enumerate() {
         hist += ranks[ii] as i64 * HIST_W[w];
@@ -275,7 +291,7 @@ fn player_showdown_score(holes: &[i32; 2], board: &[i32; MAX_BOARD]) -> i32 {
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn eligible_to_win<const N: usize>(seat_status: &[i8; N]) -> [bool; N] {
+pub(crate) fn eligible_to_win<const N: usize>(seat_status: &[i8; N]) -> [bool; N] {
     let mut e = [false; N];
     for i in 0..N {
         e[i] = seat_status[i] == SEAT_LIVE || seat_status[i] == SEAT_ALLIN;
@@ -284,7 +300,7 @@ fn eligible_to_win<const N: usize>(seat_status: &[i8; N]) -> [bool; N] {
 }
 
 /// `_cap_contributions`: cap each positive contribution at the second-highest (or highest if <2).
-fn cap_contributions<const N: usize>(committed_total: &[i32; N]) -> [i32; N] {
+pub(crate) fn cap_contributions<const N: usize>(committed_total: &[i32; N]) -> [i32; N] {
     let mut positive = [0i32; N];
     for i in 0..N {
         positive[i] = if committed_total[i] > 0 {
@@ -333,7 +349,7 @@ fn odd_chip_seat<const N: usize>(eligible: &[bool; N], button: i32) -> i32 {
 }
 
 /// `award_layer(amount, eligible, scores, button)`.
-fn award_layer<const N: usize>(
+pub(crate) fn award_layer<const N: usize>(
     amount: i32,
     eligible: &[bool; N],
     scores: &[i32; N],
@@ -447,8 +463,8 @@ pub fn compute_returns<const N: usize>(
         let pot_amt = layer_size * n_contrib;
         let mut eligible = [false; N];
         for i in 0..N {
-            eligible[i] = (seat_status[i] == SEAT_LIVE || seat_status[i] == SEAT_ALLIN)
-                && contributing[i];
+            eligible[i] =
+                (seat_status[i] == SEAT_LIVE || seat_status[i] == SEAT_ALLIN) && contributing[i];
         }
         let win = award_layer(pot_amt, &eligible, &scores, button);
         for i in 0..N {
@@ -764,6 +780,21 @@ fn action_amount<const N: usize>(s: &EnvStateN<N>, seat: usize, action: usize) -
 
 /// Bit-identical `apply_action_np(state, action)`.
 pub fn apply_action<const N: usize>(s_in: &EnvStateN<N>, action: usize) -> EnvStateN<N> {
+    apply_action_with(s_in, action, compute_returns::<N>)
+}
+
+/// `apply_action` generic over the terminal showdown SETTLE scorer, so the trainer can inject the
+/// perfect-hash `compute_returns_phe` at the IN-APPLY settle (SITE 1 — the multiway all-in run-out
+/// terminals reached inside `apply_action`) while serve / LBR / np_engine-parity keep the scalar
+/// `core::compute_returns`. `apply_action` above is exactly this with `settle = compute_returns`, so it
+/// stays byte-identical to the pre-refactor concrete body (the optimizer inlines the known fn; chip
+/// values are unchanged). `settle` MUST be chip-identical to `compute_returns` (gates:
+/// `apply_action_with_phe_matches_scalar_byte_for_byte` + `showdown_returns_matches_compute_returns`);
+/// the only effect is the per-terminal eval speed.
+pub fn apply_action_with<const N: usize, F>(s_in: &EnvStateN<N>, action: usize, settle: F) -> EnvStateN<N>
+where
+    F: Fn(&[[i32; 2]; N], &[i32; MAX_BOARD], &[i8; N], &[i32; N], i32, i32) -> [i32; N],
+{
     let mut s = *s_in;
     let seat = s.action_seat as usize;
     let amount = action_amount(&s, seat, action);
@@ -828,7 +859,7 @@ pub fn apply_action<const N: usize>(s_in: &EnvStateN<N>, action: usize) -> EnvSt
     s.done = terminal;
 
     if terminal {
-        s.rewards = compute_returns(
+        s.rewards = settle(
             &s.holes,
             &s.board,
             &s.seat_status,
