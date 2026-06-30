@@ -158,7 +158,8 @@ def _launch_with_fallback(ec2, run_kwargs: dict, *, instance_types: list[str], s
 
 
 def user_data(*, bucket, prefix, region, code_key, run_subdir, iters, n_deals, num_buckets,
-              depth_edges, checkpoint_every, keep_alive=False, emd_frozen_rel="") -> str:
+              depth_edges, checkpoint_every, keep_alive=False, emd_frozen_rel="",
+              work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05) -> str:
     run_prefix = f"{prefix}/{run_subdir}"
     final = "echo BOOTSTRAP_DONE_KEEP_ALIVE" if keep_alive else "shutdown -h now"
     depth_csv = ",".join(str(float(x)) for x in (depth_edges or []))
@@ -230,6 +231,14 @@ DEPTH_EDGES = [float(x) for x in "{depth_csv}".split(",") if x]
 # the serve encoder reads, so train==serve is bit-identical. Empty => the deployed made-hand path.
 EMD_FROZEN_REL = "{emd_frozen_rel}"
 EMD_FROZEN_PATH = ("/opt/pokerbot/" + EMD_FROZEN_REL) if EMD_FROZEN_REL else None
+# Throughput/convergence levers (gated default-OFF; both verified). work_steal: atomic deal-counter +
+# rayon::broadcast over per-thread tables -> closes the deep-deal load imbalance (+33% deals/s @64c,
+# measured). dcfr: signed-regret Discounted-CFR + active Regret-Based Pruning (~2x fewer iters to
+# convergence on Leduc exact exploitability).
+WORK_STEAL = {work_steal}
+DCFR = {dcfr}
+DCFR_PRUNE_THRESHOLD = {dcfr_prune_threshold}
+DCFR_EXPLORE_FRAC = {dcfr_explore_frac}
 
 s3 = boto3.client("s3", region_name=REGION)
 LATEST_KEY = RUN_PREFIX + "/checkpoints/latest.nlcfr"
@@ -249,12 +258,17 @@ def _upload(blob, iters_done):
     print(f"CKPT iters_done={{iters_done}} -> s3://{{BUCKET}}/{{key}} ({{len(blob)}} bytes)", flush=True)
 
 def main():
+    # full ctor: (num_buckets, depth_edges, n_deals, n_seats, prune_threshold, fast_merge, emd_frozen_path,
+    #             batch_deals, hogwild, hogwild_capacity, work_steal, dcfr, dcfr_prune_threshold, dcfr_explore_frac)
     if EMD_FROZEN_PATH:
-        # signature: (num_buckets, depth_edges, n_deals, n_seats=6, prune=-inf, fast_merge=False, emd_frozen_path=None)
-        t = bn.NlheCFRTrainer(NUM_BUCKETS, DEPTH_EDGES, N_DEALS, 6, float("-inf"), False, EMD_FROZEN_PATH)
+        t = bn.NlheCFRTrainer(NUM_BUCKETS, DEPTH_EDGES, N_DEALS, 6, float("-inf"), False, EMD_FROZEN_PATH,
+                              0, False, 1 << 21, WORK_STEAL, DCFR, DCFR_PRUNE_THRESHOLD, DCFR_EXPLORE_FRAC)
         print(f"EMD frozen lookup ACTIVE: {{EMD_FROZEN_PATH}} stamp={{t.emd_stamp()}}", flush=True)
     else:
-        t = bn.NlheCFRTrainer(NUM_BUCKETS, DEPTH_EDGES, N_DEALS)
+        t = bn.NlheCFRTrainer(NUM_BUCKETS, DEPTH_EDGES, N_DEALS, 6, float("-inf"), False, None,
+                              0, False, 1 << 21, WORK_STEAL, DCFR, DCFR_PRUNE_THRESHOLD, DCFR_EXPLORE_FRAC)
+    print(f"LEVERS work_steal={{WORK_STEAL}} dcfr={{DCFR}} "
+          f"(prune={{DCFR_PRUNE_THRESHOLD}} explore={{DCFR_EXPLORE_FRAC}}) hogwild={{t.is_hogwild()}}", flush=True)
     blob = _download_latest()
     if blob is not None and t.load_bytes(blob):
         print(f"RESUMED from latest checkpoint at iters_done={{t.iters_done()}}", flush=True)
@@ -356,6 +370,16 @@ def main() -> None:
                         "flop/turn buckets from it (river/preflop stay made-hand) — the SAME blob the serve "
                         "encoder reads (POKERBOT_POSTFLOP_EMD_FROZEN), so train==serve is bit-identical. "
                         "Empty = the deployed made-hand path. NUM_BUCKETS must equal the table's K.")
+    p.add_argument("--work-steal", action="store_true",
+                   help="atomic deal-counter + rayon::broadcast scheduler (closes the deep-deal load "
+                        "imbalance; +33%% deals/s @64c measured). Statistically-equivalent, default OFF.")
+    p.add_argument("--dcfr", action="store_true",
+                   help="signed-regret Discounted-CFR + active Regret-Based Pruning (~2x fewer iters to "
+                        "convergence on Leduc). 6-max convergence being certified; default OFF.")
+    p.add_argument("--dcfr-prune-threshold", type=float, default=-300000.0,
+                   help="RBP floor (bb regret units) used when --dcfr is on")
+    p.add_argument("--dcfr-explore-frac", type=float, default=0.05,
+                   help="fraction of iters that explore all actions (no pruning) under --dcfr; Pluribus ~0.05")
     args = p.parse_args()
 
     if args.num_buckets <= 0:
@@ -387,6 +411,8 @@ def main() -> None:
         num_buckets=args.num_buckets, depth_edges=depth_edges,
         checkpoint_every=args.checkpoint_every, keep_alive=args.keep_alive,
         emd_frozen_rel=args.emd_frozen,
+        work_steal=args.work_steal, dcfr=args.dcfr,
+        dcfr_prune_threshold=args.dcfr_prune_threshold, dcfr_explore_frac=args.dcfr_explore_frac,
     )
     run_kwargs = dict(
         ImageId=ami,
