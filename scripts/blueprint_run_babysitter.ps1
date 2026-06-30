@@ -16,7 +16,10 @@ param(
   [int]$Iters = 62000,                # --iters target (iter62000 = the LBR-unexploitable "superhuman" point;
                                       #   the convergence stop usually fires first ~iter48-50k)
   [int]$NDeals = 200,                 # --n-deals (the proven prod value; work_steal helps MORE at low n_deals)
-  [int]$NumBuckets = 160,             # --num-buckets  (MUST equal the --emd-frozen table's K; K160 blob => 160)
+  [int]$NumBuckets = 200,             # --num-buckets = serve's POSTFLOP_NUM_BUCKETS (200): the made-hand
+                                      #   fallback K for preflop/river/misses. The --emd-frozen blob's K (160)
+                                      #   is the SEPARATE flop/turn layer -- do NOT set this to 160 (trainer.rs
+                                      #   line 224: "must equal serve's num_buckets, e.g. 200").
   [string]$EmdFrozen = "data/abstraction/emd_frozen_flop_turn_160_r400.emdfrzn",  # "" = made-hand path
   [string]$DepthEdges = "",           # --depth-edges  ("" = non-depth blueprint, the deployed default)
   [int]$CheckpointEvery = 500,        # --checkpoint-every
@@ -48,7 +51,7 @@ param(
                                       # EMD abstraction floors slightly higher -> 0.020 default. Read a few
                                       # -NoConvergeStop ckpts and set it where the per-step delta drop flattens.
   [int]$ConvK = 3,                    # consecutive below-threshold checkpoints required to declare CONVERGED
-  [int]$ConvNumBuckets = 160,         # stop-helper ctor arg (irrelevant to load; match -NumBuckets for clarity)
+  [int]$ConvNumBuckets = 200,         # stop-helper ctor arg (irrelevant to load; match -NumBuckets for clarity)
   [string]$ConvDepthEdges = ""        # ctor depth-edges for the stop helper (irrelevant to load); CSV like "50,100"
 )
 $ErrorActionPreference = "Continue"
@@ -168,7 +171,7 @@ function Invoke-Launch {
 
 $capH = [int]($MAXSEC / 3600)
 $leverTxt = (@(if ($WorkSteal) { "work_steal" }; if ($Dcfr) { "dcfr" }) -join "+"); if (-not $leverTxt) { $leverTxt = "NONE (baseline)" }
-$absTxt = if ($EmdFrozen) { "EMD K$NumBuckets ($([System.IO.Path]::GetFileName($EmdFrozen)))" } else { "made-hand K$NumBuckets" }
+$absTxt = if ($EmdFrozen) { "made-hand K$NumBuckets + EMD-frozen flop/turn ($([System.IO.Path]::GetFileName($EmdFrozen)))" } else { "made-hand K$NumBuckets" }
 Write-Host "=== blueprint babysitter: $Run ===" -ForegroundColor Cyan
 Write-Host "    target=$Iters it  n_deals=$NDeals  abstraction=$absTxt  depth='$DepthEdges'"
 Write-Host "    LEVERS=$leverTxt" -ForegroundColor Green

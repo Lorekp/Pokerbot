@@ -369,7 +369,9 @@ def main() -> None:
                         "(precompute_emd_frozen_lookup.py output). When set, the trainer keys postflop "
                         "flop/turn buckets from it (river/preflop stay made-hand) — the SAME blob the serve "
                         "encoder reads (POKERBOT_POSTFLOP_EMD_FROZEN), so train==serve is bit-identical. "
-                        "Empty = the deployed made-hand path. NUM_BUCKETS must equal the table's K.")
+                        "Empty = the deployed made-hand path. --num-buckets is the made-hand fallback K "
+                        "(preflop/river/misses) and must equal serve's POSTFLOP_NUM_BUCKETS (200) -- NOT the "
+                        "EMD blob's K; the blob's K (160) is the independent flop/turn layer.")
     p.add_argument("--work-steal", action="store_true",
                    help="atomic deal-counter + rayon::broadcast scheduler (closes the deep-deal load "
                         "imbalance; +33%% deals/s @64c measured). Statistically-equivalent, default OFF.")
