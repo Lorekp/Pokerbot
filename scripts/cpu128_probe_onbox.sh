@@ -1,36 +1,42 @@
 #!/bin/bash
-# cpu128_probe_onbox.sh — the on-box driver for the instrumented 128-vCPU native-CFR profiling probe.
+# cpu128_probe_onbox.sh — on-box driver for the metal SUBTRACTIVE-ATTRIBUTION + flamegraph profiling pass.
 #
-# Holds ALL heavy logic (build + perf hard-gate + per-shape warmup->steady->2-window capture loop +
-# flamegraph + upload-as-you-go) so user_data stays well under 16KB. EXEC'd by the launcher's bootstrap
-# after it exports BUCKET/PREFIX/REGION/RUN_PREFIX/PROBE_PREFIX/TABLE_ID/NUM_BUCKETS/WARMUP_CAP/
-# WINDOW_ITERS/PROFILE_EVERY/SHAPES/WALL_GUARD_SECS/PYTHONPATH.
+# REAL MEASUREMENT, not an A/B of code variants. The headline is the bigbox-attribution-protocol STEP-2
+# SUBTRACTIVE harness: run the SAME production recursive path (EMD-K160, N=1024) across POKERBOT_AB_STUB in
+# {none, emd_nomemo, regret_zero, showdown_const} and attribute each component by the CLEAN nodes/s DELTA.
+# This is robust to BOTH (a) fat-LTO inlining collapsing the candidate leaves into one traverse frame, and
+# (b) the FxHashMap<u64,_>::get symbol COLLISION (the frozen-EMD probe and the cum_regret get are the SAME
+# monomorphized hashbrown symbol) — the two reasons a flamegraph alone is a non-answer here. WHY the stub
+# sweep and not just a flamegraph: the per-rayon-thread EMD_BUCKET_MEMO is fully warm by steady state, so the
+# real 152MB FxHashMap probe almost never fires in a steady perf window -> the frozen table reads ~0 DRAM
+# weight REGARDLESS of whether it is the bottleneck. emd_nomemo defeats the memo (a real probe every postflop
+# node) so its nodes/s drop vs PROD = the true per-node frozen-probe cost, and its DRAM flamegraph/PMU is the
+# ONE capture that can actually attribute to the 152MB lookup.
 #
-# set -uxo pipefail (NOT -e): a failing cargo build / missing perf must NOT abort the script — it must
-# emit explicit per-stage OK/FAIL markers so PROBE_DONE is only trustworthy if BUILD_OK + (PERF_OK or
-# PERF_BROKEN) + FROZEN_OK are all present. The 4 BLOCKING FIXES are wired here:
-#   #1 disk-full   : df -BG / assert >20G before each perf record (root is a 150GB gp3 from the launcher).
-#   #2 perf-broken : a HARD GATE (perf stat -e cycles true + a 2s perf record self-test) -> PERF_BROKEN
-#                    + DEGRADE to numastat+mpstat+train_profile_json-only (never a silent empty flamegraph).
-#   #3 PMU masked  : per-event <not supported> parse + a NUMA hypothesis gated on numactl --hardware node
-#                    count (NUMA_NODES<2 => NUMA_STRUCTURALLY_IMPOSSIBLE).
-#   #4 cost-runaway: STEP3 steady-wait has PID kill -0 liveness + a 900s STEADY_TIMEOUT; the independent
-#                    WALL_GUARD watchdog (armed in user_data) is the outer backstop.
+# Shapes (one ab_stub-feature build; mode none = the baseline, so the ab_stub branch overhead CANCELS in
+# every delta):
+#   PROD          none           128t  CPU-flame + DRAM-flame(memoized steady) + full PMU  -> baseline nodes/s
+#   EMDNOMEMO     emd_nomemo     128t  DRAM-flame(real probe fires) + stall/mlp/dram PMU   -> frozen-probe cost
+#   REGRETZERO    regret_zero    128t  stall/mlp/dram PMU                                  -> cum_regret cost
+#   SHOWDOWNCONST showdown_const 128t  stall/mlp/dram PMU                                  -> showdown cost
+#   PROD64        none            64t  stall/mlp/dram PMU                                  -> SMT/contention x-check
+#
+# set -uxo pipefail (NOT -e): a failing build/perf stage must DEGRADE with an explicit marker, never abort
+# before PROBE_DONE. The 4 BLOCKING FIXES stay wired: #1 disk-full df guard; #2 perf HARD-GATE -> PERF_BROKEN
+# degrade; #3 PMU-masked per-event parse + NUMA_NODES topology gate; #4 cost-runaway PID-liveness + STEADY_TIMEOUT
+# (+ the user_data WALL_GUARD backstop).
 set -uxo pipefail
 
-# ---------------------------------------------------------------------------- STEP 0: SETUP + helper
+# ---------------------------------------------------------------------------- STEP 0: SETUP + helpers
 mkdir -p /var/log/probe
 cd /opt/pokerbot
 
-# upload_one f key : sync the page cache, then aws s3 cp the file under $PROBE_PREFIX/<key>. `sync`
-# BEFORE every cp is the durability discipline that closes the prior tee-only data-loss.
 upload_one() {
   local f="$1" key="$2"
   [ -e "$f" ] || { echo "upload_one: missing $f (skip $key)"; return 0; }
   sync
   aws s3 cp "$f" "$PROBE_PREFIX/$key" --region "$REGION" || echo "WARN upload failed: $f -> $key"
 }
-# marker NAME [body] : write a one-line S3 marker (and a local copy).
 marker() {
   local name="$1"; shift
   printf '%s\n' "${*:-$(date -u +%FT%TZ)}" > "/var/log/probe/$name"
@@ -42,69 +48,71 @@ echo "PROBE_PREFIX=$PROBE_PREFIX  TABLE_ID=$TABLE_ID  SHAPES=$SHAPES"
 # Download the PRE-UPLOADED frozen blob (CACHE_HIT; the box NEVER recomputes the ~16.5M spots).
 aws s3 cp "s3://$BUCKET/$RUN_PREFIX/frozen/$TABLE_ID.emdfrzn" /opt/pokerbot/frozen.emdfrzn --region "$REGION" \
   || { echo "FROZEN_DOWNLOAD_FAIL"; marker FROZEN_DOWNLOAD_FAIL "no s3://$BUCKET/$RUN_PREFIX/frozen/$TABLE_ID.emdfrzn"; exit 1; }
-# Sidecar shipped in the tarball; copy it next to the blob for the driver's integrity verify.
 cp /opt/pokerbot/data/abstraction/emd_frozen_flop_turn_160_r400.emdfrzn.sha256 \
    /opt/pokerbot/frozen.emdfrzn.sha256 2>/dev/null || echo "WARN missing sha256 sidecar in tarball"
 
 # ---------------------------------------------------------------------------- APT (BLOCKING-FIX #2 pkgs)
 # linux-tools-common = the perf WRAPPER; linux-tools-aws = the AWS-kernel-flavour perf; linux-tools-$(uname
-# -r) = the EXACT booted-kernel build. NOT linux-tools-generic (wrong on an aws kernel). + sysstat (mpstat/
-# pidstat) + numactl + git/perl (FlameGraph).
+# -r) = the EXACT booted-kernel build. NOT linux-tools-generic (wrong on an aws kernel). + sysstat + numactl
+# + git/perl (FlameGraph) + binutils (readelf, for the inline-DWARF assert). gcc is in build-essential.
 apt-get install -y -qq linux-tools-common linux-tools-aws "linux-tools-$(uname -r)" \
-  sysstat numactl git perl || echo "WARN apt perf/sysstat install had a failure"
+  sysstat numactl git perl binutils || echo "WARN apt perf/sysstat install had a failure"
 perf --version || echo "WARN perf wrapper present but versioned binary may mismatch kernel"
 
 # ---------------------------------------------------------------------------- SYSCTL (perf permissions)
+# nmi_watchdog=0 FREES the GP counter the watchdog pins (the most likely cause of the prior "perf record
+# cycles -> 0 samples" AND counter pressure). perf_event_paranoid=-1 + kptr_restrict=0 -> full sampling.
 sysctl -w kernel.perf_event_paranoid=-1 || true
 sysctl -w kernel.kptr_restrict=0 || true
-printf 'kernel.perf_event_paranoid=-1\nkernel.kptr_restrict=0\n' > /etc/sysctl.d/99-perf.conf
+sysctl -w kernel.nmi_watchdog=0 || true
+echo 0 > /proc/sys/kernel/nmi_watchdog 2>/dev/null || true
+printf 'kernel.perf_event_paranoid=-1\nkernel.kptr_restrict=0\nkernel.nmi_watchdog=0\n' > /etc/sysctl.d/99-perf.conf
 sysctl --system || true
 sysctl -w kernel.perf_event_max_sample_rate=10000 || true
 
-# ---------------------------------------------------------------------------- BUILD (debug-symbol'd v3) — ONE .so for the MLP runtime A/B
-# KEEP -C target-cpu=x86-64-v3 (must match production codegen — the profiled binary IS the shipping
-# binary). debuginfo=2 -> DWARF symbol names for inlined leaves; force-frame-pointers -> cheap --call
-# -graph fp unwind; strip=none -> keep the symtab. Cargo.toml is NOT edited (firewall-clean; lto=fat /
-# codegen-units=1 / panic=abort stay production).
-#
-# The MLP A/B is a RUNTIME flag (cfg.batch_deals via POKERBOT_BATCH_DEALS), so ONE binary suffices: the
-# default-feature production cdylib. Each shape sets POKERBOT_BATCH_DEALS in the (fresh-process) driver env
-# (1=recursive baseline, 8=batched lockstep). batch_deals is byte-identical to recursive (proven 91/91 +
-# end-to-end identical NLCFR001 checkpoints), so this is a CLEAN throughput + PMU A/B on a single binary:
-# the ONLY difference between B1 and BMLP is the execution schedule (lockstep interleave of B deals' regret
-# get()s), which is exactly what should raise memory-level parallelism under the 128t contention regime.
+# ---------------------------------------------------------------------------- FLAMEGRAPH TOOLCHAINS (clone first)
+# Clone the perl FlameGraph FIRST (the sufficient path) so a slow `cargo install inferno` can never eat the
+# steady window; inferno is a bounded best-effort bonus.
+export PATH="$HOME/.cargo/bin:$PATH"
+git clone --depth 1 https://github.com/brendangregg/FlameGraph /opt/FlameGraph || true
+timeout 300 cargo install --locked inferno || echo "WARN inferno install failed/timed out; using FlameGraph perl"
+
+# ---------------------------------------------------------------------------- BUILD (debug-symbol'd v3, ab_stub)
+# KEEP -C target-cpu=x86-64-v3 (the profiled binary IS the shipping binary). debuginfo=2 = FULL DWARF incl
+# DW_TAG_inlined_subroutine (so perf --inline can expand the inlined leaves — line-tables-only would NOT, so
+# we deliberately do NOT set CARGO_PROFILE_RELEASE_DEBUG). force-frame-pointers -> cheap --call-graph fp.
+# strip=none -> keep symtab. NOTE: legacy mangling is the stable-rustc DEFAULT (perf demangles it fine, as the
+# prior native-LBR runs confirmed); explicitly naming `-C symbol-mangling-version=legacy` is REJECTED on stable
+# ("requires -Z unstable-options") and was the BUILD_FAIL on probe_1782727507 — so we rely on the default and
+# verify with the `nm -C` demangle assert below. --features python,ab_stub: ONE binary serves all shapes;
+# POKERBOT_AB_STUB (env, per shape) selects the subtractive mode. Cargo.toml NOT edited (firewall-clean).
 export PYO3_PYTHON="$(python3 -c 'import sys;print(sys.executable)')"
-export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
 RF='-C target-cpu=x86-64-v3 -C force-frame-pointers=yes -C debuginfo=2 -C strip=none'
-RUSTFLAGS="$RF" cargo build --release --features python --lib --manifest-path tools/battery_native/Cargo.toml || { echo "BUILD_FAIL"; marker BUILD_FAIL "cargo build failed"; exit 1; }
+RUSTFLAGS="$RF" cargo build --release --features python,ab_stub --lib --manifest-path tools/battery_native/Cargo.toml || { echo "BUILD_FAIL"; marker BUILD_FAIL "cargo build failed"; exit 1; }
 SO="$(ls tools/battery_native/target/release/libbattery_native.so 2>/dev/null || ls tools/battery_native/target/release/battery_native.so 2>/dev/null)"
 cp "$SO" /opt/pokerbot/battery_native_prod.so
 cp /opt/pokerbot/battery_native_prod.so /opt/pokerbot/battery_native.so
 ls -la /opt/pokerbot/battery_native_prod.so
-# BUILD_OK verify: debug_info present + PyInit resolves (single-binary; the A/B is runtime, no DIFFER needed).
+# BUILD_OK verify: debug_info present + PyInit resolves + FULL inline DWARF (B1) + demangle works (S7).
+INLREC="$(readelf --debug-dump=info /opt/pokerbot/battery_native_prod.so 2>/dev/null | grep -c DW_TAG_inlined_subroutine || echo 0)"
+nm -C /opt/pokerbot/battery_native_prod.so 2>/dev/null | grep -q 'battery_native::trainer' && DEMANGLE=ok || DEMANGLE=WARN_NO_DEMANGLE
 if file /opt/pokerbot/battery_native_prod.so | grep -q 'debug_info' \
    && nm /opt/pokerbot/battery_native_prod.so 2>/dev/null | grep -q 'PyInit_battery_native'; then
-  marker BUILD_OK "prod cdylib built; debug_info + PyInit_battery_native resolved (single-binary runtime batch_deals A/B)"
+  marker BUILD_OK "ab_stub cdylib; debug_info + PyInit resolved; DW_TAG_inlined_subroutine=$INLREC demangle=$DEMANGLE (inline-attribution ready)"
 else
   echo "BUILD_VERIFY_WARN: missing debug_info / PyInit symbol"
-  marker BUILD_OK "WARN: verify weak — file/nm did not match"
+  marker BUILD_OK "WARN: verify weak — file/nm did not match; inlined_subroutine=$INLREC demangle=$DEMANGLE"
 fi
-marker AB_BUILD "single prod cdylib; MLP A/B via runtime POKERBOT_BATCH_DEALS (1=recursive, 8=batched)"
-
-# ---------------------------------------------------------------------------- FLAMEGRAPH TOOLCHAINS (both)
-export PATH="$HOME/.cargo/bin:$PATH"
-cargo install --locked inferno || echo "WARN inferno install failed; will fall back to FlameGraph perl"
-git clone --depth 1 https://github.com/brendangregg/FlameGraph /opt/FlameGraph || true
+[ "${INLREC:-0}" -gt 0 ] || marker BUILD_INLINE_WARN "DW_TAG_inlined_subroutine=$INLREC — inline attribution may be degraded (B1)"
 
 # ---------------------------------------------------------------------------- PERF HARD-GATE (FIX #2)
-# DECOUPLED capabilities (the c6i.metal lesson): PMU COUNTING (perf stat) and PMU SAMPLING (perf record) are
-# INDEPENDENT. On EC2 bare metal the hardware PMI for sampling is frequently NOT delivered (perf record on
-# `cycles` yields 0 samples even for a busy process) even though COUNTING works perfectly (perf stat reads
-# the counters fine). Coupling them under one flag threw away the working stat counters when sampling failed.
-#   PERF_STAT_OK  (G1) gates the perf-stat hardware counters (IPC, stalls_mem_any, L3-miss) = the memory-bound cert.
-#   PERF_RECORD_OK(G2) gates the flamegraph; we try hardware `cycles` then SOFTWARE `cpu-clock` (an OS-timer
-#                      event that samples WITHOUT the hardware PMI), so the flamegraph still works on a sample-less PMU.
-PERF_AVAILABLE=0; PERF_STAT_OK=0; PERF_RECORD_OK=0; PERF_RECORD_EVENT=""
+# THREE decoupled capabilities (COUNTING / CPU-time SAMPLING / PEBS DRAM SAMPLING are independent on metal):
+#   PERF_STAT_OK  (G1) gates perf-stat hardware COUNTING (IPC, stalls, MLP, DRAM) = the memory-bound cert.
+#   PERF_RECORD_OK(G2) gates the CPU-TIME flamegraph (try hardware cycles, else software cpu-clock).
+#   PERF_PEBS_OK  (G3) gates the DRAM-MISS flamegraph — self-tested on a 512MB pointer-CHASE burner (the `yes`
+#                      G2 burner is L1-resident -> ~0 DRAM misses -> would false-NEGATIVE a working PEBS).
+PERF_AVAILABLE=0; PERF_STAT_OK=0; PERF_RECORD_OK=0; PERF_PEBS_OK=0; PERF_RECORD_EVENT=""
+PEBS_REC_ARGS=()      # the working DRAM PEBS event(s) as perf -e args (BOTH local+remote when both pass — S6)
 perf list 2>/dev/null > /var/log/probe/perf_event_inventory.txt || true
 upload_one /var/log/probe/perf_event_inventory.txt perf_event_inventory.txt
 # G1: hardware PMU COUNTING. cycles must NOT report <not supported>.
@@ -113,29 +121,50 @@ if perf stat -e cycles true 2>&1 | grep -q '<not supported>'; then
 else
   PERF_STAT_OK=1
 fi
-# G2: SAMPLING for the flamegraph — profile a BUSY 2s CPU-burner (NOT an idle process, which yields ~0
-# samples even on a working PMU). Try hardware `cycles`; if the metal PMI is undelivered (0 samples), fall
-# back to SOFTWARE `cpu-clock` (OS-timer sampling, needs no hardware PMI). PERF_RECORD_OK if either works.
+# G2: CPU-TIME SAMPLING — profile a BUSY 2s burner. Try hardware cycles; else software cpu-clock.
 for EV in cycles cpu-clock; do
   rm -f /tmp/perfselftest.data
-  # CRITICAL: the workload `timeout 2 yes` exits NON-ZERO (124, timeout-killed), and `perf record -- cmd`
-  # propagates cmd's exit code. So we must NOT chain `perf record && perf script` — the non-zero exit
-  # short-circuits the `&&` and masks whether sampling actually worked. Run record (ignore its exit), then
-  # INDEPENDENTLY check the captured sample count.
   perf record -e "$EV" -F 997 -g -o /tmp/perfselftest.data -- bash -c 'timeout 2 yes > /dev/null 2>&1' 2>/dev/null || true
   if perf script -i /tmp/perfselftest.data 2>/dev/null | head -5 | grep -q . ; then
     PERF_RECORD_OK=1; PERF_RECORD_EVENT="$EV"; break
   fi
 done
-[ "$PERF_RECORD_OK" = 1 ] || echo "PERF_GATE G2 FAIL: neither cycles nor cpu-clock perf-record produced samples"
+[ "$PERF_RECORD_OK" = 1 ] || echo "PERF_GATE G2 FAIL: neither cycles nor cpu-clock produced samples"
+# G3: PEBS DRAM-MISS SAMPLING — pointer-chase a 512MB (>L3) array so every load misses to DRAM, test BOTH
+# local_dram and remote_dram (a 2-socket interleaved 152MB lookup misses to BOTH — S6), record every one
+# that delivers samples.
+cat > /tmp/memburn.c <<'CEOF'
+#include <stdlib.h>
+#include <stdint.h>
+int main(void){
+  size_t n=(size_t)1<<26;                 /* 64M * 8B = 512MB > L3 */
+  uint64_t *a=(uint64_t*)malloc(n*sizeof(uint64_t));
+  if(!a) return 1;
+  for(size_t i=0;i<n;i++) a[i]=(i*2654435761ULL)>>3;
+  uint64_t idx=0,s=0;
+  for(long r=0;r<64;r++) for(size_t i=0;i<n;i++){ idx=(a[idx]^(idx*2654435761ULL))&(n-1); s+=idx; }
+  return (int)s;
+}
+CEOF
+gcc -O2 -o /tmp/memburn /tmp/memburn.c 2>/dev/null || echo "WARN gcc memburn build failed"
+perf_event_ok() { perf stat -e "$1" sleep 0.2 2>&1 | grep -Eq '<not supported>|<not counted>' && return 1; return 0; }
+for DEV in mem_load_l3_miss_retired.local_dram mem_load_l3_miss_retired.remote_dram; do
+  perf_event_ok "$DEV" || continue
+  rm -f /tmp/pebstest.data
+  if [ -x /tmp/memburn ]; then
+    perf record -e "${DEV}:pp" -c 5003 -g -o /tmp/pebstest.data -- bash -c 'timeout 3 /tmp/memburn' 2>/dev/null || true
+    if perf script -i /tmp/pebstest.data 2>/dev/null | head -5 | grep -q . ; then
+      PERF_PEBS_OK=1; PEBS_REC_ARGS+=(-e "${DEV}:pp")
+    fi
+  fi
+done
+[ "$PERF_PEBS_OK" = 1 ] || echo "PERF_GATE G3: PEBS DRAM sampling unavailable -> DRAM attribution via stat totals only"
 if [ "$PERF_STAT_OK" = 1 ] || [ "$PERF_RECORD_OK" = 1 ]; then PERF_AVAILABLE=1; fi
 if [ "$PERF_STAT_OK" = 1 ] && [ "$PERF_RECORD_OK" = 1 ]; then
-  marker PERF_OK "PERF_STAT_OK=1 PERF_RECORD_OK=1 record_event=$PERF_RECORD_EVENT (counting + sampling both work)"
+  marker PERF_OK "PERF_STAT_OK=1 PERF_RECORD_OK=1 PERF_PEBS_OK=$PERF_PEBS_OK record_event=$PERF_RECORD_EVENT pebs_args='${PEBS_REC_ARGS[*]:-none}'"
 elif [ "$PERF_STAT_OK" = 1 ] || [ "$PERF_RECORD_OK" = 1 ]; then
-  marker PERF_PARTIAL "PERF_STAT_OK=$PERF_STAT_OK PERF_RECORD_OK=$PERF_RECORD_OK record_event=${PERF_RECORD_EVENT:-none} -> capture what works, degrade the rest"
+  marker PERF_PARTIAL "PERF_STAT_OK=$PERF_STAT_OK PERF_RECORD_OK=$PERF_RECORD_OK PERF_PEBS_OK=$PERF_PEBS_OK record_event=${PERF_RECORD_EVENT:-none}"
 else
-  # DEGRADE (do NOT abort): both counting AND sampling unavailable -> route to numastat+mpstat+train_profile_json,
-  # NEVER produce a silent empty flamegraph that looks like success.
   marker PERF_BROKEN "PERF_STAT_OK=0 PERF_RECORD_OK=0 -> degrade to numastat+mpstat+train_profile_json only"
 fi
 
@@ -143,49 +172,70 @@ fi
 {
   echo "=== nproc ==="; nproc
   echo "=== lscpu ==="; lscpu
-  echo "=== RUSTFLAGS ==="; echo "-C target-cpu=x86-64-v3 -C force-frame-pointers=yes -C debuginfo=2 -C strip=none"
+  echo "=== RUSTFLAGS ==="; echo "$RF"
+  echo "=== build features ==="; echo "python,ab_stub (mode via POKERBOT_AB_STUB env per shape)"
+  echo "=== DW_TAG_inlined_subroutine ==="; echo "$INLREC (demangle=$DEMANGLE)"
   echo "=== git rev ==="; (cd /opt/pokerbot && git rev-parse HEAD 2>/dev/null || echo 'no git in tarball')
   echo "=== file .so ==="; file /opt/pokerbot/battery_native.so
   echo "=== nm train ==="; nm -C /opt/pokerbot/battery_native.so 2>/dev/null | grep -i train | head
-  echo "=== env RAYON ==="; env | grep -i rayon || echo '(no RAYON_* set)'
+  echo "=== nmi_watchdog ==="; cat /proc/sys/kernel/nmi_watchdog
   echo "=== lstopo ==="; (lstopo --of txt 2>/dev/null || echo 'lstopo not installed')
 } > /var/log/probe/probe_env.txt 2>&1
 upload_one /var/log/probe/probe_env.txt probe_env.txt
 
 numactl --hardware > /var/log/probe/numactl_topology.txt 2>&1 || echo "WARN numactl --hardware failed"
 upload_one /var/log/probe/numactl_topology.txt numactl_topology.txt
-# NUMA_NODES gate (BLOCKING-FIX #3): <2 nodes => the cross-socket hypothesis is structurally impossible.
 NUMA_NODES="$(grep -c '^node [0-9]* cpus:' /var/log/probe/numactl_topology.txt 2>/dev/null || echo 0)"
 if [ "${NUMA_NODES:-0}" -lt 2 ]; then
   echo "NUMA_STRUCTURALLY_IMPOSSIBLE NUMA_NODES=$NUMA_NODES"
   marker NUMA_STRUCTURALLY_IMPOSSIBLE "NUMA_NODES=$NUMA_NODES (<2) -> NUMA hypothesis REFUTE-by-topology"
 fi
-echo "NUMA_NODES=$NUMA_NODES PERF_AVAILABLE=$PERF_AVAILABLE"
+echo "NUMA_NODES=$NUMA_NODES PERF_AVAILABLE=$PERF_AVAILABLE PERF_PEBS_OK=$PERF_PEBS_OK"
 
-# perf_event_supported EV : true if `perf stat -e EV sleep 0.2` does not report <not supported>/<not counted>.
 perf_event_supported() {
   local ev="$1"
   perf stat -e "$ev" sleep 0.2 2>&1 | grep -Eq '<not supported>|<not counted>' && return 1
   return 0
 }
-# Emit per-event availability (BLOCKING-FIX #3) into a per-shape file so a counter-blind run is never
-# mistaken for a NUMA refutation. Writes to $1.
 write_event_availability() {
   local out="$1"
   : > "$out"
-  local evs="cycles instructions stalled-cycles-backend branch-misses cache-references cache-misses node-loads node-load-misses dTLB-loads dTLB-load-misses context-switches cpu-migrations cycle_activity.stalls_mem_any mem_load_l3_miss_retired.local_dram mem_load_l3_miss_retired.remote_dram"
+  local evs="cycles instructions cycle_activity.stalls_mem_any l1d_pend_miss.pending l1d_pend_miss.pending_cycles offcore_requests_outstanding.all_data_rd offcore_requests_outstanding.cycles_with_data_rd mem_load_l3_miss_retired.local_dram mem_load_l3_miss_retired.remote_dram"
   for ev in $evs; do
-    if [ "$PERF_AVAILABLE" = 1 ] && perf_event_supported "$ev"; then
-      echo "$ev AVAILABLE" >> "$out"
-    else
-      echo "$ev NOT_SUPPORTED" >> "$out"
-    fi
+    if [ "$PERF_AVAILABLE" = 1 ] && perf_event_supported "$ev"; then echo "$ev AVAILABLE" >> "$out"; else echo "$ev NOT_SUPPORTED" >> "$out"; fi
   done
 }
 
-# ---------------------------------------------------------------------------- STEP 1: WRITE THE DRIVER
-# A reviewable copy is also in the tarball at scripts/drive_cpu128_probe.py; use it directly if present,
-# else heredoc an equivalent. Prefer the shipped copy (single source of truth).
+# pstat NAME EVENTS SECS PID KEYDIR : ONE small (<=3 GP events + fixed cycles) perf-stat group, its OWN perf
+# invocation. Each group carries cycles (every ratio gets a denominator). After it runs, classify
+# COUNTED/UNCOUNTED (S3) so a <not counted> is never read as a true 0.
+pstat() {
+  local nm="$1" evs="$2" secs="$3" pid="$4" keydir="$5"
+  local out="/var/log/probe/${keydir}_perfstat_${nm}.txt"
+  kill -0 "$pid" 2>/dev/null || { echo "pstat $nm: PID dead, skip"; return 0; }
+  # CRITICAL: `timeout` defaults to SIGTERM, which `perf stat` does NOT handle -> it is killed before it
+  # flushes the -o file -> EMPTY output (the probe_1782728898 bug). `-s INT` sends SIGINT, which perf's
+  # handler catches to print+flush the counters (the standard `perf stat -p PID -o file` + Ctrl-C pattern).
+  timeout -s INT "$secs" perf stat -p "$pid" -e "$evs" -o "$out" 2>&1 || true
+  if [ ! -s "$out" ] || grep -Eq '<not counted>|<not supported>' "$out" 2>/dev/null; then
+    echo "$nm UNCOUNTED" >> "/var/log/probe/${keydir}_perfstat_status.txt"   # EMPTY counts as UNCOUNTED, not a true 0
+  else
+    echo "$nm COUNTED" >> "/var/log/probe/${keydir}_perfstat_status.txt"
+  fi
+  upload_one "$out" "${keydir}/${keydir}_perfstat_${nm}.txt"
+}
+run_pmu_group() {  # group_name pid keydir
+  case "$1" in
+    ipc)      pstat ipc      "cycles,instructions"                                                            16 "$2" "$3" ;;
+    stall)    pstat stall    "cycles,cycle_activity.stalls_mem_any"                                           16 "$2" "$3" ;;
+    mlp)      pstat mlp      "cycles,l1d_pend_miss.pending,l1d_pend_miss.pending_cycles"                      16 "$2" "$3" ;;
+    mlpoff_n) pstat mlpoff_n "cycles,offcore_requests_outstanding.all_data_rd"                               16 "$2" "$3" ;;  # S1: split (same-event/distinct-cmask won't co-schedule)
+    mlpoff_c) pstat mlpoff_c "cycles,offcore_requests_outstanding.cycles_with_data_rd"                       16 "$2" "$3" ;;
+    dram)     pstat dram     "cycles,mem_load_l3_miss_retired.local_dram,mem_load_l3_miss_retired.remote_dram" 16 "$2" "$3" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------- STEP 1: THE DRIVER
 if [ -f /opt/pokerbot/scripts/drive_cpu128_probe.py ]; then
   cp /opt/pokerbot/scripts/drive_cpu128_probe.py /opt/pokerbot/drive_cpu128_probe.py
 else
@@ -197,10 +247,9 @@ sys.exit(2)
 PYEOF
 fi
 
-# ---------------------------------------------------------------------------- STEP 8 (armed early): SIGTERM/spot trap
-# Even though the launcher defaults to ON-DEMAND, keep the IMDSv2 spot poller as belt-and-suspenders. On a
-# reclaim notice it SIGTERMs the driver (its finally: flushes+fsyncs+uploads partial jsonl), then sweeps
-# every on-disk artifact to S3 BEFORE shutdown can proceed.
+# ---------------------------------------------------------------------------- SIGTERM/spot trap (armed early)
+# On a reclaim: SIGTERM the driver (its finally flushes), sweep ALL artifacts to S3, write a terminal-state
+# marker (S10) so a partial run is never mistaken for a hang, THEN allow shutdown.
 cat > /tmp/spot_watch.sh <<SWEOF
 TOK=\$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 while true; do
@@ -210,7 +259,8 @@ while true; do
     pkill -TERM -f drive_cpu128_probe.py
     sleep 8
     sync
-    aws s3 cp --recursive /var/log/probe/ "$PROBE_PREFIX/SWEEP/" --region "$REGION" || true
+    aws s3 cp --recursive /var/log/probe/ "$PROBE_PREFIX/" --region "$REGION" || true
+    printf 'RECLAIM_SWEEP_DONE %s\n' "\$(date -u +%FT%TZ)" | aws s3 cp - "$PROBE_PREFIX/RECLAIM_SWEEP_DONE" --region "$REGION" || true
     break
   fi
   sleep 5
@@ -225,75 +275,66 @@ PROBE_SUMMARY="/var/log/probe/_probe_done_summary.txt"
 
 for SHAPE in "${SHAPE_ARR[@]}"; do
   echo "================= SHAPE $SHAPE ================="
-  # Per-shape config (canonical mapping; the launcher's --dry-run table mirrors this).
-  # The PHE A/B is a 2x2 (phe-ON/OFF x rayon 128t/64t), all at the production EMD-K160 fanout N=1024.
-  # SO_SEL selects which freshly-built flavor is copied to the FIXED /opt/pokerbot/battery_native.so the
-  # (fresh-process) driver imports — that copy IS the entire A/B mechanism (no driver change).
   N=1024
-  WRAP=()
   unset RAYON_NUM_THREADS || true
-  unset POKERBOT_BATCH_DEALS || true
-  SO_SEL=/opt/pokerbot/battery_native_prod.so
-  # MLP A/B shapes (a 2x2: batch_deals 1/8 x rayon 128t/64t, all at the production EMD-K160 fanout N=1024).
-  # ONE binary; each shape sets POKERBOT_BATCH_DEALS in the (fresh-process) driver env. B1 = the REGIME-GATE
-  # baseline (recursive 128t; WINDOW-B perf-stat reads memory_bound=stalls_mem_any/cycles, L3-miss DRAM, AND
-  # the NEW MLP counters offcore_requests_outstanding.all_data_rd / cycles = the EFFECTIVE MLP). BMLP = the
-  # SAME at 128t with batched lockstep = THE A/B vs B1 (does interleaving B deals' regret get()s raise the
-  # outstanding-reads/cycle AND nodes/s AND cpu% under 128t contention?). B1_64/BMLP_64 = the 64t cross-check.
+  unset POKERBOT_AB_STUB || true
+  export POKERBOT_BATCH_DEALS=0            # recursive PROD path for ALL shapes (no batched-traversal)
+  DO_CPUFLAME=0; DO_DRAMFLAME=0
+  PMU_GROUPS="stall mlp dram"
+  PERF_WIN_SECS=110
+  # PERF_WIN_SECS MUST exceed the sum of the shell's back-to-back captures so the driver PID stays live
+  # through the LAST capture. Budgets: CPU-rec 30 + DRAM-rec 35 + each pstat 16 + portable 14.
   case "$SHAPE" in
-    B1)      N=1024; export POKERBOT_BATCH_DEALS=1 ;;                                       # recursive baseline, 128t + perf
-    BMLP)    N=1024; export POKERBOT_BATCH_DEALS=8 ;;                                       # batched MLP, 128t + perf (THE A/B vs B1)
-    B1_64)   N=1024; export POKERBOT_BATCH_DEALS=1; export RAYON_NUM_THREADS=64 ;;          # recursive baseline, 64t
-    BMLP_64) N=1024; export POKERBOT_BATCH_DEALS=8; export RAYON_NUM_THREADS=64 ;;          # batched MLP, 64t (vs B1_64)
+    # PMU-CERT re-run (timeout -s INT fix recovers stall/MLP/DRAM that the prior run lost). Full PMU groups
+    # on PROD64 (the headline 64t regime the operator chose) AND PROD (128t) so the 64-vs-128 stall/MLP delta
+    # answers contention-vs-per-thread-latency-wall. Flamegraphs attempted (degrade if this box, like the last,
+    # delivers no sampling). Budgets: CPU-rec 30 + DRAM-rec 35 + 6*pstat 96 + portable 14 = 175 -> 230.
+    PROD64)        export RAYON_NUM_THREADS=64; DO_CPUFLAME=1; DO_DRAMFLAME=1; PMU_GROUPS="ipc stall mlp mlpoff_n mlpoff_c dram"; PERF_WIN_SECS=230 ;;  # 64t cert (HEADLINE)
+    PROD)          DO_CPUFLAME=1; DO_DRAMFLAME=1; PMU_GROUPS="ipc stall mlp mlpoff_n mlpoff_c dram"; PERF_WIN_SECS=230 ;;                                # 128t comparison
+    EMDNOMEMO64)   export POKERBOT_AB_STUB=emd_nomemo; export RAYON_NUM_THREADS=64; DO_DRAMFLAME=1; PMU_GROUPS="ipc stall mlp dram"; PERF_WIN_SECS=200 ;;  # 64t frozen-probe DRAM signature
+    EMDNOMEMO)     export POKERBOT_AB_STUB=emd_nomemo;     DO_DRAMFLAME=1; PMU_GROUPS="stall mlp dram"; PERF_WIN_SECS=160 ;;
+    REGRETZERO)    export POKERBOT_AB_STUB=regret_zero;    PMU_GROUPS="stall mlp dram"; PERF_WIN_SECS=110 ;;
+    SHOWDOWNCONST) export POKERBOT_AB_STUB=showdown_const; PMU_GROUPS="stall mlp dram"; PERF_WIN_SECS=110 ;;
     *) echo "UNKNOWN SHAPE $SHAPE — skip"; continue ;;
   esac
-  CAP="$WARMUP_CAP"; [ "$N" = 200 ] && CAP=600   # per-N cap (cosmetic; the driver's steady-detect is primary)
+  CAP="$WARMUP_CAP"
 
-  # Per-shape event availability (BLOCKING-FIX #3).
   write_event_availability "/var/log/probe/${SHAPE}_perf_event_availability.txt"
   upload_one "/var/log/probe/${SHAPE}_perf_event_availability.txt" "$SHAPE/${SHAPE}_perf_event_availability.txt"
 
   rm -f "/var/log/probe/$SHAPE.STEADY_BEGIN" "/var/log/probe/$SHAPE.STEADY_BEGIN_PERF" "/var/log/probe/$SHAPE.WINDOW_DONE"
+  cp /opt/pokerbot/battery_native_prod.so /opt/pokerbot/battery_native.so
+  echo "$SHAPE ab_stub=${POKERBOT_AB_STUB:-none} rayon=${RAYON_NUM_THREADS:-default} N=$N cpuflame=$DO_CPUFLAME dramflame=$DO_DRAMFLAME pmu='$PMU_GROUPS' win=$PERF_WIN_SECS"
+  marker "${SHAPE}_CFG" "ab_stub=${POKERBOT_AB_STUB:-none} rayon=${RAYON_NUM_THREADS:-default} N=$N cpuflame=$DO_CPUFLAME dramflame=$DO_DRAMFLAME pmu='$PMU_GROUPS' perf_win_secs=$PERF_WIN_SECS"
 
-  # Single prod binary at the FIXED import path; the A/B mechanism is the POKERBOT_BATCH_DEALS env (exported
-  # above into THIS shell, inherited by the fresh-process driver launched below).
-  cp "$SO_SEL" /opt/pokerbot/battery_native.so
-  echo "$SHAPE batch_deals=${POKERBOT_BATCH_DEALS:-0} rayon=${RAYON_NUM_THREADS:-default} N=$N"
-  marker "${SHAPE}_SO" "batch_deals=${POKERBOT_BATCH_DEALS:-0} rayon=${RAYON_NUM_THREADS:-default} N=$N"
-
-  # Launch the driver in the background under the shape wrapper (P3/P4: RAYON_NUM_THREADS=64).
-  "${WRAP[@]}" python3 /opt/pokerbot/drive_cpu128_probe.py \
+  python3 /opt/pokerbot/drive_cpu128_probe.py \
       --shape "$SHAPE" --ndeals "$N" --window "$WINDOW_ITERS" --profile-every "$PROFILE_EVERY" \
-      --warmup-cap "$CAP" > "/var/log/probe/${SHAPE}_driver.log" 2>&1 &
+      --warmup-cap "$CAP" --perf-window-secs "$PERF_WIN_SECS" > "/var/log/probe/${SHAPE}_driver.log" 2>&1 &
   PID=$!
-  echo "$SHAPE driver PID=$PID N=$N CAP=$CAP RAYON_NUM_THREADS=${RAYON_NUM_THREADS:-default} WRAP=${WRAP[*]:-none}"
+  echo "$SHAPE driver PID=$PID N=$N CAP=$CAP"
 
-  # ----------------------------------------- STEP 3: WAIT FOR STEADY (WINDOW A) with PID liveness (FIX #4)
-  WAITED=0
-  STEADY_OK=0
+  # ----------------------------------------- STEP 3: WAIT FOR STEADY (WINDOW A) + PID liveness (FIX #4)
+  WAITED=0; STEADY_OK=0
   while true; do
     if [ -f "/var/log/probe/$SHAPE.STEADY_BEGIN" ]; then STEADY_OK=1; break; fi
     if ! kill -0 "$PID" 2>/dev/null; then
       echo "DRIVER_DIED before STEADY_BEGIN (shape $SHAPE)"
       upload_one "/var/log/probe/${SHAPE}_driver.log" "$SHAPE/${SHAPE}_driver.log"
-      marker "${SHAPE}_FAILED" "DRIVER_DIED before STEADY_BEGIN"
-      break
+      marker "${SHAPE}_FAILED" "DRIVER_DIED before STEADY_BEGIN"; break
     fi
     if [ "$WAITED" -gt 900 ]; then
       echo "STEADY_TIMEOUT (shape $SHAPE, ${WAITED}s)"
-      kill -TERM "$PID" 2>/dev/null || true
-      sleep 5
+      kill -TERM "$PID" 2>/dev/null || true; sleep 5
       upload_one "/var/log/probe/${SHAPE}_driver.log" "$SHAPE/${SHAPE}_driver.log"
-      marker "${SHAPE}_FAILED" "STEADY_TIMEOUT after ${WAITED}s"
-      break
+      marker "${SHAPE}_FAILED" "STEADY_TIMEOUT after ${WAITED}s"; break
     fi
     sleep 2; WAITED=$((WAITED + 2))
   done
   [ "$STEADY_OK" = 1 ] || { echo "skip captures for $SHAPE"; continue; }
 
-  # WINDOW A (clean throughput, NO perf): only mpstat+numastat attach so the headline deals/s is not
-  # depressed by the profiler. The driver streams profileA.jsonl during this window.
-  echo "$SHAPE WINDOW A (clean) — mpstat + numastat only"
+  # WINDOW A: CLEAN throughput (NO perf) — mpstat + numastat. The CLEAN nodes/s here is what the subtractive
+  # attribution uses (perf attach depresses throughput; deltas must be on the un-attached number — S2).
+  echo "$SHAPE WINDOW A (clean) — mpstat + numastat"
   numastat -p "$PID" > "/var/log/probe/${SHAPE}_numastat_start.txt" 2>&1 || true
   mpstat -P ALL 1 30 > "/var/log/probe/${SHAPE}_mpstat.txt" 2>&1 &
   MPID=$!
@@ -302,14 +343,10 @@ for SHAPE in "${SHAPE_ARR[@]}"; do
   wait "$MPID" 2>/dev/null || true
   wait "$PSID" 2>/dev/null || true
   numastat -p "$PID" > "/var/log/probe/${SHAPE}_numastat_end.txt" 2>&1 || true
-  upload_one "/var/log/probe/${SHAPE}_mpstat.txt"          "$SHAPE/${SHAPE}_mpstat.txt"
-  upload_one "/var/log/probe/${SHAPE}_pidstat.txt"         "$SHAPE/${SHAPE}_pidstat.txt"
-  upload_one "/var/log/probe/${SHAPE}_numastat_start.txt"  "$SHAPE/${SHAPE}_numastat_start.txt"
-  upload_one "/var/log/probe/${SHAPE}_numastat_end.txt"    "$SHAPE/${SHAPE}_numastat_end.txt"
+  for f in mpstat pidstat numastat_start numastat_end; do upload_one "/var/log/probe/${SHAPE}_${f}.txt" "$SHAPE/${SHAPE}_${f}.txt"; done
 
   # ----------------------------------------- STEP 3b: WAIT FOR PERF WINDOW (WINDOW B)
-  WAITED=0
-  PERFWIN_OK=0
+  WAITED=0; PERFWIN_OK=0
   while true; do
     if [ -f "/var/log/probe/$SHAPE.STEADY_BEGIN_PERF" ]; then PERFWIN_OK=1; break; fi
     if ! kill -0 "$PID" 2>/dev/null; then echo "driver exited before WINDOW B (shape $SHAPE)"; break; fi
@@ -318,126 +355,110 @@ for SHAPE in "${SHAPE_ARR[@]}"; do
   done
 
   # ----------------------------------------- STEP 4: CAPTURE (WINDOW B; perf only if available)
-  # ORDER MATTERS (measurement-validity fix, refuter 2b): WINDOW B is only ~75s wall at N=1024, but on bare
-  # metal the PMU events COUNT (on KVM they were <not supported> and returned instantly). Three back-to-back
-  # full-length captures could overrun the window so the LAST capture attaches to a process already in its
-  # finally/teardown -> empty perf.data -> NO flamegraph for the headline P1. So:
-  #   (1) run `perf record` FIRST (it is the headline "name the NEXT hot kernel" deliverable) on a guaranteed
-  #       -live steady process right after STEADY_BEGIN_PERF, and gate it on a `kill -0` liveness check;
-  #   (2) shorten the two `perf stat` captures to `timeout 15` each so record(30s)+portable(15s)+vendor(15s)
-  #       = ~60s fits inside the ~75s window with margin;
-  #   (3) emit PERF_RECORD_LIVE_SECS so the decoder knows the flamegraph saw a live steady process, not a
-  #       teardown.
+  CAP_T0=$(date +%s)
   if [ "$PERFWIN_OK" = 1 ] && [ "$PERF_AVAILABLE" = 1 ]; then
-    # (a) DISK GUARD (BLOCKING-FIX #1): need >20G free before perf record (perf.data can be 200-600MB).
     AVAIL="$(df -BG / | awk 'NR==2{print $4}' | tr -d G)"
     echo "$SHAPE disk free: ${AVAIL}G"
     if [ "${AVAIL:-0}" -lt 20 ]; then
       echo "DISK_FULL (${AVAIL}G < 20G) — skipping perf record for $SHAPE"
       marker "${SHAPE}_DISK_FULL" "df / = ${AVAIL}G < 20G"
     else
-      # (d-FIRST) flamegraph record (fp unwind — we forced frame pointers; -m 16M --aio = low-overhead).
-      # Run FIRST so the headline next-hot-kernel capture sees a fully-live steady process. Liveness-gate it.
-      if [ "$PERF_RECORD_OK" = 1 ] && kill -0 "$PID" 2>/dev/null; then
-        # Use the sampling event that PASSED the G2 self-test ($PERF_RECORD_EVENT = hardware `cycles` if the
-        # PMI is delivered, else software `cpu-clock` = OS-timer CPU-time sampling). Either yields a valid
-        # call-graph flamegraph (fp unwind); cpu-clock weights by CPU time, which is exactly the "where does
-        # per-deal time go / name the NEXT hot kernel" signal.
-        PERF_REC_T0=$(date +%s)
-        timeout 30 perf record -e "$PERF_RECORD_EVENT" -p "$PID" -F 997 --call-graph fp -m 16M --aio \
+      # (A) CPU-TIME flamegraph record (where wall goes) — fp unwind on the live steady PID.
+      if [ "$DO_CPUFLAME" = 1 ] && [ "$PERF_RECORD_OK" = 1 ] && kill -0 "$PID" 2>/dev/null; then
+        timeout 30 perf record -e "$PERF_RECORD_EVENT" -p "$PID" -F 997 --call-graph fp -m 4096 --aio \
           -o "/var/log/probe/${SHAPE}_perf_fp.data" 2>&1 || true
-        PERF_REC_T1=$(date +%s)
-        # Confirm the process stayed live through the record (else the capture may have caught teardown).
-        if kill -0 "$PID" 2>/dev/null; then PERF_REC_LIVE_END=live; else PERF_REC_LIVE_END=ended_during; fi
-        marker "${SHAPE}_PERF_RECORD_LIVE_SECS" "secs=$((PERF_REC_T1 - PERF_REC_T0)) end=$PERF_REC_LIVE_END event=$PERF_RECORD_EVENT (live=flamegraph saw steady process)"
-      elif [ "$PERF_RECORD_OK" != 1 ]; then
-        echo "$SHAPE: PERF_RECORD_OK=0 (no working sampling event — hardware PMI undelivered AND cpu-clock failed) — skipping flamegraph"
-        marker "${SHAPE}_PERF_RECORD_LIVE_SECS" "secs=0 end=no_sampling_event (NO flamegraph; PMU sampling unavailable on this instance)"
-      else
-        echo "$SHAPE: PID not live before perf record — skipping flamegraph capture"
-        marker "${SHAPE}_PERF_RECORD_LIVE_SECS" "secs=0 end=dead_before_record (NO flamegraph; process exited before WINDOW B perf record)"
+        kill -0 "$PID" 2>/dev/null && LE=live || LE=ended_during
+        marker "${SHAPE}_PERF_RECORD_LIVE" "end=$LE event=$PERF_RECORD_EVENT"
+        upload_one "/var/log/probe/${SHAPE}_perf_fp.data" "$SHAPE/${SHAPE}_perf_fp.data"
       fi
-      upload_one "/var/log/probe/${SHAPE}_perf_fp.data" "$SHAPE/${SHAPE}_perf_fp.data"
-      # perf-stat hardware COUNTERS — gated on PERF_STAT_OK (counting), INDEPENDENT of sampling: on c6i.metal
-      # these COUNT even when perf record cannot sample. This is the memory-bound certification (IPC + stalls).
+      # (B) DRAM-MISS flamegraph record (the attribution) — BOTH local+remote PEBS events (S6), fp call-graph.
+      if [ "$DO_DRAMFLAME" = 1 ] && [ "$PERF_PEBS_OK" = 1 ] && kill -0 "$PID" 2>/dev/null; then
+        timeout 35 perf record "${PEBS_REC_ARGS[@]}" -p "$PID" -c 5003 --call-graph fp -m 4096 --aio \
+          -o "/var/log/probe/${SHAPE}_perf_dram.data" 2>&1 || true
+        kill -0 "$PID" 2>/dev/null && LE=live || LE=ended_during
+        marker "${SHAPE}_PERF_DRAM_LIVE" "end=$LE events='${PEBS_REC_ARGS[*]}'"
+        upload_one "/var/log/probe/${SHAPE}_perf_dram.data" "$SHAPE/${SHAPE}_perf_dram.data"
+      elif [ "$DO_DRAMFLAME" = 1 ]; then
+        marker "${SHAPE}_PERF_DRAM_LIVE" "end=no_pebs (PEBS DRAM sampling unavailable; attribution via stat totals)"
+      fi
+      # (C) PMU STAT — the per-shape small groups, each its own invocation carrying cycles.
       if [ "$PERF_STAT_OK" = 1 ]; then
-        # (b) portable per-socket counters (15s — fits the window after the record).
-        timeout 15 perf stat -p "$PID" --per-socket -I 1000 \
-          -e task-clock,cycles,instructions,stalled-cycles-backend,branch-misses,cache-references,cache-misses,node-loads,node-load-misses,dTLB-loads,dTLB-load-misses,context-switches,cpu-migrations \
+        : > "/var/log/probe/${SHAPE}_perfstat_status.txt"
+        for g in $PMU_GROUPS; do run_pmu_group "$g" "$PID" "$SHAPE"; done
+        timeout -s INT 14 perf stat -p "$PID" --per-socket -I 1000 \
+          -e task-clock,cycles,instructions,cache-references,cache-misses,dTLB-loads,dTLB-load-misses,context-switches,cpu-migrations \
           -o "/var/log/probe/${SHAPE}_perfstat_portable.txt" 2>&1 || true
         upload_one "/var/log/probe/${SHAPE}_perfstat_portable.txt" "$SHAPE/${SHAPE}_perfstat_portable.txt"
-        # (c) vendor-specific direct remote-DRAM counters (15s — isolated in their own perf invocation so a
-        # PEBS/offcore-group contention <not counted> can't poison the portable IPC read).
-        VENDOR="$(grep -m1 vendor_id /proc/cpuinfo | awk '{print $3}')"
-        if [ "$VENDOR" = "GenuineIntel" ]; then
-          timeout 15 perf stat -p "$PID" \
-            -e cycle_activity.stalls_mem_any,mem_load_l3_miss_retired.local_dram,mem_load_l3_miss_retired.remote_dram \
-            -o "/var/log/probe/${SHAPE}_perfstat_vendor.txt" 2>&1 || true
-        else
-          RAW="$(grep -iE 'fills_from_sys' /var/log/probe/perf_event_inventory.txt | awk '{print $1}' | paste -sd, -)"
-          [ -n "$RAW" ] && timeout 15 perf stat -p "$PID" -e "$RAW" \
-            -o "/var/log/probe/${SHAPE}_perfstat_vendor.txt" 2>&1 || echo "no fills_from_sys events" > "/var/log/probe/${SHAPE}_perfstat_vendor.txt"
-        fi
-        upload_one "/var/log/probe/${SHAPE}_perfstat_vendor.txt" "$SHAPE/${SHAPE}_perfstat_vendor.txt"
-        # (d) MLP + IPC counters (Intel) — THE headline read for this run. offcore_requests_outstanding.
-        # all_data_rd accumulates the NUMBER of outstanding demand data-read requests EACH cycle; / cycles
-        # = the AVG outstanding reads per cycle = the EFFECTIVE memory-level parallelism. B1 gives the
-        # CURRENT MLP (the reviewer's missing denominator -> decides if the rewrite is worth it); BMLP
-        # should RAISE it (the direct proof the lockstep interleave issued more concurrent probes).
-        # cycles_with_data_rd = cycles with >=1 outstanding (all_data_rd/cycles_with_data_rd = avg-when-busy).
-        # instructions/cycles = IPC (the next-bottleneck read; this SMALL 4-event group schedules, unlike
-        # the 13-event portable group that returned EMPTY last run).
-        if [ "$VENDOR" = "GenuineIntel" ]; then
-          timeout 15 perf stat -p "$PID" \
-            -e cycles,instructions,offcore_requests_outstanding.all_data_rd,offcore_requests_outstanding.cycles_with_data_rd \
-            -o "/var/log/probe/${SHAPE}_perfstat_mlp.txt" 2>&1 || true
-          upload_one "/var/log/probe/${SHAPE}_perfstat_mlp.txt" "$SHAPE/${SHAPE}_perfstat_mlp.txt"
-        fi
+        upload_one "/var/log/probe/${SHAPE}_perfstat_status.txt"   "$SHAPE/${SHAPE}_perfstat_status.txt"
       else
-        echo "$SHAPE: PERF_STAT_OK=0 — skipping perf stat counters (no PMU counting)"
+        echo "$SHAPE: PERF_STAT_OK=0 — skipping perf stat (no PMU counting)"
         marker "${SHAPE}_PERFSTAT_SKIPPED" "PERF_STAT_OK=0 (cycles not countable)"
       fi
     fi
   else
-    echo "$SHAPE: perf capture SKIPPED (PERF_AVAILABLE=$PERF_AVAILABLE PERFWIN_OK=$PERFWIN_OK) — DEGRADED to numastat+mpstat"
+    echo "$SHAPE: perf capture SKIPPED (PERF_AVAILABLE=$PERF_AVAILABLE PERFWIN_OK=$PERFWIN_OK) — DEGRADED"
     marker "${SHAPE}_PERF_DEGRADED" "PERF_AVAILABLE=$PERF_AVAILABLE PERFWIN_OK=$PERFWIN_OK"
   fi
+  # Capture-budget self-check (S4): warn if the back-to-back captures came within 10s of the driver's window.
+  CAP_ELAPSED=$(( $(date +%s) - CAP_T0 ))
+  echo "$SHAPE capture elapsed ${CAP_ELAPSED}s vs PERF_WIN_SECS=$PERF_WIN_SECS"
+  [ "$CAP_ELAPSED" -gt $((PERF_WIN_SECS - 10)) ] && marker "${SHAPE}_BUDGET_TIGHT" "captures ${CAP_ELAPSED}s vs win ${PERF_WIN_SECS}s — last capture may have raced teardown"
 
-  # ----------------------------------------- STEP 5: FLAMEGRAPH + TOP (only if perf.data non-empty)
-  PERFDATA="/var/log/probe/${SHAPE}_perf_fp.data"
-  if [ -s "$PERFDATA" ]; then
-    perf script -i "$PERFDATA" > "/var/log/probe/${SHAPE}_perf_fp.script" 2>/dev/null || true
+  # ----------------------------------------- STEP 5: FLAMEGRAPHS + TOP + ANNOTATE (all --inline — B1)
+  make_flame() {  # data title keysuffix
+    local data="$1" title="$2" key="$3"
+    [ -s "$data" ] || { echo "no $data — skip flame $key"; return 0; }
+    perf script -i "$data" --inline > "/var/log/probe/${SHAPE}_${key}.script" 2>/dev/null || \
+      perf script -i "$data" > "/var/log/probe/${SHAPE}_${key}.script" 2>/dev/null || true
     if command -v inferno-collapse-perf >/dev/null 2>&1; then
-      inferno-collapse-perf "/var/log/probe/${SHAPE}_perf_fp.script" > "/var/log/probe/${SHAPE}_perf_fp.folded" 2>/dev/null || true
-      inferno-flamegraph --title "battery_native $SHAPE" "/var/log/probe/${SHAPE}_perf_fp.folded" > "/var/log/probe/${SHAPE}_flame.svg" 2>/dev/null || true
+      inferno-collapse-perf "/var/log/probe/${SHAPE}_${key}.script" > "/var/log/probe/${SHAPE}_${key}.folded" 2>/dev/null || true
+      inferno-flamegraph --title "$title" "/var/log/probe/${SHAPE}_${key}.folded" > "/var/log/probe/${SHAPE}_${key}.svg" 2>/dev/null || true
     elif [ -f /opt/FlameGraph/stackcollapse-perf.pl ]; then
-      perl /opt/FlameGraph/stackcollapse-perf.pl "/var/log/probe/${SHAPE}_perf_fp.script" > "/var/log/probe/${SHAPE}_perf_fp.folded" 2>/dev/null || true
-      perl /opt/FlameGraph/flamegraph.pl --title "battery_native $SHAPE" "/var/log/probe/${SHAPE}_perf_fp.folded" > "/var/log/probe/${SHAPE}_flame.svg" 2>/dev/null || true
+      perl /opt/FlameGraph/stackcollapse-perf.pl "/var/log/probe/${SHAPE}_${key}.script" > "/var/log/probe/${SHAPE}_${key}.folded" 2>/dev/null || true
+      perl /opt/FlameGraph/flamegraph.pl --title "$title" "/var/log/probe/${SHAPE}_${key}.folded" > "/var/log/probe/${SHAPE}_${key}.svg" 2>/dev/null || true
     fi
-    perf report -i "$PERFDATA" --stdio --sort overhead,symbol 2>/dev/null | head -60 > "/var/log/probe/${SHAPE}_perf_top.txt" || true
-    upload_one "/var/log/probe/${SHAPE}_perf_fp.script" "$SHAPE/${SHAPE}_perf_fp.script"
-    upload_one "/var/log/probe/${SHAPE}_perf_fp.folded" "$SHAPE/${SHAPE}_perf_fp.folded"
-    upload_one "/var/log/probe/${SHAPE}_flame.svg"      "$SHAPE/${SHAPE}_flame.svg"
-    upload_one "/var/log/probe/${SHAPE}_perf_top.txt"   "$SHAPE/${SHAPE}_perf_top.txt"
-  else
-    echo "$SHAPE: no perf.data — no flamegraph (DEGRADED verdict from numastat+mpstat+profileA/B)"
+    upload_one "/var/log/probe/${SHAPE}_${key}.folded" "$SHAPE/${SHAPE}_${key}.folded"
+    upload_one "/var/log/probe/${SHAPE}_${key}.svg"    "$SHAPE/${SHAPE}_${key}.svg"
+  }
+  # CPU-time flamegraph + top symbols (--inline).
+  CPUDATA="/var/log/probe/${SHAPE}_perf_fp.data"
+  if [ -s "$CPUDATA" ]; then
+    make_flame "$CPUDATA" "battery_native CPU-time $SHAPE" "cpuflame"
+    perf report -i "$CPUDATA" --stdio --inline -g none --sort overhead,symbol 2>/dev/null | head -60 > "/var/log/probe/${SHAPE}_cpu_top.txt" || true
+    upload_one "/var/log/probe/${SHAPE}_cpu_top.txt" "$SHAPE/${SHAPE}_cpu_top.txt"
+  fi
+  # DRAM-miss flamegraph + top symbols + annotate (all --inline; HOT filtered to our DSO — S5).
+  DRAMDATA="/var/log/probe/${SHAPE}_perf_dram.data"
+  if [ -s "$DRAMDATA" ]; then
+    make_flame "$DRAMDATA" "battery_native DRAM-miss $SHAPE" "dramflame"
+    perf report -i "$DRAMDATA" --stdio --inline -g none --sort overhead,dso,symbol 2>/dev/null | head -80 > "/var/log/probe/${SHAPE}_dram_top.txt" || true
+    upload_one "/var/log/probe/${SHAPE}_dram_top.txt" "$SHAPE/${SHAPE}_dram_top.txt"
+    # hottest DRAM-miss symbol WITHIN our .so (reject [unknown]/0x/empty), top-5 reported (S5).
+    HOT="$(grep -E 'battery_native' "/var/log/probe/${SHAPE}_dram_top.txt" 2>/dev/null | grep -vE '^#' \
+           | awk 'NF>=4{for(i=1;i<=NF;i++) if($i=="[.]"){sym="";for(j=i+1;j<=NF;j++)sym=sym (j>i+1?" ":"") $j; print sym; exit}}' \
+           | grep -vE '^\s*$|^0x|\[unknown\]' | head -1)"
+    echo "HOTTEST DRAM-miss symbol (our DSO): $HOT"
+    marker "${SHAPE}_DRAM_HOT_SYMBOL" "${HOT:-NONE_IN_DSO}"
+    # auto-annotate the hottest symbols (no fragile --symbol match; --inline for inlined leaf source lines).
+    perf annotate -i "$DRAMDATA" --stdio --inline 2>/dev/null | head -400 > "/var/log/probe/${SHAPE}_dram_annotate.txt" || true
+    upload_one "/var/log/probe/${SHAPE}_dram_annotate.txt" "$SHAPE/${SHAPE}_dram_annotate.txt"
   fi
 
-  # ----------------------------------------- STEP 6/7: let the driver finish, upload its artifacts.
+  # ----------------------------------------- STEP 6/7: let the driver finish, upload artifacts.
   wait "$PID" 2>/dev/null || true
-  upload_one "/var/log/probe/${SHAPE}_profileA.jsonl" "$SHAPE/${SHAPE}_profileA.jsonl"
-  upload_one "/var/log/probe/${SHAPE}_profileB.jsonl" "$SHAPE/${SHAPE}_profileB.jsonl"
-  upload_one "/var/log/probe/${SHAPE}_summary.json"   "$SHAPE/${SHAPE}_summary.json"
-  upload_one "/var/log/probe/${SHAPE}_driver.log"     "$SHAPE/${SHAPE}_driver.log"
-  # One-line per-shape summary for PROBE_DONE (deals/s + CPU% extracted from the driver's summary).
+  for jn in profileA profileB summary driver; do
+    ext=jsonl; [ "$jn" = summary ] && ext=json; [ "$jn" = driver ] && ext=log
+    upload_one "/var/log/probe/${SHAPE}_${jn}.${ext}" "$SHAPE/${SHAPE}_${jn}.${ext}"
+  done
   ONE="$(python3 - "$SHAPE" <<'PYJ'
-import json,sys
+import json,sys,os
 shape=sys.argv[1]
 try:
     d=json.load(open(f"/var/log/probe/{shape}_summary.json"))
-    print(f"{shape}: deals/s={d.get('deals_per_s_clean','?')} cpu%_mean={d.get('cpu_pct_mean','?')} "
-          f"cpu%_max1s={d.get('cpu_pct_max_1s','?')} merge_share={d.get('merge_share','?')} "
-          f"rayon={d.get('rayon_threads_realized','?')} ipc_src={'perf' if __import__('os').path.exists(f'/var/log/probe/{shape}_perfstat_portable.txt') else 'NONE'}")
+    print(f"{shape}: nodes/s_clean={d.get('nodes_per_s_clean','?')} nodes/s_perf={d.get('nodes_per_s','?')} "
+          f"deals/s_clean={d.get('deals_per_s_clean','?')} cpu%_mean={d.get('cpu_pct_mean','?')} "
+          f"rayon={d.get('rayon_threads_realized','?')} "
+          f"dramflame={'Y' if os.path.exists(f'/var/log/probe/{shape}_dramflame.svg') else 'N'}")
 except Exception as e:
     print(f"{shape}: summary unavailable ({e})")
 PYJ
@@ -447,8 +468,6 @@ PYJ
 done
 
 # ---------------------------------------------------------------------------- STEP 7 (final): PROBE_DONE
-# Re-upload box-level provenance + a per-decoder ANSWERABLE/NOT index so a counter-blind run is never read
-# as a NUMA refutation.
 upload_one /var/log/cloud-init-output.log logs/cloud-init-output.log
 upload_one /var/log/probe/perf_event_inventory.txt perf_event_inventory.txt
 upload_one /var/log/probe/numactl_topology.txt numactl_topology.txt
@@ -456,32 +475,37 @@ upload_one /var/log/probe/probe_env.txt probe_env.txt
 
 {
   echo "PROBE_DONE $(date -u +%FT%TZ)"
-  echo "PERF_AVAILABLE=$PERF_AVAILABLE  NUMA_NODES=$NUMA_NODES"
-  echo "--- per-shape ---"
+  echo "PERF_AVAILABLE=$PERF_AVAILABLE PERF_PEBS_OK=$PERF_PEBS_OK NUMA_NODES=$NUMA_NODES inlined_subroutine=$INLREC demangle=$DEMANGLE"
+  echo "--- per-shape (nodes/s_clean is the attribution number; nodes/s_perf is perf-ATTACHED, depressed) ---"
   cat "$PROBE_SUMMARY"
-  echo "--- per-decoder answerability ---"
-  echo "--- MLP batched-traversal certification (batch_deals 1 vs 8, byte-identical paths) ---"
-  echo "EFFECTIVE MLP (the denominator + proof)    : ANSWERABLE (perf) — from perfstat_mlp.txt compute offcore_requests_outstanding.all_data_rd / cycles = AVG outstanding demand reads/cycle = effective MLP. B1 (batch_deals=1) value = the CURRENT MLP the reviewer needed (if already >=3 the rewrite has little headroom); BMLP (batch_deals=8) MUST be HIGHER or the lockstep interleave did not issue more concurrent probes (then the rewrite is inert)."
-  echo "THE CLINCHER A/B (recursive vs batched)    : ANSWERABLE (nodes/s, B1-vs-BMLP @128t, B1_64-vs-BMLP_64 @64t; PMU-immune). Compute per-iter nodes/s (nodes/total_ms*1000) from the ~180 profileB.jsonl rows of EACH; the BMLP delta MUST EXCEED a within-window bootstrap CI before claiming a speedup. EXPECT ~1.4-2.2x IF current MLP is low; null if current MLP already high."
-  echo "NEXT BOTTLENECK (the user's ask)           : ANSWERABLE (perf) — after BMLP, read cpu%_mean (did it rise from ~30% toward saturation?), IPC=instructions/cycles (rose?), and cycle_activity.stalls_mem_any/cycle (fell?). If cpu% still low + stalls still high + nodes/s flat -> MLP did NOT capture it (next lever = frozen-lookup MPHF / fewer probes). If cpu% rose but plateaus -> name the new limiter from the residual stall split (DRAM-bound vs L3-bound via mem_load_l3_miss_retired.{local,remote}_dram per node)."
-  if [ "$PERF_AVAILABLE" = 1 ]; then
-    echo "memory-latency-bound (IPC/backend-stall) : ANSWERABLE (perf: IPC + cycle_activity.stalls_mem_any + mem_load_l3_miss_retired.{local,remote}_dram)"
-    echo "compute-hidden-under-L3-stall test       : ANSWERABLE (did BMLP RAISE outstanding-reads/cycle + IPC + nodes/s vs B1, or was the latency-hide swallowed by contention? B1 vs BMLP perfstat_mlp delta)"
-    echo "NEXT hot kernel (flamegraph)             : ANSWERABLE (P1 perf_top.txt + flame.svg widest non-showdown frame; expect EnvStateN copy or fingerprint probe). CHECK P1_PERF_RECORD_LIVE_SECS end=live before trusting the flamegraph (record runs FIRST in WINDOW B on a guaranteed-live steady process)."
-  else
-    echo "memory-latency-bound (IPC/backend-stall) : NOT (perf unavailable on this box) -> MLP A/B clincher (nodes/s B1-vs-BMLP) still ANSWERABLE PMU-free; effective-MLP + next-bottleneck reads N/A"
-    echo "NEXT hot kernel (flamegraph)             : NOT (perf unavailable) -> flamegraph N/A"
-  fi
-  echo "SMT-sibling contention (rayon 64 vs 128)  : ANSWERABLE (B1_64-vs-B1 + BMLP_64-vs-BMLP nodes/s, no PMU)"
-  echo "traverse collect-barrier imbalance       : ANSWERABLE (mpstat/pidstat, no PMU)"
-  echo "128-thread allocator/atomic contention   : $([ "$PERF_AVAILABLE" = 1 ] && echo 'ANSWERABLE (flamegraph+%sys)' || echo 'PARTIAL (mpstat %sys + P3-vs-P1)')"
-  echo "CloudWatch wall-average contamination    : ANSWERABLE (mpstat %idle/%steal vs in-process)"
-  echo "merge-Amdahl ceiling                     : ANSWERABLE (in-process merge_share, no PMU)"
-  if [ "${NUMA_NODES:-0}" -ge 2 ]; then
-    echo "NUMA cross-socket                        : PARTIAL (numastat delta + node-load PMU; no interleave A/B shape in this PHE set)"
-  else
-    echo "NUMA cross-socket                        : REFUTE-BY-TOPOLOGY (NUMA_NODES<2)"
-  fi
+  echo "--- HOW TO DECODE (subtractive attribution = the verdict; flamegraph = corroborating color) ---"
+  echo "1. COMPONENT COST (causal, inlining/symbol-collision-proof): from nodes/s_clean:"
+  echo "   frozen-EMD probe cost  = nodes/s(PROD) - nodes/s(EMDNOMEMO)   [emd_nomemo defeats the per-thread memo"
+  echo "        -> a REAL 152MB FxHashMap probe EVERY postflop node; the drop IS the per-PROBE cost. CAUTION: this is"
+  echo "        the per-probe cost in a NO-MEMO world. The PROD-relevant cost = delta x (1 - emd_bucket_hit_rate) because"
+  echo "        the memo serves most probes in prod (emd_bucket_hit_rate is in PROD_summary.json). MPHF compaction is"
+  echo "        only justified if delta x prod-miss-rate is large; a big RAW delta with a tiny prod miss-rate is NOT.]"
+  echo "   cum_regret get cost    = nodes/s(REGRETZERO)    - nodes/s(PROD)   [regret_zero skips the get; the rise = its cost. (counter-drift caveat — skipping the get perturbs the equilibrium)]"
+  echo "   showdown cost          = nodes/s(SHOWDOWNCONST) - nodes/s(PROD)   [showdown_const skips the eval; the rise = its cost. (counter-drift caveat — same equilibrium perturbation; only emd_nomemo is zero-drift)]"
+  echo "   The LARGEST delta names the per-deal bottleneck. (ab_stub branch overhead cancels: all deltas are vs PROD on the SAME binary.)"
+  echo "2. DRAM SIGNATURE OF THE FROZEN PROBE (the headline test, memo-defeated): EMDNOMEMO_dramflame.svg +"
+  echo "   EMDNOMEMO_dram_top.txt + EMDNOMEMO_perfstat_{stall,mlp,dram}.txt. Does forcing a real probe every node"
+  echo "   SPIKE mem_load_l3_miss_retired.remote_dram + stalls_mem_any vs PROD? If yes -> the 152MB lookup is the"
+  echo "   >L3 DRAM bottleneck (direct proof). PROD_dramflame.svg shows the MEMOIZED steady hot path (frozen probe"
+  echo "   ~absent there is EXPECTED = the memo working, NOT evidence the table is innocent)."
+  echo "3. EFFECTIVE MLP: <shape>_perfstat_mlp.txt l1d_pend_miss.pending / l1d_pend_miss.pending_cycles = avg"
+  echo "   outstanding L1D misses when busy. Low(~1-2)+high stall => latency-bound, little overlap. (offcore MLP:"
+  echo "   PROD_perfstat_mlpoff_n.all_data_rd / mlpoff_c.cycles_with_data_rd — split into 2 groups so it schedules.)"
+  echo "4. STALL FRACTION + IPC: <shape>_perfstat_stall.txt stalls_mem_any/cycles ; PROD_perfstat_ipc.txt instr/cycles."
+  echo "   CHECK <shape>_perfstat_status.txt = COUNTED before trusting a 0 (UNCOUNTED = unscheduled, not a true zero)."
+  echo "5. 128t vs 64t (PROD vs PROD64): a 64t stall-fraction drop = memory-channel contention OR SMT-sibling relief"
+  echo "   (64t = 1 thread/physical-core; cannot separate the two here). Confirm rayon_realized=128 vs 64 first."
+  echo "--- artifacts ---"
+  echo "subtractive sweep  : {PROD,EMDNOMEMO,REGRETZERO,SHOWDOWNCONST,PROD64}_summary.json (nodes/s_clean)"
+  echo "flamegraphs        : PROD_cpuflame.svg ; PROD_dramflame.svg (memoized) ; EMDNOMEMO_dramflame.svg (real probe)"
+  echo "DRAM attribution   : *_dram_top.txt *_dram_annotate.txt *_DRAM_HOT_SYMBOL"
+  echo "PMU                : *_perfstat_{ipc,stall,mlp,mlpoff_n,mlpoff_c,dram,portable}.txt + *_perfstat_status.txt"
+  echo "topology           : numactl_topology.txt probe_env.txt perf_event_inventory.txt"
 } > /var/log/probe/PROBE_DONE
 upload_one /var/log/probe/PROBE_DONE PROBE_DONE
-echo "ALL SHAPES DONE — PROBE_DONE uploaded. Box stays up (keep-alive); confirm S3 then terminate manually."
+echo "ALL SHAPES DONE — PROBE_DONE uploaded."

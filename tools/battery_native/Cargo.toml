@@ -46,6 +46,16 @@ phe_site1 = []
 # flipping the default: a matched-seed T=62000 6-max A/B must pass BOTH per-infoset strategy-delta
 # (median<=1e-4, max<=1e-2, no edge-bearing line collapse) AND native LBR (lbr6) CI-overlap vs f64.
 f32_regret = []
+# HOGWILD shared-table trainer (feature hogwild, default OFF -> byte-identical to the fork-merge trainer).
+# Replaces the per-iteration fork->merge->floor barrier with ONE shared open-addressing regret/strategy
+# table that all rayon workers read+write IN PLACE (lock-free hot path, per-slot-locked first-visit claim).
+# Mirrors `pokerbot/training/shared_hogwild_table.py`. Selected at RUNTIME (env `POKERBOT_HOGWILD=1` OR
+# the `NlheCFRTrainer(hogwild=True)` constructor flag) so the same .pyd carries both paths; with the
+# feature OFF the hogwild module is not compiled and the trainer is the unchanged fork-merge path. strat_sum
+# cells are f64 (racy small-increment loss corrupts the average — measured 97 vs <5 mbb on Leduc); regret
+# cells are f64 (match the default trainer); CFR+ floor is applied on the regret add; capacity overflow is a
+# hard error. `snapshot()` produces the SAME `NlheTables` shape so checkpoints/serialize stay format-compatible.
+hogwild = []
 # ATTRIBUTION HARNESS (feature ab_stub, default OFF -> zero production overhead). When ON, env var
 # POKERBOT_AB_STUB neutralizes ONE phase of the PROFILE-twin traverse so the per-node ns/node delta vs the
 # unstubbed baseline attributes that phase (the big-box attribution protocol's STEP-2 subtractive harness):

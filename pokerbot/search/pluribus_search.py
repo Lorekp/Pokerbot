@@ -326,6 +326,15 @@ class PluribusReBeLSolver:
         self._leaf_counter = 0  # per-leaf CRN offset so distinct leaves get distinct board runouts
         self._leaf_cont_weights: dict[int, np.ndarray] | None = None  # model-aware leaf (per solve)
         self._budget_bound_count = 0  # per-solver count of decisions cut short by time_budget_ms (S2)
+        # AIVAT decision-baseline capture (default OFF => byte-identical hot loop + native fast path).
+        # When armed (search_agent.enable_decision_capture with aivat_leaf_q), the solve accumulates the
+        # ROOT per-action CFVs it ACTUALLY used to form the served strategy (depth-0 hero node) and
+        # _leaf_q returns their (CFR+-weighted) average -- a baseline CONSISTENT with the served policy,
+        # which is what makes AIVAT's decision term a POSITIVE variance reducer on the search path (the
+        # old 1-ply gadget _leaf_q was inconsistent -> anti-correlated -> negative VR).
+        self._aivat_capture = False
+        self._root_av_sum: np.ndarray | None = None   # sum_t weight_t * action_values_t at the root
+        self._root_av_wsum = 0.0                       # sum_t weight_t (the normalizer)
 
     def _blend_active(self) -> bool:
         """Resolve the blueprint-blend flag: the per-solver config override (True/False) wins; None
@@ -676,6 +685,16 @@ class PluribusReBeLSolver:
         # served average. Flat weight 1.0 = legacy uniform average (extraction normalizes by the sum).
         weight = float(t + 1) if self.config.linear_averaging else 1.0
         self._strategy_sum[key] += weight * strategy
+        # AIVAT decision-baseline capture (gated; OFF => this block is skipped, hot loop byte-identical).
+        # depth==0 is the ROOT decision node the search is solving for; accumulate the per-action CFVs it
+        # used, CFR+-weighted exactly like the served strategy, so _leaf_q can return a baseline that is
+        # CONSISTENT with the served average policy (the fix for the search-path AIVAT negative-VR bug).
+        if depth == 0 and self._aivat_capture:
+            if self._root_av_sum is None:
+                self._root_av_sum = weight * action_values.copy()
+            else:
+                self._root_av_sum += weight * action_values
+            self._root_av_wsum += weight
         return ev
 
     # ------------------------------------------------------------------ public surface
@@ -750,6 +769,8 @@ class PluribusReBeLSolver:
         self._strategy_sum.clear()
         self._bp_cache.clear()
         self._leaf_cache.clear()
+        self._root_av_sum = None      # reset the AIVAT root-CFV accumulator (per-decision; no carryover)
+        self._root_av_wsum = 0.0
         base_state = to_numpy_state(root.env)
         if cfg.per_decision_seed:
             # Fresh stream per decision, seeded from the public state: the solve is a pure function of
@@ -819,7 +840,8 @@ class PluribusReBeLSolver:
         # Python) and the model-aware leaf being off; the native solve samples opponent holes under a
         # UNIFORM belief (the eval base arm). Statistically equivalent to the Python loop below.
         if (self.opponent_model is None and self._leaf_cont_weights is None
-                and native_subgame_enabled() and not self._offtree_inserted):
+                and native_subgame_enabled() and not self._offtree_inserted
+                and not self._aivat_capture):  # AIVAT capture needs the Python loop's per-action root CFVs
             from pokerbot.engine.jax_weva_encode import _POSTFLOP_NUM_BUCKETS
             from pokerbot.search import native_solver as _ns
 
@@ -922,12 +944,18 @@ class PluribusReBeLSolver:
 
     # ------------------------------------------------------------------ AIVAT baseline
     def _leaf_q(self, env) -> np.ndarray:
-        """Per-action continuation-gadget baseline for AIVAT capture (NOT used in the CFR hot loop).
+        """Per-action AIVAT baseline at the just-solved ROOT decision (NOT used in the CFR hot loop).
 
-        Returns a length-NUM_ACTIONS vector whose legal entries are the hero-relative leaf value of the
-        state AFTER that action; illegal entries are 0. Hero is the acting seat at ``env``. Sourced from
-        the continuation gadget — never the poisoned value net. Accepts a JAX or numpy env (AIVAT capture
-        passes the JAX ``root.env``)."""
+        PREFERRED (the fix): when the solve captured the ROOT per-action CFVs (``_aivat_capture`` armed),
+        return their CFR+-weighted average -- the values the search ACTUALLY used to form the served
+        strategy, so the baseline is CONSISTENT with the served policy and AIVAT's decision term is a
+        POSITIVE variance reducer. FALLBACK (capture off, or a non-search serve such as preflop-blueprint
+        / pushfold where no CFR loop ran): the legacy 1-ply continuation-gadget value of each child --
+        which is inconsistent with the multi-ply served strategy and gave NEGATIVE VR on the search path
+        (kept only as a graceful fallback; never the poisoned value net). Illegal entries are 0; hero is
+        the acting seat at ``env``. Accepts a JAX or numpy env (AIVAT capture passes the JAX ``root.env``)."""
+        if self._root_av_sum is not None and self._root_av_wsum > 0.0:
+            return self._root_av_sum / self._root_av_wsum
         env = to_numpy_state(env)
         hero = int(env.action_seat)
         out = np.zeros(NUM_ACTIONS, dtype=np.float64)

@@ -313,6 +313,12 @@ class SearchAgent:
         control variate to be zero-mean). Off by default ⇒ argmax play unchanged."""
         self._decision_capture = []
         self._decision_rng = rng
+        # Arm the solver's ROOT per-action-CFV capture so _leaf_q returns the served-policy-CONSISTENT
+        # AIVAT baseline (positive variance reduction). Only when aivat_leaf_q is on (else bv=None and the
+        # capturer uses its crude fallback). This also forces the Python CFR loop (the native fast path
+        # cannot expose per-action root CFVs) -- acceptable for eval, where AIVAT buys far fewer hands.
+        if getattr(self, "solver", None) is not None:
+            self.solver._aivat_capture = bool(self.aivat_leaf_q)
 
     def pop_decisions_raw(self) -> list:
         if self._decision_capture is None:

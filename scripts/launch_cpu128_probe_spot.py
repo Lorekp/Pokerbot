@@ -220,10 +220,16 @@ def _shape_table(shapes: list[str]) -> str:
     """Human-readable per-shape config table for --dry-run (the on-box driver owns the canonical mapping;
     this mirrors it for the operator's go/no-go read)."""
     cfg = {
-        "B1": "N=1024, batch_deals=1 (recursive), 128t   [REGIME-GATE baseline + effective-MLP (offcore_requests_outstanding/cycles) + IPC]",
-        "BMLP": "N=1024, batch_deals=8 (batched lockstep), 128t [THE A/B vs B1 — does interleaving B deals' regret get()s raise MLP+nodes/s+cpu%?]",
-        "B1_64": "N=1024, batch_deals=1, RAYON_NUM_THREADS=64 [SMT cross-check vs B1]",
-        "BMLP_64": "N=1024, batch_deals=8, RAYON_NUM_THREADS=64 [THE A/B vs B1_64 — batched at 64t, completes the 2x2]",
+        "PROD64": "ab_stub=none, RAYON_NUM_THREADS=64 (HEADLINE) — full PMU cert at the 64t regime: IPC, stall-fraction "
+                  "(cycle_activity.stalls_mem_any/cyc), effective MLP (l1d_pend_miss.pending/pending_cycles), offcore MLP "
+                  "(split x2), DRAM local/remote. + CPU/DRAM flamegraph if this box delivers sampling.",
+        "PROD": "ab_stub=none, 128t — same full PMU, for the 64-vs-128 stall/MLP delta = does 128t add memory-channel "
+                "contention (stall up / MLP flat) or is each thread already at the per-thread latency wall?",
+        "EMDNOMEMO64": "ab_stub=emd_nomemo, RAYON_NUM_THREADS=64 — a REAL 152MB FxHashMap probe EVERY postflop node; "
+                       "its DRAM-flamegraph + stall/MLP/DRAM PMU = the frozen-table's microarchitectural DRAM signature.",
+        "EMDNOMEMO": "(legacy) ab_stub=emd_nomemo, 128t.",
+        "REGRETZERO": "(legacy) ab_stub=regret_zero — tree-drift confounded, dropped from default.",
+        "SHOWDOWNCONST": "(legacy) ab_stub=showdown_const — mild drift, dropped from default.",
     }
     lines = []
     for s in shapes:
@@ -248,10 +254,12 @@ def main() -> None:
                         "S3, NOT tarred). The .sha256 sidecar IS tarred for on-box integrity verify.")
     p.add_argument("--n-runouts", type=int, default=400, help="table_id param (frozen blob's n_runouts)")
     p.add_argument("--n-bins", type=int, default=20, help="table_id param (frozen blob's n_bins)")
-    p.add_argument("--shapes", default="B1,BMLP,B1_64,BMLP_64",
-                   help="MLP batched-traversal A/B shapes (all N=1024, EMD-K160 prod path): B1(recursive,128t) "
-                        "BMLP(batched,128t) B1_64(recursive,64t) BMLP_64(batched,64t). ONE binary; each shape "
-                        "sets POKERBOT_BATCH_DEALS (1 or 8) in the driver env. byte-identical paths -> clean A/B.")
+    p.add_argument("--shapes", default="PROD64,PROD,EMDNOMEMO64",
+                   help="PMU-CERT re-run (perf-stat timeout-SIGTERM bug FIXED -> recovers stall/MLP/IPC/DRAM the prior "
+                        "run lost). PROD64(64t, the headline regime) + PROD(128t comparison) full PMU -> the 64-vs-128 "
+                        "stall/MLP delta = contention vs per-thread latency wall; EMDNOMEMO64(64t, real 152MB probe "
+                        "every node) = the frozen-table DRAM signature. Subtractive nodes/s verdict already banked; "
+                        "this run is the microarchitectural cert.")
     p.add_argument("--warmup-iters", type=int, default=800,
                    help="WARMUP_CAP backstop (the driver's own steady-detect is the primary stop)")
     p.add_argument("--window-iters", type=int, default=200, help="measured iters per shape (per window)")

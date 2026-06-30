@@ -47,6 +47,10 @@ fn main() {
         fast_merge: false,
         emd_frozen: emd_frozen.clone(),
         batch_deals: 0,
+        work_steal: false,
+        dcfr: false,
+        dcfr_prune_threshold: -300_000.0,
+        dcfr_explore_frac: 0.05,
     };
 
     // Warm-up

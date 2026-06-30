@@ -138,15 +138,26 @@ def warmup_to_steady(t, warmup_cap: int) -> None:
     print(f"STEADY by WARMUP_CAP={warmup_cap}", flush=True)
 
 
-def run_window(t, shape: str, window: int, profile_every: int, jsonl_name: str, label: str) -> list[dict]:
-    """Stream `window` iters in batches of `profile_every`; append+flush+fsync+put_object each batch.
-    Returns the parsed rows. Any exception/SIGTERM still leaves the flushed rows on disk + S3."""
+def run_window(t, shape: str, window: int, profile_every: int, jsonl_name: str, label: str,
+               max_secs: float | None = None) -> list[dict]:
+    """Stream iters in batches of `profile_every`; append+flush+fsync+put_object each batch. If `max_secs` is
+    set the window is TIME-BOUNDED (run until that many seconds elapse — used for WINDOW B so the shell can
+    run a CPU-flame record + a DRAM-flame record + 5 perf-stat groups back-to-back in one steady window);
+    else it is ITER-bounded by `window`. Any exception/SIGTERM still leaves the flushed rows on disk + S3."""
     path = os.path.join(PROBE_DIR, jsonl_name)
     rows: list[dict] = []
     done = 0
+    start = time.time()
     with open(path, "w") as f:
-        while done < window:
-            step = min(profile_every, window - done)
+        while True:
+            if max_secs is not None:
+                if (time.time() - start) >= max_secs:
+                    break
+                step = profile_every
+            else:
+                if done >= window:
+                    break
+                step = min(profile_every, window - done)
             batch = json.loads(t.train_profile_json(step))
             for r in batch:
                 f.write(json.dumps(r) + "\n")
@@ -156,8 +167,8 @@ def run_window(t, shape: str, window: int, profile_every: int, jsonl_name: str, 
             done += step
             _put(path, f"{shape}/{jsonl_name}")  # partial put — worst-case kill loses < profile_every iters
             if batch:
-                print(f"{label} {shape} iters+={step}/{window} last_total_ms={batch[-1]['total_ms']:.3f}",
-                      flush=True)
+                print(f"{label} {shape} iters+={step} done={done} elapsed={time.time()-start:.0f}s "
+                      f"last_total_ms={batch[-1]['total_ms']:.3f}", flush=True)
     return rows
 
 
@@ -219,6 +230,11 @@ def summarize(shape: str, ndeals: int, rows_clean: list[dict], rows_perf: list[d
 
     total_clean = col(clean, "total_ms")
     deals_per_s_clean = (ndeals * 1000.0 / statistics.fmean(total_clean)) if total_clean else float("nan")
+    # nodes/s from the CLEAN window (no perf attached) — THIS is the number the subtractive ab_stub attribution
+    # uses; the perf-attached nodes_per_s below is depressed by PEBS+fp+mmap and must NOT be quoted as steady (S2).
+    nodes_clean = col(clean, "nodes")
+    nodes_per_s_clean = (statistics.fmean(nodes_clean) * 1000.0 / statistics.fmean(total_clean)) \
+        if (nodes_clean and total_clean and statistics.fmean(total_clean)) else float("nan")
 
     trav = col(perf, "traverse_ms")
     merge = col(perf, "merge_ms")
@@ -264,7 +280,8 @@ def summarize(shape: str, ndeals: int, rows_clean: list[dict], rows_perf: list[d
         "merge_share": share(merge),
         "floor_share": share(floor),
         "deals_per_s_clean": deals_per_s_clean,
-        "nodes_per_s": nodes_per_s,
+        "nodes_per_s_clean": nodes_per_s_clean,  # un-attached; the attribution number
+        "nodes_per_s": nodes_per_s,              # perf-ATTACHED (depressed) — do not quote as steady
         "fp_memo_miss_rate": fp_memo_miss_rate,
         "emd_bucket_hit_rate": emd_hit_rate,
         "rayon_threads_realized": rayon_realized,
@@ -281,6 +298,9 @@ def main() -> int:
     ap.add_argument("--window", type=int, default=200)
     ap.add_argument("--profile-every", type=int, default=20)
     ap.add_argument("--warmup-cap", type=int, default=800)
+    ap.add_argument("--perf-window-secs", type=int, default=0,
+                    help="if >0, WINDOW B is TIME-bounded to this many seconds (so the shell's CPU-flame + "
+                         "DRAM-flame + 5 perf-stat groups all fit one steady window); else iter-bounded by --window")
     args = ap.parse_args()
     shape = args.shape
 
@@ -309,10 +329,12 @@ def main() -> int:
         est_secs = max(10, min(90, int(mean_total * args.window / 1000.0)))
         print(f"EST_WINDOW_SECS={est_secs}", flush=True)
 
-        # WINDOW B: PERF attached (shell attaches perf record/stat after STEADY_BEGIN_PERF).
+        # WINDOW B: PERF attached (shell attaches perf record/stat after STEADY_BEGIN_PERF). TIME-bounded to
+        # --perf-window-secs when set, so all of the shell's back-to-back captures land on a live steady process.
         _sentinel(f"{shape}.STEADY_BEGIN_PERF")
-        rows_perf = run_window(t, shape, args.window, args.profile_every,
-                               f"{shape}_profileB.jsonl", "WINDOW_B")
+        pw = args.perf_window_secs if args.perf_window_secs > 0 else None
+        rows_perf = run_window(t, shape, (10_000_000 if pw else args.window), args.profile_every,
+                               f"{shape}_profileB.jsonl", "WINDOW_B", max_secs=pw)
     except KeyboardInterrupt:
         print(f"{shape}: SIGTERM/interrupt — flushing collected rows in finally", flush=True)
     except Exception:

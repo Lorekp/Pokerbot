@@ -41,6 +41,10 @@ fn main() {
         fast_merge,
         emd_frozen: None,
         batch_deals: 0,
+        work_steal: false,
+        dcfr: false,
+        dcfr_prune_threshold: -300_000.0,
+        dcfr_explore_frac: 0.05,
     };
 
     // Warm-up iteration excluded from timing (allocator / table growth transient).
