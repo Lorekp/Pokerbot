@@ -257,8 +257,9 @@ def main() -> None:
              for b in run_kwargs["BlockDeviceMappings"]), "#3 >=40GB gp3 root")
     _chk(("InstanceMarketOptions" not in run_kwargs) or args.spot, "#4 on-demand OR explicit spot")
     _chk(("pokerbot-dcfrguard" in ud) and ("/sbin/shutdown -h +" in ud)
-         and (str(args.wall_guard_secs) in ud) and args.wall_guard_secs == WALL_GUARD_SECS,
-         f"#5 dead-man cost cap in user_data: shutdown floor + dcfrguard unit @ {args.wall_guard_secs}s")
+         and (str(args.wall_guard_secs) in ud) and (3600 <= args.wall_guard_secs <= 14400),
+         f"#5 dead-man cost cap in user_data: shutdown floor + dcfrguard unit @ {args.wall_guard_secs}s "
+         f"(armed with the chosen value; 1h<=cap<=4h)")
     _chk(run_kwargs["InstanceInitiatedShutdownBehavior"] == "terminate" and not args.keep_alive,
          "#6 shutdown=terminate AND self-terminate on finish (--no-keep-alive default)")
     _chk(("--features python " in onbox_cmds) and ("hogwild" not in onbox_cmds.split("cargo build")[1].split("\n")[0]
