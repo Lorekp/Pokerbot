@@ -72,7 +72,7 @@ def build_and_upload_code(s3, bucket: str, prefix: str) -> str:
 
 def user_data(*, bucket, prefix, region, code_key, run_subdir, num_buckets, n_deals, milestones,
               prune_threshold, explore_frac, probe_threads_list, probe_n_deals, warm_iters, window_iters,
-              train_rayon, train_timeout, keep_alive, wall_guard_secs,
+              train_rayon, train_timeout, keep_alive, wall_guard_secs, dcfr_arms,
               awscli_zip="awscli-exe-linux-x86_64.zip") -> str:
     run_prefix = f"{prefix}/{run_subdir}"
     result_prefix = f"{run_prefix}/dcfrcurve"
@@ -113,6 +113,7 @@ export RESULT_PREFIX="{result_prefix}"
 export DCFR_NUM_BUCKETS="{num_buckets}"
 export DCFR_N_DEALS="{n_deals}"
 export DCFR_MILESTONES="{milestones}"
+export DCFR_ARMS="{dcfr_arms}"
 export DCFR_PRUNE_THRESHOLD="{prune_threshold}"
 export DCFR_EXPLORE_FRAC="{explore_frac}"
 export PROBE_THREADS_LIST="{probe_threads_list}"
@@ -149,8 +150,13 @@ def main() -> None:
     p.add_argument("--probe-threads-list", default="16,32,64,128",
                    help="RAYON_NUM_THREADS values for the work_steal scaling probe")
     p.add_argument("--probe-n-deals", type=int, default=1024)
-    p.add_argument("--warm-iters", type=int, default=2000, help="probe fixed warm state (same node-growth)")
-    p.add_argument("--window-iters", type=int, default=1500, help="probe timed window (fixed iters)")
+    p.add_argument("--dcfr-arms", default="cfrplus,dcfr",
+                   help="which arms to train (corrected run uses 'dcfr' only; CFR+ checkpoints reused from "
+                        "a prior run since training is deterministic from the fixed 0xC0FFEE base seed)")
+    # probe warm+window must fit the per-config 240s timeout in the EARLY (cheap) node-growth regime; the
+    # 2000/1500 of the first run hit the slow late regime and every config timed out. 400/300 stays cheap.
+    p.add_argument("--warm-iters", type=int, default=400, help="probe fixed warm state (early/cheap regime)")
+    p.add_argument("--window-iters", type=int, default=300, help="probe timed window (fixed iters)")
     p.add_argument("--train-rayon", type=int, default=64,
                    help="RAYON_NUM_THREADS for the curve training (64 = physical cores; SMT-negative above)")
     p.add_argument("--train-timeout", type=int, default=TRAIN_TIMEOUT)
@@ -210,7 +216,7 @@ def main() -> None:
                    probe_n_deals=args.probe_n_deals, warm_iters=args.warm_iters,
                    window_iters=args.window_iters, train_rayon=args.train_rayon,
                    train_timeout=args.train_timeout, keep_alive=args.keep_alive,
-                   wall_guard_secs=args.wall_guard_secs, awscli_zip=awscli_zip)
+                   wall_guard_secs=args.wall_guard_secs, dcfr_arms=args.dcfr_arms, awscli_zip=awscli_zip)
     ud_bytes = len(ud.encode())
     ud_b64 = len(base64.b64encode(ud.encode()))
     ud_size_ok = (ud_bytes < 15000 and ud_b64 < 16384)

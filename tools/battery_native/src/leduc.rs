@@ -401,6 +401,87 @@ pub fn train(tab: &mut Tables, iterations: u64) {
     }
 }
 
+/// DCFR (Discounted CFR, Brown & Sandholm 2019) sweeps -- the convergence-rate variant of `train`, here so
+/// the DCFR-vs-CFR+ lever can be measured on Leduc's EXACT info-set-BR exploitability (which IS monotone in
+/// convergence, unlike 6-max LBR). Mirrors the production `NlheCFRTrainer` DCFR path
+/// (trainer.rs `apply_dcfr_discount` / `dcfr_weights`): SIGNED regret (no CFR+ floor) + a per-iteration
+/// discount of positive regret by t^1.5/(t^1.5+1), negative regret by 0.5, and the strategy sum by
+/// (t/(t+1))^2. The strategy increment uses weight 1.0 (the gamma discount supplies the later-iteration
+/// weighting, in place of CFR+'s linear weight=t).
+pub fn train_dcfr(tab: &mut Tables, iterations: u64) {
+    let deals = all_deals();
+    let chance = 1.0 / deals.len() as f64;
+    let start = tab.iters_done + 1;
+    let end = tab.iters_done + iterations;
+    for t in start..=end {
+        for player in 0..NUM_PLAYERS {
+            for &(cards, public) in &deals {
+                let root = State::from_deal(cards, public);
+                cfr(&root, player, [1.0, 1.0, chance], 1.0, tab); // weight=1.0 (DCFR, not linear=t)
+            }
+            refresh_strategy_signed(tab);
+        }
+        apply_dcfr_discount(tab, t);
+        tab.iters_done = t;
+    }
+}
+
+/// Regret-match from SIGNED `cum_regret` (DCFR keeps negatives; only the strategy uses `max(0,.)`). Unlike
+/// `refresh_strategy` this does NOT floor the stored regret -- the per-iteration `apply_dcfr_discount`
+/// down-weights negatives (beta=0 => *0.5) instead.
+fn refresh_strategy_signed(tab: &mut Tables) {
+    let keys: Vec<InfoKey> = tab.cum_regret.keys().cloned().collect();
+    for key in keys {
+        let regret = tab.cum_regret[&key];
+        let mask = tab.legal_mask[&key];
+        let mut pos = [0.0f64; NUM_ACTIONS];
+        let mut total = 0.0;
+        for a in 0..NUM_ACTIONS {
+            let v = if mask[a] { regret[a].max(0.0) } else { 0.0 };
+            pos[a] = v;
+            total += v;
+        }
+        let cur = if total > 0.0 {
+            for a in 0..NUM_ACTIONS {
+                pos[a] /= total;
+            }
+            pos
+        } else {
+            uniform_over_legal(&mask)
+        };
+        tab.cur_policy.insert(key, cur);
+    }
+}
+
+/// DCFR per-iteration discount, factors matching trainer.rs `dcfr_weights` (alpha=1.5, beta=0, gamma=2).
+fn apply_dcfr_discount(tab: &mut Tables, t: u64) {
+    let tf = (t as f64).max(1.0);
+    let ta = tf.powf(1.5);
+    let pos = ta / (ta + 1.0);
+    let neg = 0.5; // t^0/(t^0+1)
+    let strat = (tf / (tf + 1.0)).powi(2);
+    for row in tab.cum_regret.values_mut() {
+        for a in 0..NUM_ACTIONS {
+            let factor = if row[a] > 0.0 { pos } else { neg };
+            row[a] *= factor;
+        }
+    }
+    for row in tab.cum_policy.values_mut() {
+        for a in 0..NUM_ACTIONS {
+            row[a] *= strat;
+        }
+    }
+}
+
+/// Convenience: train DCFR from scratch for `iterations` and return exploitability (mbb). Mirrors
+/// `solve_and_exploitability` so a curve can call both arms identically.
+pub fn solve_and_exploitability_dcfr(iterations: u64) -> (f64, f64, f64, f64, f64) {
+    let mut tab = Tables::default();
+    train_dcfr(&mut tab, iterations);
+    let avg = average_strategy(&tab);
+    infoset_exploitability_mbb(&avg)
+}
+
 /// Average strategy = `cum_policy` row-normalized (uniform-over-legal fallback for unseen keys at BR
 /// time). Mirrors `tabular_cfr`'s final `avg` and `_policy_for_key`.
 pub fn average_strategy(tab: &Tables) -> HashMap<InfoKey, [f64; NUM_ACTIONS]> {
@@ -756,6 +837,35 @@ mod tests {
             e1000 < e100,
             "more iters must not increase exploitability: {e100} -> {e1000}"
         );
+    }
+
+    #[test]
+    fn dcfr_converges_and_beats_cfrplus_on_leduc() {
+        // DCFR must (a) be zero-sum, (b) clear the same Leduc gate, and (c) converge at least as fast as
+        // CFR+ at matched iters -- the exact, monotone Leduc read of the convergence-rate lever.
+        let (ed, u0, u1, _, _) = solve_and_exploitability_dcfr(1000);
+        assert!((u0 + u1).abs() < 1e-6, "DCFR profile not zero-sum: {u0} {u1}");
+        assert!(ed < 1.0, "DCFR exploitability {ed} mbb not below the 1.0 gate @1000 iters");
+        let (ec, ..) = solve_and_exploitability(1000);
+        assert!(
+            ed <= ec * 1.05,
+            "DCFR must not converge slower than CFR+ at 1000 iters: dcfr={ed} cfr+={ec}"
+        );
+    }
+
+    #[test]
+    fn dcfr_checkpoint_resume_reproduces_straight_run() {
+        // milestone-chunked DCFR (the cert's checkpoint pattern) must reproduce an uninterrupted run --
+        // the discount/explore schedule is a pure fn of the iteration index, so resume is exact.
+        let mut straight = Tables::default();
+        train_dcfr(&mut straight, 1000);
+        let (es, ..) = infoset_exploitability_mbb(&average_strategy(&straight));
+        let mut part = Tables::default();
+        train_dcfr(&mut part, 600);
+        train_dcfr(&mut part, 400);
+        assert_eq!(part.iters_done, 1000);
+        let (ep, ..) = infoset_exploitability_mbb(&average_strategy(&part));
+        assert!((es - ep).abs() < 1e-9, "DCFR resume changed exploitability: {es} vs {ep}");
     }
 
     #[test]

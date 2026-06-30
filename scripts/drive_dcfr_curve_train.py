@@ -38,7 +38,12 @@ OUT_DIR = os.environ.get("OUT_DIR", "/var/log/dcfrcurve")
 S3_DEST = os.environ.get("S3_DEST", "").rstrip("/")          # s3://bucket/.../dcfrcurve  ("" => no upload)
 REGION = os.environ.get("REGION", "eu-central-1")
 
-ARMS = [("cfrplus", False), ("dcfr", True)]
+# Which arms to train this run. Default both; the corrected run sets DCFR_ARMS=dcfr to train ONLY the
+# DCFR arm (the CFR+ checkpoints from a prior run are reused, since training is deterministic from the
+# fixed 0xC0FFEE base seed -> the two arms are comparable across runs).
+_ALL_ARMS = [("cfrplus", False), ("dcfr", True)]
+_SELECT = {a.strip() for a in os.environ.get("DCFR_ARMS", "cfrplus,dcfr").split(",") if a.strip()}
+ARMS = [(a, d) for (a, d) in _ALL_ARMS if a in _SELECT]
 TOTAL = max(MILESTONES)
 
 
