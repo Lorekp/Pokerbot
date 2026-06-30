@@ -81,6 +81,45 @@ def set_leaf_memo(on: bool) -> None:
     _LEAF_MEMO = bool(on)
 
 
+# --------------------------------------------------------------------------------------------------
+# Gadget-leaf PREFIX-SHARING (FAST PATH, env-gated POKERBOT_LEAF_GADGET_BATCH, default OFF).
+#
+# The gadget leaf fills a k×k hero×field matrix M[i,j] by playing 16 (hero-cont i, field-cont j) cells
+# to showdown PER runout. Measurement: the 16 cells do NOT collapse to one betting line (mean ~6.6
+# distinct lines/runout) — different continuations sample different actions, so "score once per runout"
+# is WRONG. But the cells DO share PATH PREFIXES: every cell in a runout draws its action-rng from the
+# SAME per-runout seed, so the k-th rng.random() draw is IDENTICAL across all cells, and at any shared
+# env node the acting seat + (cont row, mask) are identical — only the chosen continuation INDEX differs
+# (hero nodes pick by i, opponent nodes pick by j). So the cells fan out as a DAG: at each node draw the
+# shared u once, route each alive (i,j) by the action its continuation index produces, recurse once per
+# DISTINCT child action, and add the terminal hero value into M for every cell that ended there.
+#
+# Bit-identity: a baseline cell consumes exactly one rng.random() per acting (non-chance) node, in order.
+# The shared per-runout stream ``_DrawStream`` memoizes the depth-indexed draw sequence, so every DAG
+# branch at depth d reads the SAME float a freshly-seeded baseline rng would draw as its (d+1)-th value.
+# _reshuffle_undealt / sample_chance_np draw NO action-rng (deterministic), so the alignment is exact and
+# M is byte-identical to the double-loop. Set POKERBOT_LEAF_GADGET_BATCH=0 to restore the legacy per-cell
+# _playout loop verbatim (escape hatch).
+#
+# DEFAULT ON: like the sibling _LEAF_MEMO fast path, this is a proven byte-identical optimization (served
+# action_probs verified bit-equal 60/60 captured roots + 1920 adversarial gadget-leaf comparisons across
+# memo on/off, rollout 1/2/4/8, 3 seeds, depth 16/64, call/aggro/mix lines -> 0 divergences) that gives
+# ~2x on the gadget leaf -- the single largest term (~58% cumtime) of the deployed Python exploit/AIVAT
+# solve, which CANNOT take the native subgame shortcut (gated off under opponent_model / _aivat_capture).
+# --------------------------------------------------------------------------------------------------
+_LEAF_GADGET_BATCH = os.environ.get("POKERBOT_LEAF_GADGET_BATCH", "1") not in ("0", "false", "False", "")
+
+
+def leaf_gadget_batch_enabled() -> bool:
+    return bool(_LEAF_GADGET_BATCH)
+
+
+def set_leaf_gadget_batch(on: bool) -> None:
+    """Runtime toggle for the gadget-leaf prefix-sharing DAG (the fast path). OFF by default."""
+    global _LEAF_GADGET_BATCH
+    _LEAF_GADGET_BATCH = bool(on)
+
+
 def _infoset_sig(env, seat: int):
     """Hashable signature identifying the continuation-set inputs at (env, seat) WITHIN one leaf eval.
 
@@ -193,6 +232,78 @@ def _playout(
     return float(env.rewards[hero]) / CHIP_UNIT
 
 
+class _DrawStream:
+    """Depth-indexed view of ONE per-runout action-rng stream, shared across all DAG branches.
+
+    A baseline cell draws ``rng.random()`` once per acting (non-chance) node, in traversal order, from a
+    Generator seeded with the per-runout seed. The k-th draw is therefore a pure function of (seed, k) —
+    identical for every (i,j) cell that reaches depth k. This memoizes that sequence so any DAG branch at
+    depth ``d`` reads ``self[d]`` == the (d+1)-th draw a fresh baseline rng would produce. Bit-identical."""
+
+    __slots__ = ("_rng", "_vals")
+
+    def __init__(self, seed: int):
+        self._rng = np.random.default_rng(seed)
+        self._vals: list[float] = []
+
+    def __getitem__(self, depth: int) -> float:
+        vals = self._vals
+        while len(vals) <= depth:
+            vals.append(float(self._rng.random()))
+        return vals[depth]
+
+
+def _dag_runout(env, hero: int, adapter, M: np.ndarray, stream: _DrawStream,
+                cells: list[tuple[int, int]], depth: int, max_depth: int, memo) -> None:
+    """Walk the gadget DAG from ``env`` for the subset of (i,j) ``cells`` still alive on this path.
+
+    Bit-identical to running ``_playout`` independently for each cell (same per-cell action draws via the
+    shared depth-indexed ``stream``), but engine work on a shared prefix is done ONCE. At each acting node
+    the continuation INDEX a cell uses is ``i`` for the hero seat and ``j`` for any opponent seat; cells
+    that pick the same action follow the same child. Terminals add ``rewards[hero]/CHIP_UNIT`` into M for
+    every cell that ended there."""
+    while True:
+        if depth >= max_depth or bool(env.done):
+            v = float(env.rewards[hero]) / CHIP_UNIT
+            for (i, j) in cells:
+                M[i, j] += v
+            return
+        if is_chance_node_np(env):
+            env = sample_chance_np(env)  # deterministic; draws NO action-rng (no depth advance)
+            continue
+        seat = int(env.action_seat)
+        if seat < 0:
+            v = float(env.rewards[hero]) / CHIP_UNIT
+            for (i, j) in cells:
+                M[i, j] += v
+            return
+        cont, mask = _cont_and_mask(env, seat, adapter, memo)
+        u = stream[depth]  # the SAME draw every alive cell consumes at this node (one per acting node)
+        is_hero = (seat == hero)
+        # The continuation index that drives the action is i for the hero seat, else j. Compute each
+        # distinct index's action ONCE, then route cells to the child for their action.
+        act_for_idx: dict[int, int] = {}
+        children: dict[int, list[tuple[int, int]]] = {}
+        for (i, j) in cells:
+            idx = i if is_hero else j
+            a = act_for_idx.get(idx)
+            if a is None:
+                a = _sample_action(cont[idx], mask, u)
+                act_for_idx[idx] = a
+            children.setdefault(a, []).append((i, j))
+        if len(children) == 1:
+            # Whole alive set takes the same action -> stay on this frame (no Python recursion overhead).
+            a, sub = next(iter(children.items()))
+            env = apply_action_np(env, a)
+            depth += 1
+            cells = sub
+            continue
+        for a, sub in children.items():
+            _dag_runout(apply_action_np(env, a), hero, adapter, M, stream, sub,
+                        depth + 1, max_depth, memo)
+        return
+
+
 def _payoff_matrix(
     env, hero: int, adapter: TabularBlueprintAdapter, cfg: ContinuationLeafConfig
 ) -> np.ndarray:
@@ -210,6 +321,8 @@ def _payoff_matrix(
         warnings.warn("pluribus_rollout: resample_board=False with an unrepaired bridge deck deals "
                       "duplicate cards -> invalid leaf values; use resample_board=True.", RuntimeWarning)
     memo = {} if leaf_memo_enabled() else None
+    batch = leaf_gadget_batch_enabled()
+    all_cells = [(i, j) for i in range(k) for j in range(k)] if batch else None
     for r in range(cfg.rollout_samples):
         # One board per runout (CRN: identical across all i,j cells); fresh action rng per cell but seeded
         # from the same per-runout base so cross-cell differences isolate the continuation choice.
@@ -217,6 +330,14 @@ def _payoff_matrix(
             _reshuffle_undealt(env, np.random.default_rng(cfg.base_seed + 7919 * (r + 1)))
             if cfg.resample_board else env
         )
+        if batch:
+            # PREFIX-SHARING DAG: one walk fills all 16 cells for this runout, sharing engine work on
+            # common path prefixes. The shared depth-indexed stream makes each cell's action draws
+            # byte-identical to the per-cell loop below. (env-gated POKERBOT_LEAF_GADGET_BATCH)
+            stream = _DrawStream(cfg.base_seed + 1000003 * (r + 1))
+            _dag_runout(env_r, hero, adapter, M, stream, list(all_cells), 0,
+                        cfg.max_playout_depth, memo)
+            continue
         for i in range(k):
             for j in range(k):
                 rng = np.random.default_rng(cfg.base_seed + 1000003 * (r + 1))

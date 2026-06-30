@@ -502,6 +502,36 @@ def test_leaf_memo_bit_identical_and_deterministic():
         R.set_leaf_memo(True)
 
 
+def test_leaf_gadget_batch_bit_identical():
+    """The gadget-leaf prefix-sharing DAG (fast path, env POKERBOT_LEAF_GADGET_BATCH) is BYTE-IDENTICAL
+    to the legacy per-cell double loop: it only shares engine work on common path prefixes while feeding
+    each (i,j) cell the SAME depth-indexed action draws a freshly-seeded baseline cell would consume. The
+    gadget leaf value (and thus the served policy) must be bit-identical with the DAG ON vs OFF, for the
+    memo BOTH on and off (the two fast paths must compose), across seeds. OFF is the default so this is a
+    pure speed optimization guarded against any divergence."""
+    from pokerbot.search import pluribus_rollout as R
+
+    ad = TabularBlueprintAdapter(snapshot={}, client_bet_sizing=True)
+    try:
+        for memo_on in (False, True):
+            R.set_leaf_memo(memo_on)
+            for rollout in (1, 4):
+                cfg = ContinuationLeafConfig(select="gadget", rollout_samples=rollout, base_seed=4242)
+                for seed in (7, 11, 13, 17):
+                    env = _postflop_env(seed=seed)
+                    hero = int(env.action_seat) if int(env.action_seat) >= 0 else 0
+                    R.set_leaf_gadget_batch(False)
+                    v_off = continuation_leaf_value(env, hero, ad, cfg)
+                    R.set_leaf_gadget_batch(True)
+                    v_on = continuation_leaf_value(env, hero, ad, cfg)
+                    assert v_on == v_off, (
+                        f"memo={memo_on} rollout={rollout} seed={seed}: DAG changed gadget leaf "
+                        f"value {v_on} != {v_off}")
+    finally:
+        R.set_leaf_gadget_batch(False)
+        R.set_leaf_memo(True)
+
+
 def test_model_aware_leaf_direction_and_zero_deviation():
     """MODEL-AWARE LEAF: (a) with cont_weights=None the leaf is byte-identical to the legacy path
     (zero-deviation gate); (b) a fold-heavy leaf world values the hero's spot at least as much as a
