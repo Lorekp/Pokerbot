@@ -718,23 +718,40 @@ class FoldTo3BetBot:
 
 
 def _load_blueprint_snapshot():
-    """Lazy module-level snapshot for BlueprintBot (env POKERBOT_BLUEPRINT_SNAPSHOT or the default).
-    Loaded once per process; per-hand bot construction stays cheap.
+    """Lazy module-level snapshot for BlueprintBot AND the live serve (LiveSearchAdvisor calls this when
+    no explicit blueprint is passed). Loaded once per process; per-hand bot construction stays cheap.
 
-    DEFAULT = the lossless-preflop ship candidate ``bp6max_lossless2_iter200.pkl``. Certified by the
-    25k-hand AWS LBR6 suite ``run_lbr6_oldnew1`` (cell3): fc-floor best-responder = -13.2 bb/100
-    [-43, +16] vs blueprint+search WITH ``search_preflop=ON`` — a robust ~55 bb/100 improvement on the
-    old weva ``bp6max_v2`` (-68.6). CRITICAL: this blueprint is BEATABLE served WITHOUT preflop search
-    (cell2 fc pf=OFF = +95.9, cell4 fcpa pf=OFF = +103.7), so the serve MUST keep ``search_preflop=ON``
-    (the deployed default) AND ``POKERBOT_PREFLOP_LOSSLESS=1`` set before importing pokerbot."""
+    DEFAULT = the STABLE_CURRENT ship pointer ``checkpoints/serve_blueprint_6max.pkl`` (== iter62000,
+    100,042 infosets), matching ``scripts/ship_blueprint.py``'s STABLE_CURRENT. This is the B1 PROVENANCE
+    FIX (2026-06-30): the default previously hardcoded the older ``%TEMP%\\bp6max_lossless2_iter200.pkl``
+    (96,553 infosets), which is ~2x MORE LBR-exploitable table-only (+92.4 vs +41.6 bb/100), so the
+    deployed default served a measurably worse blueprint than the certified ship unit. Override with
+    ``POKERBOT_BLUEPRINT_SNAPSHOT``; the legacy temp file is only a fallback if the stable pointer is
+    missing. CRITICAL: the table is best-responder-exploitable served WITHOUT preflop search, so the serve
+    MUST keep ``search_preflop=ON`` AND ``POKERBOT_PREFLOP_LOSSLESS=1`` (+ the other encoder flags) set
+    before importing pokerbot. The loaded blueprint is LOGGED LOUDLY (path / source / infosets / abstraction
+    / sha) so the served unit is never ambiguous again."""
+    import hashlib
     import os
     import pickle
+    import sys
+    from pathlib import Path
 
-    path = os.environ.get("POKERBOT_BLUEPRINT_SNAPSHOT",
-                          r"checkpoints/bp6max_lossless2_iter200.pkl")
+    _STABLE = Path(__file__).resolve().parents[2] / "checkpoints" / "serve_blueprint_6max.pkl"
+    _LEGACY = r"checkpoints/bp6max_lossless2_iter200.pkl"
+    env_path = os.environ.get("POKERBOT_BLUEPRINT_SNAPSHOT")
+    if env_path:
+        path, source = env_path, "POKERBOT_BLUEPRINT_SNAPSHOT (override)"
+    elif _STABLE.exists():
+        path, source = str(_STABLE), "STABLE_CURRENT ship pointer (default)"
+    else:
+        path, source = _LEGACY, "LEGACY TEMP fallback (STABLE pointer MISSING!)"
+
     if path not in _BLUEPRINT_SNAPSHOT_CACHE:
         with open(path, "rb") as f:
-            snap = pickle.load(f)
+            raw = f.read()
+        snap = pickle.loads(raw)
+        stamp = None
         if isinstance(snap, dict) and "strat_sum" in snap:
             # Cross-check the serve abstraction against the stamp the trainer wrote. A STAMPED snapshot
             # (the lossless era) is checked STRICTLY — serving it under the wrong encoder flags silently
@@ -745,6 +762,27 @@ def _load_blueprint_snapshot():
             stamp = snap.get("abstraction")
             check_blueprint_serve_env(expected=stamp, strict=stamp is not None)
             snap = snap["strat_sum"]
+        n_infosets = len(snap) if hasattr(snap, "__len__") else -1
+        sha = hashlib.sha256(raw).hexdigest()[:12]
+        # LOUD provenance banner — the served blueprint must NEVER be ambiguous again (the B1 lesson:
+        # the audited "best" was not the served one). Printed to stderr + the logging subsystem.
+        banner = (
+            "\n===================== BLUEPRINT SERVE =====================\n"
+            f"[BLUEPRINT] path     : {path}\n"
+            f"[BLUEPRINT] source   : {source}\n"
+            f"[BLUEPRINT] infosets : {n_infosets:,}   sha256[:12]={sha}\n"
+            f"[BLUEPRINT] abstract : {stamp}\n"
+            "===========================================================\n"
+        )
+        print(banner, file=sys.stderr, flush=True)
+        try:
+            import logging
+
+            logging.getLogger("pokerbot.blueprint").warning(
+                "SERVING blueprint path=%s source=%s infosets=%s sha256=%s abstraction=%s",
+                path, source, n_infosets, sha, stamp)
+        except Exception:  # noqa: BLE001 — logging must never break the serve
+            pass
         _BLUEPRINT_SNAPSHOT_CACHE[path] = snap
     return _BLUEPRINT_SNAPSHOT_CACHE[path]
 

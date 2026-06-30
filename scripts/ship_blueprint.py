@@ -460,6 +460,12 @@ def main(argv: list[str] | None = None) -> int:
             ap.error(f"--emd-frozen {args.emd_frozen} not found")
         SERVE_ABSTRACTION_ENV["POKERBOT_POSTFLOP_MODE"] = "emd"
         SERVE_ABSTRACTION_ENV["POKERBOT_POSTFLOP_EMD_FROZEN"] = str(emd_path.resolve())
+        # RIVER is intentionally NOT in the flop/turn frozen blob, so the TRAINER keys the river with a
+        # made-hand bucket; serve MUST mirror that, else a river frozen-miss returns -1 -> wrong digest
+        # branch -> 100% river miss -> UNIFORM river policy (~1/3 of postflop decision volume). Verified
+        # 2026-06-30: river serve hit-rate 0.000 (default) -> 0.601 with this flag. flop/turn are unaffected
+        # (the blob is complete -> they never frozen-miss).
+        SERVE_ABSTRACTION_ENV["POKERBOT_EMD_FROZEN_MIRROR_FALLBACK"] = "1"
 
     # MUST set serve env BEFORE importing pokerbot (the encoder bakes the flags at import).
     _set_serve_env()

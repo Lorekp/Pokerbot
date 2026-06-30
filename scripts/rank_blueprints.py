@@ -98,6 +98,10 @@ def _configure_serve_env(stamp: dict | None, args) -> dict:
     os.environ["POKERBOT_POSTFLOP_MODE"] = str(cfg["postflop_mode"])
     if cfg["emd_frozen"]:
         os.environ["POKERBOT_POSTFLOP_EMD_FROZEN"] = str(cfg["emd_frozen"])
+        # The trainer keys the RIVER with a made-hand bucket (river is not in the flop/turn frozen blob), so
+        # serve must mirror or the river plays UNIFORM (verified river hit 0.000 -> 0.601). Without this an
+        # EMD blueprint ranks FALSELY LOW (its river is garbage) -> a wrong validation-gate verdict.
+        os.environ["POKERBOT_EMD_FROZEN_MIRROR_FALLBACK"] = "1"
     if cfg["emd_table"]:
         os.environ["POKERBOT_POSTFLOP_EMD_TABLE"] = str(cfg["emd_table"])
     os.environ["POKERBOT_BP_COVERAGE"] = "1"          # enable the serve-coverage guard
