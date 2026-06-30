@@ -158,10 +158,12 @@ def _launch_with_fallback(ec2, run_kwargs: dict, *, instance_types: list[str], s
 
 
 def user_data(*, bucket, prefix, region, code_key, run_subdir, iters, n_deals, num_buckets,
-              depth_edges, checkpoint_every, keep_alive=False, emd_frozen_rel="",
-              work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05) -> str:
+              depth_edges, checkpoint_every, keep_alive=False, emd_frozen_rel="", emd_sha="",
+              work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
+              wall_guard_secs=21600, awscli_zip="awscli-exe-linux-x86_64.zip") -> str:
     run_prefix = f"{prefix}/{run_subdir}"
     final = "echo BOOTSTRAP_DONE_KEEP_ALIVE" if keep_alive else "shutdown -h now"
+    floor_min = wall_guard_secs // 60 + 5   # absolute logind floor, 5 min after the wall-guard unit
     depth_csv = ",".join(str(float(x)) for x in (depth_edges or []))
     # No output redirect (cloud-init captures stdout to /var/log/cloud-init-output.log, visible via
     # get-console-output) — same lesson the SD-CFR launcher documents.
@@ -169,10 +171,33 @@ def user_data(*, bucket, prefix, region, code_key, run_subdir, iters, n_deals, n
 set -uxo pipefail
 export HOME="${{HOME:-/root}}"   # cloud-init runs as root with HOME UNSET; under set -u a bare $HOME (rustup/cargo PATH) is FATAL and aborts the whole script
 export DEBIAN_FRONTEND=noninteractive AWS_DEFAULT_REGION={region}
+mkdir -p /opt/pokerbot
+
+# ===================== STEP 0 -- DEAD-MAN COST CAP, ARMED FIRST (before apt/rustup/build) =====================
+# TWO independent on-box terminators so the box CANNOT outlive ~{floor_min} min no matter what fails below
+# (the documented 3h20m idle-bill fix; ported from launch_cpu128_probe_spot.py). These MUST be the first real
+# commands so they survive a crash anywhere downstream (incl. a set -u abort, an apt/rustup/cargo failure, or
+# a hung driver) AND a dead babysitter / powered-off laptop:
+#  0a) ABSOLUTE FLOOR: `shutdown -h +{floor_min}` is scheduled by systemd/logind ITSELF (not a child/sleep),
+#      immune to cloud-init cgroup teardown, needs no packages. THE guard the old single-`shutdown`-at-tail
+#      design lacked -- a crash before the tail used to idle-bill the box.
+#  0b) WALL-GUARD UNIT: a systemd-run transient unit (own cgroup; NO --oneshot, whose 90s
+#      DefaultTimeoutStartSec would reap the sleep) that at {wall_guard_secs}s sweeps the train log to S3 then
+#      shuts down (~5 min before 0a).
+/sbin/shutdown -h +{floor_min} "pokerbot native-cfr wall-guard absolute cost cap" || true
+systemd-run --unit=pokerbot-wallguard --collect -p TimeoutStartSec=infinity --no-block /bin/bash -c 'sleep {wall_guard_secs} ; sync ; timeout 120 aws s3 cp /var/log/native-cfr-train.log s3://{bucket}/{run_prefix}/logs/train.WALLGUARD.log --region {region} 2>/dev/null || true ; /sbin/shutdown -h now' || true
+echo "WALL_GUARD armed: absolute shutdown +{floor_min}min floor + pokerbot-wallguard unit at {wall_guard_secs}s"
 
 apt-get update -qq
-apt-get install -y -qq python3-pip python3-dev awscli gzip curl build-essential
-aws --version
+apt-get install -y -qq python3-pip python3-dev gzip curl unzip build-essential
+# AWS CLI v2 (NOT apt awscli v1): self-contained (bundled botocore under /usr/local/aws-cli), so the driver's
+# `pip install boto3` below can bump the SYSTEM botocore WITHOUT breaking the CLI. The apt awscli v1 broke
+# exactly this way: pip boto3 -> newer botocore -> awscli v1 `KeyError: 'opsworkscm'` on every call.
+curl -fsSL "https://awscli.amazonaws.com/{awscli_zip}" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli --update
+hash -r
+aws --version   # MUST be aws-cli/2.x; if this dies, STEP-0 still bounds the box
 # Rust toolchain (rustup, stable) for the native build.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -209,9 +234,23 @@ ls -la /opt/pokerbot/battery_native.so
 # +12.6% deals/s / +18.5% nodes/s at LOWER CPU. PHYS_CORES = unique (socket,core) pairs (correct on 2-socket
 # boxes where core ids repeat per socket). Override by exporting RAYON_NUM_THREADS before launch.
 PHYS_CORES=$(lscpu -p=SOCKET,CORE | grep -v '^#' | sort -u | wc -l)
-if [ -z "$RAYON_NUM_THREADS" ]; then export RAYON_NUM_THREADS=$PHYS_CORES; fi
+if [ -z "${{RAYON_NUM_THREADS:-}}" ]; then export RAYON_NUM_THREADS=$PHYS_CORES; fi
 echo "RAYON_NUM_THREADS=$RAYON_NUM_THREADS (physical cores=$PHYS_CORES, nproc=$(nproc); SMT-off per cpu128 probe verdict)"
 export PYTHONPATH=/opt/pokerbot RUST_BACKTRACE=1
+
+# S2: verify the shipped EMD frozen blob matches its known sha256 BEFORE training. A same-K CORRUPTED blob
+# (truncated S3 round-trip) -> wrong potential-aware buckets -> a broken blueprint that the convergence-stop
+# (abstraction-agnostic) cannot catch and only the final ranking gate would; the ctor's num_buckets==K check
+# does NOT detect content corruption. Empty EMD_SHA (made-hand path) -> skipped. A mismatch terminates the box.
+EMD_SHA="{emd_sha}"
+EMD_REL="{emd_frozen_rel}"
+if [ -n "$EMD_SHA" ] && [ -n "$EMD_REL" ]; then
+  ACT=$(sha256sum "/opt/pokerbot/$EMD_REL" | awk '{{print $1}}')
+  if [ "$ACT" != "$EMD_SHA" ]; then
+    echo "FATAL: EMD blob sha mismatch expect=$EMD_SHA actual=$ACT -- aborting + terminating"; sync; /sbin/shutdown -h now; exit 1
+  fi
+  echo "EMD blob sha256 OK: $ACT"
+fi
 
 cat > /opt/pokerbot/drive_native_cfr.py <<'PYEOF'
 import os, sys, time, traceback
@@ -342,6 +381,10 @@ def main() -> None:
                         "empty = non-depth blueprint")
     p.add_argument("--checkpoint-every", type=int, default=500,
                    help="checkpoint to S3 every N iters (preemption-bounded loss)")
+    p.add_argument("--max-hours", type=float, default=6.0,
+                   help="ON-BOX absolute dead-man cost cap (hours): the box self-terminates after this no "
+                        "matter what (logind floor + systemd wall-guard), independent of the babysitter/PC. "
+                        "Set comfortably above the expected run (~2h) but below the babysitter's 12h cap.")
     p.add_argument("--run-subdir", default=None, help="S3 subdir for this run (default: run_<ts>)")
     p.add_argument("--bucket", default=DEFAULT_BUCKET)
     p.add_argument("--prefix", default=DEFAULT_PREFIX)
@@ -408,14 +451,28 @@ def main() -> None:
     print(f"AMI: {ami}  instance: {args.instance_type}  arch: {args.arch}  region: {args.region}",
           flush=True)
 
+    # S2: pass the EMD blob's expected sha256 (from its sidecar .sha256) so the box verifies it before training.
+    emd_sha = ""
+    if args.emd_frozen:
+        sha_path = ROOT / (args.emd_frozen + ".sha256")
+        if sha_path.exists():
+            emd_sha = sha_path.read_text(encoding="utf-8").split()[0].strip()
+            print(f"EMD blob sha256 (on-box verify armed): {emd_sha}", flush=True)
+        else:
+            print(f"WARN: {sha_path} missing -> on-box EMD sha check SKIPPED (blob unverified)", flush=True)
+    # B2: the on-box dead-man cost cap floor = --max-hours (absolute, independent of the babysitter/PC).
+    wall_guard_secs = max(1, int(args.max_hours * 3600))
+    awscli_zip = "awscli-exe-linux-aarch64.zip" if args.arch == "arm64" else "awscli-exe-linux-x86_64.zip"
+
     ud = user_data(
         bucket=args.bucket, prefix=args.prefix, region=args.region, code_key=code_key,
         run_subdir=run_subdir, iters=args.iters, n_deals=args.n_deals,
         num_buckets=args.num_buckets, depth_edges=depth_edges,
         checkpoint_every=args.checkpoint_every, keep_alive=args.keep_alive,
-        emd_frozen_rel=args.emd_frozen,
+        emd_frozen_rel=args.emd_frozen, emd_sha=emd_sha,
         work_steal=args.work_steal, dcfr=args.dcfr,
         dcfr_prune_threshold=args.dcfr_prune_threshold, dcfr_explore_frac=args.dcfr_explore_frac,
+        wall_guard_secs=wall_guard_secs, awscli_zip=awscli_zip,
     )
     run_kwargs = dict(
         ImageId=ami,

@@ -52,10 +52,15 @@ param(
                                       # -NoConvergeStop ckpts and set it where the per-step delta drop flattens.
   [int]$ConvK = 3,                    # consecutive below-threshold checkpoints required to declare CONVERGED
   [int]$ConvNumBuckets = 160,         # stop-helper ctor arg (irrelevant to load; match -NumBuckets for clarity)
-  [string]$ConvDepthEdges = ""        # ctor depth-edges for the stop helper (irrelevant to load); CSV like "50,100"
+  [string]$ConvDepthEdges = "",       # ctor depth-edges for the stop helper (irrelevant to load); CSV like "50,100"
+  [switch]$MadeHand                   # shortcut for the made-hand K200 abstraction: forces EmdFrozen=''
+                                      # + NumBuckets/ConvNumBuckets=200. Avoids the PowerShell quirk where
+                                      # `-EmdFrozen ""` at a backtick-continued line parses as a missing arg.
 )
 $ErrorActionPreference = "Continue"
 Set-Location (Join-Path $PSScriptRoot "..")   # repo root
+
+if ($MadeHand) { $EmdFrozen = ""; $NumBuckets = 200; $ConvNumBuckets = 200 }   # made-hand K200 shortcut
 
 if (-not $Run) {
   $Run = "bp_{0}" -f ([int][double]::Parse((Get-Date -UFormat %s)))
@@ -148,6 +153,10 @@ function Invoke-Launch {
     "scripts\launch_native_cfr_training_spot.py",
     "--run-subdir", $Run, "--iters", $Iters, "--n-deals", $NDeals,
     "--num-buckets", $NumBuckets, "--checkpoint-every", $CheckpointEvery,
+    # On-box dead-man cost cap = babysitter wall-cap + 1h, so the box self-terminates as a PC-off/babysitter-
+    # dead backstop AFTER the babysitter's own Stop-Run would fire -- and a LONG (-NoConvergeStop) run is NOT
+    # forced to relaunch at the launcher's old 6h default. The babysitter's $MaxHours stays the primary cap.
+    "--max-hours", ($MaxHours + 1),
     "--instance-type", $InstanceType, "--arch", $Arch
   )
   if ($EmdFrozen)  { $argsList += @("--emd-frozen", $EmdFrozen) }
