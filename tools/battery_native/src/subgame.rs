@@ -28,11 +28,18 @@
 
 use std::collections::HashMap;
 
-use crate::core::{self, EnvStateN, NUM_ACTIONS, SEAT_FOLDED};
+use crate::core::{self, EnvStateN, ALL_IN, BET_BUCKET_START, NUM_ACTIONS, SEAT_FOLDED};
 use crate::fingerprint::{fingerprint_fast, CHIP_UNIT};
 use crate::playout::{self, Blueprint, PlayoutConfig, Rng};
 
 const ZEROS: [f64; NUM_ACTIONS] = [0.0; NUM_ACTIONS];
+
+/// Precomputed PURE frozen-deviation table (built in Python by `exploit_table.build_frozen_table`):
+/// `(actor:u8, ctx_id:u16, legal_bits:u16) -> frozen[f64;11]`. Native NEVER computes the exploit math
+/// (context_read / posterior / cap_eff) — it only LOOKS UP this output (data-not-code firewall) and
+/// applies the documented overwrite / blend at opponent nodes. A MISS (no read at that context, or the
+/// mask not tabled) falls through to the GTO base, identical to Python's `read is None` path.
+pub type FrozenTable = HashMap<(u8, u16, u16), [f64; NUM_ACTIONS]>;
 
 /// CFR-loop knobs (distinct from the leaf playout's `PlayoutConfig`, whose `max_depth` bounds the
 /// per-leaf rollout — `max_depth` here bounds the betting-round CFR recursion).
@@ -323,6 +330,212 @@ fn leaf_seed(key: &[i64], public_seed: u64) -> u64 {
 }
 
 // --------------------------------------------------------------------------------------------------
+// context-key id (firewall-safe KEY recompute; a PORT of `_context_key_from_env`, NOT exploit math)
+// --------------------------------------------------------------------------------------------------
+
+/// Board-revealed-card count per street (mirrors turbo_rebel_search._CTX_BOARD_LEN = (0,3,4,5)).
+const CTX_BOARD_LEN: [usize; 4] = [0, 3, 4, 5];
+
+/// Board texture id (mirrors context.board_texture_rs): 0=dry, 1=wet, 2=paired. `ranks` are 2..14,
+/// `suits` are 0..3. Returns None for <3 cards (preflop has no texture in the ctx-id map).
+fn board_texture_id(ranks: &[i32], suits: &[i32]) -> Option<u8> {
+    let n = ranks.len();
+    if n < 3 {
+        return None;
+    }
+    // paired: any duplicate rank (len(set(ranks)) < n).
+    let mut seen = [false; 32];
+    let mut distinct = 0usize;
+    for &r in ranks {
+        let idx = r as usize;
+        if idx < 32 && !seen[idx] {
+            seen[idx] = true;
+            distinct += 1;
+        }
+    }
+    if distinct < n {
+        return Some(2); // paired
+    }
+    // wet (flush-heavy): max suit count >= 3.
+    let mut suit_cnt = [0i32; 4];
+    for &s in suits {
+        if (0..4).contains(&s) {
+            suit_cnt[s as usize] += 1;
+        }
+    }
+    if suit_cnt.iter().cloned().max().unwrap_or(0) >= 3 {
+        return Some(1); // wet
+    }
+    // straight-heavy: tight cluster (<=4 span) or >=2 close connections (gaps<=2) over sorted-unique.
+    let mut rs: Vec<i32> = ranks.to_vec();
+    rs.sort_unstable();
+    rs.dedup();
+    let span = rs[rs.len() - 1] - rs[0];
+    let mut close = 0usize;
+    for i in 0..rs.len() - 1 {
+        if rs[i + 1] - rs[i] <= 2 {
+            close += 1;
+        }
+    }
+    if span <= 4 || close >= 2 {
+        return Some(1); // wet
+    }
+    Some(0) // dry
+}
+
+/// Is an engine action index aggressive (bet/raise/all-in) — counts toward preflop facing depth.
+/// Mirrors context.is_aggressive_action (action_bin in {AGG_SMALL, AGG_LARGE}); equivalently a>=3.
+#[inline]
+fn is_aggressive_action_rs(a: i32) -> bool {
+    let a = a as usize;
+    (BET_BUCKET_START..=ALL_IN).contains(&a)
+}
+
+/// Raw per-street aggression count for the facing bucket (mirrors `_facing_count_from_env`):
+/// preflop = #aggressive entries over the whole flat history; postflop = binary to_call signal.
+fn facing_count<const N: usize>(s: &EnvStateN<N>, street: i32, actor: usize) -> i32 {
+    if street == 0 {
+        let hist_len = s.hist_len.max(0) as usize;
+        let mut n = 0i32;
+        for i in 0..hist_len {
+            if is_aggressive_action_rs(s.hist_action[i]) {
+                n += 1;
+            }
+        }
+        return n;
+    }
+    let to_call = s.current_bet - s.committed_street[actor];
+    if to_call <= 0 {
+        0
+    } else {
+        1
+    }
+}
+
+/// Port of `pluribus_search._context_key_from_env` -> the `all_contexts()` index (0..21). This is the
+/// SHARED firewall contract: native recomputes the KEY, Python computed the VALUE. The (street,
+/// texture, facing) -> ctx_id map MIRRORS list(all_contexts()) order EXACTLY (asserted equal to the
+/// Python list in a test). Returns None for an out-of-range street (the caller treats it as a MISS).
+///
+/// Layout (= list(all_contexts()) order):
+///   preflop (street 0): ctx_id = facing_idx, facing in {unopened:0, facing_bet:1, facing_raise:2,
+///                       facing_3bet:3} by raw aggression count capped at 3 (full preflop depth).
+///   postflop (street 1..3): ctx_id = 4 + (street-1)*6 + texture_idx*2 + facing_bin
+///                       texture in {dry:0, wet:1, paired:2}; facing_bin = min(facing,1) (binary).
+fn ctx_key_id<const N: usize>(s: &EnvStateN<N>, actor: usize) -> Option<u16> {
+    let street = s.street;
+    if !(0..4).contains(&street) {
+        return None;
+    }
+    let n_board = CTX_BOARD_LEN[street as usize];
+    let mut ranks: Vec<i32> = Vec::with_capacity(n_board);
+    let mut suits: Vec<i32> = Vec::with_capacity(n_board);
+    for i in 0..n_board {
+        let c = s.board[i];
+        if c < 0 {
+            continue;
+        }
+        ranks.push(c / 4 + 2);
+        suits.push(c % 4);
+    }
+    let n_aggr = facing_count(s, street, actor);
+    if street == 0 {
+        // preflop: full 4-level facing depth (cap at 3).
+        let f = n_aggr.clamp(0, 3) as u16;
+        return Some(f);
+    }
+    // postflop: texture (None when <3 revealed, but street>=1 always has >=3 on a settled tick).
+    let tex = board_texture_id(&ranks, &suits)?;
+    let facing_bin = if n_aggr > 0 { 1u16 } else { 0u16 };
+    let base = 4u16 + (street as u16 - 1) * 6 + (tex as u16) * 2 + facing_bin;
+    Some(base)
+}
+
+/// Public concrete-N wrapper of `ctx_key_id` for the Python cross-check (`subgame_ctx_key_id`).
+pub fn ctx_key_id_pub<const N: usize>(s: &EnvStateN<N>, actor: usize) -> Option<u16> {
+    ctx_key_id(s, actor)
+}
+
+/// 11-bit legal mask packed into a u16 (bit `a` set iff action `a` is in the abstracted legal set).
+#[inline]
+fn legal_bits(legal: &[bool; NUM_ACTIONS]) -> u16 {
+    let mut b = 0u16;
+    for a in 0..NUM_ACTIONS {
+        if legal[a] {
+            b |= 1 << a;
+        }
+    }
+    b
+}
+
+/// Exploit per-solve context: the GTO `Ctx` plus the precomputed frozen table + rnr scalars.
+struct CtxExploit<'a> {
+    base: Ctx<'a>,
+    frozen: &'a FrozenTable,
+    rnr: &'a [f64; 6],
+    // Carried for parity with the Python config; the overwrite-vs-blend decision is driven by the NaN
+    // sentinel in `rnr` (Python sets every entry NaN when rnr_restrict is off), so the flag itself is
+    // not read in the hot path. Kept so the FFI signature mirrors pluribus_search.
+    #[allow(dead_code)]
+    rnr_restrict: bool,
+    frozen_read_response: bool,
+}
+
+/// `_opponent_strategy` with the precomputed pure-frozen exploit deviation applied at opponent nodes.
+///
+/// Computes the SAME native base (blueprint-mixed regret-match) as `opponent_strategy`, then — iff the
+/// frozen table is engaged and `frozen_read_response` — recomputes the context KEY + legal_bits, looks
+/// up the frozen vector, and applies (mirroring pluribus_search.py:548-557):
+///   * rnr[actor] is NaN (rnr is None)  -> RETURN frozen                    (R1 overwrite)
+///   * else                              -> normalize((1-rnr)*base + rnr*frozen) over legal (R2 blend)
+/// A MISS (no read at ctx, or this mask not tabled) RETURNS the GTO base — identical to Python's
+/// `read is None` path and SAFER than the rare `fs<=1e-12 -> apply_context_bias` fallback we keep in
+/// Python (native treats it as a table miss => less deviation).
+fn opponent_strategy_exploit<const N: usize>(
+    s: &EnvStateN<N>,
+    actor: usize,
+    legal: &[bool; NUM_ACTIONS],
+    regrets: &[f64; NUM_ACTIONS],
+    cx: &CtxExploit,
+) -> [f64; NUM_ACTIONS] {
+    let base = opponent_strategy(s, actor, legal, regrets, &cx.base);
+    if !cx.frozen_read_response || actor >= 6 {
+        return base;
+    }
+    let ctx_id = match ctx_key_id(s, actor) {
+        Some(c) => c,
+        None => return base,
+    };
+    let bits = legal_bits(legal);
+    let frozen = match cx.frozen.get(&(actor as u8, ctx_id, bits)) {
+        Some(f) => f,
+        None => return base, // MISS -> GTO base (the firewall-safe fallback)
+    };
+    let r = cx.rnr[actor];
+    if r.is_nan() {
+        // R1: rnr is None -> overwrite the base with the frozen posterior (already normalized over
+        // legal in the Python precompute).
+        return *frozen;
+    }
+    // R2: normalize((1-r)*base + r*frozen) over the legal set (== pluribus_search.py:555-557).
+    let mut mixed = [0.0f64; NUM_ACTIONS];
+    let mut ms = 0.0;
+    for a in 0..NUM_ACTIONS {
+        let v = (1.0 - r) * base[a] + r * frozen[a];
+        mixed[a] = v;
+        ms += v;
+    }
+    if ms > 1e-12 {
+        for a in 0..NUM_ACTIONS {
+            mixed[a] /= ms;
+        }
+        mixed
+    } else {
+        *frozen
+    }
+}
+
+// --------------------------------------------------------------------------------------------------
 // opponent-hole sampling (uniform belief)
 // --------------------------------------------------------------------------------------------------
 
@@ -524,4 +737,215 @@ pub fn solve<const N: usize>(
         probs[a] /= denom;
     }
     probs
+}
+
+// --------------------------------------------------------------------------------------------------
+// EXPLOIT solve: same CFR loop, opponent nodes apply the precomputed pure-frozen deviation, and the
+// root per-action CFVs are accumulated (CFR+-weighted) for the AIVAT decision baseline.
+// --------------------------------------------------------------------------------------------------
+
+/// Tables for the exploit solve: the GTO tables plus the AIVAT root-CFV accumulators (mirrors
+/// pluribus_search.py:692-697 — `_root_av_sum` / `_root_av_wsum`, CFR+-weighted like strat_sum).
+struct TablesExploit {
+    regrets: HashMap<Vec<i64>, [f64; NUM_ACTIONS]>,
+    strat_sum: HashMap<Vec<i64>, [f64; NUM_ACTIONS]>,
+    leaf: HashMap<Vec<i64>, f64>,
+    root_av_sum: [f64; NUM_ACTIONS],
+    root_av_wsum: f64,
+}
+
+fn leaf_value_x<const N: usize>(
+    env: &EnvStateN<N>,
+    hero: usize,
+    cx: &CtxExploit,
+    tab: &mut TablesExploit,
+) -> f64 {
+    if env.done {
+        return env.rewards[hero] as f64 / CHIP_UNIT;
+    }
+    let key = leaf_key(env);
+    if let Some(&v) = tab.leaf.get(&key) {
+        return v;
+    }
+    let seed = leaf_seed(&key, cx.base.public_seed);
+    let v = playout::uniform_leaf_value(
+        env,
+        hero,
+        cx.base.bp,
+        cx.base.pcfg,
+        seed,
+        cx.base.scfg.rollout_samples,
+        cx.base.scfg.resample_board,
+    );
+    tab.leaf.insert(key, v);
+    v
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cfv_exploit<const N: usize>(
+    env: &EnvStateN<N>,
+    hero: usize,
+    depth: i32,
+    cx: &CtxExploit,
+    tab: &mut TablesExploit,
+    rng: &mut Rng,
+    t: i32,
+    want_root_q: bool,
+) -> f64 {
+    if env.done {
+        return env.rewards[hero] as f64 / CHIP_UNIT;
+    }
+    if core::is_chance_node(env) {
+        return leaf_value_x(env, hero, cx, tab);
+    }
+    if depth >= cx.base.scfg.max_depth {
+        return leaf_value_x(env, hero, cx, tab);
+    }
+    let actor_i = env.action_seat;
+    if actor_i < 0 {
+        return leaf_value_x(env, hero, cx, tab);
+    }
+    let actor = actor_i as usize;
+    let legal = abstracted_legal(env, actor, cx.base.pcfg);
+    if !any_legal(&legal) {
+        return env.rewards[hero] as f64 / CHIP_UNIT;
+    }
+    let key = infoset_key(env, actor);
+
+    if actor != hero {
+        let regrets = *tab.regrets.get(&key).unwrap_or(&ZEROS);
+        let strat = opponent_strategy_exploit(env, actor, &legal, &regrets, cx);
+        let u = rng.next_f64();
+        let a = sample_action(&strat, &legal, u);
+        let child = core::apply_action(env, a);
+        return cfv_exploit(&child, hero, depth + 1, cx, tab, rng, t, want_root_q);
+    }
+
+    // hero node: branch all (abstracted-)legal actions, CFR+ regret update.
+    let regrets = *tab.regrets.get(&key).unwrap_or(&ZEROS);
+    let strat = regret_match(&regrets, &legal);
+    let mut av = [0.0f64; NUM_ACTIONS];
+    for a in 0..NUM_ACTIONS {
+        if legal[a] {
+            let child = core::apply_action(env, a);
+            av[a] = cfv_exploit(&child, hero, depth + 1, cx, tab, rng, t, want_root_q);
+        }
+    }
+    let mut ev = 0.0;
+    for a in 0..NUM_ACTIONS {
+        ev += strat[a] * av[a];
+    }
+    let mut newr = regrets;
+    for a in 0..NUM_ACTIONS {
+        if legal[a] {
+            newr[a] = (newr[a] + av[a] - ev).max(0.0);
+        }
+    }
+    tab.regrets.insert(key.clone(), newr);
+    let w = if cx.base.scfg.linear_averaging {
+        (t + 1) as f64
+    } else {
+        1.0
+    };
+    let ss = tab.strat_sum.entry(key).or_insert([0.0; NUM_ACTIONS]);
+    for a in 0..NUM_ACTIONS {
+        ss[a] += w * strat[a];
+    }
+    // AIVAT decision-baseline capture (mirrors pluribus_search.py:692-697): at the ROOT decision node
+    // (depth==0) accumulate the per-action CFVs CFR+-weighted exactly like the served strategy, so the
+    // AIVAT baseline is CONSISTENT with the served average policy.
+    if want_root_q && depth == 0 {
+        for a in 0..NUM_ACTIONS {
+            tab.root_av_sum[a] += w * av[a];
+        }
+        tab.root_av_wsum += w;
+    }
+    ev
+}
+
+/// Run the exploit subgame solve. Returns `(root_probs[11], root_q[11])` where `root_q[a]` is the
+/// CFR+-weighted average per-action CFV at the root (the AIVAT decision baseline) — all zeros when
+/// `want_root_q` is false.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_exploit<const N: usize>(
+    root: &EnvStateN<N>,
+    hero: usize,
+    bp: &Blueprint,
+    pcfg: &PlayoutConfig,
+    scfg: &SubgameConfig,
+    public_seed: u64,
+    frozen: &FrozenTable,
+    rnr: &[f64; 6],
+    rnr_restrict: bool,
+    frozen_read_response: bool,
+    want_root_q: bool,
+) -> ([f64; NUM_ACTIONS], [f64; NUM_ACTIONS]) {
+    let legal_root = abstracted_legal(root, hero, pcfg);
+    let mut probs = [0.0f64; NUM_ACTIONS];
+    let root_q = [0.0f64; NUM_ACTIONS];
+    if !any_legal(&legal_root) {
+        return (probs, root_q);
+    }
+    let cx = CtxExploit {
+        base: Ctx {
+            bp,
+            pcfg,
+            scfg,
+            public_seed,
+        },
+        frozen,
+        rnr,
+        rnr_restrict,
+        frozen_read_response,
+    };
+    let mut tab = TablesExploit {
+        regrets: HashMap::new(),
+        strat_sum: HashMap::new(),
+        leaf: HashMap::new(),
+        root_av_sum: [0.0; NUM_ACTIONS],
+        root_av_wsum: 0.0,
+    };
+    let root_key = infoset_key(root, hero);
+    let mut rng = Rng::seed_from_u64(public_seed);
+    let iters = scfg.max_iterations.max(0);
+    for t in 0..iters {
+        let mut world = *root;
+        deal_opponent_holes(&mut world, hero, &mut rng);
+        cfv_exploit(&world, hero, 0, &cx, &mut tab, &mut rng, t, want_root_q);
+    }
+
+    let mut used_avg = false;
+    if let Some(ss) = tab.strat_sum.get(&root_key) {
+        let tot: f64 = ss.iter().sum();
+        if tot > 1e-12 {
+            for a in 0..NUM_ACTIONS {
+                probs[a] = if legal_root[a] { ss[a] } else { 0.0 };
+            }
+            used_avg = true;
+        }
+    }
+    if !used_avg {
+        let regrets = *tab.regrets.get(&root_key).unwrap_or(&ZEROS);
+        probs = regret_match(&regrets, &legal_root);
+    }
+    let mut s = 0.0;
+    for a in 0..NUM_ACTIONS {
+        if !legal_root[a] {
+            probs[a] = 0.0;
+        }
+        s += probs[a];
+    }
+    let denom = s.max(1e-12);
+    for a in 0..NUM_ACTIONS {
+        probs[a] /= denom;
+    }
+
+    // Root-CFV average (the AIVAT baseline): root_av_sum / root_av_wsum (mirrors _leaf_q extraction).
+    let mut rq = [0.0f64; NUM_ACTIONS];
+    if want_root_q && tab.root_av_wsum > 1e-12 {
+        for a in 0..NUM_ACTIONS {
+            rq[a] = tab.root_av_sum[a] / tab.root_av_wsum;
+        }
+    }
+    (probs, rq)
 }

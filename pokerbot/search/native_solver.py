@@ -453,6 +453,73 @@ def native_subgame_solve(
 
 
 # ---------------------------------------------------------------------------
+# Native EXPLOIT subgame solve (POKERBOT_NATIVE_EXPLOIT).
+#
+# Same native CFR subgame solve as native_subgame_solve, but the opponent nodes apply a PRECOMPUTED
+# pure-frozen exploit deviation (built in pokerbot.search.exploit_table, Python) instead of the GTO
+# base. The exploit MATH (context_read / Dirichlet posterior / BOCPD / nash_reference / cap_eff) runs
+# in Python; native only LOOKS UP the output frozen vector + the per-actor rnr scalar and applies the
+# documented overwrite / blend at opponent nodes (the data-not-code firewall). Native ALSO exposes the
+# root per-action CFVs it already computes (for the AIVAT decision-baseline). Default OFF; a stale .pyd
+# lacking solve_exploit silently falls back to the Python _cfv loop.
+# ---------------------------------------------------------------------------
+def native_subgame_exploit_available() -> bool:
+    """True iff the native SubgameSolver exposes solve_exploit (a rebuilt .pyd) AND the native path is
+    enabled. Probes the bound method on the class so a stale binary silently falls back to Python."""
+    if not (_AVAILABLE and _ENABLED and _EXT is not None and hasattr(_EXT, "SubgameSolver")):
+        return False
+    return hasattr(_EXT.SubgameSolver, "solve_exploit")
+
+
+def native_subgame_solve_exploit(
+    base_state, hero: int, adapter, *, public_seed: int, max_iterations: int, max_depth: int,
+    blueprint_mix: float, rollout_samples: int, resample_board: bool, max_playout_depth: int,
+    num_buckets: int, linear_averaging: bool, frozen_table, rnr, frozen_read_response: bool,
+    rnr_restrict: bool, want_root_q: bool,
+):
+    """Native exploit subgame solve. Returns ``(probs[11], root_q[11] or None)`` or ``None`` when the
+    native path is unavailable / the adapter is unsupported / the binary is stale (caller runs Python).
+
+    ``frozen_table`` is the FrozenExploitTable (parallel keys_actor / keys_ctx / keys_mask + flat vals).
+    ``rnr`` is the length-6 per-actor scalar list (NaN = overwrite-with-frozen). The native side
+    recomputes the context KEY + legal_bits and applies the overwrite / blend against its OWN base."""
+    if not native_subgame_exploit_available():
+        return None
+    ckey = (id(adapter), int(max_playout_depth), int(num_buckets))
+    eng = _SUBGAME_ENGINE_CACHE.get(ckey)
+    if eng is None:
+        # The SAME engine (ctor unchanged — the table is passed PER-CALL, not baked), so the base
+        # (model=None) cache key is shared and untouched.
+        eng = _build_subgame_engine(adapter, num_buckets, max_playout_depth)
+        if eng is None:
+            return None
+        _SUBGAME_ENGINE_CACHE[ckey] = eng
+    sb = _to_flat(base_state).tobytes()
+    keys_actor = [int(x) for x in frozen_table.keys_actor]
+    keys_ctx = [int(x) for x in frozen_table.keys_ctx]
+    keys_mask = [int(x) for x in frozen_table.keys_mask]
+    vals = [float(x) for x in frozen_table.vals]
+    rnr_list = [float(x) for x in rnr]
+    try:
+        out = eng.solve_exploit(
+            sb, int(hero), int(public_seed) & 0xFFFFFFFFFFFFFFFF,
+            int(max_iterations), int(max_depth), float(blueprint_mix),
+            int(rollout_samples), bool(resample_board), bool(linear_averaging),
+            keys_actor, keys_ctx, keys_mask, vals, rnr_list,
+            bool(frozen_read_response), bool(rnr_restrict), bool(want_root_q),
+        )
+    except (TypeError, AttributeError):
+        # Stale native binary lacking solve_exploit (or a signature mismatch) -> fall back to Python.
+        return None
+    import numpy as _np
+
+    probs, root_q = out
+    probs = _np.asarray(probs, dtype=_np.float64)
+    rq = _np.asarray(root_q, dtype=_np.float64) if (want_root_q and root_q) else None
+    return probs, rq
+
+
+# ---------------------------------------------------------------------------
 # Startup self-check: native transitions must equal the Python engine on a battery of random hands.
 # ---------------------------------------------------------------------------
 

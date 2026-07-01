@@ -186,6 +186,20 @@ class PluribusReBeLConfig:
 _NATIVE_SUBGAME = os.environ.get("POKERBOT_NATIVE_SUBGAME", "0") not in ("0", "", "false", "False")
 
 
+# POKERBOT_NATIVE_EXPLOIT: when truthy AND the native SubgameSolver exposes solve_exploit (a rebuilt
+# .pyd) AND the solve is on the FROZEN-read exploit path (opponent_model set + config.frozen_read_response
+# + a frozen table built + no off-tree insert), run the whole CFR subgame solve in Rust — opponent nodes
+# apply a PRECOMPUTED pure-frozen deviation (the exploit MATH stays in Python: context_read / Dirichlet
+# posterior / BOCPD / nash_reference / cap_eff run in exploit_table.build_frozen_table; native only LOOKS
+# UP the output frozen vector + the per-actor rnr scalar — the data-not-code firewall). Native ALSO
+# exposes the root per-action CFVs for the AIVAT decision baseline, so the AIVAT gate relaxes too. The
+# non-pure tails (frozen_read_response False -> archetype apply_opponent_bias / apply_context_bias, which
+# are hole-card dependent) are NEVER native: the gate excludes them and the Python loop runs unchanged.
+# STATISTICALLY EQUIVALENT (fast native RNG), not bit-identical. Default OFF => the Python `_cfv` loop
+# (with the full exploit tail) runs unchanged.
+_NATIVE_EXPLOIT = os.environ.get("POKERBOT_NATIVE_EXPLOIT", "0") not in ("0", "", "false", "False")
+
+
 # POKERBOT_OFFTREE_RESOLVE: Pluribus-style real-time response to an OFF-TREE opponent bet size. When the
 # villain we are facing made a bet whose pot-fraction is NOT well-represented by the static keep-list bet
 # abstraction (its pseudo-harmonic-mapped bucket differs from the observed fraction by more than
@@ -242,6 +256,16 @@ def set_native_subgame(on: bool) -> None:
     """Runtime toggle for the native CFR subgame fast path (used by the validation harness)."""
     global _NATIVE_SUBGAME
     _NATIVE_SUBGAME = bool(on)
+
+
+def native_exploit_enabled() -> bool:
+    return _NATIVE_EXPLOIT
+
+
+def set_native_exploit(on: bool) -> None:
+    """Runtime toggle for the native EXPLOIT subgame fast path (used by the validation harness)."""
+    global _NATIVE_EXPLOIT
+    _NATIVE_EXPLOIT = bool(on)
 
 
 def _abstraction_masks(client_bet_sizing: bool):
@@ -864,6 +888,63 @@ class PluribusReBeLSolver:
                     iterations=int(cfg.max_iterations),
                     metadata={"served": "search_native"},
                 )
+
+        # NATIVE EXPLOIT FAST PATH (opt-in, POKERBOT_NATIVE_EXPLOIT): the exploit analogue of the GTO
+        # native path. Engaged ONLY on the PURE frozen-read branch — opponent_model set AND
+        # config.frozen_read_response (so _opponent_strategy is a pure function of public state) AND a
+        # frozen table builds AND no off-tree insert (the augmented root mask is not modeled native-side).
+        # The exploit MATH runs in Python (exploit_table.build_frozen_table -> context_read pipeline);
+        # native only looks up the precomputed frozen vector + the per-actor rnr scalar and applies the
+        # documented overwrite / blend (firewall). When AIVAT capture is armed, native also returns the
+        # root per-action CFVs, so the AIVAT gate (``not self._aivat_capture``) is LIFTED here — the
+        # chance-term v stays Python (RNG-gadget boundary), only the decision baseline comes from native.
+        # The non-pure tails (frozen_read_response False) are NEVER native: the condition below excludes
+        # them so the Python loop runs unchanged.
+        #
+        # LEAF MODEL: like the native GTO path, this uses the native UNIFORM continuation-gadget leaf
+        # (it does NOT apply the model-aware per-seat continuation weights `_leaf_cont_weights`). The
+        # opponent-NODE frozen deviation — the dominant exploit lever — is applied exactly; the leaf
+        # world is the uniform base arm. This is the statistical-equivalence target: the cert compares
+        # native-exploit vs the Python `_cfv` exploit baseline run with the SAME (uniform) leaf. The flag
+        # is default-OFF, so the default live path (with the model-aware leaf) is unchanged.
+        if (self.opponent_model is not None
+                and native_exploit_enabled() and bool(cfg.frozen_read_response)
+                and not self._offtree_inserted):
+            from pokerbot.engine.jax_weva_encode import _POSTFLOP_NUM_BUCKETS
+            from pokerbot.search import exploit_table as _et
+            from pokerbot.search import native_solver as _ns
+
+            ftab = _et.build_frozen_table(self, base_state, hero) if _ns.native_subgame_exploit_available() else None
+            if ftab is not None:
+                out = _ns.native_subgame_solve_exploit(
+                    base_state, hero, self.adapter,
+                    public_seed=self._public_seed(base_state, hero),
+                    max_iterations=cfg.max_iterations, max_depth=cfg.max_depth,
+                    blueprint_mix=cfg.blueprint_mix,
+                    rollout_samples=cfg.leaf.rollout_samples,
+                    resample_board=cfg.leaf.resample_board,
+                    max_playout_depth=cfg.leaf.max_playout_depth,
+                    num_buckets=int(_POSTFLOP_NUM_BUCKETS),
+                    linear_averaging=bool(cfg.linear_averaging),
+                    frozen_table=ftab, rnr=ftab.rnr,
+                    frozen_read_response=bool(ftab.frozen_read_response),
+                    rnr_restrict=bool(cfg.rnr_restrict),
+                    want_root_q=bool(self._aivat_capture),
+                )
+                if out is not None:
+                    probs_n, root_q = out
+                    probs = probs_n * legal
+                    probs = probs / max(probs.sum(), 1e-12)
+                    # AIVAT: feed the native root-CFV average into the decision baseline (so _leaf_q
+                    # returns it). _root_av_wsum=1.0 because root_q is ALREADY the CFR+-weighted average.
+                    if self._aivat_capture and root_q is not None:
+                        self._root_av_sum = np.asarray(root_q, dtype=np.float64)
+                        self._root_av_wsum = 1.0
+                    return SolveResult(
+                        action_probs=probs.astype(np.float32), ev=0.0,
+                        iterations=int(cfg.max_iterations),
+                        metadata={"served": "search_native_exploit"},
+                    )
 
         root_key = self._infoset_key(base_state, hero)
         iterations = 0

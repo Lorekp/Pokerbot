@@ -354,6 +354,19 @@ mod py {
         fingerprint::evaluate_cards(&cards)
     }
 
+    /// `subgame_ctx_key_id(state, actor)` -> the all_contexts() index (0..21) the native exploit path
+    /// recomputes from public state, or -1 on an out-of-range street / no-texture state. Cross-check
+    /// entry asserting the Rust `ctx_key_id` port equals `list(all_contexts()).index(
+    /// _context_key_from_env(env, actor))` — the firewall KEY contract.
+    #[pyfunction]
+    fn subgame_ctx_key_id(state: &[u8], actor: usize) -> i32 {
+        let s = flat::from_flat(&bytes_to_flat(state));
+        match subgame::ctx_key_id_pub(&s, actor) {
+            Some(id) => id as i32,
+            None => -1,
+        }
+    }
+
     /// Native uniform-mode continuation leaf engine. Holds the blueprint + config ONCE per worker;
     /// `leaf_value` runs the rollout for a depth-limit state with no per-step Python marshaling.
     #[pyclass]
@@ -532,6 +545,77 @@ mod py {
                 linear_averaging,
             };
             subgame::solve(&s, hero, &self.bp, &self.cfg, &scfg, public_seed).to_vec()
+        }
+
+        /// EXPLOIT solve: same CFR loop as `solve`, but opponent nodes apply a PRECOMPUTED pure-frozen
+        /// deviation (built in Python by `exploit_table.build_frozen_table` — the exploit MATH stays
+        /// there) and the root per-action CFVs are exposed for the AIVAT baseline. The frozen table is
+        /// passed as parallel lists `(keys_actor:u8, keys_ctx:u16, keys_mask:u16)` + `vals` (flat
+        /// `len*11` f64) reconstructed into a `FrozenTable`. `rnr` is the length-6 per-actor scalar
+        /// (NaN = overwrite-with-frozen). Returns `(root_probs[11], root_q[11])` (root_q all-zeros when
+        /// `want_root_q` is false). The ctor is UNCHANGED (the table is per-call, not baked), so the
+        /// model=None engine cache key is shared/untouched.
+        #[allow(clippy::too_many_arguments)]
+        fn solve_exploit(
+            &self,
+            state: &[u8],
+            hero: usize,
+            public_seed: u64,
+            max_iterations: i32,
+            max_depth: i32,
+            blueprint_mix: f64,
+            rollout_samples: i32,
+            resample_board: bool,
+            linear_averaging: bool,
+            keys_actor: Vec<u8>,
+            keys_ctx: Vec<u16>,
+            keys_mask: Vec<u16>,
+            vals: Vec<f64>,
+            rnr: Vec<f64>,
+            frozen_read_response: bool,
+            rnr_restrict: bool,
+            want_root_q: bool,
+        ) -> (Vec<f64>, Vec<f64>) {
+            let s = flat::from_flat(&bytes_to_flat(state));
+            let scfg = SubgameConfig {
+                max_iterations,
+                max_depth,
+                blueprint_mix,
+                rollout_samples,
+                resample_board,
+                linear_averaging,
+            };
+            // Reconstruct the FrozenTable from the parallel key lists + flat vals (chunked by 11).
+            let n = keys_actor
+                .len()
+                .min(keys_ctx.len())
+                .min(keys_mask.len())
+                .min(vals.len() / NUM_ACTIONS);
+            let mut frozen: subgame::FrozenTable = HashMap::with_capacity(n);
+            for i in 0..n {
+                let mut row = [0.0f64; NUM_ACTIONS];
+                row.copy_from_slice(&vals[i * NUM_ACTIONS..(i + 1) * NUM_ACTIONS]);
+                frozen.insert((keys_actor[i], keys_ctx[i], keys_mask[i]), row);
+            }
+            // rnr -> [f64;6] (pad missing with NaN = overwrite-with-frozen sentinel).
+            let mut rnr6 = [f64::NAN; 6];
+            for i in 0..6.min(rnr.len()) {
+                rnr6[i] = rnr[i];
+            }
+            let (probs, root_q) = subgame::solve_exploit(
+                &s,
+                hero,
+                &self.bp,
+                &self.cfg,
+                &scfg,
+                public_seed,
+                &frozen,
+                &rnr6,
+                rnr_restrict,
+                frozen_read_response,
+                want_root_q,
+            );
+            (probs.to_vec(), root_q.to_vec())
         }
     }
 
@@ -1413,6 +1497,7 @@ mod py {
         m.add_function(wrap_pyfunction!(fingerprint_fast, m)?)?;
         m.add_function(wrap_pyfunction!(fingerprint_fast_depth, m)?)?;
         m.add_function(wrap_pyfunction!(eval_seven_phe, m)?)?;
+        m.add_function(wrap_pyfunction!(subgame_ctx_key_id, m)?)?;
         m.add_function(wrap_pyfunction!(multiway_equity_river, m)?)?;
         m.add_function(wrap_pyfunction!(leduc_solve_exploitability, m)?)?;
         m.add_function(wrap_pyfunction!(icm_equity, m)?)?;
