@@ -34,6 +34,7 @@ from pokerbot.engine.jax_engine import BET_BUCKET_START, CHIP_UNIT, NUM_ACTIONS
 from pokerbot.engine.np_engine import (
     to_numpy_state,
     SEAT_FOLDED,
+    SEAT_LIVE,
 )
 # Hot-path engine primitives via the native dispatch layer (Rust core when enabled, else np_engine).
 from pokerbot.search.native_solver import (
@@ -46,7 +47,11 @@ from pokerbot.search.isomorphism import cached_canonicalize_key
 from pokerbot.search.pbs_tracker import PBSTracker
 from pokerbot.search.state_bridge import SubgameRoot
 from pokerbot.search.tabular_blueprint_adapter import TabularBlueprintAdapter
-from pokerbot.search.pluribus_rollout import ContinuationLeafConfig, continuation_leaf_value
+from pokerbot.search.pluribus_rollout import (
+    ContinuationLeafConfig,
+    _reshuffle_undealt,
+    continuation_leaf_value,
+)
 
 # Exploit tail + helpers lifted VERBATIM from the existing solver (firewall: unchanged math/keys).
 from pokerbot.search.turbo_rebel_search import (
@@ -70,6 +75,22 @@ class PluribusReBeLConfig:
     time_budget_ms: int = 2000
     max_depth: int = 48               # safety cap on betting-round recursion depth (not the leaf limit)
     blueprint_mix: float = 0.5        # opponent node: (1-mix)*regret_match + mix*blueprint
+    # STALE-DECK FIX (2026-07-01): _set_world overwrote opponent holes but left env.deck frozen, so an
+    # all-in line (which bypasses the reshuffling leaf gadget) replayed ONE fixed board every world/iter
+    # -> the search best-responded to a single frozen runout -> catastrophic preflop over-jamming (~0.92
+    # all-in on AKs vs a blueprint 0.083). When True, _set_world rebuilds the undealt deck tail per world
+    # (deterministic per-world seed => CRN preserved). Genuine correctness fix, but it changes sampled
+    # boards everywhere (postflop + exploit path) and the NATIVE core is not yet patched, so it ships
+    # default-OFF (byte-identical + Python/native parity) until native is patched + field/rank-validated,
+    # then flipped ON.
+    repair_deck: bool = False
+    # TWO-SIDED SEARCH (2026-07-01): when True the intra-round CFR is a proper multi-player subgame solve
+    # -- the traverser cycles across live seats so EVERY player updates regrets (opponents learn to fold to
+    # jams), instead of the hero one-sidedly best-responding to a fixed opponent (which degenerates to
+    # over-aggression, the Pluribus "fixed-strategy-beyond-leaf is highly exploitable" failure). Applies to
+    # GTO/base play only; the EXPLOIT path (opponent_model set) intentionally stays a one-sided BR to the
+    # MODELED opponent. Default OFF (byte-identical one-sided) until validated + ported to native.
+    two_sided: bool = False
     client_bet_sizing: bool = True    # use the SAME action abstraction as training (blueprint keys hit)
     search_preflop: bool = False      # Pluribus: serve preflop from blueprint, search postflop only
     # A1 stack-agnostic preflop: the preflop blueprint is keyed on (hole, position) only and trained at
@@ -350,6 +371,8 @@ class PluribusReBeLSolver:
         self._leaf_counter = 0  # per-leaf CRN offset so distinct leaves get distinct board runouts
         self._leaf_cont_weights: dict[int, np.ndarray] | None = None  # model-aware leaf (per solve)
         self._budget_bound_count = 0  # per-solver count of decisions cut short by time_budget_ms (S2)
+        self._two_sided_active = False  # set per-solve; True => cycle traverser (config.two_sided, GTO path)
+        self._traversers = []
         # AIVAT decision-baseline capture (default OFF => byte-identical hot loop + native fast path).
         # When armed (search_agent.enable_decision_capture with aivat_leaf_q), the solve accumulates the
         # ROOT per-action CFVs it ACTUALLY used to form the served strategy (depth-0 hero node) and
@@ -593,6 +616,8 @@ class PluribusReBeLSolver:
         if bool(env.done):
             return float(env.rewards[hero]) / CHIP_UNIT
         key = self._leaf_key(env)
+        if self._two_sided_active:
+            key = (key, int(hero))  # two-sided: the leaf value is per-traverser, so key the cache on the seat
         hit = self._leaf_cache.get(key)
         if hit is not None:
             self._leaf_cache_hits += 1
@@ -688,7 +713,16 @@ class PluribusReBeLSolver:
         regrets = self._get_regrets(key)
 
         if actor != hero:
-            strategy = self._opponent_strategy(env, actor, legal, regrets, key)
+            # NON-TRAVERSER node. TWO-SIDED (GTO, no opponent model): this seat plays its OWN CURRENT
+            # regret-matched strategy -- its regrets ARE updated when it is the traverser on other
+            # iterations, so it learns (e.g. to fold to a jam) and the solve converges to a subgame
+            # equilibrium rather than a one-sided best-response to a fixed loose opponent. ONE-SIDED /
+            # EXPLOIT path (opponent_model set): keep the fixed modeled opponent (best-responding to a
+            # KNOWN station is the intended exploitative behaviour).
+            if self._two_sided_active:
+                strategy = _regret_match(regrets, legal.astype(np.float64))
+            else:
+                strategy = self._opponent_strategy(env, actor, legal, regrets, key)
             lp = strategy[legal]
             tot = lp.sum()
             if tot <= 1e-12:
@@ -697,7 +731,7 @@ class PluribusReBeLSolver:
                 a = int(self.rng.choice(np.flatnonzero(legal), p=lp / tot))
             return self._cfv(apply_action_np(env, a), hero, depth + 1, t)
 
-        # Hero node: branch all (abstracted-)legal actions, CFR+ regret update.
+        # Traverser (hero) node: branch all (abstracted-)legal actions, CFR+ regret update.
         strategy = _regret_match(regrets, legal.astype(np.float64))
         action_values = np.zeros(NUM_ACTIONS, dtype=np.float64)
         for a in np.flatnonzero(legal):
@@ -723,12 +757,26 @@ class PluribusReBeLSolver:
 
     # ------------------------------------------------------------------ public surface
     def _set_world(self, base_state, sampled_holes: dict[int, tuple[int, int]]):
-        """Return a copy of ``base_state`` with sampled opponent holes written into env.holes."""
+        """Return a copy of ``base_state`` with sampled opponent holes written into env.holes.
+
+        STALE-DECK FIX (config.repair_deck): after writing the sampled holes, rebuild the UNDEALT deck
+        tail from the unseen complement so every world integrates over RANDOM board runouts. Without it an
+        all-in line replays the ONE frozen board from base_state in every world/iteration and the search
+        best-responds to that single runout (the preflop over-jamming bug). The per-world reshuffle seed is
+        a deterministic function of the sampled holes, so a given decision still samples the SAME worlds
+        across processes/CRN arms (pure-function contract preserved)."""
         holes = np.asarray(base_state.holes).copy()
         for seat, (c0, c1) in sampled_holes.items():
             holes[seat, 0] = int(c0)
             holes[seat, 1] = int(c1)
-        return base_state._replace(holes=holes)
+        state = base_state._replace(holes=holes)
+        if self.config.repair_deck:
+            seed = 0
+            for s in sorted(sampled_holes):
+                c0, c1 = sampled_holes[s]
+                seed = (seed * 131 + int(s) * 2704 + int(c0) * 52 + int(c1)) & 0xFFFFFFFF
+            state = _reshuffle_undealt(state, np.random.default_rng(seed))
+        return state
 
     def _pushfold_prior(self, base_state, hero: int, legal: np.ndarray) -> np.ndarray | None:
         """Certified ICM push/fold ROOT prior for a shallow preflop spot (tournament N>6 lever), or None.
@@ -801,6 +849,20 @@ class PluribusReBeLSolver:
             # (public state, opponent model, config) — see PluribusReBeLConfig.per_decision_seed.
             self.rng = np.random.default_rng(self._public_seed(base_state, hero))
         self._leaf_cont_weights = self._build_leaf_cont_weights(hero)
+
+        # TWO-SIDED SUBGAME SOLVE (config.two_sided, GTO/base only): cycle the traverser across the seats
+        # that can still act (SEAT_LIVE) so EVERY player updates regrets and learns (e.g. to fold to a jam)
+        # -> a subgame equilibrium instead of the hero one-sidedly best-responding to a fixed opponent. The
+        # EXPLOIT path (opponent_model set) stays one-sided by design. OFF => traverser is always the hero
+        # (byte-identical to the legacy solve). The hero is always included so its own average still builds.
+        self._two_sided_active = bool(cfg.two_sided and self.opponent_model is None)
+        if self._two_sided_active:
+            _st = np.asarray(base_state.seat_status)
+            self._traversers = [int(s) for s in range(_st.shape[0]) if int(_st[s]) == int(SEAT_LIVE)]
+            if hero not in self._traversers:
+                self._traversers = [hero]
+        else:
+            self._traversers = [hero]
 
         # OFF-TREE RE-SOLVE (POKERBOT_OFFTREE_RESOLVE): if the villain we are facing bet a genuinely
         # off-tree size, augment the ROOT hero infoset's action set with the one in-abstraction bucket
@@ -967,7 +1029,11 @@ class PluribusReBeLSolver:
                 break
             sampled_holes = pbs.sample_opponent_holes(self.rng)
             world = self._set_world(base_state, sampled_holes)
-            self._cfv(world, hero, 0, iterations)
+            # Traverser cycles across live seats when two-sided (== hero when one-sided/exploit). The hero's
+            # served average (strategy_sum[root_key]) builds only on hero-traverser iterations, so two-sided
+            # needs proportionally more iterations for the same hero convergence (native makes that cheap).
+            traverser = self._traversers[iterations % len(self._traversers)]
+            self._cfv(world, traverser, 0, iterations)
             iterations += 1
 
         ss = self._strategy_sum.get(root_key)
