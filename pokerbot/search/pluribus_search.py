@@ -91,6 +91,13 @@ class PluribusReBeLConfig:
     # GTO/base play only; the EXPLOIT path (opponent_model set) intentionally stays a one-sided BR to the
     # MODELED opponent. Default OFF (byte-identical one-sided) until validated + ported to native.
     two_sided: bool = False
+    # DECOUPLE THE OPPONENT-HOLE SAMPLER's RNG (2026-07-01): opponent-hole sampling and in-tree
+    # action/rollout sampling currently share ONE per-solve stream. sample_opponent_holes consumes a
+    # VARIABLE (CDF-dependent) number of draws per world, so it desyncs the action stream -> higher-
+    # variance CFR (the diagnosed cause of the native-vs-Python fixed-point divergence: native's
+    # fixed-count Fisher-Yates draws are lower-variance). When True, world/hole sampling runs on its own
+    # deterministic sub-stream so the action stream is unperturbed. Default OFF (byte-identical).
+    decouple_sampler: bool = False
     client_bet_sizing: bool = True    # use the SAME action abstraction as training (blueprint keys hit)
     search_preflop: bool = False      # Pluribus: serve preflop from blueprint, search postflop only
     # A1 stack-agnostic preflop: the preflop blueprint is keyed on (hole, position) only and trained at
@@ -373,6 +380,7 @@ class PluribusReBeLSolver:
         self._budget_bound_count = 0  # per-solver count of decisions cut short by time_budget_ms (S2)
         self._two_sided_active = False  # set per-solve; True => cycle traverser (config.two_sided, GTO path)
         self._traversers = []
+        self._hole_rng = None  # opponent-hole sampler stream (== self.rng unless config.decouple_sampler)
         # AIVAT decision-baseline capture (default OFF => byte-identical hot loop + native fast path).
         # When armed (search_agent.enable_decision_capture with aivat_leaf_q), the solve accumulates the
         # ROOT per-action CFVs it ACTUALLY used to form the served strategy (depth-0 hero node) and
@@ -848,6 +856,13 @@ class PluribusReBeLSolver:
             # Fresh stream per decision, seeded from the public state: the solve is a pure function of
             # (public state, opponent model, config) — see PluribusReBeLConfig.per_decision_seed.
             self.rng = np.random.default_rng(self._public_seed(base_state, hero))
+        # Opponent-hole sampler stream: its OWN deterministic sub-stream when decouple_sampler (so its
+        # variable draw count can't desync the action/rollout stream), else the shared self.rng (identical).
+        if cfg.decouple_sampler:
+            _hseed = (int(self._public_seed(base_state, hero)) ^ 0x9E3779B97F4A7C15) & ((1 << 64) - 1)
+            self._hole_rng = np.random.default_rng(_hseed)
+        else:
+            self._hole_rng = self.rng
         self._leaf_cont_weights = self._build_leaf_cont_weights(hero)
 
         # TWO-SIDED SUBGAME SOLVE (config.two_sided, GTO/base only): cycle the traverser across the seats
@@ -1027,7 +1042,7 @@ class PluribusReBeLSolver:
                           f"{eff_max_iters} iters — decisions non-reproducible under load "
                           f"(per-solver count tracked in SolveResult.metadata)", flush=True)
                 break
-            sampled_holes = pbs.sample_opponent_holes(self.rng)
+            sampled_holes = pbs.sample_opponent_holes(self._hole_rng)
             world = self._set_world(base_state, sampled_holes)
             # Traverser cycles across live seats when two-sided (== hero when one-sided/exploit). The hero's
             # served average (strategy_sum[root_key]) builds only on hero-traverser iterations, so two-sided
