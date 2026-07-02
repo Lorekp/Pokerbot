@@ -72,3 +72,5 @@ artifacts/*.svg
 data/io_bench_tmp/
 artifacts/probe_watch_*.log
 _rendered_ud.sh
+# cloned external/third-party repos — never commit (pypokerengine, deepbot, slumbot, etc.)
+third_party/
