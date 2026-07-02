@@ -431,11 +431,21 @@ def _ingest_hand_to_store(
 
     for seat, street, atype, amount_bb, _is_first_flop_aggr in scalar_buf:
         ident = seat_to_identity.get(seat)
-        if ident is None:
-            continue
-
         atype_lo = atype.lower()
         is_aggressive = atype_lo in ("bet", "raise", "all_in")
+
+        # C-BET SENTINEL: seat=-1 is the hero's flop bet sentinel (see make_policy fix).
+        # It should NOT update any villain profile stats, but MUST set first_flop_aggr_found
+        # so that subsequent villain actions are correctly tagged as "facing the c-bet".
+        # first_flop_aggr_ident stays None (not a villain identity) — the comparison
+        # `ident != first_flop_aggr_ident` is always True for villain idents vs None.
+        if ident is None:
+            # Only the c-bet sentinel matters here; skip all profile stat updates.
+            if street == "flop" and is_aggressive and not first_flop_aggr_found:
+                first_flop_aggr_found = True
+                first_flop_aggr_ident = None  # hero has no tracked identity
+            continue
+
         is_call = atype_lo == "call"
         is_fold = atype_lo == "fold"
 
@@ -456,12 +466,14 @@ def _ingest_hand_to_store(
         if street in ("flop", "turn", "river"):
             saw_flop_set.add(ident)
 
-        # First flop aggression = c-bet
+        # First flop aggression = c-bet (villain as first flop bettor)
         if street == "flop" and is_aggressive and not first_flop_aggr_found:
             first_flop_aggr_found = True
             first_flop_aggr_ident = ident
 
-        # Fold-to-cbet: facing the first flop aggression and folding
+        # Fold-to-cbet: facing the first flop aggression and folding.
+        # When first_flop_aggr_ident is None (hero c-bet sentinel), every villain ident
+        # satisfies `ident != None`, so they ALL count as "cbet_faced".
         if (street == "flop" and first_flop_aggr_found
                 and ident != first_flop_aggr_ident):
             cbet_faced_set.add(ident)
@@ -590,6 +602,7 @@ def run_adaptive(
     windows: int,
     store: PlayerProfileStore,
     progress_every: int = 10,
+    diag: bool = False,           # if True: collect per-hand loss attribution + exploit firing stats
 ) -> dict:
     """Core adaptive field loop.
 
@@ -630,6 +643,14 @@ def run_adaptive(
     per_hand_ev: list[float] = []
     hand_id_ctr = 0
     last_heartbeat = time.perf_counter()
+
+    # Diagnostic accumulators (only populated when diag=True)
+    _diag_loss_from_hero_bets_called: list[float] = []   # hero bet, got called, lost
+    _diag_loss_from_blinds_preflop: list[float] = []     # folded preflop (blind loss only)
+    _diag_loss_from_showdown_call: list[float] = []      # hero called villain, went to showdown, lost
+    _diag_exploit_firing: list[dict] = []                # per-hand exploit firing stats from inner hero
+    if diag:
+        os.environ["POKERBOT_EXPLOIT_DIAG"] = "1"
 
     for h in range(hands):
         hand_id_ctr += 1
@@ -680,7 +701,27 @@ def run_adaptive(
 
             def _policy(state: GameState) -> Action:
                 if is_hero_s:
-                    return hero(state)
+                    a = hero(state)
+                    # C-BET TRACKING FIX: Record the hero's first flop aggression so that
+                    # villain's subsequent action is correctly attributed as "facing a c-bet".
+                    # Previously, since hero actions were not in scalar_buf, first_flop_aggr_ident
+                    # was never set when the hero was the first flop bettor — causing cbet_faced and
+                    # fold_to_cbet to be PERMANENTLY ZERO for opponents vs hero c-bets. We record
+                    # hero flop aggression with a sentinel seat (_hero_seat) NOT in seat_to_identity,
+                    # so _ingest_hand_to_store's `ident = seat_to_identity.get(seat)` returns None
+                    # for the hero entry (skipping all stat updates for the hero itself) while still
+                    # setting first_flop_aggr_found=True so villains' subsequent folds/calls are
+                    # correctly tagged in cbet_faced_set and fold_to_cbet_set.
+                    h_atype = a.action_type.name.lower()
+                    h_street = state.street.name.lower()
+                    h_amount = float(getattr(a, "amount_bb", 0.0) or 0.0)
+                    h_aggr = h_atype in ("bet", "raise", "all_in")
+                    if h_street == "flop" and h_aggr and not _ffa[0]:
+                        _ffa[0] = True
+                        # Use a negative seat index as the hero sentinel (won't match any real seat
+                        # and won't match any key in seat_to_identity → ident = None in ingest)
+                        _sc.append((-1, h_street, h_atype, h_amount, True))
+                    return a
                 # External bot action
                 a = bot(state) if bot is not None else hero(state)
                 acting_seat = state.action_seat
@@ -712,6 +753,40 @@ def run_adaptive(
         final_state, deltas = play_hand(policies, state=deck_state, allin_settle=settle)
         ev_bb = float(deltas.get(hero_seat, 0.0))
         per_hand_ev.append(ev_bb)
+
+        # --- Diagnostic: loss attribution + exploit-firing stats ---
+        if diag:
+            # Collect ExploitHero diagnostic counters for this hand
+            inner = getattr(hero, "_inner", None)
+            if inner is not None and hasattr(inner, "pop_diag"):
+                _diag_exploit_firing.append(inner.pop_diag())
+            # Loss attribution: classify hero's loss source
+            # We approximate by inspecting the final GameState and the hero's actions in scalar_buf
+            hero_p = final_state.players[hero_seat]
+            board_len = len(final_state.board)
+            hero_committed = float(hero_p.committed_total_bb)
+            hero_folded = hero_p.folded
+            # Identify hero's actions from the scalar_buf (which only tracks VILLAIN actions, not hero).
+            # Instead, reconstruct from the game's final state.
+            # Simplification: classify by outcome
+            if hero_folded:
+                # Hero folded — loss is the committed amount (blind or preflop fold)
+                if board_len == 0:  # folded preflop
+                    _diag_loss_from_blinds_preflop.append(-hero_committed)
+                else:
+                    _diag_loss_from_blinds_preflop.append(-hero_committed)  # postflop fold
+            elif ev_bb < 0.0 and board_len >= 3:
+                # Hero lost postflop — further split into:
+                # (a) hero bet/raised and got called: check if hero was aggressive
+                # (b) hero called villain and went to showdown
+                # We use board_len==5 (showdown) as proxy for call-and-lose
+                # Hero can't lose at showdown without reaching it
+                if board_len >= 5 and not hero_folded:
+                    _diag_loss_from_showdown_call.append(ev_bb)
+                else:
+                    _diag_loss_from_hero_bets_called.append(ev_bb)
+            elif ev_bb < 0.0 and board_len == 0:
+                _diag_loss_from_blinds_preflop.append(ev_bb)
 
         # --- Ingest villain observations into the profile store ---
         if (ctx_buf or scalar_buf) and exploit:
@@ -776,7 +851,7 @@ def run_adaptive(
         ident = agent.identity
         profile_dumps[ident] = _profile_summary(store, ident)
 
-    return {
+    out = {
         "field": field_spec,
         "hands": hands,
         "exploit": exploit,
@@ -790,6 +865,49 @@ def run_adaptive(
         "wall_s": round(wall_s, 2),
         "hands_per_second": round(hands / max(0.001, wall_s), 1),
     }
+
+    if diag and _diag_exploit_firing:
+        # Aggregate exploit-firing stats across all hands
+        agg: dict = {}
+        for d in _diag_exploit_firing:
+            for k, v in d.items():
+                agg[k] = agg.get(k, 0) + v
+        total_dec = max(1, agg.get("decisions", 1))
+        total_elig = max(1, agg.get("exploit_eligible", 1))
+        total_fired = max(1, agg.get("adj_fired", 1))
+        out["diag_exploit"] = {
+            "hands": hands,
+            "total_decisions": agg.get("decisions", 0),
+            "exploit_eligible_rate": agg.get("exploit_eligible", 0) / total_dec,
+            "exact_hit_rate_of_elig": agg.get("ctx_read_exact_hit", 0) / total_elig,
+            "aggregate_hit_rate_of_elig": agg.get("ctx_read_aggregate_hit", 0) / total_elig,
+            "total_miss_rate_of_elig": agg.get("ctx_read_total_miss", 0) / total_elig,
+            "adj_fired_rate_of_elig": agg.get("adj_fired", 0) / total_elig,
+            "mean_alpha_when_fired": agg.get("alpha_sum", 0.0) / total_fired,
+            "mean_tv_when_read": agg.get("tv_sum", 0.0) / max(1, agg.get("adj_fired", 0) + agg.get("ctx_read_aggregate_hit", 0)),
+            "mean_conf_when_read": agg.get("conf_sum", 0.0) / max(1, agg.get("adj_fired", 0) + agg.get("ctx_read_aggregate_hit", 0)),
+            "mean_n_obs_when_read": agg.get("n_obs_sum", 0) / max(1, agg.get("adj_fired", 0) + agg.get("ctx_read_aggregate_hit", 0)),
+            "mean_sizing_logit_when_fired": agg.get("sizing_logit_sum", 0.0) / total_fired,
+            "mean_bluff_suppress_logit_when_fired": agg.get("bluff_suppress_logit_sum", 0.0) / total_fired,
+            "mean_station_score_when_fired": agg.get("station_score_sum", 0.0) / total_fired,
+            "mean_station_conf_when_fired": agg.get("station_conf_sum", 0.0) / total_fired,
+        }
+        # Loss attribution summary
+        def _loss_bb100(arr):
+            return round(float(np.mean(arr)) * 100.0, 2) if arr else 0.0
+        out["diag_loss_attribution"] = {
+            "hero_folded_preflop_postflop_mean_bb100": _loss_bb100(_diag_loss_from_blinds_preflop),
+            "hero_folded_preflop_postflop_hands": len(_diag_loss_from_blinds_preflop),
+            "hero_lost_showdown_call_mean_bb100": _loss_bb100(_diag_loss_from_showdown_call),
+            "hero_lost_showdown_call_hands": len(_diag_loss_from_showdown_call),
+            "hero_lost_bet_called_approx_mean_bb100": _loss_bb100(_diag_loss_from_hero_bets_called),
+            "hero_lost_bet_called_approx_hands": len(_diag_loss_from_hero_bets_called),
+            "note": "showdown_call = hero called/bet and reached showdown and lost; "
+                    "bet_called_approx = hero lost postflop before river (may include folds by hero postflop); "
+                    "folded = hero folded at any street",
+        }
+
+    return out
 
 
 def _fmt_eta(eta_s: float) -> str:
@@ -826,6 +944,8 @@ def parse_args():
                    help="Output JSON path (default: artifacts/adaptive_<label>.json)")
     p.add_argument("--progress-every", type=int, default=10,
                    help="Print progress every N hands (default 10)")
+    p.add_argument("--diag", action="store_true", default=False,
+                   help="Collect per-hand loss attribution + exploit firing stats (writes to output JSON)")
     return p.parse_args()
 
 
@@ -888,6 +1008,7 @@ def main():
             windows=args.windows,
             store=store,
             progress_every=args.progress_every,
+            diag=args.diag,
         )
     finally:
         if tmp_dir and not args.keep_db:
