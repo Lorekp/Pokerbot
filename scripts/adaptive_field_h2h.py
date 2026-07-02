@@ -1041,7 +1041,8 @@ def run_adaptive(
         out["served_source"] = hero.served_source_counts()
 
     if diag and _diag_exploit_firing:
-        # Aggregate exploit-firing stats across all hands
+        # Aggregate exploit-firing stats across all hands (heuristic hero only; the production
+        # hero's exploit fires INSIDE the solver via opponent_model — not surfaced via pop_diag).
         agg: dict = {}
         for d in _diag_exploit_firing:
             for k, v in d.items():
@@ -1066,7 +1067,9 @@ def run_adaptive(
             "mean_station_score_when_fired": agg.get("station_score_sum", 0.0) / total_fired,
             "mean_station_conf_when_fired": agg.get("station_conf_sum", 0.0) / total_fired,
         }
-        # Loss attribution summary
+
+    if diag:
+        # Loss attribution summary (all hero modes — only needs the per-hand ev + game state data)
         def _loss_bb100(arr):
             return round(float(np.mean(arr)) * 100.0, 2) if arr else 0.0
         out["diag_loss_attribution"] = {
