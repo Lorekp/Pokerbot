@@ -14,14 +14,30 @@
 //! integer (statistical equivalence, NOT a replay of numpy's PCG64).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::core::{self, EnvStateN, BET_BUCKET_START, CALL, CHECK, FOLD, NUM_ACTIONS};
-use crate::fingerprint::{fingerprint_fast, CHIP_UNIT};
+use crate::emd::FrozenEMDLookup;
+use crate::fingerprint::{fingerprint_fast, fingerprint_fast_depth_emd, CHIP_UNIT};
 
 pub const NUM_CONTINUATIONS: usize = 4;
 
 /// Blueprint snapshot: fingerprint(16 bytes) -> strat row over the 11 actions.
 pub type Blueprint = HashMap<[u8; 16], [f64; NUM_ACTIONS]>;
+
+/// EMD frozen-lookup keying config for the serve fast paths. `None` on `PlayoutConfig.emd` (the
+/// default for every pre-existing caller) => the made-hand `fingerprint_fast` key, byte-identical
+/// to the shipped binary. `Some` => flop/turn keys come from the shared frozen EMD lookup (the
+/// abstraction the promoted EMD-K160 blueprint rows were written under; see
+/// `fingerprint::fingerprint_fast_depth_emd` for the exact key + miss semantics).
+#[derive(Clone)]
+pub struct EmdKeyCfg {
+    pub lookup: Arc<FrozenEMDLookup>,
+    /// Frozen-miss semantics, mirroring `jax_weva_encode.compute_postflop_bucket`: `true` = made-
+    /// hand fallback (mirror/silent fallback — the deployed serve regime, and the trainer's river
+    /// rule); `false` = fail-on-miss (bucket -1 -> the preflop `b"w"`-branch key).
+    pub miss_made_hand: bool,
+}
 
 /// Per-worker immutable config for the native playout.
 pub struct PlayoutConfig {
@@ -31,6 +47,28 @@ pub struct PlayoutConfig {
     pub bias_floor: f64,
     pub max_depth: i32,
     pub num_buckets: i32,
+    /// EMD frozen-lookup keying (None = made-hand fast path, byte-identical to the shipped binary).
+    pub emd: Option<EmdKeyCfg>,
+}
+
+impl PlayoutConfig {
+    /// The blueprint dict key for (state, seat) under THIS config's abstraction: made-hand
+    /// (`emd: None`, unchanged bytes) or EMD frozen-lookup keying. Every blueprint lookup on the
+    /// native subgame/rollout path routes through here so the abstraction is decided in ONE place.
+    #[inline]
+    pub fn fp_key<const N: usize>(&self, s: &EnvStateN<N>, seat: usize) -> [u8; 16] {
+        match &self.emd {
+            None => fingerprint_fast(s, seat, self.num_buckets),
+            Some(k) => fingerprint_fast_depth_emd(
+                s,
+                seat,
+                self.num_buckets,
+                &[],
+                &k.lookup,
+                k.miss_made_hand,
+            ),
+        }
+    }
 }
 
 // _BIAS_GROUPS: None(blueprint), fold={FOLD}, passive={CHECK,CALL}, aggro={BET_BUCKET_START..NUM_ACTIONS}
@@ -133,7 +171,7 @@ fn blueprint_policy<const N: usize>(
     bp: &Blueprint,
     cfg: &PlayoutConfig,
 ) -> [f64; NUM_ACTIONS] {
-    let key = fingerprint_fast(s, seat, cfg.num_buckets);
+    let key = cfg.fp_key(s, seat);
     let mut p = [0.0f64; NUM_ACTIONS];
     if let Some(row) = bp.get(&key) {
         let mut tot = 0.0;

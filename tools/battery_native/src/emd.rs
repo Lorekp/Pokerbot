@@ -21,8 +21,11 @@ use crate::fingerprint::evaluate_cards;
 use crate::playout::Rng;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
+use std::cell::RefCell;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 const EMDFRZN_MAGIC: &[u8; 8] = b"EMDFRZN1";
 const SUIT_PERMS: [[i32; 4]; 24] = [
@@ -419,6 +422,182 @@ impl FrozenEMDLookup {
         let key = canonical_frozen_key(hole, board)?;
         self.rows.get(&key).map(|&b| b as i32)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Process-wide SHARED frozen-lookup cache (serve-side fast paths).
+//
+// The blob is ~152MB on disk / ~570MB as an FxHashMap, so the serve process must load it ONCE and
+// share the `Arc` across every consumer (SubgameSolver + PlayoutEngine + Lbr6Harness + the
+// fingerprint export), lazily on first use. The trainer (`NlheCFRTrainer`) keeps its own private
+// `load_path` (unchanged, zero-risk to the certified training path); a mixed trainer+serve process
+// would carry two copies, which does not occur in practice.
+// ---------------------------------------------------------------------------
+
+static SHARED_FROZEN: OnceLock<Mutex<HashMap<String, Arc<FrozenEMDLookup>>>> = OnceLock::new();
+
+/// Resident-set size of the current process in bytes (for the one-time blob-load report).
+/// Best-effort: `None` on failure / unsupported platforms — the load itself never depends on it.
+#[cfg(windows)]
+fn process_rss_bytes() -> Option<u64> {
+    // PROCESS_MEMORY_COUNTERS via K32GetProcessMemoryInfo (kernel32, always linked). Declared
+    // inline so no new crate dependency is introduced for a log line.
+    #[repr(C)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(
+            handle: isize,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+    }
+    unsafe {
+        let mut c: ProcessMemoryCounters = std::mem::zeroed();
+        c.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 {
+            Some(c.working_set_size as u64)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_rss_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let rss_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(rss_pages * 4096)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn process_rss_bytes() -> Option<u64> {
+    None
+}
+
+/// Load (or fetch the already-loaded) frozen EMD lookup for `path`. Loads AT MOST ONCE per process
+/// per path; every subsequent call is a map probe + `Arc::clone`. Reports load time + RSS delta on
+/// the one real load (stderr, one line) so a serve process's memory jump is attributable.
+pub fn load_shared(path: &str) -> Result<Arc<FrozenEMDLookup>, String> {
+    let cache = SHARED_FROZEN.get_or_init(|| Mutex::new(HashMap::default()));
+    let mut guard = cache
+        .lock()
+        .map_err(|_| "EMD shared frozen-lookup cache poisoned".to_string())?;
+    if let Some(l) = guard.get(path) {
+        return Ok(l.clone());
+    }
+    let rss_before = process_rss_bytes();
+    let t0 = Instant::now();
+    let lookup = FrozenEMDLookup::load_path(path)?;
+    let load_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let rss_after = process_rss_bytes();
+    let delta_mb = match (rss_before, rss_after) {
+        (Some(a), Some(b)) if b >= a => format!("{:.0}", (b - a) as f64 / (1024.0 * 1024.0)),
+        _ => "n/a".to_string(),
+    };
+    eprintln!(
+        "[battery_native] EMD frozen lookup loaded (shared, once/process): path={} rows={} k={} \
+         n_bins={} n_runouts={} load_ms={:.0} rss_delta_mb={}",
+        path,
+        lookup.rows.len(),
+        lookup.n_buckets,
+        lookup.n_bins,
+        lookup.n_runouts,
+        load_ms,
+        delta_mb
+    );
+    let arc = Arc::new(lookup);
+    guard.insert(path.to_string(), arc.clone());
+    Ok(arc)
+}
+
+// ---------------------------------------------------------------------------
+// Per-thread memoized frozen-bucket probe for the SERVE fast paths (subgame / rollout / LBR /
+// fingerprint export). FAITHFUL copy of the trainer's `emd_bucket_cache_key` + `EMD_BUCKET_MEMO` +
+// `emd_bucket_memoed` (trainer.rs — the code that keyed the promoted EMD-K160 blueprint); the
+// trainer keeps its own private copy untouched (plus a profile-stats twin) so the certified
+// training path carries zero risk from the serve-side port.
+// ---------------------------------------------------------------------------
+
+type ServeEmdBucketMemo = HashMap<(usize, u64), Option<i32>>;
+thread_local! {
+    /// `(lookup ptr, packed sorted cards) -> bucket` memo. Packing: 6 bits/card, 8 slots (48 bits);
+    /// pad = 0x3F. Keyed by the lookup object's address so two frozen tables in one process never
+    /// share card-only entries. Bounded by the reachable (hole, board) space (~few hundred K keys).
+    static SERVE_EMD_BUCKET_MEMO: RefCell<ServeEmdBucketMemo> =
+        RefCell::new(ServeEmdBucketMemo::with_capacity_and_hasher(1 << 16, Default::default()));
+}
+
+#[inline]
+fn serve_bucket_cache_key(
+    lookup: &FrozenEMDLookup,
+    hole: &[i32; 2],
+    board: &[i32],
+) -> ((usize, u64), i32, i32) {
+    let mut h0 = hole[0];
+    let mut h1 = hole[1];
+    if h1 < h0 {
+        std::mem::swap(&mut h0, &mut h1);
+    }
+    let mut bs = [0i32; 5];
+    let mut bn = 0usize;
+    for &c in board {
+        if c >= 0 {
+            bs[bn] = c;
+            bn += 1;
+        }
+    }
+    if bn >= 2 {
+        bs[..bn].sort_unstable();
+    }
+    let pack = |c: i32| -> u64 {
+        if c < 0 {
+            0x3F
+        } else {
+            (c as u64) & 0x3F
+        }
+    };
+    let mut cards_key: u64 = pack(h0);
+    cards_key |= pack(h1) << 6;
+    cards_key |= pack(bs[0]) << 12;
+    cards_key |= pack(bs[1]) << 18;
+    cards_key |= pack(bs[2]) << 24;
+    cards_key |= pack(bs[3]) << 30;
+    cards_key |= pack(bs[4]) << 36;
+    let key = (lookup as *const FrozenEMDLookup as usize, cards_key);
+    (key, h0, h1)
+}
+
+/// Memoized `lookup.bucket(hole, board)` for the serve fast paths. Identical result to the direct
+/// probe (the memo key canonicalizes hole/board order exactly like `canonical_frozen_key` does);
+/// after warmup each distinct postflop (hole, board) costs one FxHash probe on an 8-byte key.
+#[inline]
+pub fn frozen_bucket_memoed(
+    lookup: &FrozenEMDLookup,
+    hole: &[i32; 2],
+    board: &[i32],
+) -> Option<i32> {
+    let (key, h0, h1) = serve_bucket_cache_key(lookup, hole, board);
+    SERVE_EMD_BUCKET_MEMO.with(|m| {
+        let map = &mut *m.borrow_mut();
+        if let Some(&cached) = map.get(&key) {
+            return cached;
+        }
+        let v = lookup.bucket(&[h0, h1], board);
+        map.insert(key, v);
+        v
+    })
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {

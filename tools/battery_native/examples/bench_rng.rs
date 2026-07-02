@@ -124,6 +124,7 @@ fn time_leaf_eval() {
         bias_floor: 0.0,
         max_depth: 24,
         num_buckets: 256,
+        emd: None,
     };
     let hero = 0usize;
     let rounds = 4u32;

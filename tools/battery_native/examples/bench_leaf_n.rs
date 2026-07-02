@@ -75,6 +75,7 @@ fn main() {
         bias_floor: 0.0,
         max_depth: 24, // same as tests.rs pcfg
         num_buckets: 200,
+        emd: None,
     };
     let base_seed: u64 = 0xC0FFEE_DEADBEEFu64;
     let resample_board = true; // matches search config (battery_native/src/playout.rs:323)

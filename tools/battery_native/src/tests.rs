@@ -460,6 +460,7 @@ mod subgame_n7 {
             bias_floor: 0.0,
             max_depth: 24, // per-leaf rollout depth
             num_buckets: 200,
+            emd: None, // made-hand keying (byte-identical default)
         }
     }
 
@@ -1352,5 +1353,139 @@ mod bit_identity {
             "compute_returns throughput {hps:.0} h/s below floor 1000 h/s"
         );
         eprintln!("[perf] compute_returns: {hps:.0} h/s ({n_done} calls in {elapsed:.3}s)");
+    }
+}
+
+// ===========================================================================
+// EMD SERVE KEYING (2026-07-02, post EMD-K160 promotion): the serve fast paths
+// (subgame / rollout / LBR / fingerprint export) must key the blueprint with the
+// SAME frozen-lookup abstraction the trainer wrote the rows under. These tests
+// pin the dispatch + miss semantics against the made-hand reference functions
+// (whose own byte-identity vs the Python oracle is pinned in `bit_identity`).
+// ===========================================================================
+mod emd_serve_keying {
+    use super::*;
+    use crate::emd::{canonical_frozen_key, frozen_bucket_memoed, FrozenEMDLookup};
+    use crate::fingerprint::{
+        fingerprint_fast, fingerprint_fast_depth, fingerprint_fast_depth_emd,
+        fingerprint_fast_depth_postflop_bucket, fingerprint_from_bucket,
+    };
+    use crate::playout::{EmdKeyCfg, PlayoutConfig};
+    use std::sync::Arc;
+
+    const BB: i32 = 100; // CHIP_UNIT
+
+    fn base_env() -> EnvStateN<6> {
+        let stacks = [100 * BB; 6];
+        let occ = [true; 6];
+        let mut deck = [0i32; 52];
+        for (i, d) in deck.iter_mut().enumerate() {
+            *d = i as i32;
+        }
+        init_hand_n::<6>(0, &stacks, &occ, 0, &deck, [0, 0])
+    }
+
+    /// Flop env with a caller-chosen board. Each test uses a DISTINCT board so the per-thread
+    /// bucket memo (keyed by lookup ADDRESS + packed cards) can never serve a stale entry across
+    /// tests if an allocator reuses a dropped lookup's address on the same test thread.
+    fn flop_env_with(board: [i32; 5]) -> EnvStateN<6> {
+        let mut env = base_env();
+        env.street = 1;
+        env.board = board; // board cards disjoint from the 12 dealt hole cards (identity deck)
+        env
+    }
+
+    fn river_env() -> EnvStateN<6> {
+        let mut env = base_env();
+        env.street = 3;
+        env.board = [20, 25, 30, 35, 40];
+        env
+    }
+
+    fn lookup_with(rows: &[(u64, u16)]) -> FrozenEMDLookup {
+        let mut map = rustc_hash::FxHashMap::default();
+        for &(k, b) in rows {
+            map.insert(k, b);
+        }
+        FrozenEMDLookup {
+            n_buckets: 160,
+            n_bins: 20,
+            n_runouts: 400,
+            rows: map,
+        }
+    }
+
+    #[test]
+    fn flop_key_uses_frozen_bucket() {
+        let env = flop_env_with([20, 25, 30, -1, -1]);
+        let seat = 3usize;
+        let key = canonical_frozen_key(&env.holes[seat], &env.board).expect("flop canonical key");
+        let lookup = lookup_with(&[(key, 7)]);
+        assert_eq!(frozen_bucket_memoed(&lookup, &env.holes[seat], &env.board), Some(7));
+        let got = fingerprint_fast_depth_emd(&env, seat, 160, &[], &lookup, true);
+        let want = fingerprint_fast_depth_postflop_bucket(&env, seat, 7);
+        assert_eq!(got, want, "flop EMD key must be the frozen-bucket postflop digest");
+    }
+
+    #[test]
+    fn river_miss_mirrors_made_hand_and_fail_closed_takes_w_branch() {
+        let env = river_env();
+        let seat = 3usize;
+        // River is never in the blob => always a frozen miss.
+        let lookup = lookup_with(&[]);
+        // mirror fallback (deployed serve regime): made-hand bucket digest — the trainer's river rule.
+        let mirrored = fingerprint_fast_depth_emd(&env, seat, 160, &[], &lookup, true);
+        assert_eq!(mirrored, fingerprint_fast_depth(&env, seat, 160, &[]));
+        // fail-on-miss: Python's bucket=-1 -> the preflop b"w" branch digest.
+        let failed = fingerprint_fast_depth_emd(&env, seat, 160, &[], &lookup, false);
+        assert_eq!(failed, fingerprint_from_bucket(&env, seat, -1, &[]));
+        assert_ne!(mirrored, failed, "the two miss semantics must key differently");
+    }
+
+    #[test]
+    fn flop_blob_miss_follows_the_same_miss_semantics() {
+        let env = flop_env_with([21, 26, 31, -1, -1]);
+        let seat = 3usize;
+        let lookup = lookup_with(&[]); // spot not covered by the blob
+        let mirrored = fingerprint_fast_depth_emd(&env, seat, 160, &[], &lookup, true);
+        assert_eq!(mirrored, fingerprint_fast_depth(&env, seat, 160, &[]));
+        let failed = fingerprint_fast_depth_emd(&env, seat, 160, &[], &lookup, false);
+        assert_eq!(failed, fingerprint_from_bucket(&env, seat, -1, &[]));
+    }
+
+    #[test]
+    fn preflop_emd_key_equals_made_hand_key() {
+        let env = base_env(); // no board cards
+        let seat = 3usize;
+        let lookup = lookup_with(&[]);
+        let got = fingerprint_fast_depth_emd(&env, seat, 200, &[], &lookup, true);
+        assert_eq!(got, fingerprint_fast_depth(&env, seat, 200, &[]));
+        assert_eq!(got, fingerprint_fast(&env, seat, 200));
+    }
+
+    #[test]
+    fn playout_config_dispatch_none_is_byte_identical_and_some_is_emd() {
+        let env = flop_env_with([22, 27, 32, -1, -1]);
+        let seat = 3usize;
+        let mk_cfg = |emd: Option<EmdKeyCfg>| PlayoutConfig {
+            allowed_pre: [true; 11],
+            allowed_post: [true; 11],
+            bias_mult: 5.0,
+            bias_floor: 0.0,
+            max_depth: 24,
+            num_buckets: 160,
+            emd,
+        };
+        // None => exactly the legacy made-hand key.
+        let cfg_none = mk_cfg(None);
+        assert_eq!(cfg_none.fp_key(&env, seat), fingerprint_fast(&env, seat, 160));
+        // Some => the frozen-bucket key.
+        let key = canonical_frozen_key(&env.holes[seat], &env.board).unwrap();
+        let lookup = Arc::new(lookup_with(&[(key, 42)]));
+        let cfg_emd = mk_cfg(Some(EmdKeyCfg { lookup, miss_made_hand: true }));
+        assert_eq!(
+            cfg_emd.fp_key(&env, seat),
+            fingerprint_fast_depth_postflop_bucket(&env, seat, 42)
+        );
     }
 }

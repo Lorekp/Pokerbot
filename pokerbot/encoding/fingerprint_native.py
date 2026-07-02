@@ -102,15 +102,28 @@ def is_enabled() -> bool:
     coverage -> uniform fallback. Forcing the Python oracle keeps train/serve byte-identity. Remove this
     guard only once the Rust core learns the depth byte and re-passes golden parity.
 
-    SAME hard override for ``POKERBOT_POSTFLOP_MODE=emd`` (the DEPLOYED regime since the 2026-07-02
-    EMD-K160 promotion): the Rust core buckets postflop by MADE-HAND rank only, so its flop/turn keys are
-    the wrong abstraction for an EMD-keyed blueprint — and because both bucket-id spaces are 0..K-1 the
-    wrong key usually COLLIDES INTO a real (different-hand) row instead of missing. The Python oracle
-    routes through the EMD-aware encoder (train==serve parity verified)."""
+    CAPABILITY-GATED override for ``POKERBOT_POSTFLOP_MODE=emd`` (the DEPLOYED regime since the
+    2026-07-02 EMD-K160 promotion): the ``tools/fingerprint_native`` crate buckets postflop by
+    MADE-HAND rank only, so its flop/turn keys are the wrong abstraction for an EMD-keyed blueprint —
+    and because both bucket-id spaces are 0..K-1 the wrong key usually COLLIDES INTO a real
+    (different-hand) row instead of missing. Under EMD the native path enables ONLY IF the extension
+    itself reports EMD frozen-lookup support (``native_caps`` including ``"emd_fingerprint"``) AND
+    the frozen blob is configured + present; otherwise it fails closed to the Python oracle (which
+    routes through the EMD-aware encoder, train==serve parity verified). NOTE: as of 2026-07-02 the
+    EMD keying was ported to ``tools/battery_native`` (whose ``fingerprint_fast_emd`` +
+    SubgameSolver/PlayoutEngine serve the hot path); THIS separate crate has NOT been ported and so
+    stays disabled under EMD until it reports the capability."""
     if _flag_truthy(os.environ.get("POKERBOT_DEPTH_BUCKETS")):
         return False
     if os.environ.get("POKERBOT_POSTFLOP_MODE", "fast").lower() == "emd":
-        return False
+        mod = load_native()
+        try:
+            caps = set(mod.native_caps()) if mod is not None else set()
+        except Exception:
+            caps = set()
+        blob = os.environ.get("POKERBOT_POSTFLOP_EMD_FROZEN") or ""
+        if "emd_fingerprint" not in caps or not blob or not os.path.exists(blob):
+            return False
     return available() and _flag_truthy(os.environ.get(_ENABLE_ENV))
 
 

@@ -324,35 +324,99 @@ def available() -> bool:
 # Default OFF; the Python loop in pluribus_rollout is unchanged when this is not engaged.
 # ---------------------------------------------------------------------------
 _EMD_NATIVE_GATE_WARNED = False
+_EMD_NATIVE_GATE_OPENED_LOGGED = False
+
+
+def _emd_native_key_config() -> tuple | None:
+    """``(blob_path, miss_made_hand)`` for the native EMD frozen-lookup keying, or ``None`` when the
+    frozen blob is not configured / not on disk.
+
+    ``miss_made_hand`` mirrors ``jax_weva_encode.compute_postflop_bucket``'s frozen-miss order
+    EXACTLY (imported, not re-implemented): made-hand fallback when the mirror or legacy-silent
+    fallback is on OR fail-on-miss is off; otherwise the Python path keys the miss as bucket=-1
+    (the preflop 'w' branch) and the native side replicates that."""
+    path = os.environ.get("POKERBOT_POSTFLOP_EMD_FROZEN") or ""
+    if not path or not os.path.exists(path):
+        return None
+    from pokerbot.engine.jax_weva_encode import (  # noqa: PLC0415
+        _emd_allow_silent_fallback,
+        _emd_fail_on_miss,
+        _emd_mirror_fallback,
+    )
+    miss_made_hand = bool(
+        _emd_mirror_fallback() or _emd_allow_silent_fallback() or not _emd_fail_on_miss()
+    )
+    return path, miss_made_hand
+
+
+def _native_supports_emd() -> bool:
+    """True iff the loaded battery_native binary REPORTS EMD frozen-lookup keying support.
+
+    A binary built before the EMD port has no ``native_caps`` symbol at all, so this fails closed
+    on stale .pyds without any version arithmetic."""
+    if _EXT is None:
+        return False
+    try:
+        caps = set(_EXT.native_caps())
+    except Exception:  # noqa: BLE001
+        return False
+    return {"emd_fingerprint", "emd_subgame", "emd_rollout"} <= caps
 
 
 def _native_fingerprint_matches_serve_abstraction() -> bool:
     """FAIL-CLOSED gate for the native blueprint-consuming fast paths under the EMD serve regime.
 
-    The Rust core computes blueprint keys with ``fingerprint.rs`` — a byte-identical port of the
-    MADE-HAND ('fast') bucketer only. Under ``POKERBOT_POSTFLOP_MODE=emd`` (the DEPLOYED regime since
-    the 2026-07-02 EMD-K160 promotion) the trained table is keyed by EMD bucket ids on flop/turn, so a
-    native made-hand key is the WRONG abstraction there — and because both id spaces are 0..K-1 the
-    wrong key usually COLLIDES INTO a real (different-hand) row instead of missing (measured 12/15 flop,
-    14/15 turn collisions), which is worse than a clean uniform-fallback miss: the in-subgame opponent
-    prior silently plays another bucket's strategy. The river IS correct (the trainer keys the river
-    made-hand — the mirror rule), but flop/turn priors would be mis-keyed, so the native fast paths are
-    DISABLED under EMD and the caller runs the Python CFR/rollout loop, whose fingerprint goes through
-    the EMD-aware encoder (train==serve parity verified). Override for experiments only with
-    POKERBOT_NATIVE_ALLOW_EMD_MISKEY=1 (never for a measurement or live).
+    HISTORY: ``fingerprint.rs`` was originally a byte-identical port of the MADE-HAND ('fast')
+    bucketer only; under ``POKERBOT_POSTFLOP_MODE=emd`` (the DEPLOYED regime since the 2026-07-02
+    EMD-K160 promotion) its flop/turn keys were the wrong abstraction and COLLIDED INTO wrong rows
+    (measured 12/15 flop, 14/15 turn), so this gate disabled the native fast paths and served the
+    ~45x-slower Python search path.
+
+    NOW: the native core carries the SAME frozen-lookup keying the trainer wrote the blueprint rows
+    under (``fingerprint::fingerprint_fast_depth_emd``, parity-gated by
+    ``scripts/probe_native_emd_parity.py``). The gate therefore OPENS under EMD iff BOTH hold:
+      * the loaded binary reports EMD support (``native_caps`` — stale .pyds fail closed), AND
+      * the frozen blob is configured and present on disk (``POKERBOT_POSTFLOP_EMD_FROZEN``).
+    The engine builders then pass the blob path + miss semantics through the FFI so every native
+    blueprint lookup keys EMD-correctly. On ANY mismatch (old binary, missing blob) the gate stays
+    fail-closed and the Python (EMD-correct) path serves. POKERBOT_NATIVE_ALLOW_EMD_MISKEY=1 remains
+    as the historical experiments-only override (it forces the gate open WITHOUT the EMD keying and
+    should no longer be needed).
     """
     if os.environ.get("POKERBOT_POSTFLOP_MODE", "fast").lower() != "emd":
         return True
     if os.environ.get("POKERBOT_NATIVE_ALLOW_EMD_MISKEY", "0").lower() in ("1", "true", "yes", "on"):
         return True
-    global _EMD_NATIVE_GATE_WARNED
+    global _EMD_NATIVE_GATE_WARNED, _EMD_NATIVE_GATE_OPENED_LOGGED
+    if _native_supports_emd() and _emd_native_key_config() is not None:
+        if not _EMD_NATIVE_GATE_OPENED_LOGGED:
+            _EMD_NATIVE_GATE_OPENED_LOGGED = True
+            path, miss_made_hand = _emd_native_key_config()
+            print("[native_solver] POKERBOT_POSTFLOP_MODE=emd: native fast paths ENABLED with EMD "
+                  f"frozen-lookup keying (blob={path}, miss_made_hand={miss_made_hand}) — parity-"
+                  "gated port of the trainer's keying.", flush=True)
+        return True
     if not _EMD_NATIVE_GATE_WARNED:
         _EMD_NATIVE_GATE_WARNED = True
         print("[native_solver] POKERBOT_POSTFLOP_MODE=emd: native subgame/rollout fast paths DISABLED "
-              "(fingerprint.rs is a made-hand port and would MIS-KEY the EMD-keyed blueprint on "
-              "flop/turn) — serving through the Python search path (EMD-correct). "
+              "(this battery_native binary does not report EMD keying support, or "
+              "POKERBOT_POSTFLOP_EMD_FROZEN is unset/missing) — serving through the Python search "
+              "path (EMD-correct). Rebuild the crate (--features python) to re-enable. "
               "POKERBOT_NATIVE_ALLOW_EMD_MISKEY=1 overrides (experiments only).", flush=True)
     return False
+
+
+def _emd_engine_kwargs() -> dict:
+    """FFI kwargs plumbing the EMD keying into a native engine ctor; {} outside the EMD regime (or
+    when the binary/blob can't support it — the availability gate already fails closed there)."""
+    if os.environ.get("POKERBOT_POSTFLOP_MODE", "fast").lower() != "emd":
+        return {}
+    if not _native_supports_emd():
+        return {}
+    cfg = _emd_native_key_config()
+    if cfg is None:
+        return {}
+    return {"emd_frozen_path": cfg[0], "emd_miss_made_hand": cfg[1]}
 
 
 def native_rollout_available() -> bool:
@@ -377,15 +441,24 @@ def _build_playout_engine(adapter, num_buckets: int, max_playout_depth: int):
         bytes(k): [float(x) for x in _np.asarray(v, dtype=_np.float64).reshape(-1)[:11]]
         for k, v in adapter.snapshot.items()
     }
-    return _EXT.PlayoutEngine(
-        bp,
-        [bool(x) for x in allowed_pre],
-        [bool(x) for x in allowed_post],
-        float(adapter.bias_mult),
-        float(adapter.bias_floor),
-        int(max_playout_depth),
-        int(num_buckets),
-    )
+    try:
+        return _EXT.PlayoutEngine(
+            bp,
+            [bool(x) for x in allowed_pre],
+            [bool(x) for x in allowed_post],
+            float(adapter.bias_mult),
+            float(adapter.bias_floor),
+            int(max_playout_depth),
+            int(num_buckets),
+            **_emd_engine_kwargs(),
+        )
+    except TypeError:
+        # Stale native binary predating the EMD keying kwargs: never construct a mis-keyed engine
+        # under the EMD regime — fall back to the Python loop (the availability gate should already
+        # have failed closed; this is defense in depth).
+        if _emd_engine_kwargs():
+            return None
+        raise
 
 
 def native_uniform_leaf_value(
@@ -439,15 +512,22 @@ def _build_subgame_engine(adapter, num_buckets: int, leaf_max_depth: int):
         bytes(k): [float(x) for x in _np.asarray(v, dtype=_np.float64).reshape(-1)[:11]]
         for k, v in adapter.snapshot.items()
     }
-    return _EXT.SubgameSolver(
-        bp,
-        [bool(x) for x in allowed_pre],
-        [bool(x) for x in allowed_post],
-        float(adapter.bias_mult),
-        float(adapter.bias_floor),
-        int(leaf_max_depth),
-        int(num_buckets),
-    )
+    try:
+        return _EXT.SubgameSolver(
+            bp,
+            [bool(x) for x in allowed_pre],
+            [bool(x) for x in allowed_post],
+            float(adapter.bias_mult),
+            float(adapter.bias_floor),
+            int(leaf_max_depth),
+            int(num_buckets),
+            **_emd_engine_kwargs(),
+        )
+    except TypeError:
+        # Stale native binary predating the EMD keying kwargs (see _build_playout_engine).
+        if _emd_engine_kwargs():
+            return None
+        raise
 
 
 def native_subgame_solve(

@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 
 use crate::core::{self, EnvStateN, ALL_IN, BET_BUCKET_START, FOLD, NUM_ACTIONS, SEAT_FOLDED, SEAT_LIVE};
-use crate::fingerprint::{fingerprint_fast, CHIP_UNIT};
+use crate::fingerprint::CHIP_UNIT;
 use crate::playout::{self, Blueprint, PlayoutConfig, Rng};
 
 const ZEROS: [f64; NUM_ACTIONS] = [0.0; NUM_ACTIONS];
@@ -238,9 +238,13 @@ fn blueprint_policy<const N: usize>(
     seat: usize,
     abst: &[bool; NUM_ACTIONS],
     bp: &Blueprint,
-    num_buckets: i32,
+    pcfg: &PlayoutConfig,
 ) -> [f64; NUM_ACTIONS] {
-    let key = fingerprint_fast(s, seat, num_buckets);
+    // Key abstraction (made-hand vs EMD frozen-lookup) is decided by `pcfg.fp_key` — the SAME
+    // dispatch the leaf playout uses, so subgame CFR + leaf + exploit all key the blueprint
+    // identically (the exploit path's `opponent_strategy_exploit` reaches here through
+    // `opponent_strategy`; ONLY the key changes there, its frozen-table firewall knobs do not).
+    let key = pcfg.fp_key(s, seat);
     let mut p = [0.0f64; NUM_ACTIONS];
     if let Some(row) = bp.get(&key) {
         let mut tot = 0.0;
@@ -272,7 +276,7 @@ fn opponent_strategy<const N: usize>(
     ctx: &Ctx,
 ) -> [f64; NUM_ACTIONS] {
     let rm = regret_match(regrets, legal);
-    let bp = blueprint_policy(s, actor, legal, ctx.bp, ctx.pcfg.num_buckets);
+    let bp = blueprint_policy(s, actor, legal, ctx.bp, ctx.pcfg);
     let s_bp: f64 = bp.iter().sum();
     if s_bp <= 1e-12 {
         return rm;
@@ -809,7 +813,7 @@ fn continue_weight<const N: usize>(
     if !legal[FOLD] {
         return 1.0; // cannot fold => no range narrowing from a continuation signal.
     }
-    let pol = blueprint_policy(&s, seat, &legal, ctx.bp, ctx.pcfg.num_buckets);
+    let pol = blueprint_policy(&s, seat, &legal, ctx.bp, ctx.pcfg);
     (1.0 - pol[FOLD]).clamp(0.0, 1.0)
 }
 

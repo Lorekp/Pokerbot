@@ -354,6 +354,68 @@ mod py {
         fingerprint::evaluate_cards(&cards)
     }
 
+    /// Capability probe for the Python fail-closed gates (`native_solver.py` /
+    /// `fingerprint_native.py`): which serve-abstraction regimes this binary can key correctly.
+    /// A binary built before the EMD port lacks this symbol entirely, so `hasattr` alone already
+    /// fails closed on stale .pyds.
+    #[pyfunction]
+    fn native_caps() -> Vec<String> {
+        vec![
+            "emd_fingerprint".to_string(),
+            "emd_subgame".to_string(),
+            "emd_rollout".to_string(),
+            "emd_lbr".to_string(),
+        ]
+    }
+
+    /// Resolve the optional EMD keying ctor args into the shared (once-per-process) lookup config.
+    fn emd_key_cfg(
+        emd_frozen_path: Option<String>,
+        emd_miss_made_hand: bool,
+    ) -> PyResult<Option<crate::playout::EmdKeyCfg>> {
+        match emd_frozen_path {
+            None => Ok(None),
+            Some(p) => {
+                let lookup = crate::emd::load_shared(&p)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
+                Ok(Some(crate::playout::EmdKeyCfg {
+                    lookup,
+                    miss_made_hand: emd_miss_made_hand,
+                }))
+            }
+        }
+    }
+
+    /// `fingerprint_fast_emd(state_bytes, seat, num_buckets, depth_edges, emd_frozen_path,
+    /// emd_miss_made_hand)` -> 16-byte digest under the EMD frozen-lookup abstraction. Byte-parity
+    /// target: `jax_weva_fast.fingerprint_fast` under `POKERBOT_POSTFLOP_MODE=emd` (the deployed
+    /// EMD-K160 regime). The blob loads once per process (shared cache). Used by the parity gate
+    /// (`scripts/probe_native_emd_parity.py`) and any EMD-mode key crosscheck.
+    #[pyfunction]
+    #[pyo3(signature = (state, seat, num_buckets, depth_edges, emd_frozen_path, emd_miss_made_hand=true))]
+    fn fingerprint_fast_emd<'py>(
+        py: Python<'py>,
+        state: &[u8],
+        seat: usize,
+        num_buckets: i32,
+        depth_edges: Vec<f64>,
+        emd_frozen_path: String,
+        emd_miss_made_hand: bool,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let lookup = crate::emd::load_shared(&emd_frozen_path)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        let s = flat::from_flat(&bytes_to_flat(state));
+        let d = fingerprint::fingerprint_fast_depth_emd(
+            &s,
+            seat,
+            num_buckets,
+            &depth_edges,
+            &lookup,
+            emd_miss_made_hand,
+        );
+        Ok(PyBytes::new(py, &d))
+    }
+
     /// `subgame_ctx_key_id(state, actor)` -> the all_contexts() index (0..21) the native exploit path
     /// recomputes from public state, or -1 on an out-of-range street / no-texture state. Cross-check
     /// entry asserting the Rust `ctx_key_id` port equals `list(all_contexts()).index(
@@ -378,7 +440,11 @@ mod py {
     #[pymethods]
     impl PlayoutEngine {
         /// blueprint: dict[bytes(16) -> sequence[float] len 11]; abstraction masks len 11.
+        /// `emd_frozen_path`/`emd_miss_made_hand` (kwargs, default None/true): EMD frozen-lookup
+        /// keying for the EMD-K160 serve regime; omitted => the made-hand key, byte-identical.
         #[new]
+        #[pyo3(signature = (blueprint, allowed_pre, allowed_post, bias_mult, bias_floor, max_depth, num_buckets, emd_frozen_path=None, emd_miss_made_hand=true))]
+        #[allow(clippy::too_many_arguments)]
         fn new(
             blueprint: &Bound<'_, PyDict>,
             allowed_pre: Vec<bool>,
@@ -387,6 +453,8 @@ mod py {
             bias_floor: f64,
             max_depth: i32,
             num_buckets: i32,
+            emd_frozen_path: Option<String>,
+            emd_miss_made_hand: bool,
         ) -> PyResult<Self> {
             let mut bp: Blueprint = HashMap::with_capacity(blueprint.len());
             for (k, v) in blueprint.iter() {
@@ -423,6 +491,7 @@ mod py {
                     bias_floor,
                     max_depth,
                     num_buckets,
+                    emd: emd_key_cfg(emd_frozen_path, emd_miss_made_hand)?,
                 },
             })
         }
@@ -468,7 +537,12 @@ mod py {
         /// Same construction as `PlayoutEngine`: blueprint dict + abstraction masks + leaf knobs.
         /// `leaf_max_depth` bounds the per-leaf rollout (PlayoutConfig.max_depth); the CFR
         /// betting-recursion depth is passed per-call to `solve`.
+        /// `emd_frozen_path`/`emd_miss_made_hand` (kwargs, default None/true): EMD frozen-lookup
+        /// keying — applies to BOTH `solve` and `solve_exploit` blueprint lookups (the exploit
+        /// path's frozen-table firewall knobs are untouched; only the key abstraction changes).
         #[new]
+        #[pyo3(signature = (blueprint, allowed_pre, allowed_post, bias_mult, bias_floor, leaf_max_depth, num_buckets, emd_frozen_path=None, emd_miss_made_hand=true))]
+        #[allow(clippy::too_many_arguments)]
         fn new(
             blueprint: &Bound<'_, PyDict>,
             allowed_pre: Vec<bool>,
@@ -477,6 +551,8 @@ mod py {
             bias_floor: f64,
             leaf_max_depth: i32,
             num_buckets: i32,
+            emd_frozen_path: Option<String>,
+            emd_miss_made_hand: bool,
         ) -> PyResult<Self> {
             let mut bp: Blueprint = HashMap::with_capacity(blueprint.len());
             for (k, v) in blueprint.iter() {
@@ -513,6 +589,7 @@ mod py {
                     bias_floor,
                     max_depth: leaf_max_depth,
                     num_buckets,
+                    emd: emd_key_cfg(emd_frozen_path, emd_miss_made_hand)?,
                 },
             })
         }
@@ -741,6 +818,7 @@ mod py {
         allowed_post: [bool; NUM_ACTIONS],
         num_buckets: i32,
         depth_edges: Vec<f64>,
+        emd: Option<crate::playout::EmdKeyCfg>,
     }
 
     #[pymethods]
@@ -748,13 +826,18 @@ mod py {
         /// blueprint: dict[bytes(16) -> seq[float] len 11] (may be EMPTY for calibration modes).
         /// `depth_edges`: depth-bucket edges for a DEPTH-BUCKETED blueprint (e.g. [50,90,140]); pass an
         /// empty list for a non-depth blueprint -- the preflop key then omits the depth byte.
+        /// `emd_frozen_path`/`emd_miss_made_hand` (kwargs, default None/true): EMD frozen-lookup
+        /// keying for an EMD-keyed blueprint; omitted => the made-hand key, byte-identical.
         #[new]
+        #[pyo3(signature = (blueprint, allowed_pre, allowed_post, num_buckets, depth_edges, emd_frozen_path=None, emd_miss_made_hand=true))]
         fn new(
             blueprint: &Bound<'_, PyDict>,
             allowed_pre: Vec<bool>,
             allowed_post: Vec<bool>,
             num_buckets: i32,
             depth_edges: Vec<f64>,
+            emd_frozen_path: Option<String>,
+            emd_miss_made_hand: bool,
         ) -> PyResult<Self> {
             let mut bp: Blueprint = HashMap::with_capacity(blueprint.len());
             for (k, v) in blueprint.iter() {
@@ -782,7 +865,34 @@ mod py {
                 allowed_post: allowed_arr(&allowed_post),
                 num_buckets,
                 depth_edges,
+                emd: emd_key_cfg(emd_frozen_path, emd_miss_made_hand)?,
             })
+        }
+
+        /// Load (shared, once/process) the frozen EMD lookup and key ALL subsequent blueprint
+        /// lookups with it (`pokerbot/eval/lbr_native.py` calls this when it is handed an
+        /// `emd_frozen_path`). Returns the lookup meta `(n_buckets, n_bins, n_runouts, rows)` —
+        /// the wrapper cross-checks `n_buckets` against the active abstraction. `miss_made_hand`
+        /// defaults to the mirror rule (made-hand on frozen miss — the trainer/serve semantics).
+        #[pyo3(signature = (path, miss_made_hand=true))]
+        fn set_emd_frozen(
+            &mut self,
+            path: String,
+            miss_made_hand: bool,
+        ) -> PyResult<(usize, usize, usize, usize)> {
+            let lookup = crate::emd::load_shared(&path)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            let meta = (
+                lookup.n_buckets,
+                lookup.n_bins,
+                lookup.n_runouts,
+                lookup.rows.len(),
+            );
+            self.emd = Some(crate::playout::EmdKeyCfg {
+                lookup,
+                miss_made_hand,
+            });
+            Ok(meta)
         }
 
         fn n_keys(&self) -> usize {
@@ -799,6 +909,7 @@ mod py {
                 allowed_post: self.allowed_post,
                 num_buckets: self.num_buckets,
                 depth_edges: self.depth_edges.clone(),
+                emd: self.emd.clone(),
                 mode: policy_mode,
             };
             policy.probs(&s, seat).to_vec()
@@ -844,6 +955,7 @@ mod py {
                 allowed_post: self.allowed_post,
                 num_buckets: self.num_buckets,
                 depth_edges: self.depth_edges.clone(),
+                emd: self.emd.clone(),
                 mode: policy_mode,
             };
             let cfg = LbrCfg {
@@ -1547,6 +1659,8 @@ mod py {
         m.add_function(wrap_pyfunction!(rayon_num_threads, m)?)?;
         m.add_function(wrap_pyfunction!(fingerprint_fast, m)?)?;
         m.add_function(wrap_pyfunction!(fingerprint_fast_depth, m)?)?;
+        m.add_function(wrap_pyfunction!(fingerprint_fast_emd, m)?)?;
+        m.add_function(wrap_pyfunction!(native_caps, m)?)?;
         m.add_function(wrap_pyfunction!(eval_seven_phe, m)?)?;
         m.add_function(wrap_pyfunction!(subgame_ctx_key_id, m)?)?;
         m.add_function(wrap_pyfunction!(multiway_equity_river, m)?)?;

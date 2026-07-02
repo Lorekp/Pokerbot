@@ -427,13 +427,29 @@ pub fn fingerprint_fast_depth<const N: usize>(
     num_buckets: i32,
     depth_edges: &[f64],
 ) -> [u8; 16] {
+    let h0 = s.holes[seat][0];
+    let h1 = s.holes[seat][1];
+    let bucket = compute_postflop_bucket(h0, h1, &s.board, num_buckets);
+    fingerprint_from_bucket(s, seat, bucket, depth_edges)
+}
+
+/// The digest for an ALREADY-RESOLVED postflop bucket id (or `bucket < 0` => the preflop `b"w"`
+/// branch, including the depth byte when enabled). Pure code motion out of `fingerprint_fast_depth`
+/// — the message assembly is byte-identical to the pre-refactor body (golden digest tests pin it).
+/// This is the shared tail that lets the EMD keying substitute the frozen-lookup bucket while
+/// reusing the exact made-hand byte layout.
+pub fn fingerprint_from_bucket<const N: usize>(
+    s: &EnvStateN<N>,
+    seat: usize,
+    bucket: i32,
+    depth_edges: &[f64],
+) -> [u8; 16] {
     let button = s.button;
     let offset = (((seat as i32 - button) % N as i32 + N as i32) % N as i32) as usize;
     let pos_enum = pos_by_offset::<N>(offset);
     let h0 = s.holes[seat][0];
     let h1 = s.holes[seat][1];
     let weva_id = weva_id_lossless(h0, h1, pos_enum);
-    let bucket = compute_postflop_bucket(h0, h1, &s.board, num_buckets);
     let betting_state = betting_abstraction_key(s, seat);
 
     let mut msg: Vec<u8> = Vec::with_capacity(1 + 4 + 2 + 1 + 6);
@@ -457,6 +473,46 @@ pub fn fingerprint_fast_depth<const N: usize>(
     let mut out = [0u8; 16];
     out.copy_from_slice(&d);
     out
+}
+
+/// EMD-mode fingerprint for the SERVE fast paths (subgame / rollout / LBR / fingerprint export) —
+/// the serve twin of the trainer's `fingerprint_fast_depth_memo_emd` (trainer.rs), which keyed the
+/// promoted EMD-K160 blueprint and is therefore the ground truth for what the blueprint rows were
+/// written under. Byte-parity target: `jax_weva_fast.fingerprint_fast` with
+/// `POKERBOT_POSTFLOP_MODE=emd` (`jax_weva_encode.compute_postflop_bucket`):
+///   * flop/turn (3-4 board cards): bucket = the FROZEN lookup id -> the postflop `b"B"` key;
+///   * frozen MISS (river always — it is not in the blob — or an off-blob flop/turn spot):
+///       - `miss_made_hand=true`  (POKERBOT_EMD_FROZEN_MIRROR_FALLBACK=1 / silent fallback /
+///         fail-on-miss OFF — the deployed serve regime): made-hand bucket, exactly what the
+///         trainer keyed the river with (the "mirror rule");
+///       - `miss_made_hand=false` (fail-on-miss, no mirror): Python returns bucket=-1, so the
+///         digest takes the preflop `b"w"` branch — replicated via `fingerprint_from_bucket(-1)`.
+///   * preflop / invalid holes: identical to the made-hand path (the branches coincide).
+pub fn fingerprint_fast_depth_emd<const N: usize>(
+    s: &EnvStateN<N>,
+    seat: usize,
+    num_buckets: i32,
+    depth_edges: &[f64],
+    lookup: &crate::emd::FrozenEMDLookup,
+    miss_made_hand: bool,
+) -> [u8; 16] {
+    let h0 = s.holes[seat][0];
+    let h1 = s.holes[seat][1];
+    let nb = s.board.iter().filter(|&&c| c >= 0).count();
+    if nb >= 3 && h0 >= 0 && h1 >= 0 {
+        if nb <= 4 {
+            if let Some(bucket) = crate::emd::frozen_bucket_memoed(lookup, &s.holes[seat], &s.board)
+            {
+                return fingerprint_fast_depth_postflop_bucket(s, seat, bucket);
+            }
+        }
+        // Frozen miss: river (never in the blob) or a true flop/turn blob miss.
+        if miss_made_hand {
+            return fingerprint_fast_depth(s, seat, num_buckets, depth_edges);
+        }
+        return fingerprint_from_bucket(s, seat, -1, depth_edges);
+    }
+    fingerprint_fast_depth(s, seat, num_buckets, depth_edges)
 }
 
 #[inline]

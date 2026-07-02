@@ -24,8 +24,8 @@ use crate::core::{
     self, EnvState, BET_BUCKET_START, CALL, CHECK, FOLD, NUM_ACTIONS, NUM_PLAYERS, SEAT_ALLIN,
     SEAT_LIVE,
 };
-use crate::fingerprint::{fingerprint_fast_depth, CHIP_UNIT};
-use crate::playout::{Blueprint, Rng};
+use crate::fingerprint::{fingerprint_fast_depth, fingerprint_fast_depth_emd, CHIP_UNIT};
+use crate::playout::{Blueprint, EmdKeyCfg, Rng};
 use rayon::prelude::*;
 
 pub const HALF_POT_INDEX: usize = BET_BUCKET_START + 1; // frac 0.5
@@ -60,6 +60,8 @@ pub struct TabularPolicy {
     pub num_buckets: i32,
     /// Depth-bucket edges for the depth-aware blueprint key (empty => non-depth blueprint).
     pub depth_edges: Vec<f64>,
+    /// EMD frozen-lookup keying (None = made-hand key, byte-identical to the shipped binary).
+    pub emd: Option<EmdKeyCfg>,
     pub mode: u8,
 }
 
@@ -162,7 +164,17 @@ impl LbrPolicy for TabularPolicy {
             _ => {
                 // MODE_BLUEPRINT
                 let abst = self.abstracted(&full, s.street);
-                let key = fingerprint_fast_depth(s, seat, self.num_buckets, &self.depth_edges);
+                let key = match &self.emd {
+                    None => fingerprint_fast_depth(s, seat, self.num_buckets, &self.depth_edges),
+                    Some(k) => fingerprint_fast_depth_emd(
+                        s,
+                        seat,
+                        self.num_buckets,
+                        &self.depth_edges,
+                        &k.lookup,
+                        k.miss_made_hand,
+                    ),
+                };
                 if let Some(row) = self.bp.get(&key) {
                     let mut p = [0.0f64; NUM_ACTIONS];
                     let mut tot = 0.0;
@@ -939,6 +951,7 @@ mod tests {
             allowed_post: allowed_all(),
             num_buckets: 200,
             depth_edges: vec![],
+            emd: None,
             mode: MODE_FOLD,
         };
         let p = pol.probs(&s, 0);
