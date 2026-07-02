@@ -33,7 +33,14 @@ import statistics as st
 from pathlib import Path
 
 # Blueprint-free heuristic battery; keep postflop bucketing consistent with the live overlay path.
-os.environ.setdefault("POKERBOT_POSTFLOP_MODE", "fast")
+os.environ.setdefault("POKERBOT_POSTFLOP_MODE", "emd")
+os.environ.setdefault("POKERBOT_POSTFLOP_NUM_BUCKETS", "160")
+# EMD-K160 deployed regime (promoted 2026-07-02, certified +32.89 bb/100 vs made-hand iter62000):
+# frozen flop/turn EMD lookup + train-mirrored made-hand fallback on the river (the river is not
+# in the blob; without the mirror flag the river frozen-miss serves a UNIFORM policy).
+os.environ.setdefault("POKERBOT_POSTFLOP_EMD_FROZEN", os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "data", "abstraction", "emd_frozen_flop_turn_160_r400.emdfrzn")))
+os.environ.setdefault("POKERBOT_EMD_FROZEN_MIRROR_FALLBACK", "1")
 
 from pokerbot.engine.actions import Action, ActionType  # noqa: E402
 
@@ -61,7 +68,14 @@ def _counter_cell(spec):
     in this infra. The n=5 ceiling is therefore set by the structural monotonicity argument (see the
     report), not an independent counter-exploiter cell."""
     n, c, hands, seed = spec
-    os.environ.setdefault("POKERBOT_POSTFLOP_MODE", "fast")
+    os.environ.setdefault("POKERBOT_POSTFLOP_MODE", "emd")
+    os.environ.setdefault("POKERBOT_POSTFLOP_NUM_BUCKETS", "160")
+    # EMD-K160 deployed regime (promoted 2026-07-02, certified +32.89 bb/100 vs made-hand iter62000):
+    # frozen flop/turn EMD lookup + train-mirrored made-hand fallback on the river (the river is not
+    # in the blob; without the mirror flag the river frozen-miss serves a UNIFORM policy).
+    os.environ.setdefault("POKERBOT_POSTFLOP_EMD_FROZEN", os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "data", "abstraction", "emd_frozen_flop_turn_160_r400.emdfrzn")))
+    os.environ.setdefault("POKERBOT_EMD_FROZEN_MIRROR_FALLBACK", "1")
     import pokerbot.eval.exploitation_battery as eb
     from pokerbot.eval.exploitation_battery import run_archetype
 
@@ -126,7 +140,14 @@ def _sizing_cell(spec):
     The SIZING=1/0 legs differ ONLY in the value_sizing overlay; everything else (deck, rng, base) is
     byte-identical, so the common variance cancels hard in the per-seed delta."""
     arch, cap, hands, seed = spec
-    os.environ.setdefault("POKERBOT_POSTFLOP_MODE", "fast")
+    os.environ.setdefault("POKERBOT_POSTFLOP_MODE", "emd")
+    os.environ.setdefault("POKERBOT_POSTFLOP_NUM_BUCKETS", "160")
+    # EMD-K160 deployed regime (promoted 2026-07-02, certified +32.89 bb/100 vs made-hand iter62000):
+    # frozen flop/turn EMD lookup + train-mirrored made-hand fallback on the river (the river is not
+    # in the blob; without the mirror flag the river frozen-miss serves a UNIFORM policy).
+    os.environ.setdefault("POKERBOT_POSTFLOP_EMD_FROZEN", os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "data", "abstraction", "emd_frozen_flop_turn_160_r400.emdfrzn")))
+    os.environ.setdefault("POKERBOT_EMD_FROZEN_MIRROR_FALLBACK", "1")
     import pokerbot.eval.exploitation_battery as eb
     from pokerbot.eval.exploitation_battery import run_archetype
 

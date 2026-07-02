@@ -70,8 +70,14 @@ _os.environ.setdefault("JAX_PLATFORMS", "cpu")          # GPU held by the 7-max 
 _os.environ.setdefault("POKERBOT_INFO_SUITS", "1")
 _os.environ.setdefault("POKERBOT_BETTING_ABSTRACTION", "1")
 _os.environ.setdefault("POKERBOT_POSTFLOP_BUCKETS", "1")
-_os.environ.setdefault("POKERBOT_POSTFLOP_MODE", "fast")
-_os.environ.setdefault("POKERBOT_POSTFLOP_NUM_BUCKETS", "200")
+_os.environ.setdefault("POKERBOT_POSTFLOP_MODE", "emd")
+_os.environ.setdefault("POKERBOT_POSTFLOP_NUM_BUCKETS", "160")
+# EMD-K160 deployed regime (promoted 2026-07-02, certified +32.89 bb/100 vs made-hand iter62000):
+# frozen flop/turn EMD lookup + train-mirrored made-hand fallback on the river (the river is not
+# in the blob; without the mirror flag the river frozen-miss serves a UNIFORM policy).
+_os.environ.setdefault("POKERBOT_POSTFLOP_EMD_FROZEN", _os.path.abspath(_os.path.join(
+    _os.path.dirname(__file__), "..", "..", "data", "abstraction", "emd_frozen_flop_turn_160_r400.emdfrzn")))
+_os.environ.setdefault("POKERBOT_EMD_FROZEN_MIRROR_FALLBACK", "1")
 _os.environ.setdefault("POKERBOT_PREFLOP_LOSSLESS", "1")  # the lossless2 ship candidate's stamp
 _os.environ.setdefault("POKERBOT_SEARCH_PREFLOP", "1")   # deployed default (de-exploits the preflop hole)
 

@@ -22,8 +22,10 @@ Environment overrides (same as preflop_onoff_h2h.py):
     POKERBOT_BETTING_ABSTRACTION=1
     POKERBOT_POSTFLOP_BUCKETS=1
     POKERBOT_PREFLOP_LOSSLESS=1
-    POKERBOT_POSTFLOP_MODE=fast
-    POKERBOT_POSTFLOP_NUM_BUCKETS=200
+    POKERBOT_POSTFLOP_MODE=emd
+    POKERBOT_POSTFLOP_NUM_BUCKETS=160
+    POKERBOT_POSTFLOP_EMD_FROZEN=<abs>/data/abstraction/emd_frozen_flop_turn_160_r400.emdfrzn
+    POKERBOT_EMD_FROZEN_MIRROR_FALLBACK=1
     H2H_SETTLE=200      (runout samples for all-in EV settle)
     H2H_REPAIR=1        (deck repair gate)
     H2H_TWOSIDED=1      (two-sided subgame CFR gate)
@@ -47,8 +49,14 @@ import time
 os.environ.setdefault("POKERBOT_BETTING_ABSTRACTION", "1")
 os.environ.setdefault("POKERBOT_POSTFLOP_BUCKETS", "1")
 os.environ.setdefault("POKERBOT_PREFLOP_LOSSLESS", "1")
-os.environ.setdefault("POKERBOT_POSTFLOP_MODE", "fast")
-os.environ.setdefault("POKERBOT_POSTFLOP_NUM_BUCKETS", "200")
+os.environ.setdefault("POKERBOT_POSTFLOP_MODE", "emd")
+os.environ.setdefault("POKERBOT_POSTFLOP_NUM_BUCKETS", "160")
+# EMD-K160 deployed regime (promoted 2026-07-02, certified +32.89 bb/100 vs made-hand iter62000):
+# frozen flop/turn EMD lookup + train-mirrored made-hand fallback on the river (the river is not
+# in the blob; without the mirror flag the river frozen-miss serves a UNIFORM policy).
+os.environ.setdefault("POKERBOT_POSTFLOP_EMD_FROZEN", os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "data", "abstraction", "emd_frozen_flop_turn_160_r400.emdfrzn")))
+os.environ.setdefault("POKERBOT_EMD_FROZEN_MIRROR_FALLBACK", "1")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import numpy as np

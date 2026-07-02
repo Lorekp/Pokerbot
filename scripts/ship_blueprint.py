@@ -18,8 +18,8 @@ What it does (LIGHT: convert + adapter validation; NO LBR / no GPU):
   2. VALIDATE (the serve-skew firewall gate — this is the -559 bb/100 guard) — the snapshot is
      loaded into a real ``TabularBlueprintAdapter`` and we assert, on a fresh 6-max probe state:
        (a) the serve abstraction MATCHES the snapshot's stamp (``check_blueprint_serve_env`` STRICT
-           on the {200-bucket / fast / preflop-lossless / non-depth} config) — a mismatch silently
-           misses every node and plays a beatable strategy;
+           on the {160-bucket / emd-frozen / preflop-lossless / non-depth} deployed config) — a
+           mismatch silently misses every node and plays a beatable strategy;
        (b) the adapter serves a finite, legal-masked, sum-to-1 11-vector;
        (c) the trained keys ACTUALLY HIT serve (blueprint coverage > 0 over a batch of probe nodes
            — proves the fingerprint key space is byte-aligned, the real train/serve skew test);
@@ -60,15 +60,26 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 # The serve abstraction config. These flags are baked into pokerbot AT IMPORT
 # (jax_weva_encode), so they MUST be set before any pokerbot import. They are the
-# deployed 6-max blueprint config: betting abstraction ON, 200 made-hand postflop
-# buckets, lossless preflop, NON-depth. The validation gate cross-checks the snapshot
-# stamp against exactly this, strictly.
+# deployed 6-max blueprint config: betting abstraction ON, EMD-K160 potential-aware
+# postflop buckets (frozen flop/turn lookup + train-mirrored made-hand river fallback,
+# promoted 2026-07-02: bp_emd_k160_1 certified +32.89 +- 28.92 bb/100 over the made-hand
+# fast/200 iter62000, n=8000, artifacts/rank_emd_vs_iter62000_8k.json), lossless preflop,
+# NON-depth. The validation gate cross-checks the snapshot stamp against exactly this,
+# strictly. To ship a LEGACY made-hand blueprint, set POKERBOT_POSTFLOP_MODE=fast and
+# POKERBOT_POSTFLOP_NUM_BUCKETS=200 in the environment first (setdefault ⇒ explicit env
+# wins) and pass --num-buckets 200.
 # --------------------------------------------------------------------------- #
+_EMD_FROZEN_DEFAULT = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "data", "abstraction", "emd_frozen_flop_turn_160_r400.emdfrzn"))
 SERVE_ABSTRACTION_ENV = {
     "POKERBOT_BETTING_ABSTRACTION": "1",
     "POKERBOT_POSTFLOP_BUCKETS": "1",
-    "POKERBOT_POSTFLOP_NUM_BUCKETS": "200",
-    "POKERBOT_POSTFLOP_MODE": "fast",
+    "POKERBOT_POSTFLOP_NUM_BUCKETS": "160",
+    "POKERBOT_POSTFLOP_MODE": "emd",
+    "POKERBOT_POSTFLOP_EMD_FROZEN": _EMD_FROZEN_DEFAULT,
+    # River is NOT in the flop/turn frozen blob: the trainer keys it made-hand, so serve must
+    # mirror that (else the river frozen-miss serves UNIFORM, ~1/3 of postflop decisions).
+    "POKERBOT_EMD_FROZEN_MIRROR_FALLBACK": "1",
     "POKERBOT_PREFLOP_LOSSLESS": "1",
     # NON-depth blueprint: leave POKERBOT_DEPTH_BUCKETS unset/0.
 }
@@ -86,7 +97,7 @@ STABLE_CURRENT = REPO_ROOT / "checkpoints" / "serve_blueprint_6max.pkl"
 STABLE_BACKUP = STABLE_CURRENT.with_suffix(STABLE_CURRENT.suffix + ".bak")
 
 # Native trainer construction for a deployed 6-max non-depth blueprint.
-NATIVE_NUM_BUCKETS = 200
+NATIVE_NUM_BUCKETS = 160
 NATIVE_DEPTH_EDGES: list = []  # non-depth
 NATIVE_N_DEALS = 1  # irrelevant for load+snapshot (we never train here)
 
@@ -343,10 +354,18 @@ def validate_serve(snapshot: dict, stamp: dict) -> dict:
 
 
 def _stamp_for_snapshot() -> dict:
-    """The abstraction stamp for the active (serve) config — written into the installed pkl."""
+    """The abstraction stamp for the active (serve) config — written into the installed pkl.
+
+    VOLATILE fields are stripped: ``postflop_emd_frozen_miss_count`` is a process-global counter
+    that the river mirror-fallback increments on EVERY river decision, so baking its value (0)
+    into the stamp would make any strict ``check_blueprint_serve_env(expected=stamp)`` performed
+    AFTER decisions have been served spuriously fail (the field-by-field loop compares every
+    stamp key). Identity fields (mode / K / frozen path / sha256 / fallback flags) are kept."""
     from pokerbot.engine.jax_weva_encode import active_abstraction_config  # noqa: PLC0415
 
-    return active_abstraction_config()
+    stamp = dict(active_abstraction_config())
+    stamp.pop("postflop_emd_frozen_miss_count", None)
+    return stamp
 
 
 # --------------------------------------------------------------------------- #
@@ -437,8 +456,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-validate", action="store_true",
                     help="(DANGEROUS) skip the serve-skew gate — never use to ship to live")
     ap.add_argument("--num-buckets", type=int, default=None,
-                    help="override the postflop bucket count (default 200). MUST equal the trained "
-                         "--num-buckets AND, for EMD, the frozen table's K — else the converter mis-keys.")
+                    help="override the postflop bucket count (default 160, the deployed EMD-K160). MUST "
+                         "equal the trained --num-buckets AND, for EMD, the frozen table's K — else the "
+                         "converter mis-keys.")
     ap.add_argument("--emd-frozen", default=None,
                     help="ship an EMD blueprint: sets POKERBOT_POSTFLOP_MODE=emd + "
                          "POKERBOT_POSTFLOP_EMD_FROZEN=<this path> so the serve encoder reads the SAME "

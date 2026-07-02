@@ -323,9 +323,42 @@ def available() -> bool:
 # NOT a replay of numpy's PCG64 (the leaf value estimates the SAME expectation).
 # Default OFF; the Python loop in pluribus_rollout is unchanged when this is not engaged.
 # ---------------------------------------------------------------------------
+_EMD_NATIVE_GATE_WARNED = False
+
+
+def _native_fingerprint_matches_serve_abstraction() -> bool:
+    """FAIL-CLOSED gate for the native blueprint-consuming fast paths under the EMD serve regime.
+
+    The Rust core computes blueprint keys with ``fingerprint.rs`` — a byte-identical port of the
+    MADE-HAND ('fast') bucketer only. Under ``POKERBOT_POSTFLOP_MODE=emd`` (the DEPLOYED regime since
+    the 2026-07-02 EMD-K160 promotion) the trained table is keyed by EMD bucket ids on flop/turn, so a
+    native made-hand key is the WRONG abstraction there — and because both id spaces are 0..K-1 the
+    wrong key usually COLLIDES INTO a real (different-hand) row instead of missing (measured 12/15 flop,
+    14/15 turn collisions), which is worse than a clean uniform-fallback miss: the in-subgame opponent
+    prior silently plays another bucket's strategy. The river IS correct (the trainer keys the river
+    made-hand — the mirror rule), but flop/turn priors would be mis-keyed, so the native fast paths are
+    DISABLED under EMD and the caller runs the Python CFR/rollout loop, whose fingerprint goes through
+    the EMD-aware encoder (train==serve parity verified). Override for experiments only with
+    POKERBOT_NATIVE_ALLOW_EMD_MISKEY=1 (never for a measurement or live).
+    """
+    if os.environ.get("POKERBOT_POSTFLOP_MODE", "fast").lower() != "emd":
+        return True
+    if os.environ.get("POKERBOT_NATIVE_ALLOW_EMD_MISKEY", "0").lower() in ("1", "true", "yes", "on"):
+        return True
+    global _EMD_NATIVE_GATE_WARNED
+    if not _EMD_NATIVE_GATE_WARNED:
+        _EMD_NATIVE_GATE_WARNED = True
+        print("[native_solver] POKERBOT_POSTFLOP_MODE=emd: native subgame/rollout fast paths DISABLED "
+              "(fingerprint.rs is a made-hand port and would MIS-KEY the EMD-keyed blueprint on "
+              "flop/turn) — serving through the Python search path (EMD-correct). "
+              "POKERBOT_NATIVE_ALLOW_EMD_MISKEY=1 overrides (experiments only).", flush=True)
+    return False
+
+
 def native_rollout_available() -> bool:
     """True iff the native extension exposes the PlayoutEngine (built) AND is enabled."""
-    return bool(_AVAILABLE and _ENABLED and _EXT is not None and hasattr(_EXT, "PlayoutEngine"))
+    return bool(_AVAILABLE and _ENABLED and _EXT is not None and hasattr(_EXT, "PlayoutEngine")
+                and _native_fingerprint_matches_serve_abstraction())
 
 
 # Per-adapter PlayoutEngine cache (built once per blueprint snapshot identity; the blueprint is large
@@ -388,7 +421,8 @@ def native_uniform_leaf_value(
 # ---------------------------------------------------------------------------
 def native_subgame_available() -> bool:
     """True iff the native extension exposes SubgameSolver (built) AND the native path is enabled."""
-    return bool(_AVAILABLE and _ENABLED and _EXT is not None and hasattr(_EXT, "SubgameSolver"))
+    return bool(_AVAILABLE and _ENABLED and _EXT is not None and hasattr(_EXT, "SubgameSolver")
+                and _native_fingerprint_matches_serve_abstraction())
 
 
 _SUBGAME_ENGINE_CACHE: dict[tuple, object] = {}
@@ -490,6 +524,8 @@ def native_subgame_exploit_available() -> bool:
     """True iff the native SubgameSolver exposes solve_exploit (a rebuilt .pyd) AND the native path is
     enabled. Probes the bound method on the class so a stale binary silently falls back to Python."""
     if not (_AVAILABLE and _ENABLED and _EXT is not None and hasattr(_EXT, "SubgameSolver")):
+        return False
+    if not _native_fingerprint_matches_serve_abstraction():
         return False
     return hasattr(_EXT.SubgameSolver, "solve_exploit")
 

@@ -100,8 +100,16 @@ def is_enabled() -> bool:
     DISABLED regardless of opt-in. The Rust core has no depth byte (it reproduces the legacy non-depth
     preflop digest), so serving a depth blueprint through it would silently drop the depth key -> ~0%
     coverage -> uniform fallback. Forcing the Python oracle keeps train/serve byte-identity. Remove this
-    guard only once the Rust core learns the depth byte and re-passes golden parity."""
+    guard only once the Rust core learns the depth byte and re-passes golden parity.
+
+    SAME hard override for ``POKERBOT_POSTFLOP_MODE=emd`` (the DEPLOYED regime since the 2026-07-02
+    EMD-K160 promotion): the Rust core buckets postflop by MADE-HAND rank only, so its flop/turn keys are
+    the wrong abstraction for an EMD-keyed blueprint — and because both bucket-id spaces are 0..K-1 the
+    wrong key usually COLLIDES INTO a real (different-hand) row instead of missing. The Python oracle
+    routes through the EMD-aware encoder (train==serve parity verified)."""
     if _flag_truthy(os.environ.get("POKERBOT_DEPTH_BUCKETS")):
+        return False
+    if os.environ.get("POKERBOT_POSTFLOP_MODE", "fast").lower() == "emd":
         return False
     return available() and _flag_truthy(os.environ.get(_ENABLE_ENV))
 

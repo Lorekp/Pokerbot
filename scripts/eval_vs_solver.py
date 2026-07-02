@@ -14,8 +14,10 @@ and the headline: does the SEARCH layer measurably REDUCE exploitability vs blue
 
 Run (git-bash; ALWAYS export the abstraction env first):
 
-    POKERBOT_BETTING_ABSTRACTION=1 POKERBOT_POSTFLOP_BUCKETS=1 POKERBOT_POSTFLOP_MODE=fast \
-    POKERBOT_POSTFLOP_NUM_BUCKETS=200 python scripts/eval_vs_solver.py \
+    POKERBOT_BETTING_ABSTRACTION=1 POKERBOT_POSTFLOP_BUCKETS=1 POKERBOT_POSTFLOP_MODE=emd \
+    POKERBOT_POSTFLOP_NUM_BUCKETS=160 \
+    POKERBOT_POSTFLOP_EMD_FROZEN=<abs>/data/abstraction/emd_frozen_flop_turn_160_r400.emdfrzn \
+    POKERBOT_EMD_FROZEN_MIRROR_FALLBACK=1 python scripts/eval_vs_solver.py \
         --config config/solver_labels_smoke.yaml \
         --blueprint "$LOCALAPPDATA/Temp/bp6max_dcfrvr_iter200.pkl" \
         --max-spots 6 --leaf uniform
@@ -35,8 +37,14 @@ from pathlib import Path
 # Abstraction env MUST be set before importing the engine/encoders (fingerprint parity).
 os.environ.setdefault("POKERBOT_BETTING_ABSTRACTION", "1")
 os.environ.setdefault("POKERBOT_POSTFLOP_BUCKETS", "1")
-os.environ.setdefault("POKERBOT_POSTFLOP_MODE", "fast")
-os.environ.setdefault("POKERBOT_POSTFLOP_NUM_BUCKETS", "200")
+os.environ.setdefault("POKERBOT_POSTFLOP_MODE", "emd")
+os.environ.setdefault("POKERBOT_POSTFLOP_NUM_BUCKETS", "160")
+# EMD-K160 deployed regime (promoted 2026-07-02, certified +32.89 bb/100 vs made-hand iter62000):
+# frozen flop/turn EMD lookup + train-mirrored made-hand fallback on the river (the river is not
+# in the blob; without the mirror flag the river frozen-miss serves a UNIFORM policy).
+os.environ.setdefault("POKERBOT_POSTFLOP_EMD_FROZEN", os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "data", "abstraction", "emd_frozen_flop_turn_160_r400.emdfrzn")))
+os.environ.setdefault("POKERBOT_EMD_FROZEN_MIRROR_FALLBACK", "1")
 
 import numpy as np  # noqa: E402
 

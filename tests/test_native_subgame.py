@@ -31,6 +31,18 @@ native_only = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _pin_fast_mode(monkeypatch):
+    """The native SubgameSolver fast path is only valid for the made-hand ('fast') abstraction: under
+    the DEPLOYED EMD serve regime (promoted 2026-07-02) ``native_solver`` gates itself OFF because
+    ``fingerprint.rs`` (a made-hand port) would MIS-KEY an EMD-keyed blueprint on flop/turn. These are
+    fast-path INVARIANT tests, so pin mode=fast for their duration — another test in the same process
+    (e.g. test_ship_blueprint_gate via ``ship._set_serve_env``) may have baked
+    ``POKERBOT_POSTFLOP_MODE=emd`` into ``os.environ``, which would otherwise flip the gate mid-suite
+    (the ``native_only`` marker was evaluated at collection, before that env leak)."""
+    monkeypatch.setenv("POKERBOT_POSTFLOP_MODE", "fast")
+
+
 def _postflop_root(seed: int = 7):
     """Play random hands via ``play_hand`` (advances streets + deals board) with a passive recording
     policy; return the first captured postflop (GameState, hero)."""

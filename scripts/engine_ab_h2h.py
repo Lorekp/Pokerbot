@@ -30,10 +30,14 @@ Usage
       --decks 6 --seed 9999 --label "zero_gate" \\
       --out artifacts/zero_gate.json
 
-Environment preamble (set before running):
+Environment preamble (set before running — the DEPLOYED EMD-K160 regime, promoted 2026-07-02):
   POKERBOT_BETTING_ABSTRACTION=1 POKERBOT_POSTFLOP_BUCKETS=1 \\
-  POKERBOT_PREFLOP_LOSSLESS=1 POKERBOT_POSTFLOP_MODE=fast \\
-  POKERBOT_POSTFLOP_NUM_BUCKETS=200
+  POKERBOT_PREFLOP_LOSSLESS=1 POKERBOT_POSTFLOP_MODE=emd \\
+  POKERBOT_POSTFLOP_NUM_BUCKETS=160 \\
+  POKERBOT_POSTFLOP_EMD_FROZEN=data/abstraction/emd_frozen_flop_turn_160_r400.emdfrzn \\
+  POKERBOT_EMD_FROZEN_MIRROR_FALLBACK=1
+(use the ABSOLUTE frozen path so it string-matches the snapshot stamp; the mirror flag keys the
+river made-hand exactly as the trainer did — without it the river serves UNIFORM)
 """
 from __future__ import annotations
 

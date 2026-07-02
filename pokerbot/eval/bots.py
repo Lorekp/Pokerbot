@@ -721,8 +721,12 @@ def _load_blueprint_snapshot():
     """Lazy module-level snapshot for BlueprintBot AND the live serve (LiveSearchAdvisor calls this when
     no explicit blueprint is passed). Loaded once per process; per-hand bot construction stays cheap.
 
-    DEFAULT = the STABLE_CURRENT ship pointer ``checkpoints/serve_blueprint_6max.pkl`` (== iter62000,
-    100,042 infosets), matching ``scripts/ship_blueprint.py``'s STABLE_CURRENT. This is the B1 PROVENANCE
+    DEFAULT = the STABLE_CURRENT ship pointer ``checkpoints/serve_blueprint_6max.pkl`` (== bp_emd_k160_1,
+    EMD-K160 potential-aware, 84,364 infosets, promoted 2026-07-02 — certified +32.89 bb/100 over the
+    made-hand iter62000 it replaced, artifacts/rank_emd_vs_iter62000_8k.json; the serve env must bake
+    POKERBOT_POSTFLOP_MODE=emd / NUM_BUCKETS=160 / POKERBOT_POSTFLOP_EMD_FROZEN=<the stamped blob> /
+    POKERBOT_EMD_FROZEN_MIRROR_FALLBACK=1), matching ``scripts/ship_blueprint.py``'s STABLE_CURRENT
+    defaults. This is the B1 PROVENANCE
     FIX (2026-06-30): the default previously hardcoded the older ``%TEMP%\\bp6max_lossless2_iter200.pkl``
     (96,553 infosets), which is ~2x MORE LBR-exploitable table-only (+92.4 vs +41.6 bb/100), so the
     deployed default served a measurably worse blueprint than the certified ship unit. Override with

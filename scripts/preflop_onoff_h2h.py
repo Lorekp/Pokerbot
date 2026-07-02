@@ -16,7 +16,9 @@ keep blueprint preflop (cheaper and at-least-as-good).
 
 Run from the native worktree (its patched .pyd loads):
   POKERBOT_BETTING_ABSTRACTION=1 POKERBOT_POSTFLOP_BUCKETS=1 POKERBOT_PREFLOP_LOSSLESS=1 \
-  POKERBOT_POSTFLOP_MODE=fast POKERBOT_POSTFLOP_NUM_BUCKETS=200 \
+  POKERBOT_POSTFLOP_MODE=emd POKERBOT_POSTFLOP_NUM_BUCKETS=160 \
+  POKERBOT_POSTFLOP_EMD_FROZEN=<abs>/data/abstraction/emd_frozen_flop_turn_160_r400.emdfrzn \
+  POKERBOT_EMD_FROZEN_MIRROR_FALLBACK=1 \
   H2H_DECKS=400 H2H_ITERS=2000 ENS_STREAMS=1 \
   python scripts/preflop_onoff_h2h.py <worktree> <main>
 """
