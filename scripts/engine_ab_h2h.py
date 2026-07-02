@@ -431,11 +431,25 @@ def main():
             else:
                 rew = np.asarray(env.rewards, dtype=np.float64)
 
+            # ZERO-GATE CRITICAL — rotation-symmetric accumulation.
+            # Sum each rotation's arm rewards into per-rotation partials (fixed seat order),
+            # then fold ONE partial per rotation into the deck totals.  When both arms are
+            # identical, the per-seat rewards are bitwise identical across rotations, so
+            # rot0's A-partial == rot1's B-partial bitwise (same values, same seat order)
+            # and vice versa; deck_a = X + Y and deck_b = Y + X are then bitwise equal by
+            # IEEE-754 addition commutativity -> per-deck diff EXACTLY 0.0 even when
+            # _ev_settle returns fractional rewards.  (The previous interleaved
+            # `deck_a += rew[s]` accumulated the same six floats in a rotation-dependent
+            # ORDER — non-associativity produced deterministic ~1e-13 dust on settle decks.)
+            rot_a = 0.0
+            rot_b = 0.0
             for s in range(6):
                 if is_a[s]:
-                    deck_a += float(rew[s])
+                    rot_a += float(rew[s])
                 else:
-                    deck_b += float(rew[s])
+                    rot_b += float(rew[s])
+            deck_a += rot_a
+            deck_b += rot_b
 
         if deck_saw_flop:
             flopdecks += 1
