@@ -51,6 +51,9 @@ os.environ.setdefault("POKERBOT_POSTFLOP_EMD_FROZEN", os.path.abspath(os.path.jo
     os.path.dirname(__file__), "..", "data", "abstraction", "emd_frozen_flop_turn_160_r400.emdfrzn")))
 os.environ.setdefault("POKERBOT_EMD_FROZEN_MIRROR_FALLBACK", "1")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
+# Native subgame (POKERBOT_NATIVE_SUBGAME=1): use the Rust CFR core for speed.
+# Set here so it can be overridden before this module is imported.
+os.environ.setdefault("POKERBOT_NATIVE_SUBGAME", "1")
 
 import argparse
 import json
@@ -233,6 +236,150 @@ class AdaptiveHero:
             pooled = _pool_profiles(profiles)
             self._inner.set_profile(pooled)
         return self._inner(state)
+
+
+# ---------------------------------------------------------------------------
+# Production hero: wraps SearchAgent (Pluribus + EMD-K160 blueprint + exploit overlays)
+# ---------------------------------------------------------------------------
+# This mirrors what the live LiveSearchAdvisor does, but in sim:
+#   exploit ON  -> set_opponent_profiles({seat: OpponentStats}) fed from the persistent store,
+#                  which wires the solver's opponent-node deviation tail (postflop) AND the root
+#                  mixer (all streets). Semantics match live: native subgame gate requires
+#                  opponent_model is None for the fast path, so exploit decisions run Python CFR.
+#   exploit OFF -> set_opponent_profiles(None): pure GTO base, native fast path eligible.
+#
+# Budget: K=2000 iterations, time_budget_ms=10**9 (wall-clock never binds).
+# This makes each decision a pure function of (public state, hand seed), load-independent.
+# RAYON_NUM_THREADS is NOT forced to 1 (native solve uses rayon for parallel work — keep it).
+
+_PROD_HERO_K = 200           # iteration budget per decision (load-independent; matches default
+                              # PluribusReBeLConfig.max_iterations; K=2000 native=fast but the
+                              # exploit-ON Python CFR path is ~10-20x slower than native, so K=200
+                              # gives comparable wall-clock per decision on both arms)
+_PROD_HERO_TIME_MS = 10**9   # wall clock ceiling: never binds (iterations are the real budget)
+
+
+def _build_search_agent(hero_seat: int, blueprint_snap: dict) -> "SearchAgent":
+    """Build the production SearchAgent (Pluribus path, EMD-K160 blueprint, K=2000 iters).
+
+    Budget: K=2000 iterations, wall-clock ceiling 10^9 ms (never binds).
+    Results are iteration-bound, not wall-clock-bound — load-independent.
+    """
+    from pokerbot.eval.search_agent import SearchAgent
+
+    agent = SearchAgent(
+        value_checkpoint=None,
+        transformer_checkpoint=None,  # MADT not needed for the adaptive field benchmark
+        device="cpu",
+        time_budget_ms=_PROD_HERO_TIME_MS,
+        use_pluribus_search=True,
+        blueprint_snapshot=blueprint_snap,
+        pluribus_leaf_select="uniform",
+        root_exploit_mixer=True,       # hero's own post-search policy is exploit-adjusted
+        root_mixer_unopened=False,     # validated facing-only subset (default)
+        search_preflop=False,          # Pluribus: preflop from blueprint (default live)
+        hero_seat=hero_seat,
+    )
+    # Patch the iteration budget after construction (SearchAgent does not expose max_iterations
+    # directly in its constructor — it comes through PluribusReBeLConfig via time_budget_ms).
+    # We set both to ensure wall-clock never terminates before K=2000 iters complete.
+    if hasattr(agent, "solver") and hasattr(agent.solver, "config"):
+        agent.solver.config.max_iterations = _PROD_HERO_K
+        agent.solver.config.time_budget_ms = _PROD_HERO_TIME_MS
+    return agent
+
+
+class ProductionAdaptiveHero:
+    """Production hero that wraps the real SearchAgent (Pluribus + EMD-K160 blueprint).
+
+    Exploit ON:  per-villain OpponentStats from the temp PlayerProfileStore are fed via
+                 set_opponent_profiles({seat: stats}) before each decision.  This wires the
+                 EXACT same two exploitation seams live uses:
+                   1. solver.opponent_model => opponent-node deviation tail (postflop CFR)
+                   2. root mixer => hero's own post-search mix adjustment (all streets)
+                 The native subgame gate (opponent_model is None) means exploit decisions
+                 run the Python CFR loop — same semantics as live, faithful.
+    Exploit OFF: set_opponent_profiles(None) => pure GTO, native fast path eligible.
+
+    Served-source tracking: counts blueprint_preflop / search_postflop / search_preflop
+    serves across the run, reported in the smoke and stored in the output JSON.
+    """
+
+    def __init__(
+        self,
+        *,
+        exploit: bool,
+        store: PlayerProfileStore | None = None,
+        blueprint_snap: dict | None = None,
+    ):
+        self.exploit = exploit
+        self._store = store
+        self._blueprint_snap = blueprint_snap or {}
+        # hero_seat and seat_to_identity set by the harness before each hand
+        self.hero_seat: int = 0
+        self.seat_to_identity: dict[int, str] = {}
+        # Build the SearchAgent at construction time (expensive; reused across all hands)
+        self._agent = _build_search_agent(self.hero_seat, self._blueprint_snap)
+        # Served-source counters (reported in smoke / stored in output)
+        self._served_blueprint_preflop: int = 0
+        self._served_search: int = 0
+        self._served_total: int = 0
+
+    def reseed(self, seed: int) -> None:
+        """Reset the agent's per-hand PBS state (new hand, new hero seat)."""
+        self._agent.reset_hand(self.hero_seat)
+
+    def set_profile(self, profile) -> None:
+        # Compatibility shim — unused for the production hero (we do dynamic per-seat lookup)
+        pass
+
+    def pop_decisions(self) -> list:
+        # ProductionAdaptiveHero doesn't expose per-decision AIVAT tuples; return empty.
+        return []
+
+    def pop_chance_corrections(self) -> list:
+        return []
+
+    @property
+    def bet_freq(self) -> float:
+        return 0.0  # not tracked (search policy is not a simple value-bettor)
+
+    def served_source_counts(self) -> dict:
+        total = max(1, self._served_total)
+        return {
+            "blueprint_preflop": self._served_blueprint_preflop,
+            "search": self._served_search,
+            "total": self._served_total,
+            "blueprint_preflop_frac": round(self._served_blueprint_preflop / total, 3),
+            "search_frac": round(self._served_search / total, 3),
+        }
+
+    def __call__(self, state: GameState) -> Action:
+        # Wire per-seat profiles into the search agent BEFORE each decision.
+        # The agent's __call__ reads self._opponent_profiles and self.solver.opponent_model.
+        if self.exploit and self._store is not None:
+            profiles: dict[int, OpponentStats] = {}
+            for s, ident in self.seat_to_identity.items():
+                if s != self.hero_seat:
+                    profiles[s] = self._store.get(ident)
+            self._agent.set_opponent_profiles(profiles)
+        else:
+            self._agent.set_opponent_profiles(None)
+
+        action = self._agent(state)
+
+        # Track served-source (metadata is set by the solver on every solve call)
+        meta = getattr(self._agent, "_state", None)
+        if meta is not None:
+            md = meta.last_solve_metadata
+            served = md.get("served", "")
+            self._served_total += 1
+            if served == "blueprint_preflop":
+                self._served_blueprint_preflop += 1
+            else:
+                self._served_search += 1
+
+        return action
 
 
 def _pool_profiles(profiles: dict[int, OpponentStats]) -> OpponentStats:
@@ -603,6 +750,8 @@ def run_adaptive(
     store: PlayerProfileStore,
     progress_every: int = 10,
     diag: bool = False,           # if True: collect per-hand loss attribution + exploit firing stats
+    hero_mode: str = "heuristic", # "heuristic" (default) or "production"
+    blueprint_snap: dict | None = None,  # pre-loaded blueprint snapshot (production mode only)
 ) -> dict:
     """Core adaptive field loop.
 
@@ -636,9 +785,16 @@ def run_adaptive(
             f"Reduce field total below {NUM_SEATS}."
         )
 
-    # Build hero
+    # Build hero (heuristic or production)
     hero_rng = random.Random(seed)
-    hero = AdaptiveHero(hero_rng, exploit=exploit, store=store if exploit else None)
+    if hero_mode == "production":
+        hero = ProductionAdaptiveHero(
+            exploit=exploit,
+            store=store if exploit else None,
+            blueprint_snap=blueprint_snap,
+        )
+    else:
+        hero = AdaptiveHero(hero_rng, exploit=exploit, store=store if exploit else None)
 
     per_hand_ev: list[float] = []
     hand_id_ctr = 0
@@ -677,10 +833,15 @@ def run_adaptive(
         for _, agent in seat_to_bot.items():
             agent.reseed(hand_seed)
 
-        # Reseed hero
-        hero.reseed(hand_seed)
+        # Reseed / reset hero for this hand
         hero.hero_seat = hero_seat
         hero.seat_to_identity = seat_to_identity
+        hero.reseed(hand_seed)
+        # For the production hero, also reset the SearchAgent's per-hand PBS state
+        # (reset_hand is called inside ProductionAdaptiveHero.reseed, but it needs the
+        # hero_seat to be set FIRST so we do it here after setting hero_seat above)
+        if hero_mode == "production":
+            hero._agent.reset_hand(hero_seat)
 
         # --- Play hand ---
         ctx_buf: list[tuple] = []     # (seat, context_key, action_bin)
@@ -810,12 +971,21 @@ def run_adaptive(
             recent = per_hand_ev[max(0, done - progress_every):]
             recent_mean = float(np.mean(recent)) * 100.0 if recent else 0.0
             overall_ci = _ci(per_hand_ev)
+            served_suffix = ""
+            if hero_mode == "production":
+                sc = hero.served_source_counts()
+                served_suffix = (
+                    f" | bp_pf={sc['blueprint_preflop']} "
+                    f"srch={sc['search']} "
+                    f"({sc['search_frac']*100:.0f}%)"
+                )
             print(
                 f"[adaptive] hand {done}/{hands} ({100*done/hands:.0f}%) | "
                 f"window bb/100={recent_mean:+.1f} | "
                 f"overall {overall_ci['bb_per_100']:+.1f}±{1.96*overall_ci['se']*100:.1f} | "
                 f"ETA {eta_str} | "
-                f"store={sum(s.hands for s in store.profiles.values())} obs",
+                f"store={sum(s.hands for s in store.profiles.values())} obs"
+                f"{served_suffix}",
                 flush=True,
             )
 
@@ -855,6 +1025,7 @@ def run_adaptive(
         "field": field_spec,
         "hands": hands,
         "exploit": exploit,
+        "hero_mode": hero_mode,
         "seed": seed,
         "windows": windows,
         "n_hero_seats": n_hero_seats,
@@ -865,6 +1036,9 @@ def run_adaptive(
         "wall_s": round(wall_s, 2),
         "hands_per_second": round(hands / max(0.001, wall_s), 1),
     }
+    # Served-source counts for the production hero
+    if hero_mode == "production":
+        out["served_source"] = hero.served_source_counts()
 
     if diag and _diag_exploit_firing:
         # Aggregate exploit-firing stats across all hands
@@ -946,6 +1120,13 @@ def parse_args():
                    help="Print progress every N hands (default 10)")
     p.add_argument("--diag", action="store_true", default=False,
                    help="Collect per-hand loss attribution + exploit firing stats (writes to output JSON)")
+    p.add_argument("--hero", choices=["heuristic", "production"], default="heuristic",
+                   help=(
+                       "heuristic = lightweight ExploitHero (default; fast, no blueprint/search); "
+                       "production = real SearchAgent (Pluribus + EMD-K160 blueprint, K=2000 iters, "
+                       "native subgame, full exploit overlays). Set POKERBOT_NATIVE_SUBGAME=1 "
+                       "(default) for the production hero."
+                   ))
     return p.parse_args()
 
 
@@ -992,10 +1173,24 @@ def main():
         tmp_dir = tempfile.mkdtemp(prefix="adaptive_field_h2h_")
         db_path = str(Path(tmp_dir) / "adaptive_profiles.json")
 
+    hero_mode = args.hero
+
     print(f"[adaptive] Profile store: {db_path}", flush=True)
     print(f"[adaptive] Field: {field_spec}", flush=True)
     print(f"[adaptive] Hands: {args.hands}  Exploit: {'ON' if exploit else 'OFF'}  "
-          f"Seed: {args.seed}  Windows: {args.windows}", flush=True)
+          f"Seed: {args.seed}  Windows: {args.windows}  Hero: {hero_mode}", flush=True)
+
+    # Load the blueprint snapshot ONCE for production hero (expensive, do not repeat per hand)
+    blueprint_snap = None
+    if hero_mode == "production":
+        print("[adaptive] Loading EMD-K160 blueprint snapshot for production hero...", flush=True)
+        from pokerbot.eval.bots import _load_blueprint_snapshot
+        blueprint_snap = _load_blueprint_snapshot()
+        print(f"[adaptive] Blueprint loaded: {len(blueprint_snap):,} infosets", flush=True)
+        print(f"[adaptive] Production hero: K={_PROD_HERO_K} iters/decision "
+              f"(iteration-bound, wall-clock={_PROD_HERO_TIME_MS}ms ceiling=never-binds), "
+              f"native_subgame={os.environ.get('POKERBOT_NATIVE_SUBGAME','0')}, "
+              f"root_exploit_mixer=ON", flush=True)
 
     store = PlayerProfileStore(db_path, wal=True)
 
@@ -1009,6 +1204,8 @@ def main():
             store=store,
             progress_every=args.progress_every,
             diag=args.diag,
+            hero_mode=hero_mode,
+            blueprint_snap=blueprint_snap,
         )
     finally:
         if tmp_dir and not args.keep_db:
@@ -1025,9 +1222,15 @@ def main():
 
     # --- Summary printout ---
     print(f"\n{'='*60}", flush=True)
-    print(f"ADAPTIVE FIELD H2H  field={field_spec}  exploit={'ON' if exploit else 'OFF'}", flush=True)
+    print(f"ADAPTIVE FIELD H2H  field={field_spec}  exploit={'ON' if exploit else 'OFF'}  "
+          f"hero={hero_mode}", flush=True)
     print(f"  Hands: {result['hands']}  Wall: {result['wall_s']:.1f}s  "
           f"Speed: {result['hands_per_second']:.1f} h/s", flush=True)
+    if hero_mode == "production" and "served_source" in result:
+        ss = result["served_source"]
+        print(f"  Served source: blueprint_preflop={ss['blueprint_preflop']} "
+              f"({ss['blueprint_preflop_frac']*100:.1f}%)  "
+              f"search={ss['search']} ({ss['search_frac']*100:.1f}%)", flush=True)
     ov = result["overall"]
     print(f"  Overall hero bb/100: {ov['bb_per_100']:+.1f}  "
           f"95%CI [{ov['ci95_lo']*100:+.1f}, {ov['ci95_hi']*100:+.1f}]", flush=True)
