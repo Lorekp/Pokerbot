@@ -49,6 +49,24 @@ import subprocess
 import sys
 import time
 
+# ---------------------------------------------------------------------------
+# CRITICAL: POKERBOT_* env vars must be set BEFORE any pokerbot import.
+# Mirrors the preamble in adaptive_field_h2h.py / blueprint_ranking.py.
+# These setdefaults are the deployed EMD-K160 regime (promoted 2026-07-02).
+# A pinned external env always wins (setdefault never overwrites an existing value).
+# ---------------------------------------------------------------------------
+os.environ.setdefault("POKERBOT_BETTING_ABSTRACTION", "1")
+os.environ.setdefault("POKERBOT_POSTFLOP_BUCKETS", "1")
+os.environ.setdefault("POKERBOT_PREFLOP_LOSSLESS", "1")
+os.environ.setdefault("POKERBOT_POSTFLOP_MODE", "emd")
+os.environ.setdefault("POKERBOT_POSTFLOP_NUM_BUCKETS", "160")
+# EMD-K160 deployed regime (certified +32.89 bb/100 vs made-hand iter62000).
+# Frozen flop/turn lookup; river uses train-mirrored made-hand fallback.
+# POKERBOT_EMD_FROZEN_MIRROR_FALLBACK=1 is required — without it the river serves UNIFORM.
+os.environ.setdefault("POKERBOT_POSTFLOP_EMD_FROZEN", os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "data", "abstraction",
+    "emd_frozen_flop_turn_160_r400.emdfrzn")))
+os.environ.setdefault("POKERBOT_EMD_FROZEN_MIRROR_FALLBACK", "1")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import numpy as np
