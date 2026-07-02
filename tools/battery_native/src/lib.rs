@@ -534,6 +534,16 @@ mod py {
             rollout_samples: i32,
             resample_board: bool,
             linear_averaging: bool,
+            repair_deck: bool,
+            two_sided: bool,
+            decouple_sampler: bool,
+            range_aware: bool,
+            range_uniform_floor: f64,
+            ensemble_streams: i32,
+            leaf_cache_worlds: i32,
+            avg_skip_frac: f64,
+            leaf_biased_continuations: bool,
+            leaf_bias_mult: f64,
         ) -> Vec<f64> {
             let s = flat::from_flat(&bytes_to_flat(state));
             let scfg = SubgameConfig {
@@ -543,6 +553,20 @@ mod py {
                 rollout_samples,
                 resample_board,
                 linear_averaging,
+                repair_deck,
+                two_sided,
+                decouple_sampler,
+                range_aware,
+                range_uniform_floor,
+                ensemble_streams,
+                // BUG-1 leaf hole-world integration (1 = legacy first-touch freeze) + BUG-5 delayed
+                // averaging (0.0 = legacy accumulate-from-t=0). Both default no-op at the Python caller.
+                leaf_cache_worlds,
+                avg_skip_frac,
+                // R2 — Pluribus biased continuation leaves (default OFF at the Python caller => the
+                // legacy uniform leaf, byte-identical).
+                leaf_biased_continuations,
+                leaf_bias_mult,
             };
             subgame::solve(&s, hero, &self.bp, &self.cfg, &scfg, public_seed).to_vec()
         }
@@ -575,6 +599,10 @@ mod py {
             frozen_read_response: bool,
             rnr_restrict: bool,
             want_root_q: bool,
+            repair_deck: bool,
+            decouple_sampler: bool,
+            range_aware: bool,
+            range_uniform_floor: f64,
         ) -> (Vec<f64>, Vec<f64>) {
             let s = flat::from_flat(&bytes_to_flat(state));
             let scfg = SubgameConfig {
@@ -584,6 +612,29 @@ mod py {
                 rollout_samples,
                 resample_board,
                 linear_averaging,
+                repair_deck,
+                // FIREWALL: two_sided is NEVER exposed on the exploit path (one-sided BR to the modeled
+                // opponent is the intended behaviour). Hard-code false so a caller mistake can't flip it.
+                two_sided: false,
+                // Q2/Q3 world-sampling levers apply to the exploit path too (they change ONLY the sampled
+                // opponent worlds, never the frozen-read exploit math -> firewall-safe).
+                decouple_sampler,
+                range_aware,
+                range_uniform_floor,
+                // ENSEMBLE: the exploit path is left single-stream for now (solve_exploit ignores this
+                // field entirely). Firewalled follow-up once the GTO ensemble is validated.
+                ensemble_streams: 1,
+                // FIREWALL: leaf_cache_worlds / avg_skip_frac are GTO-path knobs, NOT exposed on the
+                // exploit FFI — hard-code the no-op values so solve_exploit is byte-identical to the
+                // certified exploit path regardless of what a caller sets on the GTO side (subgame.rs
+                // additionally forces them in the exploit Ctx, defense in depth).
+                leaf_cache_worlds: 1,
+                avg_skip_frac: 0.0,
+                // FIREWALL: R2 biased continuation leaves are a GTO-path knob, NOT exposed on the
+                // exploit FFI — hard-code OFF (subgame.rs additionally forces leaf_biased=false in the
+                // exploit Ctx, defense in depth) so the certified exploit leaf is untouched.
+                leaf_biased_continuations: false,
+                leaf_bias_mult: 5.0,
             };
             // Reconstruct the FrozenTable from the parallel key lists + flat vals (chunked by 11).
             let n = keys_actor

@@ -157,13 +157,18 @@ class TabularBlueprintAdapter:
     # Backwards/clarity alias — the solver's opponent-node mix uses the plain blueprint.
     __call__ = blueprint
 
-    def continuation_set(self, env, seat: int) -> np.ndarray:
+    def continuation_set(self, env, seat: int, bias_mult: float | None = None) -> np.ndarray:
         """All four continuation strategies stacked as ``(NUM_CONTINUATIONS, NUM_ACTIONS)``.
 
         Row 0 is the blueprint; rows 1-3 are fold/call/raise-biased. Each row sums to 1 over the legal
         (abstracted) mask. The blueprint policy is evaluated ONCE and reweighted, so this is one snapshot
         lookup + cheap arithmetic per leaf seat.
+
+        ``bias_mult`` (optional): explicit multiplier override for the biased rows — used by the R2
+        biased-continuation leaf, whose solve-level ``leaf_bias_mult`` knob (Pluribus's 5) replaces the
+        adapter-level default. ``None`` (default) uses ``self.bias_mult``, byte-identical to before.
         """
+        mult = self.bias_mult if bias_mult is None else float(bias_mult)
         mask = legal_action_mask_np(env, seat).astype(bool)
         if self.client_bet_sizing:
             mask = _apply_abstraction_mask(
@@ -173,6 +178,6 @@ class TabularBlueprintAdapter:
         out = np.empty((NUM_CONTINUATIONS, NUM_ACTIONS), dtype=np.float64)
         for r, group in enumerate(_BIAS_GROUPS):
             out[r] = bias_continuation(
-                bp, group, mask, bias_mult=self.bias_mult, bias_floor=self.bias_floor
+                bp, group, mask, bias_mult=mult, bias_floor=self.bias_floor
             )
         return out

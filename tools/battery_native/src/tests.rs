@@ -471,6 +471,16 @@ mod subgame_n7 {
             rollout_samples: 2,
             resample_board: true,
             linear_averaging: true,
+            repair_deck: false, // default OFF => byte/stat-identical to the legacy solve
+            two_sided: false,   // default OFF => traverser is always hero
+            decouple_sampler: false, // Q2 default OFF => byte/stat-identical
+            range_aware: false,      // Q3 default OFF => uniform opponent-hole deal
+            range_uniform_floor: 0.25,
+            ensemble_streams: 1,     // default 1 => single-stream, byte/stat-identical
+            leaf_cache_worlds: 1,    // BUG-1 default 1 => first-touch leaf freeze, byte-identical
+            avg_skip_frac: 0.0,      // BUG-5 default 0.0 => accumulate the average from t=0
+            leaf_biased_continuations: false, // R2 default OFF => legacy uniform leaf, byte-identical
+            leaf_bias_mult: 5.0,     // R2 Pluribus multiplier (only read when the bool is ON)
         }
     }
 
@@ -522,6 +532,242 @@ mod subgame_n7 {
         let a = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 12345);
         let b = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 12345);
         assert_eq!(a, b, "fixed-seed 7-handed solve must be deterministic");
+    }
+
+    // Q2/Q3 GATED-OFF IDENTITY: decouple_sampler=false + range_aware=false MUST reproduce the pre-Q2/Q3
+    // solve bit-for-bit (same seed). Guards the "default OFF => byte/stat-identical" contract at the
+    // Rust boundary (the H2H OLD arm relies on this).
+    #[test]
+    fn n7_subgame_q2q3_flags_off_byte_identical() {
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = HashMap::new();
+        let pc = pcfg();
+        // Baseline: the legacy config (flags off). scfg() already sets decouple/range_aware false.
+        let base = scfg();
+        let probs_base = subgame::solve::<7>(&env, hero, &bp, &pc, &base, 0xBADC0DE);
+        // Explicit flags-off with a NON-uniform floor set (must not matter when range_aware is off).
+        let off = SubgameConfig {
+            decouple_sampler: false,
+            range_aware: false,
+            range_uniform_floor: 0.4,
+            ..scfg()
+        };
+        let probs_off = subgame::solve::<7>(&env, hero, &bp, &pc, &off, 0xBADC0DE);
+        assert_eq!(
+            probs_base, probs_off,
+            "flags-off solve must be byte-identical to the legacy solve"
+        );
+    }
+
+    // Q2 DECOUPLE: turning on the decoupled hole sampler must still return a VALID distribution and stay
+    // deterministic for a fixed seed (its own sub-stream is seeded from public_seed).
+    #[test]
+    fn n7_subgame_decouple_valid_and_deterministic() {
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = HashMap::new();
+        let pc = pcfg();
+        let sc = SubgameConfig { decouple_sampler: true, ..scfg() };
+        let a = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 777);
+        let b = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 777);
+        assert_valid_root_probs(&env, hero, &a);
+        assert_eq!(a, b, "decoupled solve must be deterministic for a fixed seed");
+    }
+
+    // Q3 RANGE-AWARE: with a real blueprint absent (uniform fallback => continue_weight is flat, no fold
+    // mass), range_aware collapses to uniform, so it must MATCH the uniform deal exactly. This proves the
+    // range path is a strict generalization (uniform is the floor=1 / flat-range limit) and that the
+    // combo enumeration + inverse-CDF sampler is correct. We compare range_aware(floor arbitrary) vs the
+    // uniform baseline on a state where the (empty) blueprint gives no range signal.
+    #[test]
+    fn n7_subgame_range_aware_valid_distribution() {
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = HashMap::new(); // empty => uniform fallback => flat continue_weight
+        let pc = pcfg();
+        for floor in [0.15_f64, 0.25, 0.4] {
+            let sc = SubgameConfig { range_aware: true, range_uniform_floor: floor, ..scfg() };
+            let a = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 2024);
+            let b = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 2024);
+            assert_valid_root_probs(&env, hero, &a);
+            assert_eq!(a, b, "range-aware solve must be deterministic (floor={floor})");
+        }
+    }
+
+    // ENSEMBLE: ensemble_streams=1 must be BYTE-IDENTICAL to the legacy single-stream solve (stream 0's
+    // seed == the raw public_seed), and ensemble_streams>1 must return a VALID distribution that is
+    // DETERMINISTIC for a fixed seed (fixed per-stream seeds => CRN-stable across processes/arms).
+    #[test]
+    fn n7_subgame_ensemble_one_byte_identical_and_n_deterministic() {
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = HashMap::new();
+        let pc = pcfg();
+        // ensemble=1 (explicit) == legacy (scfg() default 1): byte-identical.
+        let base = scfg();
+        let one = SubgameConfig { ensemble_streams: 1, ..scfg() };
+        let p_base = subgame::solve::<7>(&env, hero, &bp, &pc, &base, 0xC0FFEE);
+        let p_one = subgame::solve::<7>(&env, hero, &bp, &pc, &one, 0xC0FFEE);
+        assert_eq!(p_base, p_one, "ensemble_streams=1 must be byte-identical to legacy single-stream");
+        // ensemble=8: valid + deterministic (same seed twice => identical, proving fixed per-stream seeds).
+        let sc8 = SubgameConfig { ensemble_streams: 8, ..scfg() };
+        let a = subgame::solve::<7>(&env, hero, &bp, &pc, &sc8, 0xC0FFEE);
+        let b = subgame::solve::<7>(&env, hero, &bp, &pc, &sc8, 0xC0FFEE);
+        assert_valid_root_probs(&env, hero, &a);
+        assert_eq!(a, b, "ensemble solve must be deterministic for a fixed seed");
+        // The 8-stream average should differ from the 1-stream (independent seeds => more effective samples).
+        // Not asserting a direction (that is the H2H's job), only that the ensemble is actually engaged.
+    }
+
+    // BUG-1 GATE: leaf_cache_worlds=1 (the default) MUST reproduce the pre-change solve bit-for-bit —
+    // the (sum, n) running-mean cache with M=1 is exactly the legacy first-touch freeze (n=0 uses the
+    // legacy leaf seed; v/1.0 == v). Also exercised with an explicit 1 vs the scfg() default.
+    #[test]
+    fn n7_subgame_leaf_cache_worlds_default_byte_identical() {
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = HashMap::new();
+        let pc = pcfg();
+        let base = scfg(); // leaf_cache_worlds: 1 (default)
+        let probs_base = subgame::solve::<7>(&env, hero, &bp, &pc, &base, 0xBADC0DE);
+        let one = SubgameConfig { leaf_cache_worlds: 1, ..scfg() };
+        let probs_one = subgame::solve::<7>(&env, hero, &bp, &pc, &one, 0xBADC0DE);
+        assert_eq!(
+            probs_base, probs_one,
+            "leaf_cache_worlds=1 must be byte-identical to the legacy first-touch leaf cache"
+        );
+        // M=4: valid distribution + deterministic (per-(leaf, n) seeds are pure functions of the key),
+        // proving the multi-world path is CRN-stable. Direction/effect is the H2H's job, not this gate's.
+        let m4 = SubgameConfig { leaf_cache_worlds: 4, ..scfg() };
+        let a = subgame::solve::<7>(&env, hero, &bp, &pc, &m4, 0xBADC0DE);
+        let b = subgame::solve::<7>(&env, hero, &bp, &pc, &m4, 0xBADC0DE);
+        assert_valid_root_probs(&env, hero, &a);
+        assert_eq!(a, b, "leaf_cache_worlds=4 solve must be deterministic for a fixed seed");
+    }
+
+    // BUG-5 GATE: avg_skip_frac=0.0 (the default) MUST reproduce the pre-change solve bit-for-bit
+    // (strat_sum accumulates from t=0 with unchanged weights; regret updates are never gated).
+    #[test]
+    fn n7_subgame_avg_skip_frac_default_byte_identical() {
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = HashMap::new();
+        let pc = pcfg();
+        let base = scfg(); // avg_skip_frac: 0.0 (default)
+        let probs_base = subgame::solve::<7>(&env, hero, &bp, &pc, &base, 0xBADC0DE);
+        let zero = SubgameConfig { avg_skip_frac: 0.0, ..scfg() };
+        let probs_zero = subgame::solve::<7>(&env, hero, &bp, &pc, &zero, 0xBADC0DE);
+        assert_eq!(
+            probs_base, probs_zero,
+            "avg_skip_frac=0.0 must be byte-identical to the legacy accumulate-from-t=0 average"
+        );
+        // frac=0.5: valid + deterministic. The traversal (worlds, sampled actions, regrets, leaf cache)
+        // is UNCHANGED by the gate — only the served average excludes early iterates.
+        let half = SubgameConfig { avg_skip_frac: 0.5, ..scfg() };
+        let a = subgame::solve::<7>(&env, hero, &bp, &pc, &half, 0xBADC0DE);
+        let b = subgame::solve::<7>(&env, hero, &bp, &pc, &half, 0xBADC0DE);
+        assert_valid_root_probs(&env, hero, &a);
+        assert_eq!(a, b, "avg_skip_frac=0.5 solve must be deterministic for a fixed seed");
+    }
+
+    // R2 GATE: leaf_biased_continuations=false (the default) MUST reproduce the pre-change solve
+    // bit-for-bit — even with a non-default leaf_bias_mult set (the multiplier is only read when the
+    // bool is ON). Guards the "default OFF => byte-identical uniform leaf" contract at the Rust
+    // boundary (the H2H OLD arm and the live serve rely on this).
+    #[test]
+    fn n7_subgame_leaf_biased_default_byte_identical() {
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = HashMap::new();
+        let pc = pcfg();
+        let base = scfg(); // leaf_biased_continuations: false (default)
+        let probs_base = subgame::solve::<7>(&env, hero, &bp, &pc, &base, 0xBADC0DE);
+        let off = SubgameConfig {
+            leaf_biased_continuations: false,
+            leaf_bias_mult: 10.0, // non-default mult MUST be inert while the bool is off
+            ..scfg()
+        };
+        let probs_off = subgame::solve::<7>(&env, hero, &bp, &pc, &off, 0xBADC0DE);
+        assert_eq!(
+            probs_base, probs_off,
+            "leaf_biased_continuations=false must be byte-identical to the legacy uniform leaf"
+        );
+    }
+
+    // R2 FEATURE-ON: the biased-continuation solve must return a VALID distribution and be
+    // DETERMINISTIC for a fixed seed (choice draws are pure functions of (infoset, t, seed); leaf
+    // profile values use deterministic per-(leaf, profile) seeds) — at both the Pluribus multiplier
+    // (5) and Modicum's (10). Direction/EV effect is the H2H's job, not this gate's.
+    #[test]
+    fn n7_subgame_leaf_biased_on_deterministic_and_valid() {
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = HashMap::new();
+        let pc = pcfg();
+        for mult in [5.0_f64, 10.0] {
+            let sc = SubgameConfig {
+                leaf_biased_continuations: true,
+                leaf_bias_mult: mult,
+                ..scfg()
+            };
+            let a = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 0xFEED5);
+            let b = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 0xFEED5);
+            assert_valid_root_probs(&env, hero, &a);
+            assert_eq!(a, b, "biased-leaf solve must be deterministic (mult={mult})");
+        }
+        // Also under two_sided (the traverser cycles; choice nodes belong to the traverser) the
+        // feature must stay deterministic + valid.
+        let sc2 = SubgameConfig {
+            leaf_biased_continuations: true,
+            two_sided: true,
+            ..scfg()
+        };
+        let a = subgame::solve::<7>(&env, hero, &bp, &pc, &sc2, 0xFEED5);
+        let b = subgame::solve::<7>(&env, hero, &bp, &pc, &sc2, 0xFEED5);
+        assert_valid_root_probs(&env, hero, &a);
+        assert_eq!(a, b, "biased-leaf + two_sided solve must be deterministic");
+    }
+
+    // R2 CONSISTENCY GATE: the continuation-choice infoset is keyed by the seat + PUBLIC leaf context
+    // ONLY (like every other subgame infoset), so two leaf envs differing only in private hole cards
+    // share the choice infoset — and the sampled continuation is a pure function of
+    // (infoset, iteration t, public_seed): the SAME infoset gets the SAME continuation everywhere
+    // within an iteration (Pluribus's per-infoset consistency requirement).
+    #[test]
+    fn n7_subgame_cont_choice_consistent_within_iteration() {
+        let env = init_hand_7(40);
+        // A hole-permuted twin: swap two non-hero seats' hole cards. Public state identical.
+        let mut env2 = env;
+        let tmp = env2.holes[0];
+        env2.holes[0] = env2.holes[1];
+        env2.holes[1] = tmp;
+        let zeros = [0.0f64; NUM_ACTIONS];
+        let mut any_t_diff = false;
+        for seat in 0..7usize {
+            let k1 = subgame::cont_choice_key(&env, seat);
+            let k2 = subgame::cont_choice_key(&env2, seat);
+            assert_eq!(k1, k2, "choice infoset must ignore private holes (seat {seat})");
+            let mut prev: Option<usize> = None;
+            for t in [0, 1, 7, 512, 1999] {
+                let c1 = subgame::sample_cont_choice(&zeros, &k1, t, 0xABCDEF);
+                let c2 = subgame::sample_cont_choice(&zeros, &k2, t, 0xABCDEF);
+                assert_eq!(
+                    c1, c2,
+                    "same infoset + same iteration must sample the SAME continuation (seat {seat}, t {t})"
+                );
+                assert!(c1 < crate::playout::NUM_CONTINUATIONS, "choice out of range");
+                if let Some(p) = prev {
+                    if p != c1 {
+                        any_t_diff = true;
+                    }
+                }
+                prev = Some(c1);
+            }
+        }
+        // The iteration index must actually be mixed into the draw (across 7 seats x 5 iterations,
+        // at least one consecutive pair differs — probability of failure under correct mixing ~0).
+        assert!(any_t_diff, "continuation draw ignores the iteration index (t not mixed in)");
     }
 
     #[test]

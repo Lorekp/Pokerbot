@@ -165,12 +165,26 @@ fn blueprint_policy<const N: usize>(
 
 /// bias_continuation for a single group over the abstracted mask. Mirrors the Python:
 /// p = bp*mask; if group None -> renorm; else optional floor on legal target, *bias_mult on legal
-/// target, renorm.
+/// target, renorm. Delegates to the explicit-multiplier variant with `cfg.bias_mult` (byte-identical
+/// to the pre-refactor body: same ops, same order).
 fn bias_continuation(
     bp: &[f64; NUM_ACTIONS],
     group: usize,
     mask: &[bool; NUM_ACTIONS],
     cfg: &PlayoutConfig,
+) -> [f64; NUM_ACTIONS] {
+    bias_continuation_mult(bp, group, mask, cfg, cfg.bias_mult)
+}
+
+/// `bias_continuation` with an EXPLICIT multiplier (Pluribus biased-continuation leaves use the
+/// solve-level `leaf_bias_mult` knob — default 5.0, Pluribus's value — instead of the adapter-level
+/// `cfg.bias_mult`). The floor still comes from `cfg.bias_floor` (0.0 = faithful, unchanged).
+fn bias_continuation_mult(
+    bp: &[f64; NUM_ACTIONS],
+    group: usize,
+    mask: &[bool; NUM_ACTIONS],
+    cfg: &PlayoutConfig,
+    mult: f64,
 ) -> [f64; NUM_ACTIONS] {
     let mut p = [0.0f64; NUM_ACTIONS];
     for a in 0..NUM_ACTIONS {
@@ -189,7 +203,7 @@ fn bias_continuation(
     }
     for a in 0..NUM_ACTIONS {
         if mask[a] && group_member(group, a) {
-            p[a] *= cfg.bias_mult;
+            p[a] *= mult;
         }
     }
     renorm_legal(&mut p, mask);
@@ -257,7 +271,7 @@ fn sample_action(row: &[f64; NUM_ACTIONS], full_mask: &[bool; NUM_ACTIONS], u: f
 /// Port of `_reshuffle_undealt`: rebuild the UNDEALT deck tail as a shuffled permutation of the
 /// UNSEEN cards (52 minus every set hole/board card). Uses the native RNG (statistical equivalence:
 /// integrates board luck; not a replay of numpy's shuffle).
-fn reshuffle_undealt<const N: usize>(env: &mut EnvStateN<N>, rng: &mut Rng) {
+pub fn reshuffle_undealt<const N: usize>(env: &mut EnvStateN<N>, rng: &mut Rng) {
     let mut known = [false; 52];
     for i in 0..N {
         for k in 0..2 {
@@ -317,6 +331,80 @@ pub fn uniform_leaf_value<const N: usize>(
         total += playout(&env_r, hero, bp, cfg, &mut arng);
     }
     total / rollout_samples as f64
+}
+
+/// PLURIBUS BIASED-CONTINUATION LEAF (2026-07-02): leaf value under a FIXED per-seat continuation
+/// PROFILE with an explicit bias multiplier. Mean over `rollout_samples` runouts of `playout_fixed`
+/// — same runout/seed schedule as `uniform_leaf_value` (7919/1000003 offsets), so the two paths draw
+/// statistically-identical board integration; only the continuation choices differ (fixed by the
+/// subgame CFR's choice nodes instead of drawn uniformly per playout).
+#[allow(clippy::too_many_arguments)]
+pub fn biased_leaf_value<const N: usize>(
+    env: &EnvStateN<N>,
+    hero: usize,
+    bp: &Blueprint,
+    cfg: &PlayoutConfig,
+    base_seed: u64,
+    rollout_samples: i32,
+    resample_board: bool,
+    choices: &[i32; N],
+    bias_mult: f64,
+) -> f64 {
+    if env.done {
+        return env.rewards[hero] as f64 / CHIP_UNIT;
+    }
+    let mut total = 0.0f64;
+    for r in 0..rollout_samples {
+        let rr = (r as u64).wrapping_add(1);
+        let mut env_r = *env;
+        if resample_board {
+            let mut brng = Rng::seed_from_u64(base_seed.wrapping_add(7919u64.wrapping_mul(rr)));
+            reshuffle_undealt(&mut env_r, &mut brng);
+        }
+        let mut arng = Rng::seed_from_u64(base_seed.wrapping_add(1_000_003u64.wrapping_mul(rr)));
+        total += playout_fixed(&env_r, hero, bp, cfg, &mut arng, choices, bias_mult);
+    }
+    total / rollout_samples as f64
+}
+
+/// `_playout` under a FIXED per-seat continuation profile: `choices[seat]` in 0..NUM_CONTINUATIONS
+/// selects that seat's continuation for the whole playout; a seat with `choices[seat] < 0` (a seat
+/// that could not act at the leaf — folded/all-in — and therefore was given no choice node) falls
+/// back to group 0 (the unaltered blueprint). Such a seat never acts in a well-formed playout, so
+/// the fallback is defensive only. The bias multiplier is the explicit `bias_mult` (the solve-level
+/// `leaf_bias_mult` knob), NOT `cfg.bias_mult`.
+pub fn playout_fixed<const N: usize>(
+    env_in: &EnvStateN<N>,
+    hero: usize,
+    bp: &Blueprint,
+    cfg: &PlayoutConfig,
+    rng: &mut Rng,
+    choices: &[i32; N],
+    bias_mult: f64,
+) -> f64 {
+    let mut env = *env_in;
+    let mut depth = 0;
+    while depth < cfg.max_depth && !env.done {
+        if core::is_chance_node(&env) {
+            env = core::sample_chance(&env);
+            continue;
+        }
+        let seat_i = env.action_seat;
+        if seat_i < 0 {
+            break;
+        }
+        let seat = seat_i as usize;
+        let full = core::legal_action_mask(&env, seat_i);
+        let abst = abstracted_mask(&full, env.street, cfg);
+        let bp_row = blueprint_policy(&env, seat, &abst, bp, cfg);
+        let group = if choices[seat] >= 0 { choices[seat] as usize } else { 0 };
+        let row = bias_continuation_mult(&bp_row, group, &abst, cfg, bias_mult);
+        let u = rng.next_f64();
+        let a = sample_action(&row, &full, u);
+        env = core::apply_action(&env, a);
+        depth += 1;
+    }
+    env.rewards[hero] as f64 / CHIP_UNIT
 }
 
 /// Native uniform-mode `_playout`. choices[seat] is the fixed continuation index for that seat

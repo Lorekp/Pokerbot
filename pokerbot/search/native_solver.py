@@ -419,14 +419,29 @@ def _build_subgame_engine(adapter, num_buckets: int, leaf_max_depth: int):
 def native_subgame_solve(
     base_state, hero: int, adapter, *, public_seed: int, max_iterations: int, max_depth: int,
     blueprint_mix: float, rollout_samples: int, resample_board: bool, max_playout_depth: int,
-    num_buckets: int, linear_averaging: bool = True,
+    num_buckets: int, linear_averaging: bool = True, repair_deck: bool = False,
+    two_sided: bool = False, decouple_sampler: bool = False, range_aware: bool = False,
+    range_uniform_floor: float = 0.25, ensemble_streams: int = 1, leaf_cache_worlds: int = 1,
+    avg_skip_frac: float = 0.0, leaf_biased_continuations: bool = False, leaf_bias_mult: float = 5.0,
 ):
     """Native root action-probability vector (length 11) for a depth-limited subgame solve, or None
     if the native path is unavailable / the adapter is not in the supported (bounded, client_bet_sizing)
     config — in which case the caller runs the Python CFR loop.
 
     ``linear_averaging`` mirrors PluribusReBeLConfig.linear_averaging (CFR+ recency-weighted strategy
-    average); the native core must apply the SAME weighting or the python/native crosscheck diverges."""
+    average); the native core must apply the SAME weighting or the python/native crosscheck diverges.
+
+    ``decouple_sampler`` (Q2) gives the opponent-hole deal its own deterministic sub-stream; ``range_aware``
+    (Q3) weights that deal by the blueprint continuation range mixed with ``range_uniform_floor`` uniform.
+
+    ``leaf_cache_worlds`` (BUG-1 fix) makes the public-keyed leaf cache a running mean over the first M
+    visiting hole-worlds (1 = legacy first-touch freeze, byte-identical); ``avg_skip_frac`` (BUG-5
+    partial) starts strat_sum accumulation at iteration floor(frac * K) (0.0 = legacy, byte-identical).
+
+    ``leaf_biased_continuations`` (R2) turns every depth-limit leaf into the Pluribus 4-way
+    continuation-CHOICE node per live seat, solved by the same subgame CFR; the leaf playout applies
+    ``leaf_bias_mult`` (Pluribus 5 / Modicum 10) to the chosen bias group. False (default) = the legacy
+    uniform-draw leaf, byte-identical. GTO path only — the exploit FFI does not accept these knobs."""
     if not native_subgame_available():
         return None
     ckey = (id(adapter), int(max_playout_depth), int(num_buckets))
@@ -442,10 +457,18 @@ def native_subgame_solve(
             sb, int(hero), int(public_seed) & 0xFFFFFFFFFFFFFFFF,
             int(max_iterations), int(max_depth), float(blueprint_mix),
             int(rollout_samples), bool(resample_board), bool(linear_averaging),
+            bool(repair_deck), bool(two_sided),
+            bool(decouple_sampler), bool(range_aware), float(range_uniform_floor),
+            int(ensemble_streams),
+            int(leaf_cache_worlds), float(avg_skip_frac),
+            bool(leaf_biased_continuations), float(leaf_bias_mult),
         )
     except TypeError:
-        # Stale native binary built before the linear_averaging arg — fall back to Python so a
-        # not-yet-rebuilt crate doesn't crash the solve (the Python path applies the weighting).
+        # Stale native binary built before the linear_averaging / repair_deck / two_sided / decouple /
+        # range_aware / leaf_cache_worlds / avg_skip_frac / leaf_biased_continuations args — fall back
+        # to Python so a not-yet-rebuilt crate doesn't crash the solve (the Python path applies the same
+        # weighting + repair_deck/two_sided + leaf_cache_worlds/avg_skip_frac/leaf_biased_continuations;
+        # the Q2/Q3 world-sampling levers are native-only, so the fallback is the uniform-deal base arm).
         return None
     import numpy as _np
 
@@ -475,7 +498,8 @@ def native_subgame_solve_exploit(
     base_state, hero: int, adapter, *, public_seed: int, max_iterations: int, max_depth: int,
     blueprint_mix: float, rollout_samples: int, resample_board: bool, max_playout_depth: int,
     num_buckets: int, linear_averaging: bool, frozen_table, rnr, frozen_read_response: bool,
-    rnr_restrict: bool, want_root_q: bool,
+    rnr_restrict: bool, want_root_q: bool, repair_deck: bool = False,
+    decouple_sampler: bool = False, range_aware: bool = False, range_uniform_floor: float = 0.25,
 ):
     """Native exploit subgame solve. Returns ``(probs[11], root_q[11] or None)`` or ``None`` when the
     native path is unavailable / the adapter is unsupported / the binary is stale (caller runs Python).
@@ -507,6 +531,8 @@ def native_subgame_solve_exploit(
             int(rollout_samples), bool(resample_board), bool(linear_averaging),
             keys_actor, keys_ctx, keys_mask, vals, rnr_list,
             bool(frozen_read_response), bool(rnr_restrict), bool(want_root_q),
+            bool(repair_deck),
+            bool(decouple_sampler), bool(range_aware), float(range_uniform_floor),
         )
     except (TypeError, AttributeError):
         # Stale native binary lacking solve_exploit (or a signature mismatch) -> fall back to Python.

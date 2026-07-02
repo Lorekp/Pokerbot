@@ -50,8 +50,10 @@ from pokerbot.search.tabular_blueprint_adapter import TabularBlueprintAdapter
 from pokerbot.search.pluribus_rollout import (
     ContinuationLeafConfig,
     _reshuffle_undealt,
+    biased_profile_leaf_value,
     continuation_leaf_value,
 )
+from pokerbot.search.tabular_blueprint_adapter import NUM_CONTINUATIONS
 
 # Exploit tail + helpers lifted VERBATIM from the existing solver (firewall: unchanged math/keys).
 from pokerbot.search.turbo_rebel_search import (
@@ -97,7 +99,82 @@ class PluribusReBeLConfig:
     # variance CFR (the diagnosed cause of the native-vs-Python fixed-point divergence: native's
     # fixed-count Fisher-Yates draws are lower-variance). When True, world/hole sampling runs on its own
     # deterministic sub-stream so the action stream is unperturbed. Default OFF (byte-identical).
+    # Threaded into the NATIVE fast path too (native's fixed-count Fisher-Yates is already low-variance in
+    # the UNIFORM case, so native's effect is small until range_aware makes the draw count data-dependent).
     decouple_sampler: bool = False
+    # Q3 — RANGE-AWARE OPPONENT-HOLE SAMPLING (native lever). When True, the native solve weights each
+    # opponent's sampled hole by the blueprint CONTINUATION probability at the solve root (1 - P(FOLD)),
+    # mixed with a uniform robustness floor, so the hero best-responds to a REALISTIC (tighter) opponent
+    # that would not have folded the action so far -> faster convergence + a more realistic BR. Default OFF
+    # => uniform opponent-hole deal (byte-identical). Native-only for now (the Python _cfv loop samples via
+    # PBSTracker.sample_opponent_holes, which is uniform in the eval base arm).
+    range_aware: bool = False
+    # Q3 — UNIFORM ROBUSTNESS FLOOR for range_aware. sample_prob = (1-floor)*range + floor*uniform. Mirrors
+    # the RNR restricted-response cap: a PRO who bluffs off-range is still sampled with weight >= floor, so
+    # the hero keeps defending off-range/bluff hands. floor too LOW = exploitable by an off-range bluffer;
+    # floor=1.0 == range_aware OFF (pure uniform). Only read when range_aware.
+    range_uniform_floor: float = 0.25
+    # ENSEMBLE PARALLELISM (2026-07-01, native GTO path only). Run this many INDEPENDENT CFR streams in
+    # parallel inside the native solve (rayon), each with its OWN regret/strategy tables + its OWN RNG
+    # (seed = public_seed ^ (stream_idx*ODD)), then MERGE by summing the per-stream ROOT strategy_sum before
+    # extracting the served policy. The idle cores (the sequential native solve uses ~1 of N) pack ~N x more
+    # effective search into the SAME wall-clock -> faster convergence at the live budget (variance reduction:
+    # averaging N independent CFR averages). No shared mutable state => embarrassingly parallel => ~linear
+    # core scaling. `<= 1` => single-stream, byte/stat-identical to the pre-ensemble native binary. Threaded
+    # ONLY into the native GTO fast path (opponent_model is None); the exploit path stays single-stream
+    # (firewalled follow-up). Default 1 => production unchanged. See tools/battery_native/src/subgame.rs.
+    ensemble_streams: int = 1
+    # BUG-1 FIX (2026-07-02) — LEAF CACHE HOLE-WORLD INTEGRATION. The leaf value cache (_leaf_value) is
+    # keyed by PUBLIC state only, but the env reaching a leaf carries THAT ITERATION's sampled opponent
+    # holes — so the value computed under the FIRST visiting hole-world was frozen and reused for all
+    # remaining ~K iterations (a single-hole-world draw, not an expectation over the range: an arbitrary
+    # per-leaf bias the CFR best-responds to; the frozen-villain-hands sibling of the stale-deck bug).
+    # When > 1, the cached leaf is a RUNNING MEAN over the first `leaf_cache_worlds` VISITING worlds:
+    # each cache hit while n < M re-evaluates the leaf under the CURRENT iteration's sampled holes (with
+    # a deterministic per-(leaf, n) seed — CRN/pure-function contract preserved) and returns the
+    # incremental mean; after M samples the mean freezes. Default 1 => first-touch freeze, byte-identical
+    # to today (world 0 uses EXACTLY the legacy seed string). Applies to whichever path runs _cfv
+    # (GTO and exploit alike — it only changes the leaf's world-integration, never the exploit math);
+    # the NATIVE exploit fast path (solve_exploit) instead FORCES the no-op value (firewall: the
+    # certified native-exploit serve is byte-identical regardless of this knob). Mirrored in the native
+    # GTO solve (subgame.rs leaf_cache_worlds).
+    # ADOPTED 2026-07-02: default 4 (full-game H2H, 3 seeds, 3300 decks pooled:
+    # +146.3 chips/deck CI95 [+55.9, +236.8] vs the legacy first-touch freeze).
+    leaf_cache_worlds: int = 4
+    # BUG-5 (partial, 2026-07-02) — DELAYED AVERAGING (DeepStack skips the first 50-98% of iterations
+    # from the served average; Supremus weights iteration t by max{0, t-100}). strat_sum accumulation
+    # (and the AIVAT root-CFV capture, which must stay CONSISTENT with the served average) begins only
+    # at iteration t >= floor(avg_skip_frac * K), where K is the solve's iteration target. Regret updates
+    # are NEVER skipped, and the CFR+ plus-clamp is untouched (that is a separate experiment). Default
+    # 0.0 => accumulate from t=0, byte-identical to today. Mirrored in the native GTO solve (subgame.rs
+    # avg_skip_frac); the NATIVE exploit fast path FORCES 0.0 (firewall).
+    avg_skip_frac: float = 0.0
+    # R2 (2026-07-02) — PLURIBUS BIASED CONTINUATION LEAVES. When True, every depth-limit leaf becomes
+    # a 4-way CONTINUATION-CHOICE node for each player still able to act (SEAT_LIVE): (0) unaltered
+    # blueprint, (1) fold-biased x leaf_bias_mult, (2) call-biased, (3) raise-biased — the Pluribus
+    # depth-limited construction (Science 2019 supp; Modicum: k=1 pure-blueprint leaves are WORSE than
+    # no search at all). The choice is made by the SAME CFR that solves the subgame ("essentially just
+    # another action"): the traverser BRANCHES its 4 continuations at the leaf (regret update +
+    # strategy-sum, exactly like an action node); every other live seat SAMPLES from its own learned
+    # 4-way strategy via a draw that is a PURE FUNCTION of (choice infoset, iteration) — identical
+    # across all leaves in the same infoset within an iteration, per Pluribus. BOTH hero and opponents
+    # choose (opponent-only choice makes the searcher defensive/lower-EV — documented). Leaf value =
+    # playout under the chosen JOINT profile (per-seat bias applied to the blueprint probs before
+    # sampling; hero's continuation biases hero's own playout actions too). Default False => the
+    # legacy uniform-draw leaf, byte-identical. GTO path only (mirrors two_sided gating:
+    # opponent_model must be None); the NATIVE exploit path forces OFF and its FFI does not expose the
+    # knob (firewall, defense in depth). Mirrored in the native GTO solve (subgame.rs
+    # leaf_biased_continuations). NOTE: applies to the "uniform" leaf-select regime (the deployed
+    # live/native leaf); with select="gadget" the Python loop's per-leaf 4x4 maximin matrix is a
+    # RELATED but DIFFERENT construction (per-leaf matrix game, opponents collapsed to one field, no
+    # cross-leaf learning) — this flag replaces the leaf evaluation entirely when active, superseding
+    # the select mode.
+    leaf_biased_continuations: bool = False
+    # R2 — bias multiplier for the biased continuations (target-group mass x this, renormalized).
+    # Pluribus used 5, Modicum 10 (the adapter-level default 10.0 still drives the legacy gadget /
+    # uniform leaf tilts — this knob applies ONLY to the biased-continuation leaf). Only read when
+    # leaf_biased_continuations is True.
+    leaf_bias_mult: float = 5.0
     client_bet_sizing: bool = True    # use the SAME action abstraction as training (blueprint keys hit)
     search_preflop: bool = False      # Pluribus: serve preflop from blueprint, search postflop only
     # A1 stack-agnostic preflop: the preflop blueprint is keyed on (hole, position) only and trained at
@@ -372,7 +449,9 @@ class PluribusReBeLSolver:
         self._regrets: dict[str, np.ndarray] = {}
         self._strategy_sum: dict[str, np.ndarray] = {}
         self._bp_cache: dict[str, np.ndarray] = {}  # blueprint probs by infoset key (within a solve)
-        self._leaf_cache: dict[str, float] = {}
+        # Leaf value cache: key -> (sum, n) running mean over the first config.leaf_cache_worlds
+        # VISITING hole-worlds (BUG-1 fix; (v, 1) first-touch-frozen at the default of 1).
+        self._leaf_cache: dict = {}
         self._leaf_eval_count = 0
         self._leaf_cache_hits = 0
         self._leaf_counter = 0  # per-leaf CRN offset so distinct leaves get distinct board runouts
@@ -380,6 +459,12 @@ class PluribusReBeLSolver:
         self._budget_bound_count = 0  # per-solver count of decisions cut short by time_budget_ms (S2)
         self._two_sided_active = False  # set per-solve; True => cycle traverser (config.two_sided, GTO path)
         self._traversers = []
+        # R2 biased continuation leaves: set per-solve (config.leaf_biased_continuations, GTO path only —
+        # mirrors the two_sided gating). False (default) => the legacy leaf path, byte-identical.
+        self._leaf_biased_active = False
+        # BUG-5 delayed averaging: iterations t < this accumulate NO strat_sum / AIVAT root CFVs. Set
+        # per-solve from config.avg_skip_frac * the solve's iteration target; 0 (default) = legacy.
+        self._avg_skip_iters = 0
         self._hole_rng = None  # opponent-hole sampler stream (== self.rng unless config.decouple_sampler)
         # AIVAT decision-baseline capture (default OFF => byte-identical hot loop + native fast path).
         # When armed (search_agent.enable_decision_capture with aivat_leaf_q), the solve accumulates the
@@ -619,25 +704,47 @@ class PluribusReBeLSolver:
         return strategy
 
     # ------------------------------------------------------------------ leaf
-    def _leaf_value(self, env, hero: int) -> float:
-        """Hero bb value at a depth-limit leaf via the continuation gadget, cached by canonical key."""
+    def _leaf_value(self, env, hero: int, t: int = 0) -> float:
+        """Hero bb value at a depth-limit leaf via the continuation gadget, cached by canonical key.
+
+        ``t`` = the CFR iteration index, read ONLY by the R2 biased-continuation branch (the choice
+        nodes weight their strategy-sum like action nodes and the non-traverser draw is a pure function
+        of (infoset, t)); the legacy path below ignores it — byte-identical default.
+
+        BUG-1 FIX (config.leaf_cache_worlds): the cache entry is a ``(sum, n)`` RUNNING MEAN over the
+        first M VISITING hole-worlds. The env at each visit carries THAT iteration's sampled opponent
+        holes, so while n < M every hit re-evaluates the gadget under the CURRENT world (deterministic
+        per-(leaf, n) seed) and the mean integrates M independent hole-worlds instead of freezing the
+        first-touch draw; n >= M freezes the mean. M=1 (default) is exactly the legacy first-touch
+        cache, byte-identical (world 0 uses the EXACT legacy seed string and sum/1 == v)."""
         if bool(env.done):
             return float(env.rewards[hero]) / CHIP_UNIT
         key = self._leaf_key(env)
         if self._two_sided_active:
             key = (key, int(hero))  # two-sided: the leaf value is per-traverser, so key the cache on the seat
+        # R2 — Pluribus biased continuation leaves (gated, default OFF => the legacy path below runs
+        # byte-identically).
+        if self._leaf_biased_active:
+            return self._leaf_value_biased(env, hero, key, t)
+        m_worlds = max(1, int(self.config.leaf_cache_worlds))
         hit = self._leaf_cache.get(key)
         if hit is not None:
-            self._leaf_cache_hits += 1
-            return hit
+            leaf_sum, leaf_n = hit
+            if leaf_n >= m_worlds:
+                self._leaf_cache_hits += 1
+                return leaf_sum / leaf_n
+        else:
+            leaf_sum, leaf_n = 0.0, 0
         leaf_cfg = self.config.leaf
         if self.config.per_decision_seed:
             # Deterministic per-leaf CRN: seed from the canonical leaf key, so the SAME leaf situation
             # integrates the SAME board runouts in any solve, any process, any arm of a CRN A/B —
-            # while distinct leaves still get distinct runouts (distinct keys).
-            digest = hashlib.blake2b(
-                f"{leaf_cfg.base_seed}|{key}".encode(), digest_size=8
-            ).digest()
+            # while distinct leaves still get distinct runouts (distinct keys). World 0 keeps the EXACT
+            # legacy salt (byte-identity at the default M=1); worlds n>=1 mix the world index in, so the
+            # nth re-evaluation of a leaf is still a pure function of (leaf key, n).
+            salt = (f"{leaf_cfg.base_seed}|{key}" if leaf_n == 0
+                    else f"{leaf_cfg.base_seed}|{key}|w{leaf_n}")
+            digest = hashlib.blake2b(salt.encode(), digest_size=8).digest()
             seed = int.from_bytes(digest, "little")
         else:
             # Legacy: a running counter so distinct leaves get distinct runouts (history-dependent).
@@ -653,9 +760,138 @@ class PluribusReBeLSolver:
         )
         v = continuation_leaf_value(env, hero, self.adapter, cfg,
                                     cont_weights=self._leaf_cont_weights)
-        self._leaf_cache[key] = v
+        # n=0: the sum IS v (not 0.0+v, which could flip a -0.0) so the M=1 default path caches and
+        # returns EXACTLY the legacy first-touch value.
+        leaf_sum = v if leaf_n == 0 else leaf_sum + v
+        leaf_n += 1
+        self._leaf_cache[key] = (leaf_sum, leaf_n)
         self._leaf_eval_count += 1
-        return v
+        return leaf_sum / leaf_n
+
+    # ------------------------------------------------------------------ R2 biased continuation leaves
+    # 4-way legal mask for a continuation-CHOICE node: the first NUM_CONTINUATIONS "actions" are the
+    # continuations (0=blueprint, 1=fold-biased, 2=call-biased, 3=raise-biased); the rest dead. Lets
+    # the choice node reuse _regret_match / the NUM_ACTIONS table rows in the SAME regret/strategy maps.
+    _CONT_LEGAL = np.array(
+        [1.0] * NUM_CONTINUATIONS + [0.0] * (NUM_ACTIONS - NUM_CONTINUATIONS), dtype=np.float64
+    )
+
+    def _cont_choice_key(self, env, seat: int) -> str:
+        """The continuation-choice infoset key for ``seat`` at leaf ``env``: keyed EXACTLY like every
+        other subgame infoset (seat + public state + betting history + spr) plus a prefix that can
+        never collide with an action infoset (action keys start with the seat digit). NOTE (honest
+        scope): like ALL subgame infoset keys in this engine it carries no private-hand component (the
+        documented BUG-2/R3 limitation) — hero's hand is fixed per solve so hero's choice is exactly
+        Pluribus-keyed; a two-sided opponent's choice is range-average across its resampled worlds,
+        the same approximation its ACTION infosets already make."""
+        return "cont!" + self._infoset_key(env, seat)
+
+    def _cont_choice_u(self, ck: str, t: int) -> float:
+        """Deterministic u in [0,1) for a non-traverser's continuation draw: a PURE FUNCTION of
+        (choice infoset, iteration t) — never the shared traversal rng — so the same infoset gets the
+        SAME continuation everywhere within an iteration (Pluribus's per-infoset consistency) and the
+        solve stays CRN-stable across processes/arms."""
+        digest = hashlib.blake2b(
+            f"{self.config.leaf.base_seed}|contchoice|{ck}|{t}".encode(), digest_size=8
+        ).digest()
+        return int.from_bytes(digest, "little") / float(1 << 64)
+
+    def _leaf_value_biased(self, env, hero: int, base_key, t: int) -> float:
+        """R2 — the biased-continuation LEAF NODE: a 4-way continuation-choice decision for every seat
+        that can still act (SEAT_LIVE), solved by the SAME CFR as the rest of the subgame (mirrors
+        subgame.rs::leaf_value_biased exactly):
+
+          * every live NON-traverser seat SAMPLES its continuation from its own learned 4-way strategy
+            (regret-matched over its choice-infoset regrets; uniform until it has traversed — under
+            one-sided solving non-traversers never update, matching that mode's semantics), via the
+            pure-function draw above;
+          * the TRAVERSER (``hero`` here is the current traverser) BRANCHES all 4 continuations,
+            evaluates each joint profile, and does the standard CFR+ regret update + (avg-gated,
+            linear-weighted) strategy-sum accumulation on its choice infoset — "essentially just
+            another action" (Pluribus); BOTH hero and opponents choose;
+          * a traverser that cannot act beyond the leaf (folded / all-in) has no choice: the value is
+            the single playout under the others' sampled profile.
+
+        Folded/all-in seats get NO choice node (absent from ``choices``): a folded seat has no stake
+        and an all-in seat has no remaining decisions, so a continuation cannot affect either."""
+        st = np.asarray(env.seat_status)
+        choices: dict[int, int] = {}
+        for s in range(st.shape[0]):
+            if s == hero or int(st[s]) != int(SEAT_LIVE):
+                continue
+            ck = self._cont_choice_key(env, s)
+            strat = _regret_match(self._get_regrets(ck), self._CONT_LEGAL)
+            cum = np.cumsum(strat[:NUM_CONTINUATIONS])
+            u = self._cont_choice_u(ck, t)
+            choices[s] = int(min(np.searchsorted(cum, u, side="right"), NUM_CONTINUATIONS - 1))
+        if int(st[hero]) != int(SEAT_LIVE):
+            return self._biased_profile_value(env, hero, base_key, choices)
+        # Traverser's choice node: branch all 4 continuations (hero's own continuation biases hero's
+        # own playout actions too).
+        ck = self._cont_choice_key(env, hero)
+        regrets = self._get_regrets(ck)
+        strat = _regret_match(regrets, self._CONT_LEGAL)
+        cv = np.zeros(NUM_CONTINUATIONS, dtype=np.float64)
+        for c in range(NUM_CONTINUATIONS):
+            choices[hero] = c
+            cv[c] = self._biased_profile_value(env, hero, base_key, choices)
+        ev = float(np.dot(strat[:NUM_CONTINUATIONS], cv))
+        for c in range(NUM_CONTINUATIONS):
+            regrets[c] = max(regrets[c] + cv[c] - ev, 0.0)
+        # Strategy-sum accumulation: identical gating/weighting to the action nodes (delayed averaging
+        # + CFR+ linear weight), so the choice node is a first-class citizen of the served average.
+        if t >= self._avg_skip_iters:
+            weight = float(t + 1) if self.config.linear_averaging else 1.0
+            self._strategy_sum[ck][:NUM_CONTINUATIONS] += weight * strat[:NUM_CONTINUATIONS]
+        return ev
+
+    def _biased_profile_value(self, env, hero: int, base_key, choices: dict[int, int]) -> float:
+        """Leaf value under the JOINT continuation profile ``choices``, cached + M-world-integrated
+        exactly like the legacy leaf.
+
+        LEAF-CACHE KEY DESIGN (mirrors subgame.rs::biased_profile_value): the cache key is
+        ``(base_key, "cont_prof", sorted profile)`` — ``base_key`` already carries the two-sided
+        traverser id — so a cached value is valid ONLY for the exact continuation profile it was
+        computed under, and the ``leaf_cache_worlds`` running mean applies PER (leaf, profile) entry.
+        Worst-case profile space is 4^n_live per public leaf, but entries are created LAZILY on visits
+        only: per leaf visit the traverser branches its 4 choices while every other seat's choice is
+        SAMPLED (one profile per visit) — Pluribus's compression insight — so the map grows by at most
+        4 entries per leaf visit and the 4^n blowup never materializes."""
+        prof = tuple(sorted(choices.items()))
+        ckey = (base_key, "cont_prof", prof)
+        m_worlds = max(1, int(self.config.leaf_cache_worlds))
+        hit = self._leaf_cache.get(ckey)
+        if hit is not None:
+            leaf_sum, leaf_n = hit
+            if leaf_n >= m_worlds:
+                self._leaf_cache_hits += 1
+                return leaf_sum / leaf_n
+        else:
+            leaf_sum, leaf_n = 0.0, 0
+        leaf_cfg = self.config.leaf
+        if self.config.per_decision_seed:
+            salt = (f"{leaf_cfg.base_seed}|{ckey}" if leaf_n == 0
+                    else f"{leaf_cfg.base_seed}|{ckey}|w{leaf_n}")
+            digest = hashlib.blake2b(salt.encode(), digest_size=8).digest()
+            seed = int.from_bytes(digest, "little")
+        else:
+            self._leaf_counter += 1
+            seed = leaf_cfg.base_seed + 100003 * self._leaf_counter
+        cfg = ContinuationLeafConfig(
+            select=leaf_cfg.select,  # not read by the fixed-profile playout; carried for parity
+            rollout_samples=leaf_cfg.rollout_samples,
+            gadget_iters=leaf_cfg.gadget_iters,
+            max_playout_depth=leaf_cfg.max_playout_depth,
+            base_seed=seed,
+            resample_board=leaf_cfg.resample_board,
+        )
+        v = biased_profile_leaf_value(env, hero, self.adapter, cfg, choices,
+                                      float(self.config.leaf_bias_mult))
+        leaf_sum = v if leaf_n == 0 else leaf_sum + v
+        leaf_n += 1
+        self._leaf_cache[ckey] = (leaf_sum, leaf_n)
+        self._leaf_eval_count += 1
+        return leaf_sum / leaf_n
 
     def _build_leaf_cont_weights(self, hero: int) -> dict[int, np.ndarray] | None:
         """MODEL-AWARE LEAF: per-seat continuation-draw weights from the opponent model's aggregate
@@ -695,14 +931,16 @@ class PluribusReBeLSolver:
         if bool(env.done):
             return float(env.rewards[hero]) / CHIP_UNIT
         # Depth limit = end of current betting round: the next chance node (street deal) is the leaf.
+        # ``t`` is threaded into the leaf for the R2 biased-continuation choice nodes (legacy leaf
+        # ignores it — byte-identical default).
         if is_chance_node_np(env):
-            return self._leaf_value(env, hero)
+            return self._leaf_value(env, hero, t)
         if depth >= self.config.max_depth:
-            return self._leaf_value(env, hero)
+            return self._leaf_value(env, hero, t)
 
         actor = int(env.action_seat)
         if actor < 0:
-            return self._leaf_value(env, hero)
+            return self._leaf_value(env, hero, t)
         legal = self._legal(env, actor)
         if not legal.any():
             # E1 fix: an empty legal mask at a non-terminal street is an engine-state invariant
@@ -747,20 +985,25 @@ class PluribusReBeLSolver:
         ev = float(np.dot(strategy, action_values))
         for a in np.flatnonzero(legal):
             regrets[a] = max(regrets[a] + action_values[a] - ev, 0.0)
-        # CFR+ linear averaging: weight by (t+1) so later (better-converged) iterates dominate the
-        # served average. Flat weight 1.0 = legacy uniform average (extraction normalizes by the sum).
-        weight = float(t + 1) if self.config.linear_averaging else 1.0
-        self._strategy_sum[key] += weight * strategy
-        # AIVAT decision-baseline capture (gated; OFF => this block is skipped, hot loop byte-identical).
-        # depth==0 is the ROOT decision node the search is solving for; accumulate the per-action CFVs it
-        # used, CFR+-weighted exactly like the served strategy, so _leaf_q can return a baseline that is
-        # CONSISTENT with the served average policy (the fix for the search-path AIVAT negative-VR bug).
-        if depth == 0 and self._aivat_capture:
-            if self._root_av_sum is None:
-                self._root_av_sum = weight * action_values.copy()
-            else:
-                self._root_av_sum += weight * action_values
-            self._root_av_wsum += weight
+        # BUG-5 (partial) — DELAYED AVERAGING (config.avg_skip_frac): the SERVED average excludes
+        # iterations t < _avg_skip_iters (= floor(avg_skip_frac * K), 0 = legacy). Regret updates above
+        # are NEVER skipped. The AIVAT root-CFV capture is gated IDENTICALLY so the decision baseline
+        # stays CONSISTENT with the served average (its whole design contract).
+        if t >= self._avg_skip_iters:
+            # CFR+ linear averaging: weight by (t+1) so later (better-converged) iterates dominate the
+            # served average. Flat weight 1.0 = legacy uniform average (extraction normalizes by the sum).
+            weight = float(t + 1) if self.config.linear_averaging else 1.0
+            self._strategy_sum[key] += weight * strategy
+            # AIVAT decision-baseline capture (gated; OFF => this block is skipped, hot loop byte-identical).
+            # depth==0 is the ROOT decision node the search is solving for; accumulate the per-action CFVs it
+            # used, CFR+-weighted exactly like the served strategy, so _leaf_q can return a baseline that is
+            # CONSISTENT with the served average policy (the fix for the search-path AIVAT negative-VR bug).
+            if depth == 0 and self._aivat_capture:
+                if self._root_av_sum is None:
+                    self._root_av_sum = weight * action_values.copy()
+                else:
+                    self._root_av_sum += weight * action_values
+                self._root_av_wsum += weight
         return ev
 
     # ------------------------------------------------------------------ public surface
@@ -843,6 +1086,11 @@ class PluribusReBeLSolver:
         if force_bb is not None and force_bb > 0:
             eff_max_iters = int(force_bb)
             eff_budget_ms = 10 ** 12  # wall clock never bounds -> exactly eff_max_iters iterations run
+        # BUG-5 delayed averaging: strat_sum (and AIVAT root-CFV) accumulation starts at iteration
+        # floor(avg_skip_frac * K), K = this solve's iteration target. 0.0 (default) => 0 => legacy.
+        self._avg_skip_iters = int(
+            float(np.clip(getattr(cfg, "avg_skip_frac", 0.0), 0.0, 1.0)) * eff_max_iters
+        )
         # Each decision is an independent depth-limited subgame solve: reset regrets/strategy + the
         # per-solve caches so there is no cross-hand contamination and memory stays bounded over a long eval.
         self._regrets.clear()
@@ -864,6 +1112,16 @@ class PluribusReBeLSolver:
         else:
             self._hole_rng = self.rng
         self._leaf_cont_weights = self._build_leaf_cont_weights(hero)
+
+        # R2 BIASED CONTINUATION LEAVES (config.leaf_biased_continuations, GTO/base only — mirrors the
+        # two_sided gating): the exploit path (opponent_model set) keeps its certified leaf, and the
+        # model-aware leaf weights (_leaf_cont_weights, which require an opponent model) can never
+        # coexist with this flag. False (default) => the legacy leaf, byte-identical.
+        self._leaf_biased_active = bool(
+            cfg.leaf_biased_continuations
+            and self.opponent_model is None
+            and self._leaf_cont_weights is None
+        )
 
         # TWO-SIDED SUBGAME SOLVE (config.two_sided, GTO/base only): cycle the traverser across the seats
         # that can still act (SEAT_LIVE) so EVERY player updates regrets and learns (e.g. to fold to a jam)
@@ -956,6 +1214,27 @@ class PluribusReBeLSolver:
                 max_playout_depth=cfg.leaf.max_playout_depth,
                 num_buckets=int(_POSTFLOP_NUM_BUCKETS),
                 linear_averaging=bool(cfg.linear_averaging),
+                repair_deck=bool(cfg.repair_deck),
+                # two_sided is GTO-only; this branch is already gated on opponent_model is None, so
+                # mirror _two_sided_active = bool(cfg.two_sided and opponent_model is None) exactly.
+                two_sided=bool(cfg.two_sided and self.opponent_model is None),
+                # Q2/Q3 world-sampling levers (native): decouple the hole sampler + range-aware weighting.
+                decouple_sampler=bool(cfg.decouple_sampler),
+                range_aware=bool(cfg.range_aware),
+                range_uniform_floor=float(cfg.range_uniform_floor),
+                # ENSEMBLE: N independent parallel CFR streams merged at the root (native rayon fan-out).
+                ensemble_streams=int(cfg.ensemble_streams),
+                # BUG-1 leaf hole-world integration (1 = legacy first-touch freeze) + BUG-5 delayed
+                # averaging (0.0 = legacy). Native mirrors the Python semantics exactly; both no-op at
+                # the defaults.
+                leaf_cache_worlds=int(cfg.leaf_cache_worlds),
+                avg_skip_frac=float(cfg.avg_skip_frac),
+                # R2 biased continuation leaves (GTO-only; this branch is gated on opponent_model is
+                # None, mirroring _leaf_biased_active). False (default) => the legacy uniform native
+                # leaf, byte-identical.
+                leaf_biased_continuations=bool(cfg.leaf_biased_continuations
+                                               and self.opponent_model is None),
+                leaf_bias_mult=float(cfg.leaf_bias_mult),
             )
             if probs_n is not None:
                 probs = probs_n * legal
@@ -1007,6 +1286,18 @@ class PluribusReBeLSolver:
                     frozen_read_response=bool(ftab.frozen_read_response),
                     rnr_restrict=bool(cfg.rnr_restrict),
                     want_root_q=bool(self._aivat_capture),
+                    # repair_deck applies to the exploit path too (Python _set_world reshuffles for every
+                    # solve); two_sided stays OFF here (firewall: exploit is one-sided).
+                    repair_deck=bool(cfg.repair_deck),
+                    # Q2/Q3 world-sampling levers (native): they change ONLY the sampled worlds, not the
+                    # frozen-read exploit math (firewall-safe).
+                    decouple_sampler=bool(cfg.decouple_sampler),
+                    range_aware=bool(cfg.range_aware),
+                    range_uniform_floor=float(cfg.range_uniform_floor),
+                    # NOTE: leaf_cache_worlds / avg_skip_frac / leaf_biased_continuations (+ its
+                    # leaf_bias_mult) are deliberately NOT forwarded — the native solve_exploit
+                    # hard-codes their no-op values and its FFI does not even accept them (firewall:
+                    # the certified exploit serve is byte-identical regardless of those GTO-path knobs).
                 )
                 if out is not None:
                     probs_n, root_q = out

@@ -139,23 +139,27 @@ def _infoset_sig(env, seat: int):
     )
 
 
-def _cont_and_mask(env, seat: int, adapter: "TabularBlueprintAdapter", memo):
+def _cont_and_mask(env, seat: int, adapter: "TabularBlueprintAdapter", memo, bias_mult=None):
     """Return (continuation_rows, full_legal_mask) for (env, seat), using the per-leaf ``memo`` dict
     when enabled. ``continuation_rows`` is the (NUM_CONTINUATIONS, NUM_ACTIONS) abstraction-masked
     strategy stack; ``full_legal_mask`` is the UN-abstracted legal bool mask — exactly what the legacy
     ``_playout`` passed to ``_sample_action`` (it samples the abstraction-masked row restricted to the
-    full legal index set; the two agree because the row is zero outside the abstraction support)."""
+    full legal index set; the two agree because the row is zero outside the abstraction support).
+
+    ``bias_mult`` (optional, R2 biased-continuation leaf): explicit multiplier override for the biased
+    rows; None (default) = the adapter's own ``bias_mult`` — byte-identical legacy behavior. The memo
+    is per-leaf-eval and the multiplier is constant within one leaf eval, so the memo key is unchanged."""
     if memo is not None:
         key = _infoset_sig(env, seat)
         hit = memo.get(key)
         if hit is not None:
             return hit
         mask = legal_action_mask_np(env, seat).astype(bool)
-        cont = adapter.continuation_set(env, seat)
+        cont = adapter.continuation_set(env, seat, bias_mult=bias_mult)
         memo[key] = (cont, mask)
         return cont, mask
     mask = legal_action_mask_np(env, seat).astype(bool)
-    cont = adapter.continuation_set(env, seat)
+    cont = adapter.continuation_set(env, seat, bias_mult=bias_mult)
     return cont, mask
 
 
@@ -208,12 +212,14 @@ def _playout(
     rng: np.random.Generator,
     max_depth: int,
     memo=None,
+    bias_mult=None,
 ) -> float:
     """Play ``env`` to showdown; at each acting seat use the continuation selected by ``choice_fn(seat)``.
 
     ``choice_fn(seat) -> int`` returns the continuation index (0..3) that seat commits to (constant across
     the playout — matching the gadget's "same choice across indistinguishable infosets"). ``memo`` is the
-    per-leaf continuation-set cache (None disables it). Returns the hero terminal value in bb
+    per-leaf continuation-set cache (None disables it). ``bias_mult`` (R2): explicit continuation-bias
+    multiplier override (None = adapter default, byte-identical). Returns the hero terminal value in bb
     (``rewards[hero]/CHIP_UNIT``).
     """
     depth = 0
@@ -224,7 +230,7 @@ def _playout(
         seat = int(env.action_seat)
         if seat < 0:
             break
-        cont, mask = _cont_and_mask(env, seat, adapter, memo)
+        cont, mask = _cont_and_mask(env, seat, adapter, memo, bias_mult=bias_mult)
         row = cont[int(choice_fn(seat))]
         a = _sample_action(row, mask, float(rng.random()))
         env = apply_action_np(env, a)
@@ -449,3 +455,41 @@ def continuation_leaf_value(
         return _solve_zero_sum(M, cfg.gadget_iters)
 
     raise ValueError(f"unknown continuation_select: {cfg.select!r}")
+
+
+def biased_profile_leaf_value(
+    env,
+    hero: int,
+    adapter: TabularBlueprintAdapter,
+    cfg: ContinuationLeafConfig,
+    choices: dict[int, int],
+    bias_mult: float,
+) -> float:
+    """R2 (Pluribus biased continuation leaves): leaf value under a FIXED joint continuation profile.
+
+    ``choices`` maps seat -> continuation index (0=blueprint, 1=fold-biased, 2=call-biased,
+    3=raise-biased); the profile is chosen by the subgame CFR's per-seat 4-way choice nodes (see
+    ``PluribusReBeLSolver._leaf_value_biased``), NOT drawn here — this function only integrates board
+    runouts under that fixed profile. A seat absent from ``choices`` (folded / all-in at the leaf — it
+    never acts) defensively plays continuation 0 (the unaltered blueprint). ``bias_mult`` is the
+    solve-level multiplier (Pluribus 5 / Modicum 10), overriding the adapter-level default.
+
+    Runout/seed schedule (7919 / 1000003 offsets from ``cfg.base_seed``) matches the uniform leaf, so
+    the two paths integrate statistically-identical board luck; only the continuation choices differ."""
+    if bool(env.done):
+        return float(env.rewards[hero]) / CHIP_UNIT
+    total = 0.0
+    memo = {} if leaf_memo_enabled() else None
+
+    def choice(s: int) -> int:
+        return int(choices.get(s, 0))
+
+    for r in range(cfg.rollout_samples):
+        env_r = (
+            _reshuffle_undealt(env, np.random.default_rng(cfg.base_seed + 7919 * (r + 1)))
+            if cfg.resample_board else env
+        )
+        rng = np.random.default_rng(cfg.base_seed + 1000003 * (r + 1))
+        total += _playout(env_r, hero, adapter, choice, rng, cfg.max_playout_depth, memo,
+                          bias_mult=bias_mult)
+    return total / float(cfg.rollout_samples)
