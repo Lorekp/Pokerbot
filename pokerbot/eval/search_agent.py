@@ -85,7 +85,24 @@ class SearchAgent:
                     rnr_restrict=os.environ.get("POKERBOT_RNR_SOLVER_EVAL", "0") not in ("0", "", "false", "False"),
                 ),
             )
+            # NATIVE EXPLOIT serve wiring (2026-07-02) — SearchAgent is the offline mirror of
+            # LiveSearchAdvisor, so the frozen-read-response serve decision applies here too: when
+            # POKERBOT_LIVE_NATIVE_EXPLOIT=1 (OPT-IN — default OFF: the fidelity gate measured the
+            # frozen serve diverging from the dynamic tail at equal K, flip 0.667 / L1 0.77, see
+            # wire_native_exploit_serve) and the native solve_exploit surface is available, exploit
+            # decisions (set_opponent_profiles => solver.opponent_model) run the native solve against
+            # Python-built frozen deviation tables (all exploit math incl. the RNR cap stays in
+            # Python — data-not-code firewall) instead of the ~10-20x slower dynamic Python tail.
+            # This is what gives the adaptive-field benchmark's exploit-ON arm native speed. Not
+            # opted in => config.frozen_read_response stays False => the dynamic tail byte-unchanged.
+            from pokerbot.search.pluribus_search import wire_native_exploit_serve
+
+            self.native_exploit_active = bool(wire_native_exploit_serve(self.solver))
+            if self.native_exploit_active:
+                print("[search_agent] NATIVE EXPLOIT serve ACTIVE (frozen-read-response; "
+                      "POKERBOT_LIVE_NATIVE_EXPLOIT=0 to disable)", flush=True)
         else:
+            self.native_exploit_active = False
             ckpt = Path(value_checkpoint) if value_checkpoint else DEFAULT_VALUE_CKPT
             if use_mock_leaf or not ckpt.exists():
                 self.leaf_eval = MockHistoryValueEvaluator()

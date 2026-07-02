@@ -244,18 +244,25 @@ class AdaptiveHero:
 # This mirrors what the live LiveSearchAdvisor does, but in sim:
 #   exploit ON  -> set_opponent_profiles({seat: OpponentStats}) fed from the persistent store,
 #                  which wires the solver's opponent-node deviation tail (postflop) AND the root
-#                  mixer (all streets). Semantics match live: native subgame gate requires
-#                  opponent_model is None for the fast path, so exploit decisions run Python CFR.
+#                  mixer (all streets). Semantics match live (2026-07-02): with
+#                  POKERBOT_LIVE_NATIVE_EXPLOIT=1 (OPT-IN; default OFF pending the value A/B —
+#                  the fidelity gate measured the frozen serve diverging at equal K, flip 0.667)
+#                  SearchAgent wires the frozen-read-response native exploit serve, so exploit
+#                  decisions run the native solve_exploit against Python-built frozen deviation
+#                  tables (exploit math stays in Python — firewall). Default/unset = the dynamic
+#                  Python CFR exploit tail (the certified live behaviour).
 #   exploit OFF -> set_opponent_profiles(None): pure GTO base, native fast path eligible.
 #
-# Budget: K=2000 iterations, time_budget_ms=10**9 (wall-clock never binds).
+# Budget: K iterations (below), time_budget_ms=10**9 (wall-clock never binds).
 # This makes each decision a pure function of (public state, hand seed), load-independent.
 # RAYON_NUM_THREADS is NOT forced to 1 (native solve uses rayon for parallel work — keep it).
 
-_PROD_HERO_K = 200           # iteration budget per decision (load-independent; matches default
-                              # PluribusReBeLConfig.max_iterations; K=2000 native=fast but the
-                              # exploit-ON Python CFR path is ~10-20x slower than native, so K=200
-                              # gives comparable wall-clock per decision on both arms)
+_PROD_HERO_K = int(os.environ.get("ADAPTIVE_PROD_K", "200"))
+                              # iteration budget per decision (load-independent; default 200 matches
+                              # PluribusReBeLConfig.max_iterations). With the native exploit serve
+                              # active BOTH arms are native-fast, so ADAPTIVE_PROD_K=2000 (the live
+                              # K class) is feasible; the dynamic Python exploit tail
+                              # (POKERBOT_LIVE_NATIVE_EXPLOIT=0) is ~10-20x slower — keep 200 there.
 _PROD_HERO_TIME_MS = 10**9   # wall clock ceiling: never binds (iterations are the real budget)
 
 
@@ -297,8 +304,10 @@ class ProductionAdaptiveHero:
                  EXACT same two exploitation seams live uses:
                    1. solver.opponent_model => opponent-node deviation tail (postflop CFR)
                    2. root mixer => hero's own post-search mix adjustment (all streets)
-                 The native subgame gate (opponent_model is None) means exploit decisions
-                 run the Python CFR loop — same semantics as live, faithful.
+                 With POKERBOT_LIVE_NATIVE_EXPLOIT=1 (opt-in; default OFF pending the value
+                 A/B) exploit decisions run the frozen-read-response NATIVE solve_exploit
+                 (tables built in Python per decision) — same gate as live, faithful.
+                 Default/unset = the dynamic Python CFR exploit tail.
     Exploit OFF: set_opponent_profiles(None) => pure GTO, native fast path eligible.
 
     Served-source tracking: counts blueprint_preflop / search_postflop / search_preflop
@@ -1193,6 +1202,7 @@ def main():
         print(f"[adaptive] Production hero: K={_PROD_HERO_K} iters/decision "
               f"(iteration-bound, wall-clock={_PROD_HERO_TIME_MS}ms ceiling=never-binds), "
               f"native_subgame={os.environ.get('POKERBOT_NATIVE_SUBGAME','0')}, "
+              f"live_native_exploit={os.environ.get('POKERBOT_LIVE_NATIVE_EXPLOIT','0 (default-off)')}, "
               f"root_exploit_mixer=ON", flush=True)
 
     store = PlayerProfileStore(db_path, wal=True)

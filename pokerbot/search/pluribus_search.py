@@ -373,6 +373,58 @@ def set_native_exploit(on: bool) -> None:
     _NATIVE_EXPLOIT = bool(on)
 
 
+def wire_native_exploit_serve(solver) -> bool:
+    """LIVE/production wiring for the NATIVE exploit fast path (POKERBOT_LIVE_NATIVE_EXPLOIT).
+
+    The frozen-read-response serve decision (2026-07-02): exploit decisions (opponent_model set) have
+    been the last starved search surface — the dynamic Python exploit tail bought only ~68 iters in the
+    800ms live budget while GTO decisions run the full K=2000 natively. The dynamic tail is provably
+    STATIC within a solve (opponent regrets never update one-sided => uniform regret-match; the
+    blueprint half is cached; context_read is a pure function of (fixed stats, public-state ctx key)),
+    so freezing the read-response into tables at solve start loses no within-solve adaptivity. What
+    changes is the modeled-opponent FUNCTIONAL FORM: the frozen serve is the read's posterior expanded
+    over legal actions (RNR-blended), not the alpha-capped ``apply_context_bias`` tilt — the
+    DBR response the ``frozen_read_response`` config documents (the dynamic tail best-responds to a
+    half-uniform phantom postflop). Firewall: ALL exploit math (context_read / Dirichlet / BOCPD /
+    cap_eff — the RNR cap binds BEFORE freezing) runs in Python inside
+    ``exploit_table.build_frozen_table`` per decision; native only READS the frozen vectors + per-actor
+    rnr scalars (data-not-code), and its Rust side hard-forces two_sided/leaf_biased/avg_skip/
+    leaf_worlds to the certified no-op values.
+
+    Gate semantics: DEFAULT OFF — opt-in via POKERBOT_LIVE_NATIVE_EXPLOIT=1 (an explicit env value
+    always wins; under POKERBOT_TEST_MODE it is OFF like everything else). WHY OFF: the 2026-07-02
+    FIDELITY GATE (artifacts/native_exploit_fidelity_gate.json — 15 game-flow exploit states, real
+    learned profiles, FIXED equal K=1000) measured the frozen-native serve GENUINELY DIVERGING from
+    the dynamic Python serve: action flip rate 0.667, mean policy L1 0.77 (decomposed: the frozen
+    SEMANTICS alone flip 0.40 / L1 0.52 — the different functional form above — the rest is the
+    certified native-RNG + uniform-leaf component). The dynamic response IS static within a solve,
+    so freezing loses no adaptivity, but the frozen response is a DIFFERENT modeled opponent; per
+    the divergence rule the default cannot flip on speed alone. It flips only after a VALUE A/B
+    (adaptive-harness exploit-ON, this gate ON vs OFF, same seeds — note scripts/engine_ab_h2h.py
+    CANNOT express exploit arms: it never sets opponent_model) certifies which fixed point earns
+    more. Speed when opted in: mean 1525 iters in 382ms (worst 685ms) at the live 800ms budget vs
+    the dynamic tail's ~62 iters (worst wall 1042ms) — ~25x iterations-in-budget.
+
+    When opted in AND the native solve_exploit surface is available (built .pyd + EMD capability
+    gate), sets the solver's ``config.frozen_read_response = True`` and flips the process-global
+    native-exploit gate. Returns True iff wired. Fail-safe: any unavailability/exception leaves the
+    solver on the dynamic Python exploit tail byte-unchanged."""
+    want = os.environ.get("POKERBOT_LIVE_NATIVE_EXPLOIT", "0").lower() not in (
+        "0", "", "false", "no", "off")
+    if not want:
+        return False
+    try:
+        from pokerbot.search import native_solver as _ns
+
+        if not _ns.native_subgame_exploit_available():
+            return False
+        solver.config.frozen_read_response = True
+        set_native_exploit(True)
+        return True
+    except Exception:  # noqa: BLE001  (never let the enable kill a serve path)
+        return False
+
+
 # NATIVE BUDGET FIT (live wiring 2026-07-02). A native subgame solve is one non-interruptible FFI
 # call, and per-iteration cost varies ~20x across roots (a big multiway flop subgame at K=2000 costs
 # ~1.7s on the live box; a river heads-up spot ~40ms). Under a live-scale wall budget
@@ -1346,35 +1398,68 @@ class PluribusReBeLSolver:
             from pokerbot.search import exploit_table as _et
             from pokerbot.search import native_solver as _ns
 
+            _tb0 = time.perf_counter()
             ftab = _et.build_frozen_table(self, base_state, hero) if _ns.native_subgame_exploit_available() else None
+            _table_build_ms = (time.perf_counter() - _tb0) * 1000.0
             if ftab is not None:
-                out = _ns.native_subgame_solve_exploit(
-                    base_state, hero, self.adapter,
-                    public_seed=self._public_seed(base_state, hero),
-                    max_iterations=cfg.max_iterations, max_depth=cfg.max_depth,
-                    blueprint_mix=cfg.blueprint_mix,
-                    rollout_samples=cfg.leaf.rollout_samples,
-                    resample_board=cfg.leaf.resample_board,
-                    max_playout_depth=cfg.leaf.max_playout_depth,
-                    num_buckets=int(_POSTFLOP_NUM_BUCKETS),
-                    linear_averaging=bool(cfg.linear_averaging),
-                    frozen_table=ftab, rnr=ftab.rnr,
-                    frozen_read_response=bool(ftab.frozen_read_response),
-                    rnr_restrict=bool(cfg.rnr_restrict),
-                    want_root_q=bool(self._aivat_capture),
-                    # repair_deck applies to the exploit path too (Python _set_world reshuffles for every
-                    # solve); two_sided stays OFF here (firewall: exploit is one-sided).
-                    repair_deck=bool(cfg.repair_deck),
-                    # Q2/Q3 world-sampling levers (native): they change ONLY the sampled worlds, not the
-                    # frozen-read exploit math (firewall-safe).
-                    decouple_sampler=bool(cfg.decouple_sampler),
-                    range_aware=bool(cfg.range_aware),
-                    range_uniform_floor=float(cfg.range_uniform_floor),
-                    # NOTE: leaf_cache_worlds / avg_skip_frac / leaf_biased_continuations (+ its
-                    # leaf_bias_mult) are deliberately NOT forwarded — the native solve_exploit
-                    # hard-codes their no-op values and its FFI does not even accept them (firewall:
-                    # the certified exploit serve is byte-identical regardless of those GTO-path knobs).
-                )
+                # LIVE BUDGET FIT (2026-07-02 exploit wiring, mirrors the GTO native path above): the
+                # native exploit solve is one non-interruptible FFI call, so under a live-scale wall
+                # budget (eff_budget_ms < _NATIVE_FIT_BUDGET_MS) split it into a K=200 probe that
+                # measures THIS root's per-iteration cost (the probe wall also absorbs the one-time
+                # Python table build above — conservative, fits FEWER main iterations) and one main
+                # call fitted to the remaining budget (same public seed => statistically one longer
+                # solve; cancel checked between the calls). Eval/battery/cert callers use huge budgets
+                # (>= the threshold) so the fit is skipped and the single full-K call is byte-identical
+                # to the pre-wiring behavior. eff_max_iters (not cfg.max_iterations) so the live
+                # single-table convergence floor reaches the exploit path exactly like the GTO path.
+                _pub_seed = self._public_seed(base_state, hero)
+
+                def _native_exploit_call(_k: int):
+                    return _ns.native_subgame_solve_exploit(
+                        base_state, hero, self.adapter,
+                        public_seed=_pub_seed,
+                        max_iterations=int(_k), max_depth=cfg.max_depth,
+                        blueprint_mix=cfg.blueprint_mix,
+                        rollout_samples=cfg.leaf.rollout_samples,
+                        resample_board=cfg.leaf.resample_board,
+                        max_playout_depth=cfg.leaf.max_playout_depth,
+                        num_buckets=int(_POSTFLOP_NUM_BUCKETS),
+                        linear_averaging=bool(cfg.linear_averaging),
+                        frozen_table=ftab, rnr=ftab.rnr,
+                        frozen_read_response=bool(ftab.frozen_read_response),
+                        rnr_restrict=bool(cfg.rnr_restrict),
+                        want_root_q=bool(self._aivat_capture),
+                        # repair_deck applies to the exploit path too (Python _set_world reshuffles for
+                        # every solve); two_sided stays OFF here (firewall: exploit is one-sided).
+                        repair_deck=bool(cfg.repair_deck),
+                        # Q2/Q3 world-sampling levers (native): they change ONLY the sampled worlds, not
+                        # the frozen-read exploit math (firewall-safe).
+                        decouple_sampler=bool(cfg.decouple_sampler),
+                        range_aware=bool(cfg.range_aware),
+                        range_uniform_floor=float(cfg.range_uniform_floor),
+                        # NOTE: leaf_cache_worlds / avg_skip_frac / leaf_biased_continuations (+ its
+                        # leaf_bias_mult) are deliberately NOT forwarded — the native solve_exploit
+                        # hard-codes their no-op values and its FFI does not even accept them (firewall:
+                        # the certified exploit serve is byte-identical regardless of those GTO-path knobs).
+                    )
+
+                _fit = eff_budget_ms < _NATIVE_FIT_BUDGET_MS
+                k_probe = min(_NATIVE_FIT_PROBE_ITERS, int(eff_max_iters)) if _fit else int(eff_max_iters)
+                out = _native_exploit_call(k_probe)
+                iters_used = int(k_probe)
+                if out is not None and _fit and k_probe < int(eff_max_iters):
+                    probe_ms = (time.perf_counter() - t0) * 1000.0
+                    # Cancel between the FFI calls (audit-fixed live cancel wiring): if the user already
+                    # acted, serve the probe solve (K>=200 beats the ~tens of Python-loop iterations a
+                    # cancelled dynamic solve would have banked).
+                    if not (cancel_event is not None and cancel_event.is_set()):
+                        rate = max(probe_ms / float(k_probe), 1e-6)  # ms/iter AT THIS ROOT (+ table amort.)
+                        remaining_ms = float(eff_budget_ms) - probe_ms
+                        k_main = min(int(eff_max_iters), int((remaining_ms * 0.9) / rate))
+                        if k_main > k_probe:
+                            out_full = _native_exploit_call(k_main)
+                            if out_full is not None:
+                                out, iters_used = out_full, int(k_main)
                 if out is not None:
                     probs_n, root_q = out
                     probs = probs_n * legal
@@ -1384,10 +1469,26 @@ class PluribusReBeLSolver:
                     if self._aivat_capture and root_q is not None:
                         self._root_av_sum = np.asarray(root_q, dtype=np.float64)
                         self._root_av_wsum = 1.0
+                    budget_ms = (time.perf_counter() - t0) * 1000.0
+                    if budget_ms >= eff_budget_ms * 1.5 and not self._native_over_budget_warned:
+                        self._native_over_budget_warned = True
+                        print(f"[search] NATIVE exploit solve exceeded its wall budget: "
+                              f"{budget_ms:.0f}ms >= 1.5x {eff_budget_ms}ms at K={iters_used} "
+                              f"(non-interruptible FFI calls; table build {_table_build_ms:.0f}ms) — "
+                              f"lower POKERBOT_SEARCH_MAX_ITERS or investigate CPU contention",
+                              flush=True)
                     return SolveResult(
                         action_probs=probs.astype(np.float32), ev=0.0,
-                        iterations=int(cfg.max_iterations),
-                        metadata={"served": "search_native_exploit"},
+                        iterations=iters_used,
+                        metadata={"served": "search_native_exploit",
+                                  "eff_max_iters": int(eff_max_iters),
+                                  "single_table": bool(single_table) if single_table is not None else None,
+                                  "budget_used_ms": budget_ms,
+                                  "table_build_ms": _table_build_ms,
+                                  # True iff the budget fit served fewer iterations than the target
+                                  # (never triggers the blueprint blend — same rationale as the GTO
+                                  # native path header note).
+                                  "budget_bound": bool(iters_used < int(eff_max_iters))},
                     )
 
         root_key = self._infoset_key(base_state, hero)
