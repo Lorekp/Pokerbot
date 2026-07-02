@@ -530,6 +530,27 @@ def _build_subgame_engine(adapter, num_buckets: int, leaf_max_depth: int):
         raise
 
 
+def warm_subgame_engine(adapter, *, num_buckets: int, max_playout_depth: int) -> bool:
+    """Pre-build + cache the native SubgameSolver engine for ``adapter`` (live startup warm-up).
+
+    The engine ctor is where the one-time process costs live: the blueprint HashMap marshal and —
+    under the EMD regime — the frozen-lookup blob load (~1.1s, ~550MB RSS). Without warming, those
+    land INSIDE the first live decision's solve call and blow its wall budget. Called by the live
+    advisor at construction time; returns True iff the engine is built and cached (the subsequent
+    native_subgame_solve calls hit the cache). False => unavailable/unsupported (callers fall back
+    exactly as native_subgame_solve would)."""
+    if not native_subgame_available():
+        return False
+    ckey = (id(adapter), int(max_playout_depth), int(num_buckets))
+    if _SUBGAME_ENGINE_CACHE.get(ckey) is not None:
+        return True
+    eng = _build_subgame_engine(adapter, int(num_buckets), int(max_playout_depth))
+    if eng is None:
+        return False
+    _SUBGAME_ENGINE_CACHE[ckey] = eng
+    return True
+
+
 def native_subgame_solve(
     base_state, hero: int, adapter, *, public_seed: int, max_iterations: int, max_depth: int,
     blueprint_mix: float, rollout_samples: int, resample_board: bool, max_playout_depth: int,

@@ -373,6 +373,17 @@ def set_native_exploit(on: bool) -> None:
     _NATIVE_EXPLOIT = bool(on)
 
 
+# NATIVE BUDGET FIT (live wiring 2026-07-02). A native subgame solve is one non-interruptible FFI
+# call, and per-iteration cost varies ~20x across roots (a big multiway flop subgame at K=2000 costs
+# ~1.7s on the live box; a river heads-up spot ~40ms). Under a live-scale wall budget
+# (eff_budget_ms < _NATIVE_FIT_BUDGET_MS) the solve is split into a K=_NATIVE_FIT_PROBE_ITERS probe
+# call that measures THIS root's rate, then one main call fitted to the remaining budget (same public
+# seed => statistically one longer solve). Budgets >= the threshold (eval/battery/measurement configs
+# use 1e9+ or no wall) skip the fit entirely — single full-K call, byte-identical to before.
+_NATIVE_FIT_BUDGET_MS = 10_000
+_NATIVE_FIT_PROBE_ITERS = 200
+
+
 def _abstraction_masks(client_bet_sizing: bool):
     if not client_bet_sizing:
         return None, None
@@ -457,6 +468,10 @@ class PluribusReBeLSolver:
         self._leaf_counter = 0  # per-leaf CRN offset so distinct leaves get distinct board runouts
         self._leaf_cont_weights: dict[int, np.ndarray] | None = None  # model-aware leaf (per solve)
         self._budget_bound_count = 0  # per-solver count of decisions cut short by time_budget_ms (S2)
+        # One-time warning latch: a NATIVE solve (one non-interruptible FFI call) whose wall exceeded
+        # its budget. Separate from _budget_bound_count (which keeps its certified S2 semantics:
+        # Python-loop solves cut short mid-iteration).
+        self._native_over_budget_warned = False
         self._two_sided_active = False  # set per-solve; True => cycle traverser (config.two_sided, GTO path)
         self._traversers = []
         # R2 biased continuation leaves: set per-solve (config.leaf_biased_continuations, GTO path only —
@@ -1198,51 +1213,112 @@ class PluribusReBeLSolver:
         # EnvState marshaling). Gated on opponent_model is None (firewall: the exploit tail stays in
         # Python) and the model-aware leaf being off; the native solve samples opponent holes under a
         # UNIFORM belief (the eval base arm). Statistically equivalent to the Python loop below.
+        #
+        # LIVE SEMANTICS (2026-07-02 live native wiring):
+        #   * ITERATIONS: the native call runs ``eff_max_iters`` — cfg.max_iterations everywhere it
+        #     always did (eval/battery callers never pass single_table), PLUS the live single-table
+        #     convergence floor (single_table=True) and the measurement-only force_budget_bound count,
+        #     both of which the old ``cfg.max_iterations`` pass-through silently ignored.
+        #   * CANCEL/BUDGET FIT: each native call is a non-interruptible FFI call — cancel_event and
+        #     the wall clock cannot fire INSIDE it. Under a live-scale budget (eff_budget_ms below
+        #     _NATIVE_FIT_BUDGET_MS) the solve is therefore split into a small PROBE call (K=200,
+        #     measures this root's per-iteration cost — subgame size varies ~20x across spots) and one
+        #     MAIN call whose iteration count is fitted to the remaining budget (capped at
+        #     eff_max_iters). Both calls use the SAME public seed, so probe+main is statistically a
+        #     single K_main-iteration solve (the main call replays the probe's stream prefix); the
+        #     cancel event is checked between the calls. Worst-case wall = ~eff_budget_ms + rate noise;
+        #     worst-case non-cancellable window = one call <= ~the remaining budget. With a huge /
+        #     absent budget (eval, batteries, measurement: >= _NATIVE_FIT_BUDGET_MS) the fit is skipped
+        #     and the single full-K call is byte-identical to the pre-wiring behavior.
+        #     NOTE: a budget-fitted native serve (K_main < eff_max_iters) reports budget_bound=True but
+        #     deliberately does NOT trigger the starvation blueprint blend — the blend exists for the
+        #     ~tens-of-iterations Python starved average; a fitted native solve is >= the probe K (200),
+        #     far past the noise regime the blend was built for.
         if (self.opponent_model is None and self._leaf_cont_weights is None
                 and native_subgame_enabled() and not self._offtree_inserted
                 and not self._aivat_capture):  # AIVAT capture needs the Python loop's per-action root CFVs
             from pokerbot.engine.jax_weva_encode import _POSTFLOP_NUM_BUCKETS
             from pokerbot.search import native_solver as _ns
 
-            probs_n = _ns.native_subgame_solve(
-                base_state, hero, self.adapter,
-                public_seed=self._public_seed(base_state, hero),
-                max_iterations=cfg.max_iterations, max_depth=cfg.max_depth,
-                blueprint_mix=cfg.blueprint_mix,
-                rollout_samples=cfg.leaf.rollout_samples,
-                resample_board=cfg.leaf.resample_board,
-                max_playout_depth=cfg.leaf.max_playout_depth,
-                num_buckets=int(_POSTFLOP_NUM_BUCKETS),
-                linear_averaging=bool(cfg.linear_averaging),
-                repair_deck=bool(cfg.repair_deck),
-                # two_sided is GTO-only; this branch is already gated on opponent_model is None, so
-                # mirror _two_sided_active = bool(cfg.two_sided and opponent_model is None) exactly.
-                two_sided=bool(cfg.two_sided and self.opponent_model is None),
-                # Q2/Q3 world-sampling levers (native): decouple the hole sampler + range-aware weighting.
-                decouple_sampler=bool(cfg.decouple_sampler),
-                range_aware=bool(cfg.range_aware),
-                range_uniform_floor=float(cfg.range_uniform_floor),
-                # ENSEMBLE: N independent parallel CFR streams merged at the root (native rayon fan-out).
-                ensemble_streams=int(cfg.ensemble_streams),
-                # BUG-1 leaf hole-world integration (1 = legacy first-touch freeze) + BUG-5 delayed
-                # averaging (0.0 = legacy). Native mirrors the Python semantics exactly; both no-op at
-                # the defaults.
-                leaf_cache_worlds=int(cfg.leaf_cache_worlds),
-                avg_skip_frac=float(cfg.avg_skip_frac),
-                # R2 biased continuation leaves (GTO-only; this branch is gated on opponent_model is
-                # None, mirroring _leaf_biased_active). False (default) => the legacy uniform native
-                # leaf, byte-identical.
-                leaf_biased_continuations=bool(cfg.leaf_biased_continuations
-                                               and self.opponent_model is None),
-                leaf_bias_mult=float(cfg.leaf_bias_mult),
-            )
+            _pub_seed = self._public_seed(base_state, hero)
+
+            def _native_call(_k: int):
+                return _ns.native_subgame_solve(
+                    base_state, hero, self.adapter,
+                    public_seed=_pub_seed,
+                    max_iterations=int(_k), max_depth=cfg.max_depth,
+                    blueprint_mix=cfg.blueprint_mix,
+                    rollout_samples=cfg.leaf.rollout_samples,
+                    resample_board=cfg.leaf.resample_board,
+                    max_playout_depth=cfg.leaf.max_playout_depth,
+                    num_buckets=int(_POSTFLOP_NUM_BUCKETS),
+                    linear_averaging=bool(cfg.linear_averaging),
+                    repair_deck=bool(cfg.repair_deck),
+                    # two_sided is GTO-only; this branch is already gated on opponent_model is None, so
+                    # mirror _two_sided_active = bool(cfg.two_sided and opponent_model is None) exactly.
+                    two_sided=bool(cfg.two_sided and self.opponent_model is None),
+                    # Q2/Q3 world-sampling levers (native): decouple the hole sampler + range-aware
+                    # weighting.
+                    decouple_sampler=bool(cfg.decouple_sampler),
+                    range_aware=bool(cfg.range_aware),
+                    range_uniform_floor=float(cfg.range_uniform_floor),
+                    # ENSEMBLE: N independent parallel CFR streams merged at the root (native rayon
+                    # fan-out).
+                    ensemble_streams=int(cfg.ensemble_streams),
+                    # BUG-1 leaf hole-world integration (1 = legacy first-touch freeze) + BUG-5 delayed
+                    # averaging (0.0 = legacy). Native mirrors the Python semantics exactly; both no-op
+                    # at the defaults.
+                    leaf_cache_worlds=int(cfg.leaf_cache_worlds),
+                    avg_skip_frac=float(cfg.avg_skip_frac),
+                    # R2 biased continuation leaves (GTO-only; this branch is gated on opponent_model
+                    # is None, mirroring _leaf_biased_active). False (default) => the legacy uniform
+                    # native leaf, byte-identical.
+                    leaf_biased_continuations=bool(cfg.leaf_biased_continuations
+                                                   and self.opponent_model is None),
+                    leaf_bias_mult=float(cfg.leaf_bias_mult),
+                )
+
+            _fit = eff_budget_ms < _NATIVE_FIT_BUDGET_MS
+            k_probe = min(_NATIVE_FIT_PROBE_ITERS, int(eff_max_iters)) if _fit else int(eff_max_iters)
+            probs_n = _native_call(k_probe)
+            iters_used = int(k_probe)
+            if probs_n is not None and _fit and k_probe < int(eff_max_iters):
+                probe_ms = (time.perf_counter() - t0) * 1000.0
+                # Cancel between the FFI calls (the audit-fixed live cancel wiring): if the user already
+                # acted, serve the probe solve (K>=200 — still far better-converged than the ~tens of
+                # iterations the cancelled Python loop would have banked).
+                if not (cancel_event is not None and cancel_event.is_set()):
+                    rate = max(probe_ms / float(k_probe), 1e-6)  # ms per iteration AT THIS ROOT
+                    remaining_ms = float(eff_budget_ms) - probe_ms
+                    k_main = min(int(eff_max_iters), int((remaining_ms * 0.9) / rate))
+                    if k_main > k_probe:
+                        probs_full = _native_call(k_main)
+                        if probs_full is not None:
+                            probs_n, iters_used = probs_full, int(k_main)
             if probs_n is not None:
                 probs = probs_n * legal
                 probs = probs / max(probs.sum(), 1e-12)
+                budget_ms = (time.perf_counter() - t0) * 1000.0
+                # Budget visibility (S2 parity with the Python loop): the wall spent must be visible to
+                # the live decision log (the coach reads budget_used_ms). A native serve that EXCEEDS
+                # its wall budget despite the fit is a loud one-time warning: the calls are
+                # non-interruptible, so an overrun is the operator's cue to lower the iteration target
+                # (or investigate CPU contention), not a silent latency regression.
+                if budget_ms >= eff_budget_ms * 1.5 and not self._native_over_budget_warned:
+                    self._native_over_budget_warned = True
+                    print(f"[search] NATIVE solve exceeded its wall budget: {budget_ms:.0f}ms >= "
+                          f"1.5x {eff_budget_ms}ms at K={iters_used} (non-interruptible FFI calls) — "
+                          f"lower POKERBOT_SEARCH_MAX_ITERS or investigate CPU contention", flush=True)
                 return SolveResult(
                     action_probs=probs.astype(np.float32), ev=0.0,
-                    iterations=int(cfg.max_iterations),
-                    metadata={"served": "search_native"},
+                    iterations=iters_used,
+                    metadata={"served": "search_native",
+                              "eff_max_iters": int(eff_max_iters),
+                              "single_table": bool(single_table) if single_table is not None else None,
+                              "budget_used_ms": budget_ms,
+                              # True iff the budget fit served fewer iterations than the target (never
+                              # triggers the blueprint blend on this path — see the header note).
+                              "budget_bound": bool(iters_used < int(eff_max_iters))},
                 )
 
         # NATIVE EXPLOIT FAST PATH (opt-in, POKERBOT_NATIVE_EXPLOIT): the exploit analogue of the GTO
