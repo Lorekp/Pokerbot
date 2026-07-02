@@ -175,6 +175,21 @@ class PluribusReBeLConfig:
     # uniform leaf tilts — this knob applies ONLY to the biased-continuation leaf). Only read when
     # leaf_biased_continuations is True.
     leaf_bias_mult: float = 5.0
+    # R5a (2026-07-02) — SERVE THE FINAL ITERATE (Pluribus, Science 2019 supp: the bot "plays the
+    # final iterate, not the average" — the weighted average keeps mass on poor actions not yet
+    # completely eliminated; belief updates still use the average). When True, the served ROOT
+    # policy is the REGRET-MATCHING distribution over the root infoset's CUMULATIVE (CFR+-clamped)
+    # regrets AFTER the last iteration — the current (final-iterate) strategy the CFR would play on
+    # iteration K, exactly the expression the existing no-average fallback computes — instead of the
+    # (linear-)averaged strategy_sum. NOTHING else changes: traversal, regret updates, strategy_sum
+    # accumulation, and the starvation blueprint blend (which composes on whatever root policy is
+    # served) are untouched. GTO/base path only (mirrors the two_sided gating: opponent_model must
+    # be None) — the EXPLOIT path always serves the certified average, and the NATIVE exploit FFI
+    # does not expose the knob (subgame.rs solve_exploit never reads it; firewall, defense in
+    # depth). NOTE: the AIVAT decision baseline (_root_av_sum) is built consistent with the AVERAGE;
+    # do not combine this knob with AIVAT-capture measurement. Default False => the averaged serve,
+    # byte-identical. Mirrored in the native GTO solve (subgame.rs serve_final_iterate).
+    serve_final_iterate: bool = False
     client_bet_sizing: bool = True    # use the SAME action abstraction as training (blueprint keys hit)
     search_preflop: bool = False      # Pluribus: serve preflop from blueprint, search postflop only
     # A1 stack-agnostic preflop: the preflop blueprint is keyed on (hole, position) only and trained at
@@ -1328,6 +1343,11 @@ class PluribusReBeLSolver:
                     leaf_biased_continuations=bool(cfg.leaf_biased_continuations
                                                    and self.opponent_model is None),
                     leaf_bias_mult=float(cfg.leaf_bias_mult),
+                    # R5a final-iterate serving (GTO-only; this branch is gated on opponent_model is
+                    # None, mirroring the Python-loop _serve_final gate). False (default) => the
+                    # averaged extraction, byte-identical.
+                    serve_final_iterate=bool(cfg.serve_final_iterate
+                                             and self.opponent_model is None),
                 )
 
             _fit = eff_budget_ms < _NATIVE_FIT_BUDGET_MS
@@ -1519,8 +1539,14 @@ class PluribusReBeLSolver:
             self._cfv(world, traverser, 0, iterations)
             iterations += 1
 
+        # R5a — FINAL-ITERATE SERVING (config.serve_final_iterate, GTO/base only — mirrors the
+        # two_sided gating; the exploit path always serves the certified average): skip the averaged
+        # branch and serve the regret-match of the root's cumulative (CFR+-clamped) regrets AFTER the
+        # last iteration — the CFR's current strategy at iteration K, exactly the expression the
+        # no-average fallback below computes. Default False => the averaged serve, byte-identical.
+        _serve_final = bool(cfg.serve_final_iterate and self.opponent_model is None)
         ss = self._strategy_sum.get(root_key)
-        if ss is not None and ss.sum() > 1e-12:
+        if not _serve_final and ss is not None and ss.sum() > 1e-12:
             avg = ss * legal
             probs = avg / max(avg.sum(), 1e-12)
         else:

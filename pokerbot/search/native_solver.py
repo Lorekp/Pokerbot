@@ -558,6 +558,7 @@ def native_subgame_solve(
     two_sided: bool = False, decouple_sampler: bool = False, range_aware: bool = False,
     range_uniform_floor: float = 0.25, ensemble_streams: int = 1, leaf_cache_worlds: int = 1,
     avg_skip_frac: float = 0.0, leaf_biased_continuations: bool = False, leaf_bias_mult: float = 5.0,
+    serve_final_iterate: bool = False,
 ):
     """Native root action-probability vector (length 11) for a depth-limited subgame solve, or None
     if the native path is unavailable / the adapter is not in the supported (bounded, client_bet_sizing)
@@ -576,7 +577,12 @@ def native_subgame_solve(
     ``leaf_biased_continuations`` (R2) turns every depth-limit leaf into the Pluribus 4-way
     continuation-CHOICE node per live seat, solved by the same subgame CFR; the leaf playout applies
     ``leaf_bias_mult`` (Pluribus 5 / Modicum 10) to the chosen bias group. False (default) = the legacy
-    uniform-draw leaf, byte-identical. GTO path only — the exploit FFI does not accept these knobs."""
+    uniform-draw leaf, byte-identical. GTO path only — the exploit FFI does not accept these knobs.
+
+    ``serve_final_iterate`` (R5a) serves the ROOT policy from the final iterate's regret-matching
+    distribution (regret-match over the root's cumulative CFR+ regrets after the last iteration)
+    instead of the averaged strategy_sum — Pluribus plays the final iterate, not the average. False
+    (default) = the averaged serve, byte-identical. GTO path only — the exploit FFI does not accept it."""
     if not native_subgame_available():
         return None
     ckey = (id(adapter), int(max_playout_depth), int(num_buckets))
@@ -597,13 +603,15 @@ def native_subgame_solve(
             int(ensemble_streams),
             int(leaf_cache_worlds), float(avg_skip_frac),
             bool(leaf_biased_continuations), float(leaf_bias_mult),
+            bool(serve_final_iterate),
         )
     except TypeError:
         # Stale native binary built before the linear_averaging / repair_deck / two_sided / decouple /
-        # range_aware / leaf_cache_worlds / avg_skip_frac / leaf_biased_continuations args — fall back
-        # to Python so a not-yet-rebuilt crate doesn't crash the solve (the Python path applies the same
-        # weighting + repair_deck/two_sided + leaf_cache_worlds/avg_skip_frac/leaf_biased_continuations;
-        # the Q2/Q3 world-sampling levers are native-only, so the fallback is the uniform-deal base arm).
+        # range_aware / leaf_cache_worlds / avg_skip_frac / leaf_biased_continuations /
+        # serve_final_iterate args — fall back to Python so a not-yet-rebuilt crate doesn't crash the
+        # solve (the Python path applies the same weighting + repair_deck/two_sided +
+        # leaf_cache_worlds/avg_skip_frac/leaf_biased_continuations/serve_final_iterate; the Q2/Q3
+        # world-sampling levers are native-only, so the fallback is the uniform-deal base arm).
         return None
     import numpy as _np
 

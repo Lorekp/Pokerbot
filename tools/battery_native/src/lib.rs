@@ -621,6 +621,7 @@ mod py {
             avg_skip_frac: f64,
             leaf_biased_continuations: bool,
             leaf_bias_mult: f64,
+            serve_final_iterate: bool,
         ) -> Vec<f64> {
             let s = flat::from_flat(&bytes_to_flat(state));
             let scfg = SubgameConfig {
@@ -644,6 +645,9 @@ mod py {
                 // legacy uniform leaf, byte-identical).
                 leaf_biased_continuations,
                 leaf_bias_mult,
+                // R5a — final-iterate serving (default OFF at the Python caller => the averaged
+                // extraction, byte-identical).
+                serve_final_iterate,
             };
             subgame::solve(&s, hero, &self.bp, &self.cfg, &scfg, public_seed).to_vec()
         }
@@ -712,6 +716,10 @@ mod py {
                 // exploit Ctx, defense in depth) so the certified exploit leaf is untouched.
                 leaf_biased_continuations: false,
                 leaf_bias_mult: 5.0,
+                // FIREWALL: R5a final-iterate serving is a GTO-path knob, NOT exposed on the exploit
+                // FFI — hard-code OFF (subgame.rs solve_exploit's extraction never reads the field
+                // either, defense in depth) so the certified averaged exploit serve is untouched.
+                serve_final_iterate: false,
             };
             // Reconstruct the FrozenTable from the parallel key lists + flat vals (chunked by 11).
             let n = keys_actor

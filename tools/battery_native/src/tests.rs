@@ -482,6 +482,7 @@ mod subgame_n7 {
             avg_skip_frac: 0.0,      // BUG-5 default 0.0 => accumulate the average from t=0
             leaf_biased_continuations: false, // R2 default OFF => legacy uniform leaf, byte-identical
             leaf_bias_mult: 5.0,     // R2 Pluribus multiplier (only read when the bool is ON)
+            serve_final_iterate: false, // R5a default OFF => averaged extraction, byte-identical
         }
     }
 
@@ -728,6 +729,89 @@ mod subgame_n7 {
         let b = subgame::solve::<7>(&env, hero, &bp, &pc, &sc2, 0xFEED5);
         assert_valid_root_probs(&env, hero, &a);
         assert_eq!(a, b, "biased-leaf + two_sided solve must be deterministic");
+    }
+
+    // R5a ZERO-GATE: serve_final_iterate=false (the default) MUST reproduce the pre-change solve
+    // bit-for-bit — the averaged extraction branch is entered exactly as before (the flag only
+    // SKIPS that branch when true; the traversal/regrets/strategy_sum are untouched either way).
+    #[test]
+    fn n7_subgame_serve_final_iterate_default_byte_identical() {
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = HashMap::new();
+        let pc = pcfg();
+        let base = scfg(); // serve_final_iterate: false (default)
+        let probs_base = subgame::solve::<7>(&env, hero, &bp, &pc, &base, 0xBADC0DE);
+        let off = SubgameConfig { serve_final_iterate: false, ..scfg() };
+        let probs_off = subgame::solve::<7>(&env, hero, &bp, &pc, &off, 0xBADC0DE);
+        assert_eq!(
+            probs_base, probs_off,
+            "serve_final_iterate=false must be byte-identical to the legacy averaged serve"
+        );
+    }
+
+    // R5a GOLDEN — EXACT EXTRACTION SEMANTICS: against the raw ensemble-merged root rows
+    // (subgame::solve_rows — the identical loop `solve` runs), the flag-ON policy must equal the
+    // REGRET-MATCH of the root's cumulative (CFR+-clamped) regrets after the last iteration (the
+    // final-iterate strategy), and the flag-OFF policy must equal the masked+normalized averaged
+    // strategy_sum. Also: ON is deterministic, a valid distribution, and (at this state/seed)
+    // genuinely differs from the averaged serve — the knob is not a placebo.
+    #[test]
+    fn n7_subgame_serve_final_iterate_golden_extraction() {
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = HashMap::new();
+        let pc = pcfg();
+        let sc_on = SubgameConfig { serve_final_iterate: true, ..scfg() };
+        let sc_off = scfg();
+        let legal = subgame::abstracted_legal::<7>(&env, hero, &pc);
+
+        // Raw root rows from the IDENTICAL solve loop (same seed => same traversal for ON and OFF:
+        // the flag is read only at extraction, so solve_rows(sc_on) == solve_rows(sc_off)).
+        let (ss_on, rr_on, _) = subgame::solve_rows::<7>(&env, hero, &bp, &pc, &sc_on, 0xFEED5);
+        let (ss_off, rr_off, has_avg) =
+            subgame::solve_rows::<7>(&env, hero, &bp, &pc, &sc_off, 0xFEED5);
+        assert_eq!(ss_on, ss_off, "the flag must not touch the traversal (strategy_sum)");
+        assert_eq!(rr_on, rr_off, "the flag must not touch the traversal (regrets)");
+        assert!(has_avg, "test premise: the root accumulated average mass");
+
+        // ON == regret-match of the final cumulative regrets (already normalized over legal).
+        let probs_on = subgame::solve::<7>(&env, hero, &bp, &pc, &sc_on, 0xFEED5);
+        let expect_final = subgame::regret_match(&rr_on, &legal);
+        for a in 0..NUM_ACTIONS {
+            assert!(
+                (probs_on[a] - expect_final[a]).abs() < 1e-12,
+                "final-iterate serve mismatch at action {a}: {} vs {}",
+                probs_on[a],
+                expect_final[a]
+            );
+        }
+        assert_valid_root_probs(&env, hero, &probs_on);
+        let probs_on2 = subgame::solve::<7>(&env, hero, &bp, &pc, &sc_on, 0xFEED5);
+        assert_eq!(probs_on, probs_on2, "final-iterate serve must be deterministic");
+
+        // OFF == masked+normalized averaged strategy_sum.
+        let probs_off = subgame::solve::<7>(&env, hero, &bp, &pc, &sc_off, 0xFEED5);
+        let mut expect_avg = [0.0f64; NUM_ACTIONS];
+        let mut tot = 0.0;
+        for a in 0..NUM_ACTIONS {
+            expect_avg[a] = if legal[a] { ss_off[a] } else { 0.0 };
+            tot += expect_avg[a];
+        }
+        for a in 0..NUM_ACTIONS {
+            expect_avg[a] /= tot.max(1e-12);
+        }
+        for a in 0..NUM_ACTIONS {
+            assert!(
+                (probs_off[a] - expect_avg[a]).abs() < 1e-12,
+                "averaged serve mismatch at action {a}: {} vs {}",
+                probs_off[a],
+                expect_avg[a]
+            );
+        }
+        // The knob must actually move the served policy at this state (final != average here).
+        let l1: f64 = (0..NUM_ACTIONS).map(|a| (probs_on[a] - probs_off[a]).abs()).sum();
+        assert!(l1 > 1e-9, "final-iterate serve identical to the average — placebo knob? L1={l1}");
     }
 
     // R2 CONSISTENCY GATE: the continuation-choice infoset is keyed by the seat + PUBLIC leaf context

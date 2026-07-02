@@ -110,6 +110,11 @@ _DEPLOYED_BASELINE = {
     # R2 bias multiplier for the biased continuations (Pluribus 5, Modicum 10; read only when
     # leaf_biased_continuations is on)
     "leaf_bias_mult": 5.0,
+    # R5a final-iterate serving: serve the root policy from the final iterate's regret-matching
+    # distribution (regret-match over the root's cumulative CFR+ regrets after the last iteration)
+    # instead of the averaged strategy_sum — Pluribus plays the final iterate, not the average
+    # (False = averaged serve, DEPLOYED default, byte-identical)
+    "serve_final_iterate": False,
     # blueprint checkpoint path (None = auto-detect from cwd)
     "blueprint_path": None,
     # max CFR depth (safety cap)
@@ -204,6 +209,7 @@ def _build_policy(spec: dict, snap, base_seed: int, repo_root: str):
     sv.config.avg_skip_frac = float(_resolve(spec, "avg_skip_frac"))
     sv.config.leaf_biased_continuations = bool(_resolve(spec, "leaf_biased_continuations"))
     sv.config.leaf_bias_mult = float(_resolve(spec, "leaf_bias_mult"))
+    sv.config.serve_final_iterate = bool(_resolve(spec, "serve_final_iterate"))
     sv.config.max_depth = int(_resolve(spec, "max_depth"))
     sv.config.linear_averaging = bool(_resolve(spec, "linear_averaging"))
     sv.config.per_decision_seed = bool(_resolve(spec, "per_decision_seed"))

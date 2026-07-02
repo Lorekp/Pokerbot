@@ -212,6 +212,64 @@ def test_zero_deviation_bit_identity():
     assert np.allclose(base.action_probs, dev.action_probs, atol=1e-9)
 
 
+def test_serve_final_iterate_golden_and_zero_gate():
+    """R5a: serve_final_iterate=True serves the regret-match of the ROOT's cumulative (CFR+-clamped)
+    regrets after the last iteration (the final-iterate strategy) instead of the averaged
+    strategy_sum; False (default) is byte-identical to the legacy averaged serve."""
+    from pokerbot.search.pluribus_search import _regret_match
+
+    env = _postflop_env()
+    hero = int(env.action_seat)
+    root = SubgameRoot(env=env, hero_seat=hero, pbs_vector=None,
+                       legal_mask=legal_action_mask_np(env, hero).astype(bool))
+
+    def _cfg(**kw):
+        return PluribusReBeLConfig(max_iterations=12, time_budget_ms=20000,
+                                   leaf=ContinuationLeafConfig(select="uniform", rollout_samples=2),
+                                   **kw)
+
+    # Zero-gate: explicit False == default (byte-identical).
+    r_def = PluribusReBeLSolver({}, _cfg()).solve(root, _StubPBS(env, hero))
+    r_off = PluribusReBeLSolver({}, _cfg(serve_final_iterate=False)).solve(root, _StubPBS(env, hero))
+    assert np.array_equal(r_def.action_probs, r_off.action_probs)
+
+    # Golden: ON == regret-match over the solver's FINAL root regrets, masked+renormalized.
+    sv = PluribusReBeLSolver({}, _cfg(serve_final_iterate=True))
+    r_on = sv.solve(root, _StubPBS(env, hero))
+    base_state = to_numpy_state(env)
+    root_key = sv._infoset_key(base_state, hero)
+    legal = sv._legal(base_state, hero)
+    expect = _regret_match(sv._regrets[root_key], legal.astype(np.float64))
+    expect = expect * legal
+    expect = expect / max(expect.sum(), 1e-12)
+    assert np.allclose(r_on.action_probs, expect.astype(np.float32), atol=1e-7)
+    # The knob must actually move the served policy here (final != average) — not a placebo.
+    assert float(np.abs(r_on.action_probs - r_off.action_probs).sum()) > 1e-6
+
+
+def test_serve_final_iterate_exploit_path_gated():
+    """R5a firewall: with opponent_model set (exploit path) the knob is INERT — the exploit serve is
+    always the certified averaged strategy (mirrors the two_sided gating)."""
+    from pokerbot.opponent.stats import OpponentStats
+
+    env = _postflop_env()
+    hero = int(env.action_seat)
+    root = SubgameRoot(env=env, hero_seat=hero, pbs_vector=None,
+                       legal_mask=legal_action_mask_np(env, hero).astype(bool))
+    model = {s: OpponentStats(hands=2) for s in range(NUM_PLAYERS) if s != hero}
+
+    def _cfg(**kw):
+        return PluribusReBeLConfig(max_iterations=10, time_budget_ms=20000,
+                                   leaf=ContinuationLeafConfig(select="uniform", rollout_samples=2),
+                                   **kw)
+
+    r_off = PluribusReBeLSolver({}, _cfg(serve_final_iterate=False),
+                                opponent_model=model).solve(root, _StubPBS(env, hero))
+    r_on = PluribusReBeLSolver({}, _cfg(serve_final_iterate=True),
+                               opponent_model=model).solve(root, _StubPBS(env, hero))
+    assert np.array_equal(r_on.action_probs, r_off.action_probs)
+
+
 def test_preflop_served_from_blueprint():
     env = to_numpy_state(init_hand(jax.random.PRNGKey(5), occupancy=_OCC))
     while is_chance_node_np(env):

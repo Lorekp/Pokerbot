@@ -139,6 +139,20 @@ pub struct SubgameConfig {
     /// Pluribus used 5, Modicum 10. Only read when `leaf_biased_continuations` is ON (the legacy
     /// uniform leaf keeps using the adapter-level PlayoutConfig.bias_mult, untouched).
     pub leaf_bias_mult: f64,
+    /// R5a (2026-07-02) — SERVE THE FINAL ITERATE (Pluribus, Science 2019 supp: the bot "plays the
+    /// final iterate, not the average" — the weighted average retains mass on poor actions that were
+    /// not completely eliminated; belief updates still use the average). When ON, the served ROOT
+    /// policy is the REGRET-MATCHING distribution over the root infoset's CUMULATIVE (CFR+-clamped)
+    /// regrets AFTER the last iteration — i.e. the current (final-iterate) strategy the CFR would
+    /// play on iteration K, exactly the expression the existing no-average fallback already computes
+    /// — instead of the (linear-)averaged `strategy_sum`. NOTHING else changes: the traversal,
+    /// regret updates, and strategy_sum accumulation are untouched (the average is still built; it
+    /// is just not served). Under `ensemble_streams > 1` the final iterate is the regret-match of
+    /// the SUMMED per-stream root regrets (the same merge the existing fallback uses; deployed
+    /// streams=1). Default OFF => the averaged extraction, byte-identical to today. GTO `solve`
+    /// path only; `solve_exploit` NEVER reads this field (its extraction is hard-coded to the
+    /// certified averaged serve) and its FFI does not expose the knob (firewall, defense in depth).
+    pub serve_final_iterate: bool,
 }
 
 /// Immutable per-solve context handed down the recursion.
@@ -181,7 +195,7 @@ struct Tables {
 // --------------------------------------------------------------------------------------------------
 
 #[inline]
-fn abstracted_legal<const N: usize>(
+pub(crate) fn abstracted_legal<const N: usize>(
     s: &EnvStateN<N>,
     seat: usize,
     pcfg: &PlayoutConfig,
@@ -206,7 +220,7 @@ fn any_legal(m: &[bool; NUM_ACTIONS]) -> bool {
 
 /// `_regret_match`: positive regrets over legal, renormalized; uniform-over-legal when no positive mass.
 #[inline]
-fn regret_match(regrets: &[f64; NUM_ACTIONS], legal: &[bool; NUM_ACTIONS]) -> [f64; NUM_ACTIONS] {
+pub(crate) fn regret_match(regrets: &[f64; NUM_ACTIONS], legal: &[bool; NUM_ACTIONS]) -> [f64; NUM_ACTIONS] {
     let mut pos = [0.0f64; NUM_ACTIONS];
     let mut s = 0.0;
     for a in 0..NUM_ACTIONS {
@@ -1301,20 +1315,18 @@ fn solve_stream<const N: usize>(
     (ss, rr, has_avg)
 }
 
-/// Run the depth-limited CFR subgame solve and return the root action probabilities (length 11).
-pub fn solve<const N: usize>(
+/// The full CFR solve MINUS the extraction: the ensemble-merged ROOT rows
+/// `(strategy_sum, regrets, any-avg-mass)` that `solve` reads its served policy off. Pure code
+/// motion from `solve` (behavior byte-identical); `pub(crate)` so the R5a golden test can assert
+/// the exact extraction semantics (averaged vs final-iterate) against the raw rows.
+pub(crate) fn solve_rows<const N: usize>(
     root: &EnvStateN<N>,
     hero: usize,
     bp: &Blueprint,
     pcfg: &PlayoutConfig,
     scfg: &SubgameConfig,
     public_seed: u64,
-) -> [f64; NUM_ACTIONS] {
-    let legal_root = abstracted_legal(root, hero, pcfg);
-    let mut probs = [0.0f64; NUM_ACTIONS];
-    if !any_legal(&legal_root) {
-        return probs;
-    }
+) -> ([f64; NUM_ACTIONS], [f64; NUM_ACTIONS], bool) {
     let ctx = Ctx {
         bp,
         pcfg,
@@ -1383,11 +1395,34 @@ pub fn solve<const N: usize>(
                 },
             )
     };
+    (sum_ss, sum_rr, any_avg)
+}
+
+/// Run the depth-limited CFR subgame solve and return the root action probabilities (length 11).
+pub fn solve<const N: usize>(
+    root: &EnvStateN<N>,
+    hero: usize,
+    bp: &Blueprint,
+    pcfg: &PlayoutConfig,
+    scfg: &SubgameConfig,
+    public_seed: u64,
+) -> [f64; NUM_ACTIONS] {
+    let legal_root = abstracted_legal(root, hero, pcfg);
+    let mut probs = [0.0f64; NUM_ACTIONS];
+    if !any_legal(&legal_root) {
+        return probs;
+    }
+    let (sum_ss, sum_rr, any_avg) = solve_rows(root, hero, bp, pcfg, scfg, public_seed);
 
     // Root strategy = SUMMED strategy_sum (masked, normalized) when any stream had mass, else regret-match
     // fallback on the SUMMED regrets. Identical extraction shape to the single-stream path.
+    //
+    // R5a — FINAL-ITERATE SERVING (scfg.serve_final_iterate): skip the averaged branch entirely and
+    // serve the regret-match of the root's cumulative (CFR+-clamped) regrets AFTER the last iteration
+    // — the CFR's current strategy at iteration K, which is EXACTLY the expression the no-average
+    // fallback below already computes. Default OFF => the averaged extraction runs byte-identically.
     let mut used_avg = false;
-    if any_avg {
+    if !scfg.serve_final_iterate && any_avg {
         let tot: f64 = sum_ss.iter().sum();
         if tot > 1e-12 {
             for a in 0..NUM_ACTIONS {
@@ -1579,6 +1614,9 @@ pub fn solve_exploit<const N: usize>(
             // FIREWALL: R2 biased continuation leaves are a GTO-path knob; force OFF here regardless of
             // scfg (defense in depth — the exploit FFI does not expose the knob either), so the
             // certified exploit leaf (leaf_value_x) is byte-identical no matter what a caller sets.
+            // R5a serve_final_iterate is likewise a GTO-path knob: solve_exploit's extraction below is
+            // HARD-CODED to the certified averaged serve (it never reads scfg.serve_final_iterate),
+            // and the exploit FFI does not expose the knob (lib.rs hard-codes it false).
             leaf_biased: false,
             leaf_bias_mult: 5.0,
         },
