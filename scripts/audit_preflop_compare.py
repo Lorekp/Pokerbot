@@ -60,7 +60,10 @@ assert len(HANDS) == 169, len(HANDS)
 
 def main() -> int:
     pub = json.load(open(os.path.join(REPO, "artifacts", "published_preflop_ranges.json")))
-    bot = json.load(open(os.path.join(REPO, "artifacts", "audit_preflop_blueprint.json")))
+    # AUDIT_PF_BOT_JSON / AUDIT_PF_OUT: audit an alternative extraction (e.g. a blueprint-v2
+    # candidate) without clobbering the committed deployed-baseline artifacts.
+    bot = json.load(open(os.environ.get(
+        "AUDIT_PF_BOT_JSON", os.path.join(REPO, "artifacts", "audit_preflop_blueprint.json"))))
 
     out = {"meta": {
         "sources": pub["sources"],
@@ -172,7 +175,8 @@ def main() -> int:
               f"{v['chart']['3bet_pct']}/{v['chart']['call_pct']}/{v['chart']['fold_pct']}% "
               f"(single source)")
 
-    path = os.path.join(REPO, "artifacts", "audit_preflop_vs_published.json")
+    path = os.environ.get("AUDIT_PF_OUT",
+                          os.path.join(REPO, "artifacts", "audit_preflop_vs_published.json"))
     with open(path, "w") as f:
         json.dump(out, f, indent=1)
     print(f"\nwrote {path}")

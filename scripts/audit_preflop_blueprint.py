@@ -81,8 +81,22 @@ def main() -> int:
     n_deals = int(sys.argv[1]) if len(sys.argv) > 1 else 2000
     t0 = time.time()
 
-    raw = pickle.load(open(os.path.join(REPO, "checkpoints", "serve_blueprint_6max.pkl"), "rb"))
-    snap = raw["strat_sum"] if isinstance(raw, dict) and "strat_sum" in raw else raw
+    # Optional overrides (blueprint-v2 gate reuse): audit an arbitrary checkpoint without
+    # touching the deployed serve pkl or the committed baseline artifact.
+    #   AUDIT_PF_CHECKPOINT: path to a .pkl snapshot OR a raw .nlcfr native checkpoint
+    #   AUDIT_PF_OUT:        output json path (default artifacts/audit_preflop_blueprint.json)
+    ckpt = os.environ.get("AUDIT_PF_CHECKPOINT",
+                          os.path.join(REPO, "checkpoints", "serve_blueprint_6max.pkl"))
+    if ckpt.endswith(".nlcfr"):
+        # Pure-python NLCFR001 -> snapshot conversion; avg_strategy mirrors
+        # trainer.rs::snapshot (row-normalized strat_sum, uniform fallback) exactly.
+        sys.path.insert(0, os.path.join(REPO, "scripts"))
+        from f32_regret_strategy_delta import load_checkpoint, avg_strategy
+        _ck = load_checkpoint(ckpt)
+        snap = {k: avg_strategy(row) for k, row in _ck["strat"].items()}
+    else:
+        raw = pickle.load(open(ckpt, "rb"))
+        snap = raw["strat_sum"] if isinstance(raw, dict) and "strat_sum" in raw else raw
     # The deployed serve stack (engine_ab_h2h `{}` baseline). At preflop nodes solve() returns
     # _root_blueprint without search, so iterations/native knobs are inert here — but we go through
     # the same wrapper to audit what is actually SERVED.
@@ -232,7 +246,8 @@ def main() -> int:
                 "within_class_L1_spread_max": round(max_spread, 5),
             }
 
-    path = os.path.join(REPO, "artifacts", "audit_preflop_blueprint.json")
+    path = os.environ.get("AUDIT_PF_OUT",
+                          os.path.join(REPO, "artifacts", "audit_preflop_blueprint.json"))
     with open(path, "w") as f:
         json.dump(out, f, indent=1)
     log(f"DONE wrote {path} in {time.time() - t0:.0f}s")
