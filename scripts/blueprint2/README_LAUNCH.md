@@ -96,6 +96,14 @@ Remove-Item env:POKERBOT_RIVER_OCHS
 Compare vs the baselines in `artifacts/bp2_selfplay_term_emd.json` (85.1% preflop-end, 35%
 preflop all-in) — expect both to drop. These are mechanism metrics, NOT the gate.
 
+Also rerun the decision-quality audit's Leg A on the new checkpoint (~seconds; audit commit
+af88c37, artifacts/decision_quality_audit.md) as a mechanism acceptance check against the
+published-consensus preflop baselines (deployed: BTN opens 9.5% vs 43.6% consensus, BB-vs-BTN
+folds 81.8% vs 46.8%, positional monotonicity INVERTED, 32-36% of opens are 100bb jams):
+expect BTN open% to rise sharply toward consensus, the BB overfold to shrink, monotonicity to
+flip to normal (wider toward the button), and jam mass to collapse. Directional check, NOT the
+gate — 4c decides.
+
 ### 4c. THE GATE — CRN-paired ranking vs the deployed blueprint at >=8k decks
 
 The two arms have DIFFERENT river abstractions (deployed = mirror river; new = river-OCHS), so
