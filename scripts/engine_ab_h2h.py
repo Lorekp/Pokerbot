@@ -97,6 +97,11 @@ _DEPLOYED_BASELINE = {
     "range_aware": True,
     # uniform robustness floor for range-aware sampling (deployed 0.25)
     "range_uniform_floor": 0.25,
+    # R1 reach-consistent opponent root ranges: per-combo weight = blueprint REACH product along the
+    # hand's observed public history (natively replayed + verified; falls back to fold-now/uniform on
+    # an unverifiable history) instead of the fold-now proxy. Floored by range_uniform_floor.
+    # (False = fold-now proxy per range_aware, DEPLOYED default, byte-identical)
+    "range_reach_full": False,
     # BUG-1 leaf-cache hole-world integration: running mean over the first M visiting worlds
     # (4 = ADOPTED 2026-07-02 default, +146/deck CI-certified; 1 = legacy first-touch freeze)
     "leaf_cache_worlds": 4,
@@ -204,6 +209,7 @@ def _build_policy(spec: dict, snap, base_seed: int, repo_root: str):
     sv.config.decouple_sampler = bool(_resolve(spec, "decouple_sampler"))
     sv.config.range_aware = bool(_resolve(spec, "range_aware"))
     sv.config.range_uniform_floor = float(_resolve(spec, "range_uniform_floor"))
+    sv.config.range_reach_full = bool(_resolve(spec, "range_reach_full"))
     sv.config.ensemble_streams = int(_resolve(spec, "ensemble_streams"))
     sv.config.leaf_cache_worlds = int(_resolve(spec, "leaf_cache_worlds"))
     sv.config.avg_skip_frac = float(_resolve(spec, "avg_skip_frac"))

@@ -616,6 +616,7 @@ mod py {
             decouple_sampler: bool,
             range_aware: bool,
             range_uniform_floor: f64,
+            range_reach_full: bool,
             ensemble_streams: i32,
             leaf_cache_worlds: i32,
             avg_skip_frac: f64,
@@ -636,6 +637,9 @@ mod py {
                 decouple_sampler,
                 range_aware,
                 range_uniform_floor,
+                // R1 reach-consistent opponent root ranges (default OFF at the Python caller => the
+                // legacy fold-now / uniform deal, byte-identical).
+                range_reach_full,
                 ensemble_streams,
                 // BUG-1 leaf hole-world integration (1 = legacy first-touch freeze) + BUG-5 delayed
                 // averaging (0.0 = legacy accumulate-from-t=0). Both default no-op at the Python caller.
@@ -650,6 +654,44 @@ mod py {
                 serve_final_iterate,
             };
             subgame::solve(&s, hero, &self.bp, &self.cfg, &scfg, public_seed).to_vec()
+        }
+
+        /// PROBE/DEBUG (R1, never on the solve hot path): the per-seat opponent-range weights the
+        /// world sampler would draw from at this root. `mode` is "fold_now" (the Q3 proxy),
+        /// "reach" (the R1 blueprint-reach product) or "reach_strict" (reach with NO fold-now
+        /// fallback — returns None whenever the history replay fails, exposing the fallback path).
+        /// Returns a seat-major flattened `N*52*52` weight vector (upper triangle c0<c1 populated,
+        /// pre-floor / pre-normalization), or None when no table applies. Used by the offline
+        /// sanity + log-loss validation of the reach-range plumbing.
+        fn range_weights(&self, state: &[u8], hero: usize, mode: &str) -> Option<Vec<f64>> {
+            let s = flat::from_flat(&bytes_to_flat(state));
+            let (range_aware, range_reach_full) = match mode {
+                "fold_now" => (true, false),
+                "reach" => (true, true),
+                "reach_strict" => (false, true),
+                _ => return None,
+            };
+            let scfg = SubgameConfig {
+                max_iterations: 0,
+                max_depth: 0,
+                blueprint_mix: 1.0,
+                rollout_samples: 1,
+                resample_board: false,
+                linear_averaging: true,
+                repair_deck: false,
+                two_sided: false,
+                decouple_sampler: false,
+                range_aware,
+                range_uniform_floor: 0.25,
+                range_reach_full,
+                ensemble_streams: 1,
+                leaf_cache_worlds: 1,
+                avg_skip_frac: 0.0,
+                leaf_biased_continuations: false,
+                leaf_bias_mult: 5.0,
+                serve_final_iterate: false,
+            };
+            subgame::build_rtab(&s, hero, &self.bp, &self.cfg, &scfg).map(|rt| rt.to_flat())
         }
 
         /// EXPLOIT solve: same CFR loop as `solve`, but opponent nodes apply a PRECOMPUTED pure-frozen
@@ -684,6 +726,7 @@ mod py {
             decouple_sampler: bool,
             range_aware: bool,
             range_uniform_floor: f64,
+            range_reach_full: bool,
         ) -> (Vec<f64>, Vec<f64>) {
             let s = flat::from_flat(&bytes_to_flat(state));
             let scfg = SubgameConfig {
@@ -697,11 +740,12 @@ mod py {
                 // FIREWALL: two_sided is NEVER exposed on the exploit path (one-sided BR to the modeled
                 // opponent is the intended behaviour). Hard-code false so a caller mistake can't flip it.
                 two_sided: false,
-                // Q2/Q3 world-sampling levers apply to the exploit path too (they change ONLY the sampled
-                // opponent worlds, never the frozen-read exploit math -> firewall-safe).
+                // Q2/Q3/R1 world-sampling levers apply to the exploit path too (they change ONLY the
+                // sampled opponent worlds, never the frozen-read exploit math -> firewall-safe).
                 decouple_sampler,
                 range_aware,
                 range_uniform_floor,
+                range_reach_full,
                 // ENSEMBLE: the exploit path is left single-stream for now (solve_exploit ignores this
                 // field entirely). Firewalled follow-up once the GTO ensemble is validated.
                 ensemble_streams: 1,

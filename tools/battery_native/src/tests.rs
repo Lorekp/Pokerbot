@@ -477,6 +477,7 @@ mod subgame_n7 {
             decouple_sampler: false, // Q2 default OFF => byte/stat-identical
             range_aware: false,      // Q3 default OFF => uniform opponent-hole deal
             range_uniform_floor: 0.25,
+            range_reach_full: false, // R1 default OFF => legacy fold-now/uniform deal, byte-identical
             ensemble_streams: 1,     // default 1 => single-stream, byte/stat-identical
             leaf_cache_worlds: 1,    // BUG-1 default 1 => first-touch leaf freeze, byte-identical
             avg_skip_frac: 0.0,      // BUG-5 default 0.0 => accumulate the average from t=0
@@ -559,6 +560,33 @@ mod subgame_n7 {
         assert_eq!(
             probs_base, probs_off,
             "flags-off solve must be byte-identical to the legacy solve"
+        );
+    }
+
+    // R1 GATE: range_reach_full=false (the default) is exercised by every test above (scfg() sets it
+    // false — those are the byte-identity gates). Here: range_reach_full=true must (a) be valid +
+    // deterministic, and (b) with range_aware ALSO on, reproduce the range_aware-only solve exactly
+    // when the reach table degrades to no-information — an EMPTY blueprint makes every reach decision
+    // all-miss (skipped => flat 1.0 weights) and the fold-now proxy flat too, so BOTH tables induce
+    // the same flat sampling distribution over combos (identical draw counts => identical RNG stream).
+    #[test]
+    fn n7_subgame_range_reach_valid_and_flat_matches_fold_now() {
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = HashMap::new(); // empty => reach factors all-miss => flat table
+        let pc = pcfg();
+        let reach = SubgameConfig { range_aware: true, range_reach_full: true, ..scfg() };
+        let a = subgame::solve::<7>(&env, hero, &bp, &pc, &reach, 4242);
+        let b = subgame::solve::<7>(&env, hero, &bp, &pc, &reach, 4242);
+        assert_valid_root_probs(&env, hero, &a);
+        assert_eq!(a, b, "range_reach_full solve must be deterministic for a fixed seed");
+        // Empty blueprint: fold-now weight = 1 - 1/n_legal (flat) vs reach weight = 1.0 (flat) —
+        // both normalize to the SAME per-combo distribution, so the solves must coincide exactly.
+        let fold_now = SubgameConfig { range_aware: true, range_reach_full: false, ..scfg() };
+        let c = subgame::solve::<7>(&env, hero, &bp, &pc, &fold_now, 4242);
+        assert_eq!(
+            a, c,
+            "flat reach table must induce the same world distribution as the flat fold-now proxy"
         );
     }
 
@@ -1571,5 +1599,202 @@ mod emd_serve_keying {
             cfg_emd.fp_key(&env, seat),
             fingerprint_fast_depth_postflop_bucket(&env, seat, 42)
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R1 — reach-consistent opponent root ranges (range_reach_full): history replay round-trip +
+// the directive's sanity property (limp-call line: blueprint-always-fold hands ~0, always-jam
+// premiums down-weighted, blueprint-miss combos neutral at the decision's mean hit probability).
+// ---------------------------------------------------------------------------
+mod range_reach_r1 {
+    use super::*;
+    use crate::playout::{Blueprint, PlayoutConfig};
+    use crate::subgame::{self, SubgameConfig};
+    use std::collections::HashMap;
+
+    fn pcfg6() -> PlayoutConfig {
+        PlayoutConfig {
+            allowed_pre: [true; NUM_ACTIONS],
+            allowed_post: [true; NUM_ACTIONS],
+            bias_mult: 5.0,
+            bias_floor: 0.0,
+            max_depth: 24,
+            num_buckets: 200,
+            emd: None,
+        }
+    }
+
+    fn scfg6(range_aware: bool, range_reach_full: bool) -> SubgameConfig {
+        SubgameConfig {
+            max_iterations: 16,
+            max_depth: 8,
+            blueprint_mix: 1.0,
+            rollout_samples: 2,
+            resample_board: true,
+            linear_averaging: true,
+            repair_deck: false,
+            two_sided: false,
+            decouple_sampler: false,
+            range_aware,
+            range_uniform_floor: 0.25,
+            range_reach_full,
+            ensemble_streams: 1,
+            leaf_cache_worlds: 1,
+            avg_skip_frac: 0.0,
+            leaf_biased_continuations: false,
+            leaf_bias_mult: 5.0,
+            serve_final_iterate: false,
+        }
+    }
+
+    /// 6-max 100bb identity-deck hand: UTG (seat 3) LIMP-CALLS, everyone else folds, BB (seat 2)
+    /// checks; flop deals cards 12,13,14. Returns `(flop root with hero=seat 2 to act, st0 = the
+    /// public state at seat 3's preflop limp decision)`.
+    fn scripted_limp_root() -> (EnvStateN<6>, EnvStateN<6>) {
+        let stacks = [100 * BB_CHIPS; 6];
+        let occ = [true; 6];
+        let mut deck = [0i32; 52];
+        for (i, d) in deck.iter_mut().enumerate() {
+            *d = i as i32;
+        }
+        let mut env = init_hand_n::<6>(0, &stacks, &occ, 0, &deck, [0u32, 0u32]);
+        let st0 = env; // seat 3 (UTG) to act — the limp decision the reach factor conditions on.
+        assert_eq!(env.action_seat, 3, "6-max UTG is the first preflop actor");
+        let script: [(i32, usize); 6] =
+            [(3, CALL), (4, FOLD), (5, FOLD), (0, FOLD), (1, FOLD), (2, CHECK)];
+        for (seat, action) in script {
+            assert!(!is_chance_node(&env), "unexpected chance node mid-script");
+            assert_eq!(env.action_seat, seat, "script actor mismatch");
+            env = apply_action(&env, action);
+        }
+        while is_chance_node(&env) {
+            env = sample_chance(&env);
+        }
+        assert_eq!(env.street, STREET_FLOP);
+        assert_eq!(env.action_seat, 2, "BB acts first on the flop (button 0, seat 1 folded)");
+        (env, st0)
+    }
+
+    // The replay must reconstruct EXACTLY hist_len public decision states, in order, with the
+    // recorded actors — and refuse (None) any root whose history it cannot verify.
+    #[test]
+    fn replay_reconstructs_the_scripted_history() {
+        let (root, st0) = scripted_limp_root();
+        let steps = subgame::replay_public_states(&root).expect("replay must succeed");
+        assert_eq!(steps.len(), root.hist_len as usize);
+        assert_eq!(steps.len(), 6);
+        let expected: [(usize, usize); 6] =
+            [(3, CALL), (4, FOLD), (5, FOLD), (0, FOLD), (1, FOLD), (2, CHECK)];
+        for (k, (seat, action, st)) in steps.iter().enumerate() {
+            assert_eq!((*seat, *action), expected[k], "step {k} actor/action");
+            assert_eq!(st.street, 0, "all scripted decisions are preflop");
+            assert_eq!(st.action_seat, *seat as i32, "snapshot actor");
+            assert_eq!(st.hist_len, k as i32, "snapshot history depth");
+        }
+        // The first snapshot is the hand-start decision state: publicly identical to init_hand's.
+        let s0 = &steps[0].2;
+        assert_eq!(s0.committed_street, st0.committed_street);
+        assert_eq!(s0.stacks, st0.stacks);
+        assert_eq!(s0.current_bet, st0.current_bet);
+        assert_eq!(s0.pot_dead, st0.pot_dead);
+        // A corrupted history must be REFUSED, never mis-keyed.
+        let mut bad = root;
+        bad.hist_seat[0] = 4;
+        assert!(
+            subgame::replay_public_states(&bad).is_none(),
+            "corrupted history must fail the replay verification"
+        );
+    }
+
+    // The directive's sanity property, on a synthetic blueprint pinned to seat 3's limp decision:
+    //   * a combo class the blueprint always FOLDS -> reach weight 0 for the observed CALL line
+    //     (the floor-blend at sample time keeps support >= floor*uniform);
+    //   * a premium class the blueprint always JAMS -> weight 0 for the observed CALL line;
+    //   * a combo class the blueprint always CALLS -> weight 1;
+    //   * a blueprint-MISS combo -> the decision's mean hit probability (scale-neutral);
+    //   * seats whose only observed action has no blueprint coverage (the folders) -> flat 1.0.
+    #[test]
+    fn reach_weights_limp_call_sanity() {
+        let (root, st0) = scripted_limp_root();
+        let hero = 2usize;
+        let pc = pcfg6();
+        let mut bp: Blueprint = HashMap::new();
+        // Blueprint rows keyed EXACTLY like the serve path (pcfg.fp_key on the decision state with
+        // the candidate combo substituted — preflop lossless keys).
+        let key_for = |c0: i32, c1: i32| {
+            let mut s = st0;
+            s.holes[3][0] = c0;
+            s.holes[3][1] = c1;
+            pc.fp_key(&s, 3)
+        };
+        let mut row_call = [0.0f64; NUM_ACTIONS];
+        row_call[CALL] = 1.0;
+        let mut row_jam = [0.0f64; NUM_ACTIONS];
+        row_jam[ALL_IN] = 1.0;
+        let mut row_fold = [0.0f64; NUM_ACTIONS];
+        row_fold[FOLD] = 1.0;
+        // (6,7): the only unseen rank-1 pair (hero holds 4,5) -> a 1-combo class. Always-CALL.
+        bp.insert(key_for(6, 7), row_call);
+        // (16,20): suited 4-5 rank class (4 unseen combos share the key). Always-JAM (premium).
+        bp.insert(key_for(16, 20), row_jam);
+        // (44,45): the rank-11 pair class (cards 44..47 -> C(4,2)=6 combos). Always-FOLD.
+        bp.insert(key_for(44, 45), row_fold);
+        // (24,25): NO row -> blueprint miss -> neutral mean-hit factor.
+
+        let known = {
+            let mut k = [false; 52];
+            for c in [4usize, 5, 12, 13, 14] {
+                k[c] = true;
+            }
+            k
+        };
+        let rt = subgame::build_range_table_reach(&root, hero, &known, &bp, &pc)
+            .expect("reach table must build on a verified replay");
+        // Hit counts at seat 3's limp decision: always-call 1 combo (p=1), always-jam 4 combos
+        // (p=0), always-fold 6 combos (p=0) => mean_hit = 1/11.
+        let mean_hit = 1.0 / 11.0;
+        assert!((rt.get(3, 6, 7) - 1.0).abs() < 1e-12, "limp-call class keeps weight 1");
+        assert!(rt.get(3, 16, 20).abs() < 1e-12, "always-jam premium is zeroed for a CALL line");
+        assert!(rt.get(3, 44, 45).abs() < 1e-12, "always-fold trash is zeroed for a CALL line");
+        assert!(
+            (rt.get(3, 24, 25) - mean_hit).abs() < 1e-12,
+            "blueprint-miss combo gets the decision's mean hit probability, got {}",
+            rt.get(3, 24, 25)
+        );
+        // Folders (seats 4,5,0,1): their only decision has zero blueprint coverage -> flat 1.0.
+        for seat in [4usize, 5, 0, 1] {
+            assert!(
+                (rt.get(seat, 6, 7) - 1.0).abs() < 1e-12,
+                "uncovered seat {seat} must stay flat"
+            );
+        }
+        // build_rtab dispatch: reach-strict (no fold-now fallback) must refuse a corrupted history;
+        // with range_aware also on it must FALL BACK to the fold-now proxy (Some).
+        let mut bad = root;
+        bad.hist_seat[0] = 4;
+        assert!(
+            subgame::build_rtab(&bad, hero, &bp, &pc, &scfg6(false, true)).is_none(),
+            "reach-only on an unverifiable history must yield NO table (uniform deal)"
+        );
+        assert!(
+            subgame::build_rtab(&bad, hero, &bp, &pc, &scfg6(true, true)).is_some(),
+            "reach + range_aware on an unverifiable history must fall back to fold-now"
+        );
+        // And the full solve with the reach knob must stay a valid, deterministic distribution
+        // (the floor-blend keeps every combo's support > 0, so the CFR never starves a world).
+        let sc = scfg6(true, true);
+        let a = subgame::solve::<6>(&root, hero, &bp, &pc, &sc, 99);
+        let b = subgame::solve::<6>(&root, hero, &bp, &pc, &sc, 99);
+        assert_eq!(a, b, "reach-range solve must be deterministic");
+        let legal = legal_action_mask(&root, hero as i32);
+        let mut ssum = 0.0;
+        for a2 in 0..NUM_ACTIONS {
+            if !legal[a2] {
+                assert!(a[a2].abs() < 1e-9);
+            }
+            ssum += a[a2];
+        }
+        assert!((ssum - 1.0).abs() < 1e-6, "root probs must sum to 1");
     }
 }

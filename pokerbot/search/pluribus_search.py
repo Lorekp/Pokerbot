@@ -112,8 +112,26 @@ class PluribusReBeLConfig:
     # Q3 — UNIFORM ROBUSTNESS FLOOR for range_aware. sample_prob = (1-floor)*range + floor*uniform. Mirrors
     # the RNR restricted-response cap: a PRO who bluffs off-range is still sampled with weight >= floor, so
     # the hero keeps defending off-range/bluff hands. floor too LOW = exploitable by an off-range bluffer;
-    # floor=1.0 == range_aware OFF (pure uniform). Only read when range_aware.
+    # floor=1.0 == range_aware OFF (pure uniform). Only read when range_aware (or range_reach_full).
     range_uniform_floor: float = 0.25
+    # R1 (2026-07-03) — REACH-CONSISTENT OPPONENT ROOT RANGES (native lever; the honest fix for the
+    # BUG-2 "opponents may deviate above the node" half — replaces, does not stack on, the Q3 fold-now
+    # proxy). When True, the native solve weights each opponent seat's candidate hole combo by the
+    # BLUEPRINT REACH PRODUCT along the hand's observed public history: prod over the seat's observed
+    # decisions t of P_bp(a_t | combo, state_t) — the Pluribus/Libratus root-belief construction (Bayes
+    # under the blueprint) instead of "would this hand fold NOW". The per-decision states are rebuilt
+    # natively by REPLAYING the root's recorded history through the same engine, verified per step and
+    # against the root's public fields — on ANY mismatch the table falls back to the legacy behavior
+    # (fold-now if range_aware, else uniform), so a mis-keyed reach weight is impossible. Blueprint
+    # lookups use the same EMD-correct serve keying as everything else (preflop lossless preflop).
+    # Hero's decisions are skipped (his hand is a known point mass). The range_uniform_floor blend
+    # applies unchanged, so support is never zero. Weights are computed ONCE per solve at the root.
+    # Applies to BOTH the GTO and exploit native paths (like range_aware: GTO-consistent DATA about
+    # the public history entering only the world sampler; the frozen-read exploit math is untouched).
+    # NATIVE-ONLY (same precedent as range_aware/range_uniform_floor: the Python _cfv loop samples via
+    # PBSTracker, uniform in the eval base arm — per-combo replay likelihoods are prohibitively slow
+    # in Python). Default OFF => byte/stat-identical.
+    range_reach_full: bool = False
     # ENSEMBLE PARALLELISM (2026-07-01, native GTO path only). Run this many INDEPENDENT CFR streams in
     # parallel inside the native solve (rayon), each with its OWN regret/strategy tables + its OWN RNG
     # (seed = public_seed ^ (stream_idx*ODD)), then MERGE by summing the per-stream ROOT strategy_sum before
@@ -1329,6 +1347,9 @@ class PluribusReBeLSolver:
                     decouple_sampler=bool(cfg.decouple_sampler),
                     range_aware=bool(cfg.range_aware),
                     range_uniform_floor=float(cfg.range_uniform_floor),
+                    # R1 reach-consistent opponent root ranges (native replay + blueprint-reach
+                    # product; falls back to fold-now/uniform on an unverifiable history).
+                    range_reach_full=bool(cfg.range_reach_full),
                     # ENSEMBLE: N independent parallel CFR streams merged at the root (native rayon
                     # fan-out).
                     ensemble_streams=int(cfg.ensemble_streams),
@@ -1457,6 +1478,9 @@ class PluribusReBeLSolver:
                         decouple_sampler=bool(cfg.decouple_sampler),
                         range_aware=bool(cfg.range_aware),
                         range_uniform_floor=float(cfg.range_uniform_floor),
+                        # R1 reach ranges apply to the exploit path too (world sampling only — the
+                        # frozen-read exploit math is untouched, same precedent as range_aware).
+                        range_reach_full=bool(cfg.range_reach_full),
                         # NOTE: leaf_cache_worlds / avg_skip_frac / leaf_biased_continuations (+ its
                         # leaf_bias_mult) are deliberately NOT forwarded — the native solve_exploit
                         # hard-codes their no-op values and its FFI does not even accept them (firewall:

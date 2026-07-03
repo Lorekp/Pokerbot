@@ -556,7 +556,8 @@ def native_subgame_solve(
     blueprint_mix: float, rollout_samples: int, resample_board: bool, max_playout_depth: int,
     num_buckets: int, linear_averaging: bool = True, repair_deck: bool = False,
     two_sided: bool = False, decouple_sampler: bool = False, range_aware: bool = False,
-    range_uniform_floor: float = 0.25, ensemble_streams: int = 1, leaf_cache_worlds: int = 1,
+    range_uniform_floor: float = 0.25, range_reach_full: bool = False,
+    ensemble_streams: int = 1, leaf_cache_worlds: int = 1,
     avg_skip_frac: float = 0.0, leaf_biased_continuations: bool = False, leaf_bias_mult: float = 5.0,
     serve_final_iterate: bool = False,
 ):
@@ -568,7 +569,10 @@ def native_subgame_solve(
     average); the native core must apply the SAME weighting or the python/native crosscheck diverges.
 
     ``decouple_sampler`` (Q2) gives the opponent-hole deal its own deterministic sub-stream; ``range_aware``
-    (Q3) weights that deal by the blueprint continuation range mixed with ``range_uniform_floor`` uniform.
+    (Q3) weights that deal by the blueprint continuation range mixed with ``range_uniform_floor`` uniform;
+    ``range_reach_full`` (R1) replaces the Q3 fold-now proxy with the blueprint REACH product along the
+    hand's observed public history (natively replayed + verified; falls back to fold-now/uniform on an
+    unverifiable history), floored by the same ``range_uniform_floor`` blend.
 
     ``leaf_cache_worlds`` (BUG-1 fix) makes the public-keyed leaf cache a running mean over the first M
     visiting hole-worlds (1 = legacy first-touch freeze, byte-identical); ``avg_skip_frac`` (BUG-5
@@ -600,6 +604,7 @@ def native_subgame_solve(
             int(rollout_samples), bool(resample_board), bool(linear_averaging),
             bool(repair_deck), bool(two_sided),
             bool(decouple_sampler), bool(range_aware), float(range_uniform_floor),
+            bool(range_reach_full),
             int(ensemble_streams),
             int(leaf_cache_worlds), float(avg_skip_frac),
             bool(leaf_biased_continuations), float(leaf_bias_mult),
@@ -607,8 +612,9 @@ def native_subgame_solve(
         )
     except TypeError:
         # Stale native binary built before the linear_averaging / repair_deck / two_sided / decouple /
-        # range_aware / leaf_cache_worlds / avg_skip_frac / leaf_biased_continuations /
-        # serve_final_iterate args — fall back to Python so a not-yet-rebuilt crate doesn't crash the
+        # range_aware / range_reach_full / leaf_cache_worlds / avg_skip_frac /
+        # leaf_biased_continuations / serve_final_iterate args — fall back to Python so a
+        # not-yet-rebuilt crate doesn't crash the
         # solve (the Python path applies the same weighting + repair_deck/two_sided +
         # leaf_cache_worlds/avg_skip_frac/leaf_biased_continuations/serve_final_iterate; the Q2/Q3
         # world-sampling levers are native-only, so the fallback is the uniform-deal base arm).
@@ -645,6 +651,7 @@ def native_subgame_solve_exploit(
     num_buckets: int, linear_averaging: bool, frozen_table, rnr, frozen_read_response: bool,
     rnr_restrict: bool, want_root_q: bool, repair_deck: bool = False,
     decouple_sampler: bool = False, range_aware: bool = False, range_uniform_floor: float = 0.25,
+    range_reach_full: bool = False,
 ):
     """Native exploit subgame solve. Returns ``(probs[11], root_q[11] or None)`` or ``None`` when the
     native path is unavailable / the adapter is unsupported / the binary is stale (caller runs Python).
@@ -678,6 +685,7 @@ def native_subgame_solve_exploit(
             bool(frozen_read_response), bool(rnr_restrict), bool(want_root_q),
             bool(repair_deck),
             bool(decouple_sampler), bool(range_aware), float(range_uniform_floor),
+            bool(range_reach_full),
         )
     except (TypeError, AttributeError):
         # Stale native binary lacking solve_exploit (or a signature mismatch) -> fall back to Python.

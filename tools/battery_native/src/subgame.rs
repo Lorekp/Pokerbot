@@ -28,7 +28,10 @@
 
 use std::collections::HashMap;
 
-use crate::core::{self, EnvStateN, ALL_IN, BET_BUCKET_START, FOLD, NUM_ACTIONS, SEAT_FOLDED, SEAT_LIVE};
+use crate::core::{
+    self, EnvStateN, ALL_IN, BB_CHIPS, BET_BUCKET_START, FOLD, NUM_ACTIONS, SB_CHIPS, SEAT_FOLDED,
+    SEAT_LIVE,
+};
 use crate::fingerprint::CHIP_UNIT;
 use crate::playout::{self, Blueprint, PlayoutConfig, Rng};
 
@@ -84,8 +87,32 @@ pub struct SubgameConfig {
     /// per-combo sampling probability is `(1-floor)*range + floor*uniform`. A PRO who bluffs off-range is
     /// still sampled with weight >= floor/|unseen combos| per seat, so the hero keeps defending off-range /
     /// bluff hands. floor=1.0 => pure uniform (== range_aware OFF); floor=0.0 => the honest-range extreme
-    /// (exploitable by an off-range bluffer). Only read when `range_aware`.
+    /// (exploitable by an off-range bluffer). Only read when `range_aware` (or `range_reach_full`).
     pub range_uniform_floor: f64,
+    /// R1 (2026-07-03) — REACH-CONSISTENT OPPONENT ROOT RANGES (the honest fix for the BUG-2 "opponents
+    /// may deviate above the node" half; replaces — does not stack on — the Q3 fold-now proxy). When ON,
+    /// each opponent seat's range weight per candidate hole combo is the BLUEPRINT REACH PRODUCT along the
+    /// hand's OBSERVED public history: `w_s[combo] = Π_{observed decisions t of seat s} P_bp(a_t | combo,
+    /// state_t)` — "how likely is this hand GIVEN every action the seat actually took", the Pluribus/
+    /// Libratus root-belief construction (Bayes under the blueprint, never re-sampled) instead of the
+    /// one-node "would this hand fold NOW" proxy. The per-decision states are reconstructed by REPLAYING
+    /// the root's recorded history (`hist_seat`/`hist_action`) forward from a rebuilt hand-start state
+    /// through the SAME `core::apply_action`/`sample_chance` engine, and the replay is VERIFIED per step
+    /// (recorded amounts) and at the end (public-field equality with the root) — on ANY mismatch the
+    /// table falls back to the legacy behavior (`range_aware` fold-now proxy if set, else uniform), so a
+    /// mis-keyed reach weight is structurally impossible (the miskey lesson: worse than uniform).
+    /// Blueprint lookups use the SAME `pcfg.fp_key` EMD-correct serve keying as every other lookup
+    /// (preflop lossless keys for preflop actions). HERO's decisions are SKIPPED (hero's hand is a known
+    /// point mass; his actions carry no information about opponent holes). Blueprint MISSES factor to the
+    /// decision's mean hit probability (no per-combo information, scale-neutral); a decision whose
+    /// observed action is outside the abstracted legal set, or with no blueprint hits at all, is skipped
+    /// entirely. The existing `range_uniform_floor` blend applies unchanged at sample time, so support is
+    /// NEVER zero (an off-blueprint line is still sampled at >= floor*uniform — RNR-style robustness).
+    /// Weights are computed ONCE per solve at the root (pure function of the public history). Applies to
+    /// BOTH the GTO and exploit paths (like `range_aware`: GTO-consistent DATA about the public history
+    /// entering only the world sampler — the frozen-read exploit math is untouched). Default OFF =>
+    /// byte/stat-identical to today.
+    pub range_reach_full: bool,
     /// ENSEMBLE PARALLELISM (2026-07-01). Run this many INDEPENDENT CFR streams in parallel (rayon), each
     /// with its OWN regret/strategy tables + its OWN RNG (seed = public_seed ^ (stream_idx*ODD_CONST)), then
     /// MERGE by summing the per-stream root strategy_sum (and regrets, for the fallback) before extracting
@@ -686,7 +713,7 @@ fn hero_board_known<const N: usize>(root: &EnvStateN<N>, hero: usize) -> [bool; 
 /// `(root, seat, hole)` — INVARIANT across worlds — so hoisting it out of the per-world deal turns range-
 /// aware sampling from O(K * combos) blueprint lookups into O(combos) (K× cheaper). `None` when range-aware
 /// is off (the uniform path never touches it).
-struct RangeTable {
+pub(crate) struct RangeTable {
     // Flattened [seat][52*52]; only the c0<c1 upper triangle is populated (others 0, never read).
     w: Vec<f64>,
     stride: usize,
@@ -694,9 +721,16 @@ struct RangeTable {
 
 impl RangeTable {
     #[inline]
-    fn get(&self, seat: usize, c0: i32, c1: i32) -> f64 {
+    pub(crate) fn get(&self, seat: usize, c0: i32, c1: i32) -> f64 {
         let (a, b) = if c0 < c1 { (c0, c1) } else { (c1, c0) };
         self.w[seat * self.stride + (a as usize) * 52 + (b as usize)]
+    }
+
+    /// Flattened seat-major copy of the weight table (52*52 per seat, c0<c1 upper triangle) — the
+    /// probe/debug FFI surface (`SubgameSolver.range_weights`), used by the offline sanity/log-loss
+    /// validation of the reach-range plumbing. Never on the solve hot path.
+    pub(crate) fn to_flat(&self) -> Vec<f64> {
+        self.w.clone()
     }
 }
 
@@ -708,7 +742,8 @@ fn build_range_table<const N: usize>(
     root: &EnvStateN<N>,
     hero: usize,
     known: &[bool; 52],
-    ctx: &Ctx,
+    bp: &Blueprint,
+    pcfg: &PlayoutConfig,
 ) -> RangeTable {
     let stride = 52 * 52;
     let mut w = vec![0.0f64; N * stride];
@@ -722,7 +757,7 @@ fn build_range_table<const N: usize>(
             for j in (i + 1)..unseen.len() {
                 let c0 = unseen[i];
                 let c1 = unseen[j];
-                let cw = continue_weight(root, seat, c0, c1, ctx);
+                let cw = continue_weight(root, seat, c0, c1, bp, pcfg);
                 w[base + (c0 as usize) * 52 + (c1 as usize)] = cw;
             }
         }
@@ -762,7 +797,7 @@ fn deal_opponent_holes<const N: usize>(
         }
     }
 
-    let rtab = match (scfg.range_aware, rtab) {
+    let rtab = match (scfg.range_aware || scfg.range_reach_full, rtab) {
         (true, Some(rt)) => rt,
         _ => {
             // UNIFORM (byte/stat-identical to the pre-Q3 deal): Fisher-Yates over the whole unseen pool.
@@ -817,18 +852,466 @@ fn continue_weight<const N: usize>(
     seat: usize,
     c0: i32,
     c1: i32,
-    ctx: &Ctx,
+    bp: &Blueprint,
+    pcfg: &PlayoutConfig,
 ) -> f64 {
     // Substitute the candidate hole into a scratch copy (only holes[seat] is read by the fingerprint).
     let mut s = *root;
     s.holes[seat][0] = c0;
     s.holes[seat][1] = c1;
-    let legal = abstracted_legal(&s, seat, ctx.pcfg);
+    let legal = abstracted_legal(&s, seat, pcfg);
     if !legal[FOLD] {
         return 1.0; // cannot fold => no range narrowing from a continuation signal.
     }
-    let pol = blueprint_policy(&s, seat, &legal, ctx.bp, ctx.pcfg);
+    let pol = blueprint_policy(&s, seat, &legal, bp, pcfg);
     (1.0 - pol[FOLD]).clamp(0.0, 1.0)
+}
+
+// --------------------------------------------------------------------------------------------------
+// R1 — reach-consistent opponent root ranges (range_reach_full; gated, default OFF)
+// --------------------------------------------------------------------------------------------------
+
+/// `core::first_live_after` twin (core's is private and core.rs is frozen — reimplemented verbatim):
+/// the first SEAT_LIVE seat clockwise after `from_seat`, or -1 when none.
+fn first_live_after_rs<const N: usize>(seat_status: &[i8; N], from_seat: i32) -> i32 {
+    for off in 1..=(N as i32) {
+        let seat = ((from_seat + off).rem_euclid(N as i32)) as usize;
+        if seat_status[seat] == SEAT_LIVE {
+            return seat as i32;
+        }
+    }
+    -1
+}
+
+/// `core::nth_live_after` twin: the n-th live seat clockwise after `from_seat` (n >= 1).
+fn nth_live_after_rs<const N: usize>(seat_status: &[i8; N], from_seat: i32, n: i32) -> i32 {
+    let mut seat = from_seat;
+    for _ in 0..n {
+        seat = first_live_after_rs(seat_status, seat);
+        if seat < 0 {
+            return -1;
+        }
+    }
+    seat
+}
+
+/// One observed decision from the replayed public history: `(seat, action, state)` where `state` is
+/// the PUBLIC state at which the decision was taken. Holes are NOT reconstructed (they are unknowable
+/// and unused): the reach builder substitutes each candidate combo into `state.holes[seat]` before the
+/// fingerprint lookup — the only reader of hole data on this path.
+pub(crate) type ReplayStep<const N: usize> = (usize, usize, EnvStateN<N>);
+
+/// PUBLIC-field equality between the replayed end state and the solve root — the replay's acceptance
+/// gate. Deliberately excludes private/derived fields the replay cannot or need not reproduce: holes
+/// (unknown), deck/deck_ptr/rng_key (the replay deck is a synthetic stuffing of the observed board),
+/// rewards (root is non-terminal) and the hist arrays (verified per step during the replay).
+fn public_eq<const N: usize>(a: &EnvStateN<N>, b: &EnvStateN<N>) -> bool {
+    a.street == b.street
+        && a.board == b.board
+        && a.pot_dead == b.pot_dead
+        && a.current_bet == b.current_bet
+        && a.min_raise == b.min_raise
+        && a.button == b.button
+        && a.action_seat == b.action_seat
+        && a.last_aggressor == b.last_aggressor
+        && a.last_raise_full == b.last_raise_full
+        && a.done == b.done
+        && a.pending_deal == b.pending_deal
+        && a.hist_len == b.hist_len
+        && a.seat_status == b.seat_status
+        && a.stacks == b.stacks
+        && a.committed_street == b.committed_street
+        && a.committed_total == b.committed_total
+        && a.acted == b.acted
+}
+
+/// Replay the root's recorded history forward from a rebuilt hand-start state (given per-seat antes),
+/// snapshotting the PUBLIC state before every decision. Returns None on ANY inconsistency: seat/action
+/// out of range, wrong actor, illegal action, a recorded amount that does not reproduce, or a final
+/// state that is not publicly identical to the root. The start state mirrors `core::init_hand_n` /
+/// `post_blinds_n` exactly (blinds from SB_CHIPS/BB_CHIPS clamped to stacks, antes to pot_dead +
+/// committed_total, all-in marking, UTG/HU first actor); the deck is stuffed with the observed board
+/// so `sample_chance` reveals exactly the real runout at each street close.
+fn replay_with_ante<const N: usize>(
+    root: &EnvStateN<N>,
+    ante_each: &[i32; N],
+) -> Option<Vec<ReplayStep<N>>> {
+    let hist_len = root.hist_len;
+    if root.done || !(0..=core::MAX_HISTORY as i32).contains(&hist_len) {
+        return None;
+    }
+    let hist_len = hist_len as usize;
+
+    // ---- hand-start reconstruction ----
+    let mut status0 = [core::SEAT_EMPTY; N];
+    for i in 0..N {
+        if root.seat_status[i] != core::SEAT_EMPTY {
+            status0[i] = SEAT_LIVE;
+        }
+    }
+    let mut stacks0 = [0i32; N];
+    for i in 0..N {
+        stacks0[i] = root.stacks[i] + root.committed_total[i];
+    }
+    let button = root.button;
+    let sb = nth_live_after_rs(&status0, button, 1);
+    let bb = nth_live_after_rs(&status0, button, 2);
+    if sb < 0 || bb < 0 || sb == bb {
+        return None;
+    }
+    let (sb, bb) = (sb as usize, bb as usize);
+    let mut committed = [0i32; N];
+    // post_blinds_n order: blinds first (clamped to the pre-ante stack), then antes (clamped to the
+    // post-blind stack). sb/bb are SEAT_LIVE by construction of nth_live_after_rs.
+    let sb_paid = SB_CHIPS.min(stacks0[sb].max(0));
+    let bb_paid = BB_CHIPS.min(stacks0[bb].max(0));
+    stacks0[sb] -= sb_paid;
+    stacks0[bb] -= bb_paid;
+    committed[sb] = sb_paid;
+    committed[bb] = bb_paid;
+    let mut committed_total0 = [0i32; N];
+    let mut pot_dead0 = 0i32;
+    for i in 0..N {
+        let a = ante_each[i];
+        if status0[i] == core::SEAT_EMPTY {
+            if a != 0 {
+                return None;
+            }
+            continue;
+        }
+        if a < 0 || a > stacks0[i] {
+            return None;
+        }
+        stacks0[i] -= a;
+        pot_dead0 += a;
+        committed_total0[i] = committed[i] + a;
+    }
+    for i in 0..N {
+        if status0[i] != core::SEAT_EMPTY && stacks0[i] == 0 {
+            status0[i] = core::SEAT_ALLIN;
+        }
+    }
+    let mut current_bet0 = 0i32;
+    for i in 0..N {
+        if committed[i] > current_bet0 {
+            current_bet0 = committed[i];
+        }
+    }
+    let mut n_live = 0i32;
+    for i in 0..N {
+        if status0[i] == SEAT_LIVE {
+            n_live += 1;
+        }
+    }
+    let btn_first = nth_live_after_rs(&status0, button, 1);
+    let utg = nth_live_after_rs(&status0, button, 3);
+    let action_seat0 = if n_live <= 2 { btn_first } else { utg };
+    if action_seat0 < 0 {
+        return None;
+    }
+
+    // Deck stuffed with the observed board at the front so street closes reveal the real runout;
+    // the tail (never dealt during a valid replay) is filled with the remaining distinct cards.
+    let mut deck = [0i32; 52];
+    let mut used = [false; 52];
+    let mut p = 0usize;
+    for &c in root.board.iter() {
+        if c >= 0 {
+            if !(0..52).contains(&c) || used[c as usize] {
+                return None;
+            }
+            deck[p] = c;
+            used[c as usize] = true;
+            p += 1;
+        }
+    }
+    for c in 0..52i32 {
+        if !used[c as usize] {
+            deck[p] = c;
+            p += 1;
+        }
+    }
+
+    let mut s = EnvStateN::<N> {
+        holes: [[-1i32; 2]; N],
+        board: [-1i32; core::MAX_BOARD],
+        seat_status: status0,
+        stacks: stacks0,
+        committed_street: committed,
+        committed_total: committed_total0,
+        street: core::STREET_PREFLOP,
+        pot_dead: pot_dead0,
+        current_bet: current_bet0,
+        min_raise: BB_CHIPS,
+        button,
+        action_seat: action_seat0,
+        last_aggressor: -1,
+        acted: [false; N],
+        last_raise_full: true,
+        deck,
+        deck_ptr: 0,
+        rng_key: root.rng_key,
+        hist_seat: [-1i32; core::MAX_HISTORY],
+        hist_action: [-1i32; core::MAX_HISTORY],
+        hist_amount: [0i32; core::MAX_HISTORY],
+        hist_len: 0,
+        done: false,
+        rewards: [0i32; N],
+        pending_deal: false,
+    };
+
+    // ---- forward replay with per-step verification ----
+    let mut steps: Vec<ReplayStep<N>> = Vec::with_capacity(hist_len);
+    for t in 0..hist_len {
+        let mut guard = 0;
+        while core::is_chance_node(&s) {
+            s = core::sample_chance(&s);
+            guard += 1;
+            if guard > 4 {
+                return None;
+            }
+        }
+        if s.done {
+            return None;
+        }
+        let seat = root.hist_seat[t];
+        let action = root.hist_action[t];
+        if seat < 0 || seat >= N as i32 || !(0..NUM_ACTIONS as i32).contains(&action) {
+            return None;
+        }
+        if s.action_seat != seat {
+            return None;
+        }
+        let full = core::legal_action_mask(&s, seat);
+        if !full[action as usize] {
+            return None;
+        }
+        steps.push((seat as usize, action as usize, s));
+        s = core::apply_action(&s, action as usize);
+        // The replayed engine re-records the action it just applied; the recorded (seat, action,
+        // amount) triple must reproduce the root's history entry exactly (amount mismatches catch a
+        // wrong start-state reconstruction immediately, e.g. mis-derived antes or blinds).
+        if s.hist_len as usize != t + 1
+            || s.hist_seat[t] != root.hist_seat[t]
+            || s.hist_action[t] != root.hist_action[t]
+            || s.hist_amount[t] != root.hist_amount[t]
+        {
+            return None;
+        }
+    }
+    let mut guard = 0;
+    while core::is_chance_node(&s) {
+        s = core::sample_chance(&s);
+        guard += 1;
+        if guard > 4 {
+            return None;
+        }
+    }
+    if !public_eq(&s, root) {
+        return None;
+    }
+    Some(steps)
+}
+
+/// Replay the root's recorded public history, deriving per-seat antes from the chip identity
+/// `ante[i] = committed_total[i] - blind[i] - Σ recorded amounts of seat i` (exact for every normal
+/// hand; a clamped call-for-less overstates the recorded amount, driving the derived ante negative —
+/// in that case retry with zero antes, which is exact for the ante-free cash regimes this serves).
+/// Every attempt is fully verified (per-step + final public equality), so a wrong guess can never
+/// produce states — only a None (=> the caller falls back to the legacy range behavior).
+pub(crate) fn replay_public_states<const N: usize>(root: &EnvStateN<N>) -> Option<Vec<ReplayStep<N>>> {
+    let hist_len = root.hist_len;
+    if root.done || !(0..=core::MAX_HISTORY as i32).contains(&hist_len) {
+        return None;
+    }
+    let hl = hist_len as usize;
+    // Blind seats/amounts from the reconstructed start occupancy (mirrors replay_with_ante).
+    let mut status0 = [core::SEAT_EMPTY; N];
+    for i in 0..N {
+        if root.seat_status[i] != core::SEAT_EMPTY {
+            status0[i] = SEAT_LIVE;
+        }
+    }
+    let mut stacks0 = [0i64; N];
+    for i in 0..N {
+        stacks0[i] = root.stacks[i] as i64 + root.committed_total[i] as i64;
+    }
+    let sb = nth_live_after_rs(&status0, root.button, 1);
+    let bb = nth_live_after_rs(&status0, root.button, 2);
+    if sb < 0 || bb < 0 || sb == bb {
+        return None;
+    }
+    let mut blind = [0i64; N];
+    blind[sb as usize] = (SB_CHIPS as i64).min(stacks0[sb as usize].max(0));
+    blind[bb as usize] = (BB_CHIPS as i64).min(stacks0[bb as usize].max(0));
+    let mut hist_commit = [0i64; N];
+    for t in 0..hl {
+        let seat = root.hist_seat[t];
+        if seat < 0 || seat >= N as i32 {
+            return None;
+        }
+        hist_commit[seat as usize] += root.hist_amount[t].max(0) as i64;
+    }
+    let mut ante = [0i32; N];
+    let mut derived_ok = true;
+    let mut any_nonzero = false;
+    for i in 0..N {
+        let a = root.committed_total[i] as i64 - blind[i] - hist_commit[i];
+        if a < 0 {
+            derived_ok = false;
+            break;
+        }
+        if a > 0 {
+            any_nonzero = true;
+        }
+        ante[i] = a as i32;
+    }
+    if derived_ok {
+        if let Some(v) = replay_with_ante(root, &ante) {
+            return Some(v);
+        }
+        if !any_nonzero {
+            return None; // zero-ante attempt already failed; a retry would be identical.
+        }
+    }
+    replay_with_ante(root, &[0i32; N])
+}
+
+/// Blueprint probability of `action` for `seat` at state `s` (holes already substituted), masked +
+/// renormalized over the abstracted legal set — the SAME `pcfg.fp_key` serve keying as every other
+/// blueprint lookup. Returns None on a blueprint MISS or zero masked mass: the row carries no
+/// per-combo information (the caller substitutes the decision's mean hit probability, scale-neutral).
+fn blueprint_action_prob<const N: usize>(
+    s: &EnvStateN<N>,
+    seat: usize,
+    abst: &[bool; NUM_ACTIONS],
+    action: usize,
+    bp: &Blueprint,
+    pcfg: &PlayoutConfig,
+) -> Option<f64> {
+    let key = pcfg.fp_key(s, seat);
+    let row = bp.get(&key)?;
+    let mut tot = 0.0;
+    for a in 0..NUM_ACTIONS {
+        if abst[a] {
+            tot += row[a].max(0.0);
+        }
+    }
+    if tot <= 1e-12 {
+        return None;
+    }
+    Some(row[action].max(0.0) / tot)
+}
+
+/// R1 — build the REACH-CONSISTENT range table: `w_s[combo] = Π_{observed decisions t of seat s}
+/// P_bp(a_t | combo, state_t)` over the replayed public history. Hero's decisions are skipped (his
+/// hand is a known point mass). Per decision: the abstracted legal mask is hole-independent (computed
+/// once); a decision whose observed action falls outside the abstraction, or with no blueprint hits
+/// (or all-zero hit mass — e.g. the action is never taken by ANY holding under the blueprint), is
+/// skipped as carrying no per-combo information; blueprint-MISS combos factor the decision's mean hit
+/// probability (neutral — no information about THAT combo, without distorting the hit combos' scale).
+/// Returns None when the history cannot be replayed + verified (caller falls back to legacy behavior).
+pub(crate) fn build_range_table_reach<const N: usize>(
+    root: &EnvStateN<N>,
+    hero: usize,
+    known: &[bool; 52],
+    bp: &Blueprint,
+    pcfg: &PlayoutConfig,
+) -> Option<RangeTable> {
+    let steps = replay_public_states(root)?;
+    let stride = 52 * 52;
+    let mut w = vec![0.0f64; N * stride];
+    let unseen: Vec<i32> = (0..52).filter(|&c| !known[c as usize]).collect();
+    let m = unseen.len();
+    if m < 2 {
+        return None;
+    }
+    let mut combos: Vec<(i32, i32)> = Vec::with_capacity(m * (m - 1) / 2);
+    for i in 0..m {
+        for j in (i + 1)..m {
+            combos.push((unseen[i], unseen[j]));
+        }
+    }
+    // Prior: weight 1.0 (no information) for every candidate combo of every non-hero seat — a seat
+    // with no observed decisions (or only uninformative ones) stays uniform, exactly like today.
+    for seat in 0..N {
+        if seat == hero {
+            continue;
+        }
+        let base = seat * stride;
+        for &(c0, c1) in &combos {
+            w[base + (c0 as usize) * 52 + c1 as usize] = 1.0;
+        }
+    }
+    let mut p = vec![0.0f64; combos.len()];
+    let mut hit = vec![false; combos.len()];
+    for (seat, action, st) in steps.iter() {
+        let (seat, action) = (*seat, *action);
+        if seat == hero {
+            continue;
+        }
+        let legal = abstracted_legal(st, seat, pcfg);
+        if !legal[action] {
+            continue; // observed action outside the search abstraction: no info under this keying.
+        }
+        let mut scratch = *st;
+        let mut sum_hit = 0.0f64;
+        let mut n_hit = 0usize;
+        let mut max_p = 0.0f64;
+        for (k, &(c0, c1)) in combos.iter().enumerate() {
+            scratch.holes[seat][0] = c0;
+            scratch.holes[seat][1] = c1;
+            match blueprint_action_prob(&scratch, seat, &legal, action, bp, pcfg) {
+                Some(prob) => {
+                    p[k] = prob;
+                    hit[k] = true;
+                    sum_hit += prob;
+                    n_hit += 1;
+                    if prob > max_p {
+                        max_p = prob;
+                    }
+                }
+                None => hit[k] = false,
+            }
+        }
+        if n_hit == 0 || max_p <= 1e-12 {
+            continue; // no per-combo signal at this decision (all-miss, or action prob 0 everywhere).
+        }
+        let mean_hit = sum_hit / n_hit as f64;
+        let base = seat * stride;
+        for (k, &(c0, c1)) in combos.iter().enumerate() {
+            let f = if hit[k] { p[k] } else { mean_hit };
+            w[base + (c0 as usize) * 52 + c1 as usize] *= f;
+        }
+    }
+    Some(RangeTable { w, stride })
+}
+
+/// The range-table dispatcher shared by `solve_rows` and `solve_exploit` (and the probe FFI):
+///   * `range_reach_full` => the R1 reach table; on replay failure fall back to the legacy behavior
+///     implied by `range_aware` alone (fold-now proxy if set, else None => uniform deal);
+///   * `range_aware` only => the Q3 fold-now proxy (unchanged);
+///   * neither => None (the uniform deal, byte-identical to today).
+pub(crate) fn build_rtab<const N: usize>(
+    root: &EnvStateN<N>,
+    hero: usize,
+    bp: &Blueprint,
+    pcfg: &PlayoutConfig,
+    scfg: &SubgameConfig,
+) -> Option<RangeTable> {
+    if !(scfg.range_aware || scfg.range_reach_full) {
+        return None;
+    }
+    let known = hero_board_known(root, hero);
+    if scfg.range_reach_full {
+        if let Some(rt) = build_range_table_reach(root, hero, &known, bp, pcfg) {
+            return Some(rt);
+        }
+        if !scfg.range_aware {
+            return None;
+        }
+    }
+    Some(build_range_table(root, hero, &known, bp, pcfg))
 }
 
 /// Sample one distinct 2-card combo for `seat` from the range-tilted distribution over combos of unseen
@@ -1355,14 +1838,11 @@ pub(crate) fn solve_rows<const N: usize>(
     } else {
         vec![hero]
     };
-    // Q3 RANGE TABLE: build the per-seat blueprint continuation-weight table ONCE (invariant across worlds
-    // AND across ensemble streams -- it is a pure blueprint read of the fixed root).
-    let rtab = if scfg.range_aware {
-        let known = hero_board_known(root, hero);
-        Some(build_range_table(root, hero, &known, &ctx))
-    } else {
-        None
-    };
+    // Q3/R1 RANGE TABLE: build the per-seat range table ONCE (invariant across worlds AND across
+    // ensemble streams -- a pure blueprint read of the fixed root + its recorded public history).
+    // range_reach_full => the R1 blueprint-reach product (fold-now / uniform fallback on replay
+    // failure); range_aware only => the Q3 fold-now proxy; neither => None (uniform deal).
+    let rtab = build_rtab(root, hero, bp, pcfg, scfg);
 
     // Sum the per-stream ROOT strategy_sum (mass-weighted average of N independent CFR averages == variance
     // reduction) and root regrets (for the no-avg fallback). Single stream => stream 0 with seed exactly
@@ -1640,13 +2120,10 @@ pub fn solve_exploit<const N: usize>(
     } else {
         None
     };
-    // Q3 RANGE TABLE (built against the exploit path's base Ctx — a pure blueprint read, firewall-safe).
-    let rtab = if scfg.range_aware {
-        let known = hero_board_known(root, hero);
-        Some(build_range_table(root, hero, &known, &cx.base))
-    } else {
-        None
-    };
+    // Q3/R1 RANGE TABLE (a pure blueprint read of the root + its recorded public history — like
+    // range_aware, reach-consistent ranges are GTO-consistent DATA entering only the world sampler;
+    // the frozen-read exploit math is untouched, firewall-safe).
+    let rtab = build_rtab(root, hero, bp, pcfg, scfg);
     let iters = scfg.max_iterations.max(0);
     for t in 0..iters {
         let mut world = *root;
