@@ -135,6 +135,7 @@ fn main() {
         dcfr: false,
         dcfr_prune_threshold: -300_000.0,
         dcfr_explore_frac: 0.05,
+        river_ochs: None,
     };
 
     let mut tab = NlheTables::new();

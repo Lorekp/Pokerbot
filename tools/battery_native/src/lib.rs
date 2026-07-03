@@ -22,6 +22,7 @@ pub mod leduc;
 pub mod nnet;
 pub mod phe_tables;
 pub mod playout;
+pub mod river_ochs;
 pub mod subgame;
 pub mod trainer;
 
@@ -1152,6 +1153,7 @@ mod py {
         tab: nlhe_trainer::NlheTables,
         cfg: nlhe_trainer::TrainerCfg,
         emd_stamp: String,
+        river_stamp: String,
         // HOGWILD runtime state (feature `hogwild`). `Some` when the trainer was constructed with the
         // hogwild path enabled (constructor `hogwild=True` OR env `POKERBOT_HOGWILD=1`): all `train` calls
         // then read+write the shared lock-free table in place (no fork/merge/floor barrier). When `None`
@@ -1170,7 +1172,7 @@ mod py {
     #[pymethods]
     impl NlheCFRTrainer {
         #[new]
-        #[pyo3(signature = (num_buckets, depth_edges, n_deals_per_iter, n_seats=6, prune_threshold=f64::NEG_INFINITY, fast_merge=false, emd_frozen_path=None, batch_deals=0, hogwild=false, hogwild_capacity=1_048_576, work_steal=false, dcfr=false, dcfr_prune_threshold=-300_000.0, dcfr_explore_frac=0.05))]
+        #[pyo3(signature = (num_buckets, depth_edges, n_deals_per_iter, n_seats=6, prune_threshold=f64::NEG_INFINITY, fast_merge=false, emd_frozen_path=None, batch_deals=0, hogwild=false, hogwild_capacity=1_048_576, work_steal=false, dcfr=false, dcfr_prune_threshold=-300_000.0, dcfr_explore_frac=0.05, river_ochs_path=None))]
         #[allow(clippy::too_many_arguments)]
         fn new(
             num_buckets: i32,
@@ -1189,6 +1191,9 @@ mod py {
             dcfr: bool,
             dcfr_prune_threshold: f64,
             dcfr_explore_frac: f64,
+            // Blueprint-v2 river OCHS table (`river_ochs.rs`); None (default) = made-hand mirror river,
+            // byte-identical to the shipped trainer.
+            river_ochs_path: Option<String>,
         ) -> PyResult<Self> {
             let (emd_frozen, emd_stamp) = match emd_frozen_path {
                 Some(path) => {
@@ -1209,6 +1214,15 @@ mod py {
                         lookup.rows.len()
                     );
                     (Some(Arc::new(lookup)), stamp)
+                }
+                None => (None, "none".to_string()),
+            };
+            let (river_ochs, river_stamp) = match river_ochs_path {
+                Some(path) => {
+                    let table = crate::river_ochs::RiverOchs::load_path(&path)
+                        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+                    let stamp = format!("path={} k={} n_clusters={}", path, table.n_buckets, 8);
+                    (Some(Arc::new(table)), stamp)
                 }
                 None => (None, "none".to_string()),
             };
@@ -1246,8 +1260,10 @@ mod py {
                     dcfr,
                     dcfr_prune_threshold,
                     dcfr_explore_frac,
+                    river_ochs,
                 },
                 emd_stamp,
+                river_stamp,
                 #[cfg(feature = "hogwild")]
                 hog: if _hogwild_requested {
                     Some(HogState {
@@ -1291,6 +1307,12 @@ mod py {
 
         fn emd_stamp(&self) -> String {
             self.emd_stamp.clone()
+        }
+
+        /// Provenance stamp of the river OCHS table this trainer keys the river with ("none" =
+        /// the made-hand mirror river of the shipped trainer).
+        fn river_ochs_stamp(&self) -> String {
+            self.river_stamp.clone()
         }
 
         fn train(&mut self, py: Python<'_>, iterations: u64) -> PyResult<()> {

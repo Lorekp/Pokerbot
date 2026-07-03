@@ -325,6 +325,15 @@ pub struct TrainerCfg {
     /// DETERMINISTIC function of the iteration seed (reproducible across resume), NOT a fresh RNG. Default
     /// `0.05` (Pluribus's ~5%). Ignored when `dcfr` is OFF.
     pub dcfr_explore_frac: f64,
+    /// Blueprint-v2 river OCHS abstraction (`river_ochs.rs`). `None` (the default) keeps the river on
+    /// the made-hand mirror bucket — BYTE-IDENTICAL to the shipped trainer. `Some(table)` routes RIVER
+    /// (5-board-card) postflop buckets through the OCHS nearest-centroid id instead (flop/turn stay on
+    /// `emd_frozen`; preflop unchanged). River OCHS bucket ids intentionally share the `b"B"` message
+    /// space with flop/turn ids — the street byte in the betting state disambiguates — so the key FORMAT
+    /// is unchanged and only the river-row SEMANTICS differ. A blueprint trained with this MUST be served
+    /// with the same table (`POKERBOT_RIVER_OCHS`), else serve HITS wrong-semantics river rows (the stamp
+    /// guard enforces this). Wrapped in `Arc` so rayon workers share one read-only table.
+    pub river_ochs: Option<Arc<crate::river_ochs::RiverOchs>>,
 }
 
 /// The persistent, durable trainer state — the genuine gap #1. Survives every traversal; merged
@@ -960,13 +969,27 @@ pub fn fingerprint_fast_depth_memo_emd<const N: usize>(
     num_buckets: i32,
     depth_edges: &[f64],
     emd_frozen: Option<&FrozenEMDLookup>,
+    river_ochs: Option<&crate::river_ochs::RiverOchs>,
     memo: &mut FpMemo,
 ) -> [u8; 16] {
+    let nb = s.board.iter().filter(|&&c| c >= 0).count();
+    // Blueprint-v2: river OCHS bucket (5 board cards) when a table is configured. Checked FIRST so
+    // the river never silently falls through to the made-hand mirror when OCHS is active (the two
+    // share bucket-id space; a fall-through would write wrong-semantics rows). `None` (default) is
+    // byte-identical to the shipped trainer.
+    if let Some(table) = river_ochs {
+        if nb == 5 && s.holes[seat][0] >= 0 && s.holes[seat][1] >= 0 {
+            if let Some(bucket) =
+                crate::river_ochs::river_ochs_bucket_memoed(table, &s.holes[seat], &s.board)
+            {
+                return fingerprint_fast_depth_postflop_bucket_memo(s, seat, bucket, memo);
+            }
+        }
+    }
     if let Some(lookup) = emd_frozen {
         // Try the frozen EMD bucket for flop/turn postflop. `lookup.bucket` returns `None` for
         // preflop / river / malformed spots — those go through the made-hand path (river is
         // made-hand-equivalent by construction; see `emd::strength_histogram`).
-        let nb = s.board.iter().filter(|&&c| c >= 0).count();
         if nb >= 3 && nb <= 4 && s.holes[seat][0] >= 0 && s.holes[seat][1] >= 0 {
             if let Some(bucket) = emd_bucket_memoed(lookup, &s.holes[seat], &s.board) {
                 return fingerprint_fast_depth_postflop_bucket_memo(s, seat, bucket, memo);
@@ -989,9 +1012,20 @@ fn fingerprint_fast_depth_memo_emd_profile<const N: usize>(
     depth_edges: &[f64],
     emd_frozen: Option<&FrozenEMDLookup>,
     memo: &mut FpMemo,
+    river_ochs: Option<&crate::river_ochs::RiverOchs>,
     stats: &mut TraverseStats,
 ) -> [u8; 16] {
     stats.fingerprint_calls += 1;
+    if let Some(table) = river_ochs {
+        let nb = s.board.iter().filter(|&&c| c >= 0).count();
+        if nb == 5 && s.holes[seat][0] >= 0 && s.holes[seat][1] >= 0 {
+            if let Some(bucket) =
+                crate::river_ochs::river_ochs_bucket_memoed(table, &s.holes[seat], &s.board)
+            {
+                return fingerprint_fast_depth_postflop_bucket_memo(s, seat, bucket, memo);
+            }
+        }
+    }
     if let Some(lookup) = emd_frozen {
         let nb = s.board.iter().filter(|&&c| c >= 0).count();
         if nb >= 3 && nb <= 4 && s.holes[seat][0] >= 0 && s.holes[seat][1] >= 0 {
@@ -1410,6 +1444,7 @@ fn one_traversal<const N: usize>(
         cfg.num_buckets,
         &cfg.depth_edges,
         cfg.emd_frozen.as_deref(),
+        cfg.river_ochs.as_deref(),
         memo,
     );
 
@@ -1609,6 +1644,7 @@ fn one_traversal_hogwild<const N: usize>(
         cfg.num_buckets,
         &cfg.depth_edges,
         cfg.emd_frozen.as_deref(),
+        cfg.river_ochs.as_deref(),
         memo,
     );
     let (lidx, ln) = compact_legal(&legal);
@@ -1807,6 +1843,7 @@ fn advance_to_probe<const N: usize>(
                     cfg.num_buckets,
                     &cfg.depth_edges,
                     cfg.emd_frozen.as_deref(),
+                    cfg.river_ochs.as_deref(),
                     memo,
                 );
                 // Suspend: the regret read for `key` is issued in Phase B (the MLP), consumed in Phase C.
@@ -2067,6 +2104,7 @@ fn one_traversal_profile<const N: usize>(
         &cfg.depth_edges,
         cfg.emd_frozen.as_deref(),
         memo,
+        cfg.river_ochs.as_deref(),
         stats,
     );
 
@@ -3109,6 +3147,7 @@ mod tests {
             dcfr: false,
             dcfr_prune_threshold: -300_000.0,
             dcfr_explore_frac: 0.05,
+            river_ochs: None,
         }
     }
 
@@ -3129,6 +3168,7 @@ mod tests {
             dcfr: false,
             dcfr_prune_threshold: -300_000.0,
             dcfr_explore_frac: 0.05,
+            river_ochs: None,
         }
     }
 
