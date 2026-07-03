@@ -104,6 +104,8 @@ def _configure_serve_env(stamp: dict | None, args) -> dict:
         os.environ["POKERBOT_EMD_FROZEN_MIRROR_FALLBACK"] = "1"
     if cfg["emd_table"]:
         os.environ["POKERBOT_POSTFLOP_EMD_TABLE"] = str(cfg["emd_table"])
+    if getattr(args, "river_ochs", None):
+        os.environ["POKERBOT_RIVER_OCHS"] = str(args.river_ochs)
     os.environ["POKERBOT_BP_COVERAGE"] = "1"          # enable the serve-coverage guard
     if str(cfg["postflop_mode"]).lower() == "emd" and not (cfg["emd_frozen"] or cfg["emd_table"]):
         print("[rank] WARNING: postflop_mode=emd but no --emd-frozen/--emd-table (and none in the stamp "
@@ -176,6 +178,10 @@ def main() -> int:
                          "EMD K160 production blueprint (then pass --emd-frozen/--emd-table).")
     ap.add_argument("--emd-frozen", default=None, help="path to the frozen EMD lookup (.emdfrzn) for emd mode")
     ap.add_argument("--emd-table", default=None, help="path to the EMD centroids (.json) for emd mode")
+    ap.add_argument("--river-ochs", default=None,
+                    help="ROCHS river table (blueprint-v2). BOTH A and B must have been trained with it "
+                         "(one env per process); for a mirror-river vs river-OCHS comparison use "
+                         "scripts/rank_cross_abstraction.py --a-river-ochs/--b-river-ochs instead.")
     ap.add_argument("--coverage-floor", type=float, default=0.5,
                     help="min postflop serve coverage; below this the run FAILS LOUD (abstraction mismatch)")
     ap.add_argument("--label-a", default="A")

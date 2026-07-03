@@ -248,6 +248,23 @@ def validate_serve(snapshot: dict, stamp: dict) -> dict:
                 f"(0) SHA256 mismatch for EMD frozen blob: expected {expected_sha[:16]}..., " +
                 f"got {actual_sha[:16]}...  blob may be stale or tampered with.")
 
+    # (0b) Same content-stamp check for the blueprint-v2 river-OCHS table (when configured). A
+    # modified/stale table would silently re-map every river bucket -> wrong-row river hits.
+    river_ochs_env = os.environ.get("POKERBOT_RIVER_OCHS")
+    if river_ochs_env:
+        rochs_path = Path(river_ochs_env)
+        rochs_sidecar = rochs_path.with_suffix(rochs_path.suffix + ".sha256")
+        if not rochs_sidecar.exists():
+            raise ValidationError(
+                f"(0b) SHA256 sidecar missing for river-OCHS table: {rochs_sidecar}. "
+                "Re-run scripts/blueprint2/fit_river_ochs.py to regenerate table + sidecar together.")
+        expected_sha = rochs_sidecar.read_text(encoding="ascii").strip().split()[0]
+        actual_sha = hashlib.sha256(rochs_path.read_bytes()).hexdigest()
+        if expected_sha != actual_sha:
+            raise ValidationError(
+                f"(0b) SHA256 mismatch for river-OCHS table: expected {expected_sha[:16]}..., "
+                f"got {actual_sha[:16]}...  table may be stale or tampered with.")
+
     # (a) STRICT serve-abstraction cross-check: the active encoder config must field-match the stamp.
     from pokerbot.eval.lbr import check_blueprint_serve_env  # noqa: PLC0415
 
@@ -464,6 +481,12 @@ def main(argv: list[str] | None = None) -> int:
                          "POKERBOT_POSTFLOP_EMD_FROZEN=<this path> so the serve encoder reads the SAME "
                          "frozen (hole,board)->bucket table the blueprint trained against. The serve-skew "
                          "gate then asserts the frozen-table content hash matches the snapshot stamp.")
+    ap.add_argument("--river-ochs", default=None,
+                    help="ship a blueprint-v2 river-OCHS blueprint: sets POKERBOT_RIVER_OCHS=<this "
+                         ".rochs path> so serve keys the river with the SAME OCHS nearest-centroid "
+                         "bucket the trainer wrote river rows under (a skew HITS wrong-semantics river "
+                         "rows — the stamp guard + sha sidecar gate enforce the match). Leave unset for "
+                         "pre-river-OCHS blueprints (e.g. the deployed bp_emd_k160_1).")
     args = ap.parse_args(argv)
 
     # Apply EMD/bucket overrides into the serve-abstraction env BEFORE _set_serve_env (which only
@@ -486,6 +509,11 @@ def main(argv: list[str] | None = None) -> int:
         # 2026-06-30: river serve hit-rate 0.000 (default) -> 0.601 with this flag. flop/turn are unaffected
         # (the blob is complete -> they never frozen-miss).
         SERVE_ABSTRACTION_ENV["POKERBOT_EMD_FROZEN_MIRROR_FALLBACK"] = "1"
+    if args.river_ochs:
+        rochs_path = Path(args.river_ochs)
+        if not rochs_path.exists():
+            ap.error(f"--river-ochs {args.river_ochs} not found")
+        SERVE_ABSTRACTION_ENV["POKERBOT_RIVER_OCHS"] = str(rochs_path.resolve())
 
     # MUST set serve env BEFORE importing pokerbot (the encoder bakes the flags at import).
     _set_serve_env()

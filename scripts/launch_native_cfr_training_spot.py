@@ -56,7 +56,7 @@ def _tar_filter(ti: tarfile.TarInfo):
 
 
 def build_and_upload_code(s3, bucket: str, prefix: str, crate_src: str = "tools/battery_native",
-                          emd_frozen: str = "") -> str:
+                          emd_frozen: str = "", river_ochs: str = "") -> str:
     # (src, arcname) pairs. The crate may come from a FROZEN COPY (``crate_src``) but is ALWAYS uploaded
     # under "tools/battery_native" so the box builds it at the expected manifest path — this isolates a
     # running blueprint job from concurrent edits to the live crate (e.g. a parallel search optimization).
@@ -69,6 +69,10 @@ def build_and_upload_code(s3, bucket: str, prefix: str, crate_src: str = "tools/
     # serve encoder will read (bit-identical train/serve). Uploaded under its given relative path.
     if emd_frozen:
         includes.append((emd_frozen, emd_frozen))
+    # Blueprint-v2 river OCHS table (~10 KB): shipped so the box's trainer keys the RIVER with the
+    # SAME nearest-centroid table the serve encoder will read (POKERBOT_RIVER_OCHS).
+    if river_ochs:
+        includes.append((river_ochs, river_ochs))
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for src, arc in includes:
@@ -159,6 +163,7 @@ def _launch_with_fallback(ec2, run_kwargs: dict, *, instance_types: list[str], s
 
 def user_data(*, bucket, prefix, region, code_key, run_subdir, iters, n_deals, num_buckets,
               depth_edges, checkpoint_every, keep_alive=False, emd_frozen_rel="", emd_sha="",
+              river_ochs_rel="", river_ochs_sha="",
               work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
               wall_guard_secs=21600, awscli_zip="awscli-exe-linux-x86_64.zip") -> str:
     run_prefix = f"{prefix}/{run_subdir}"
@@ -252,6 +257,18 @@ if [ -n "$EMD_SHA" ] && [ -n "$EMD_REL" ]; then
   echo "EMD blob sha256 OK: $ACT"
 fi
 
+# Blueprint-v2: verify the shipped river-OCHS table sha256 (same corruption rationale as the EMD blob;
+# a corrupted table re-maps every river bucket -> a silently broken blueprint). Empty => skipped.
+ROCHS_SHA="{river_ochs_sha}"
+ROCHS_REL="{river_ochs_rel}"
+if [ -n "$ROCHS_SHA" ] && [ -n "$ROCHS_REL" ]; then
+  ACT=$(sha256sum "/opt/pokerbot/$ROCHS_REL" | awk '{{print $1}}')
+  if [ "$ACT" != "$ROCHS_SHA" ]; then
+    echo "FATAL: river-OCHS table sha mismatch expect=$ROCHS_SHA actual=$ACT -- aborting + terminating"; sync; /sbin/shutdown -h now; exit 1
+  fi
+  echo "river-OCHS table sha256 OK: $ACT"
+fi
+
 cat > /opt/pokerbot/drive_native_cfr.py <<'PYEOF'
 import os, sys, time, traceback
 import boto3
@@ -270,6 +287,11 @@ DEPTH_EDGES = [float(x) for x in "{depth_csv}".split(",") if x]
 # the serve encoder reads, so train==serve is bit-identical. Empty => the deployed made-hand path.
 EMD_FROZEN_REL = "{emd_frozen_rel}"
 EMD_FROZEN_PATH = ("/opt/pokerbot/" + EMD_FROZEN_REL) if EMD_FROZEN_REL else None
+# Blueprint-v2 river OCHS table: when set, the trainer keys the RIVER with the OCHS nearest-centroid
+# bucket (flop/turn stay on the EMD frozen blob; preflop unchanged). The blueprint MUST then be served
+# with POKERBOT_RIVER_OCHS pointing at this same table (stamp-guarded). Empty => made-hand mirror river.
+RIVER_OCHS_REL = "{river_ochs_rel}"
+RIVER_OCHS_PATH = ("/opt/pokerbot/" + RIVER_OCHS_REL) if RIVER_OCHS_REL else None
 # Throughput/convergence levers (gated default-OFF; both verified). work_steal: atomic deal-counter +
 # rayon::broadcast over per-thread tables -> closes the deep-deal load imbalance (+33% deals/s @64c,
 # measured). dcfr: signed-regret Discounted-CFR + active Regret-Based Pruning (~2x fewer iters to
@@ -301,11 +323,15 @@ def main():
     #             batch_deals, hogwild, hogwild_capacity, work_steal, dcfr, dcfr_prune_threshold, dcfr_explore_frac)
     if EMD_FROZEN_PATH:
         t = bn.NlheCFRTrainer(NUM_BUCKETS, DEPTH_EDGES, N_DEALS, 6, float("-inf"), False, EMD_FROZEN_PATH,
-                              0, False, 1 << 21, WORK_STEAL, DCFR, DCFR_PRUNE_THRESHOLD, DCFR_EXPLORE_FRAC)
+                              0, False, 1 << 21, WORK_STEAL, DCFR, DCFR_PRUNE_THRESHOLD, DCFR_EXPLORE_FRAC,
+                              river_ochs_path=RIVER_OCHS_PATH)
         print(f"EMD frozen lookup ACTIVE: {{EMD_FROZEN_PATH}} stamp={{t.emd_stamp()}}", flush=True)
     else:
         t = bn.NlheCFRTrainer(NUM_BUCKETS, DEPTH_EDGES, N_DEALS, 6, float("-inf"), False, None,
-                              0, False, 1 << 21, WORK_STEAL, DCFR, DCFR_PRUNE_THRESHOLD, DCFR_EXPLORE_FRAC)
+                              0, False, 1 << 21, WORK_STEAL, DCFR, DCFR_PRUNE_THRESHOLD, DCFR_EXPLORE_FRAC,
+                              river_ochs_path=RIVER_OCHS_PATH)
+    if RIVER_OCHS_PATH:
+        print(f"river-OCHS ACTIVE: {{RIVER_OCHS_PATH}} stamp={{t.river_ochs_stamp()}}", flush=True)
     print(f"LEVERS work_steal={{WORK_STEAL}} dcfr={{DCFR}} "
           f"(prune={{DCFR_PRUNE_THRESHOLD}} explore={{DCFR_EXPLORE_FRAC}}) hogwild={{t.is_hogwild()}}", flush=True)
     blob = _download_latest()
@@ -416,6 +442,13 @@ def main() -> None:
                         "(the ctor enforces num_buckets==lookup.K; e.g. 160 for the K160 blob); the EMD "
                         "blueprint is a self-consistent K (serve must use the same K + EMD). Made-hand path "
                         "(empty) uses --num-buckets=200 to match serve's POSTFLOP_NUM_BUCKETS.")
+    p.add_argument("--river-ochs", default="",
+                   help="path (repo-relative) to the blueprint-v2 river-OCHS table (.rochs, from "
+                        "scripts/blueprint2/fit_river_ochs.py). When set, the trainer keys the RIVER with "
+                        "the OCHS nearest-centroid bucket (flop/turn stay on --emd-frozen; preflop "
+                        "unchanged) and the checkpoint MUST be served with POKERBOT_RIVER_OCHS pointing at "
+                        "the SAME table (stamp-guarded; a skew HITS wrong-semantics river rows). "
+                        "Empty = the deployed made-hand mirror river.")
     p.add_argument("--work-steal", action="store_true",
                    help="atomic deal-counter + rayon::broadcast scheduler (closes the deep-deal load "
                         "imbalance; +33%% deals/s @64c measured). Statistically-equivalent, default OFF.")
@@ -432,6 +465,8 @@ def main() -> None:
         p.error("--num-buckets must be > 0 (serve uses 200)")
     if args.emd_frozen and not (ROOT / args.emd_frozen).exists():
         p.error(f"--emd-frozen {args.emd_frozen} not found (run precompute_emd_frozen_lookup.py first)")
+    if args.river_ochs and not (ROOT / args.river_ochs).exists():
+        p.error(f"--river-ochs {args.river_ochs} not found (run scripts/blueprint2/fit_river_ochs.py first)")
     depth_edges = [float(x) for x in args.depth_edges.split(",") if x.strip()]
 
     s3 = boto3.client("s3", region_name=args.region)
@@ -446,7 +481,7 @@ def main() -> None:
         print(f"Reusing existing code tarball -> s3://{args.bucket}/{code_key} (--reuse-code)", flush=True)
     else:
         code_key = build_and_upload_code(s3, args.bucket, args.prefix, crate_src=crate_src,
-                                         emd_frozen=args.emd_frozen)
+                                         emd_frozen=args.emd_frozen, river_ochs=args.river_ochs)
     ami = resolve_ubuntu_ami(ec2, args.arch)
     print(f"AMI: {ami}  instance: {args.instance_type}  arch: {args.arch}  region: {args.region}",
           flush=True)
@@ -460,6 +495,15 @@ def main() -> None:
             print(f"EMD blob sha256 (on-box verify armed): {emd_sha}", flush=True)
         else:
             print(f"WARN: {sha_path} missing -> on-box EMD sha check SKIPPED (blob unverified)", flush=True)
+    river_ochs_sha = ""
+    if args.river_ochs:
+        sha_path = ROOT / (args.river_ochs + ".sha256")
+        if sha_path.exists():
+            river_ochs_sha = sha_path.read_text(encoding="utf-8").split()[0].strip()
+            print(f"river-OCHS table sha256 (on-box verify armed): {river_ochs_sha}", flush=True)
+        else:
+            print(f"WARN: {sha_path} missing -> on-box river-OCHS sha check SKIPPED (table unverified)",
+                  flush=True)
     # B2: the on-box dead-man cost cap floor = --max-hours (absolute, independent of the babysitter/PC).
     wall_guard_secs = max(1, int(args.max_hours * 3600))
     awscli_zip = "awscli-exe-linux-aarch64.zip" if args.arch == "arm64" else "awscli-exe-linux-x86_64.zip"
@@ -470,6 +514,7 @@ def main() -> None:
         num_buckets=args.num_buckets, depth_edges=depth_edges,
         checkpoint_every=args.checkpoint_every, keep_alive=args.keep_alive,
         emd_frozen_rel=args.emd_frozen, emd_sha=emd_sha,
+        river_ochs_rel=args.river_ochs, river_ochs_sha=river_ochs_sha,
         work_steal=args.work_steal, dcfr=args.dcfr,
         dcfr_prune_threshold=args.dcfr_prune_threshold, dcfr_explore_frac=args.dcfr_explore_frac,
         wall_guard_secs=wall_guard_secs, awscli_zip=awscli_zip,

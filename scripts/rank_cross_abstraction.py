@@ -48,7 +48,7 @@ def _load(path: str) -> dict:
     return {bytes(k): np.asarray(v, dtype=np.float64) for k, v in inner.items()}
 
 
-def _arm_env(base, *, mode, num_buckets, emd_frozen, workers) -> dict:
+def _arm_env(base, *, mode, num_buckets, emd_frozen, workers, river_ochs="") -> dict:
     """Serve env for one arm (set by the parent for the subprocess; baked at the child's pokerbot import)."""
     env = dict(base)
     env["POKERBOT_BETTING_ABSTRACTION"] = "1"
@@ -63,6 +63,10 @@ def _arm_env(base, *, mode, num_buckets, emd_frozen, workers) -> dict:
         # river is keyed made-hand by the trainer (not in the flop/turn blob) -> serve must mirror or the
         # river plays UNIFORM and the EMD arm ranks falsely low (verified river hit 0.000 -> 0.601).
         env["POKERBOT_EMD_FROZEN_MIRROR_FALLBACK"] = "1"
+    if river_ochs:
+        # blueprint-v2 river OCHS: the arm's river keys come from the OCHS table the arm's
+        # blueprint trained under (a skew would HIT wrong-semantics river rows, not miss).
+        env["POKERBOT_RIVER_OCHS"] = os.path.abspath(river_ochs)
     return env
 
 
@@ -90,11 +94,13 @@ def _arm_main(args) -> int:
     return 0
 
 
-def _run_arm(blueprint, *, mode, num_buckets, emd_frozen, decks, seed, workers, label) -> dict:
+def _run_arm(blueprint, *, mode, num_buckets, emd_frozen, decks, seed, workers, label,
+             river_ochs="") -> dict:
     out = tempfile.mktemp(suffix=f"_{label}.json")
     cmd = [sys.executable, os.path.abspath(__file__), "--arm", "--blueprint", blueprint,
            "--decks", str(decks), "--seed", str(seed), "--out", out, "--label", label]
-    env = _arm_env(os.environ, mode=mode, num_buckets=num_buckets, emd_frozen=emd_frozen, workers=workers)
+    env = _arm_env(os.environ, mode=mode, num_buckets=num_buckets, emd_frozen=emd_frozen,
+                   workers=workers, river_ochs=river_ochs)
     print(f"[xrank] launching arm {label} ({mode}/K{num_buckets}) ...", flush=True)
     r = subprocess.run(cmd, env=env, capture_output=True, text=True)
     for line in r.stdout.splitlines():
@@ -123,6 +129,8 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=10)
     ap.add_argument("--a"); ap.add_argument("--a-mode", default="fast"); ap.add_argument("--a-num-buckets", type=int, default=200); ap.add_argument("--a-emd-frozen", default="")
     ap.add_argument("--b"); ap.add_argument("--b-mode", default="emd"); ap.add_argument("--b-num-buckets", type=int, default=160); ap.add_argument("--b-emd-frozen", default="")
+    ap.add_argument("--a-river-ochs", default="", help="ROCHS table for arm A (blueprint-v2 river OCHS)")
+    ap.add_argument("--b-river-ochs", default="", help="ROCHS table for arm B (blueprint-v2 river OCHS)")
     ap.add_argument("--label-a", default="A"); ap.add_argument("--label-b", default="B")
     ap.add_argument("--out-json", default=None)
     args = ap.parse_args()
@@ -134,9 +142,11 @@ def main() -> int:
           f"({args.b_mode}/K{args.b_num_buckets})  decks={args.decks} seed={args.seed} workers={args.workers}",
           flush=True)
     da = _run_arm(args.a, mode=args.a_mode, num_buckets=args.a_num_buckets, emd_frozen=args.a_emd_frozen,
-                  decks=args.decks, seed=args.seed, workers=args.workers, label=args.label_a)
+                  decks=args.decks, seed=args.seed, workers=args.workers, label=args.label_a,
+                  river_ochs=args.a_river_ochs)
     db = _run_arm(args.b, mode=args.b_mode, num_buckets=args.b_num_buckets, emd_frozen=args.b_emd_frozen,
-                  decks=args.decks, seed=args.seed, workers=args.workers, label=args.label_b)
+                  decks=args.decks, seed=args.seed, workers=args.workers, label=args.label_b,
+                  river_ochs=args.b_river_ochs)
 
     # both arms used the SAME roster (default_pool_roster is deterministic) -> pair by archetype.
     if list(da["per"]) != list(db["per"]):
