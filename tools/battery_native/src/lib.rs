@@ -366,6 +366,9 @@ mod py {
             "emd_subgame".to_string(),
             "emd_rollout".to_string(),
             "emd_lbr".to_string(),
+            // blueprint-v3: fingerprint.rs carries the env-gated (POKERBOT_PREFLOP_HIST_KEY=1)
+            // 3-byte preflop history key; native_solver fails closed on binaries without this.
+            "preflop_hist_key".to_string(),
         ]
     }
 

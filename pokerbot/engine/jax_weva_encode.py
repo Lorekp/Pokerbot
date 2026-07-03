@@ -36,6 +36,14 @@ _DEPTH_BUCKETS = os.environ.get("POKERBOT_DEPTH_BUCKETS", "0").lower() not in (
     "false",
     "no",
 )
+# Preflop HISTORY key (blueprint-v3, bp3_prefhist_1): append 3 preflop-history bytes
+# [n_limps, n_raises, opener_pos+1] to the PREFLOP tabular key so strategically distinct preflop
+# histories stop ALIASING into one infoset (the root cause of the ultra-tight/limpy trained preflop —
+# artifacts/preflop_mispricing_diagnosis.md). EXACT twin of fingerprint.rs::preflop_hist_key_enabled:
+# ONLY the literal "1" enables (both sides), read ONCE at import. Train and serve MUST agree
+# (stamped in active_abstraction_config + two-sided serve guard, the river-OCHS pattern): a skew
+# misses EVERY preflop row -> uniform preflop fallback. Off (default) => digest byte-identical.
+_PREFLOP_HIST_KEY = os.environ.get("POKERBOT_PREFLOP_HIST_KEY", "") == "1"
 _GLOBAL_BUCKETER: Any = None
 # Inline card-abstraction mode: "fast" (one made-hand eval/node, ~2us — the per-node-affordable
 # default) vs "ehs" (Monte-Carlo EHS, accurate but ~ms/cold-key — only for offline precompute).
@@ -267,6 +275,11 @@ def active_abstraction_config() -> dict:
         from pokerbot.engine.jax_weva_fast import _DEPTH_EDGES  # lazy: avoids an import cycle
         cfg["depth_bucketed"] = True
         cfg["depth_edges"] = list(_DEPTH_EDGES)
+    # Preflop history key (blueprint-v3): emitted ONLY when enabled so the default stamp stays
+    # byte-identical to pre-hist checkpoints (the river_ochs/depth_bucketed pattern). The serve
+    # guard (check_blueprint_serve_env) also does an explicit two-sided default-False check.
+    if _PREFLOP_HIST_KEY:
+        cfg["preflop_hist_key"] = True
     return cfg
 
 
@@ -332,6 +345,11 @@ class NLHEEncodeBundle:
     # Effective-STARTING-stack-depth bucket (A2), hashed into the PREFLOP key ONLY when POKERBOT_DEPTH_BUCKETS
     # is set. -1 => not computed / depth-buckets off ⇒ not hashed (digest byte-identical). See depth_bucket().
     depth_bucket: int = -1
+    # 3-byte preflop-HISTORY extension (POKERBOT_PREFLOP_HIST_KEY=1, blueprint-v3):
+    # [n_limps, n_raises, opener_pos+1], hashed into the PREFLOP key ONLY when the flag is on
+    # (b"H" + bytes, after the depth byte, before the betting bytes — the exact fingerprint.rs order).
+    # b"" + flag off => not hashed (digest byte-identical). See jax_weva_fast.preflop_hist_bytes().
+    preflop_hist: bytes = b""
 
     def _digest(self, person: bytes) -> bytes:
         h = hashlib.blake2b(digest_size=16, person=person)
@@ -359,6 +377,18 @@ class NLHEEncodeBundle:
                 if _DEPTH_BUCKETS and self.depth_bucket >= 0:
                     h.update(b"D")
                     h.update(int(self.depth_bucket).to_bytes(1, "little"))
+                # Preflop history key (bp3): b"H" + 3 bytes, after the depth byte and before the
+                # betting bytes — the EXACT fingerprint.rs message order. FAIL LOUD if the caller
+                # did not populate the twin bytes: silently hashing without them would key non-hist
+                # rows (the exact train/serve skew this flag guards against).
+                if _PREFLOP_HIST_KEY:
+                    if len(self.preflop_hist) != 3:
+                        raise RuntimeError(
+                            "POKERBOT_PREFLOP_HIST_KEY=1 but NLHEEncodeBundle.preflop_hist is not "
+                            "populated — pass jax_weva_fast.preflop_hist_bytes(state) when building "
+                            "the bundle (a silent skip would key wrong preflop rows)")
+                    h.update(b"H")
+                    h.update(self.preflop_hist)
                 if weva_encoder._PREFLOP_LOSSLESS and weva_encoder._PREFLOP_LOSSLESS_BETTING:
                     h.update(b"H")
                     h.update(self.history_key)
@@ -449,9 +479,15 @@ def encode_nlhe_weva_bundle(
     policy_position = fuse_position_scope(enc["position"], enc["spot_scope"])
     holes = np.asarray(state.holes)
     bucket = compute_postflop_bucket(holes[seat], np.asarray(state.board))
-    from pokerbot.engine.jax_weva_fast import betting_abstraction_key, betting_history_key, depth_bucket
+    from pokerbot.engine.jax_weva_fast import (
+        betting_abstraction_key,
+        betting_history_key,
+        depth_bucket,
+        preflop_hist_bytes,
+    )
 
     dbucket = depth_bucket(state) if _DEPTH_BUCKETS else -1
+    phist = preflop_hist_bytes(state) if (_PREFLOP_HIST_KEY and bucket < 0) else b""
     return NLHEEncodeBundle(
         weva_id=int(enc["weva_id"]),
         cards=np.asarray(enc["cards"], dtype=np.float32),
@@ -463,6 +499,7 @@ def encode_nlhe_weva_bundle(
         history_key=betting_history_key(state),
         betting_state=betting_abstraction_key(state, seat),
         depth_bucket=dbucket,
+        preflop_hist=phist,
     )
 
 

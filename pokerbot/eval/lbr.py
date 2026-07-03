@@ -209,6 +209,15 @@ def check_blueprint_serve_env(*, strict: bool = False, expected: dict | None = N
                 f"river_ochs mismatch (trained={expected.get('river_ochs', False)}, "
                 f"serve={cfg.get('river_ochs', False)}) — set POKERBOT_RIVER_OCHS to the snapshot's "
                 "table (or unset it for a pre-river-OCHS snapshot); a skew HITS wrong river rows")
+        # Preflop-history-key guard (blueprint-v3), two-sided with a False default like the two
+        # above. A skew is a 100% PREFLOP MISS in either direction (hist-trained rows served
+        # without the env hash no H bytes; non-hist rows served with it hash bytes the table never
+        # saw) — every preflop decision falls back to uniform-over-legal.
+        if bool(expected.get("preflop_hist_key", False)) != bool(cfg.get("preflop_hist_key", False)):
+            problems.append(
+                f"preflop_hist_key mismatch (trained={expected.get('preflop_hist_key', False)}, "
+                f"serve={cfg.get('preflop_hist_key', False)}) — set POKERBOT_PREFLOP_HIST_KEY=1 for "
+                "a hist-key snapshot (and unset it for any other), else every preflop node misses")
     if problems:
         msg = f"blueprint serve MISCONFIGURED: {'; '.join(problems)}. active={cfg}"
         if strict:

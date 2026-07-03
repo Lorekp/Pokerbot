@@ -230,6 +230,47 @@ def betting_history_key(state: EnvState | Any) -> bytes:
     return hl.to_bytes(2, "little") + seat.tobytes() + act.tobytes()
 
 
+def preflop_hist_bytes(state: EnvState | Any) -> bytes:
+    """Serve twin of ``fingerprint.rs::preflop_hist_bytes`` (the ``POKERBOT_PREFLOP_HIST_KEY=1``
+    blueprint-v3 preflop key extension) — 3 bytes appended to the PREFLOP tabular key so
+    strategically distinct preflop histories stop ALIASING (UTG-RFI vs after-a-limper, BB-vs-UTG-open
+    vs BB-vs-BTN-open, 4bet-jam vs limp-trap-jam; see artifacts/preflop_mispricing_diagnosis.md).
+
+    Layout: ``[n_limps_before_first_raise (cap 3), n_raises (cap 3), first_raiser_pos_enum + 1]``.
+    Semantics MUST stay byte-identical to the Rust source (fingerprint.rs, not the diagnosis prose):
+      * "limp"  = a CALL action (index 2) strictly BEFORE the first raise. Blind posts are NOT
+        history entries (init_hand starts hist_len=0); CHECK and FOLD are ignored. Capped at 3.
+      * "raise" = ANY action index in [BET_BUCKET_START, ALL_IN] (all sized bets/raises AND the
+        all-in jam — an open-jam IS the opener). Capped at 3; the FIRST records the opener's seat.
+      * opener byte = ``_POS_BY_OFFSET[(opener_seat - button) % 6] + 1``; 0 = nothing raised yet.
+    The digest hashes this only on the preflop ``b"w"`` branch. Like the Rust, the scan runs over the
+    FULL history: on the rare postflop bucket<0 fail-closed branch (EMD frozen-miss without mirror)
+    both sides scan the extra street actions identically, so parity holds there too.
+    """
+    hl = int(np.asarray(state.hist_len))
+    hist_action = np.asarray(state.hist_action)
+    hist_seat = np.asarray(state.hist_seat)
+    n = max(0, min(hl, int(hist_action.shape[0])))
+    n_calls = 0
+    n_raises = 0
+    opener_seat = -1
+    for i in range(n):
+        a = int(hist_action[i])
+        if a == CALL:
+            if n_raises == 0 and n_calls < 3:
+                n_calls += 1
+        elif BET_BUCKET_START <= a <= ALL_IN:
+            if n_raises == 0:
+                opener_seat = int(hist_seat[i])
+            if n_raises < 3:
+                n_raises += 1
+    if opener_seat >= 0:
+        opener_pos = int(_POS_BY_OFFSET[(opener_seat - int(np.asarray(state.button))) % NUM_PLAYERS])
+    else:
+        opener_pos = -1
+    return bytes((n_calls, n_raises, opener_pos + 1))
+
+
 def encode_actions_numpy(
     *,
     holes: np.ndarray,
@@ -383,10 +424,11 @@ def encode_nlhe_bundle_fast(
     _ = oop_range, ip_range
     spot_scope = encode_spot_scope_numpy(spot_class)
     policy_position = fuse_position_scope(position, spot_scope)
-    from pokerbot.engine.jax_weva_encode import _DEPTH_BUCKETS, compute_postflop_bucket
+    from pokerbot.engine.jax_weva_encode import _DEPTH_BUCKETS, _PREFLOP_HIST_KEY, compute_postflop_bucket
 
     bucket = compute_postflop_bucket(holes[seat], board)
     dbucket = depth_bucket(state) if _DEPTH_BUCKETS else -1  # hashed preflop only; -1 => not hashed
+    phist = preflop_hist_bytes(state) if (_PREFLOP_HIST_KEY and bucket < 0) else b""
     return NLHEEncodeBundle(
         weva_id=weva_id,
         cards=cards,
@@ -398,6 +440,7 @@ def encode_nlhe_bundle_fast(
         history_key=betting_history_key(state),
         betting_state=betting_abstraction_key(state, seat),
         depth_bucket=dbucket,
+        preflop_hist=phist,
     )
 
 
@@ -417,6 +460,7 @@ def fingerprint_fast(state: EnvState | Any, seat: int, *, weva_table: np.ndarray
     from pokerbot.engine.jax_weva_encode import (
         _BETTING_ABSTRACTION,
         _DEPTH_BUCKETS,
+        _PREFLOP_HIST_KEY,
         NLHEEncodeBundle,
         compute_postflop_bucket,
     )
@@ -441,10 +485,15 @@ def fingerprint_fast(state: EnvState | Any, seat: int, *, weva_table: np.ndarray
     # Minimal bundle: bounded-mode .fingerprint() reads weva_id/postflop_bucket_id + (history_key preflop-
     # lossless | betting_state otherwise) — see NLHEEncodeBundle._digest.
     dbucket = depth_bucket(state) if _DEPTH_BUCKETS else -1  # serve-side twin of the train encode
+    # Preflop history key (bp3): computed only when the flag is on AND the digest will take the
+    # preflop b"w" branch (bucket < 0) — the only place the bytes are hashed. Serve twin of the
+    # trainer's fingerprint.rs preflop_hist_bytes (byte-identical; parity-gated).
+    phist = preflop_hist_bytes(state) if (_PREFLOP_HIST_KEY and bucket < 0) else b""
     return NLHEEncodeBundle(
         weva_id=weva_id, cards=_FP_FAST_EMPTY, actions=_FP_FAST_EMPTY, position=_FP_FAST_EMPTY,
         spot_scope=_FP_FAST_EMPTY, policy_position=_FP_FAST_EMPTY, postflop_bucket_id=bucket,
         history_key=history_key, betting_state=betting_state, depth_bucket=dbucket,
+        preflop_hist=phist,
     ).fingerprint()
 
 

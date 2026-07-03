@@ -115,6 +115,13 @@ def is_enabled() -> bool:
     stays disabled under EMD until it reports the capability."""
     if _flag_truthy(os.environ.get("POKERBOT_DEPTH_BUCKETS")):
         return False
+    # HARD OVERRIDE (blueprint-v3): THIS crate has no preflop-HISTORY key (POKERBOT_PREFLOP_HIST_KEY);
+    # serving a hist-key blueprint through it would drop the b"H" bytes from every preflop key ->
+    # 0% preflop coverage -> uniform fallback. Fail closed to the Python oracle (byte-identical twin).
+    # (tools/battery_native DOES carry the hist keying, env-gated in its fingerprint.rs — this guard
+    # is only for the separate tools/fingerprint_native crate.)
+    if os.environ.get("POKERBOT_PREFLOP_HIST_KEY", "") == "1":
+        return False
     if os.environ.get("POKERBOT_POSTFLOP_MODE", "fast").lower() == "emd":
         mod = load_native()
         try:

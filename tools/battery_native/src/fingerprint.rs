@@ -443,8 +443,13 @@ pub fn fingerprint_fast_depth<const N: usize>(
 // b"H" + [n_limps_before_first_raise, n_raises (cap 3), first_raiser_pos_enum + 1] to PREFLOP keys
 // so the trainer can distinguish those histories. Gated by POKERBOT_PREFLOP_HIST_KEY=1 read ONCE;
 // default OFF is byte-identical to the shipped key space (golden digest tests unaffected).
-// TRAIN/SERVE SKEW WARNING: a checkpoint trained with this ON must be served with matching keying;
-// it is an EXPERIMENT knob, not wired into any serve stamp yet.
+// TRAIN/SERVE SKEW WARNING: a checkpoint trained with this ON must be served with matching keying.
+// SERVE WIRING (blueprint-v3 ship prep): the Python twin is jax_weva_fast::preflop_hist_bytes +
+// the b"H" branch in jax_weva_encode.NLHEEncodeBundle._digest (parity-gated by
+// scripts/probe_preflop_hist_key_parity.py + tests/test_preflop_hist_key_parity.py); the flag is
+// stamped via active_abstraction_config()["preflop_hist_key"] and two-sided-guarded in
+// lbr.check_blueprint_serve_env; native_caps() advertises "preflop_hist_key" so stale .pyds fail
+// closed in native_solver. Keep all of those in lockstep with any change here.
 // ---------------------------------------------------------------------------
 
 pub fn preflop_hist_key_enabled() -> bool {
