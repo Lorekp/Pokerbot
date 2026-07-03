@@ -121,6 +121,11 @@ _DEPLOYED_BASELINE = {
     # instead of the averaged strategy_sum — Pluribus plays the final iterate, not the average
     # (False = averaged serve, DEPLOYED default, byte-identical)
     "serve_final_iterate": False,
+    # Stage-1 river overbet root menu: a river first-in / facing-check root gains bet bucket 6
+    # (2.0x pot) in the hero's ROOT action menu only (native root_unmask + Python _root_extra_post;
+    # artifacts/offtree_resolve_design.md §3/§8). GTO path only.
+    # (False = static keep-list everywhere, DEPLOYED default, byte-identical)
+    "river_overbet": False,
     # blueprint checkpoint path (None = auto-detect from cwd)
     "blueprint_path": None,
     # max CFR depth (safety cap)
@@ -217,6 +222,18 @@ def _build_policy(spec: dict, snap, base_seed: int, repo_root: str):
     sv.config.leaf_biased_continuations = bool(_resolve(spec, "leaf_biased_continuations"))
     sv.config.leaf_bias_mult = float(_resolve(spec, "leaf_bias_mult"))
     sv.config.serve_final_iterate = bool(_resolve(spec, "serve_final_iterate"))
+    sv.config.river_overbet = bool(_resolve(spec, "river_overbet"))
+    # BUG-4c dead-knob guard: an arm that sets river_overbet must run against a pyd whose
+    # SubgameSolver.solve accepts root_unmask — otherwise the armed river serves would silently
+    # fall back to the ~25x-slower Python loop mid-battery (correct but wall-clock-poisoned).
+    if sv.config.river_overbet:
+        import inspect
+        from pokerbot.search import native_solver as _ns_sig
+        _sig = inspect.signature(_ns_sig._EXT.SubgameSolver.solve)
+        assert "root_unmask" in _sig.parameters, (
+            "river_overbet arm requires a battery_native pyd built with root_unmask "
+            f"(installed solve signature: {_sig})"
+        )
     sv.config.max_depth = int(_resolve(spec, "max_depth"))
     sv.config.linear_averaging = bool(_resolve(spec, "linear_averaging"))
     sv.config.per_decision_seed = bool(_resolve(spec, "per_decision_seed"))

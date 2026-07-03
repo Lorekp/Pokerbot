@@ -559,7 +559,7 @@ def native_subgame_solve(
     range_uniform_floor: float = 0.25, range_reach_full: bool = False,
     ensemble_streams: int = 1, leaf_cache_worlds: int = 1,
     avg_skip_frac: float = 0.0, leaf_biased_continuations: bool = False, leaf_bias_mult: float = 5.0,
-    serve_final_iterate: bool = False,
+    serve_final_iterate: bool = False, root_unmask: int = 0,
 ):
     """Native root action-probability vector (length 11) for a depth-limited subgame solve, or None
     if the native path is unavailable / the adapter is not in the supported (bounded, client_bet_sizing)
@@ -586,7 +586,12 @@ def native_subgame_solve(
     ``serve_final_iterate`` (R5a) serves the ROOT policy from the final iterate's regret-matching
     distribution (regret-match over the root's cumulative CFR+ regrets after the last iteration)
     instead of the averaged strategy_sum — Pluribus plays the final iterate, not the average. False
-    (default) = the averaged serve, byte-identical. GTO path only — the exploit FFI does not accept it."""
+    (default) = the averaged serve, byte-identical. GTO path only — the exploit FFI does not accept it.
+
+    ``root_unmask`` (Stage-1 river overbet / off-tree root widening, artifacts/offtree_resolve_design.md
+    §3/§8): bitmask of action indices to OR into the abstracted legal mask at the ROOT node only
+    (full-legality ANDed; the extraction mask is widened identically). 0 (default) = no widening,
+    byte-identical. GTO path only — the exploit FFI does not accept it."""
     if not native_subgame_available():
         return None
     ckey = (id(adapter), int(max_playout_depth), int(num_buckets))
@@ -609,15 +614,19 @@ def native_subgame_solve(
             int(leaf_cache_worlds), float(avg_skip_frac),
             bool(leaf_biased_continuations), float(leaf_bias_mult),
             bool(serve_final_iterate),
+            int(root_unmask) & 0xFFFFFFFF,
         )
     except TypeError:
         # Stale native binary built before the linear_averaging / repair_deck / two_sided / decouple /
         # range_aware / range_reach_full / leaf_cache_worlds / avg_skip_frac /
-        # leaf_biased_continuations / serve_final_iterate args — fall back to Python so a
-        # not-yet-rebuilt crate doesn't crash the
+        # leaf_biased_continuations / serve_final_iterate / root_unmask args — fall back to Python so
+        # a not-yet-rebuilt crate doesn't crash the
         # solve (the Python path applies the same weighting + repair_deck/two_sided +
-        # leaf_cache_worlds/avg_skip_frac/leaf_biased_continuations/serve_final_iterate; the Q2/Q3
+        # leaf_cache_worlds/avg_skip_frac/leaf_biased_continuations/serve_final_iterate + the
+        # root_unmask widening via _root_extra_post; the Q2/Q3
         # world-sampling levers are native-only, so the fallback is the uniform-deal base arm).
+        # NOTE (BUG-4c dead-knob trap): pluribus_search.solve() additionally warns LOUDLY when a
+        # river_overbet-armed solve hits this fallback (metadata river_overbet_native_fallback).
         return None
     import numpy as _np
 

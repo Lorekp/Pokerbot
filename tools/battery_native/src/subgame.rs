@@ -180,6 +180,17 @@ pub struct SubgameConfig {
     /// path only; `solve_exploit` NEVER reads this field (its extraction is hard-coded to the
     /// certified averaged serve) and its FFI does not expose the knob (firewall, defense in depth).
     pub serve_final_iterate: bool,
+    /// STAGE-1 RIVER OVERBET / OFF-TREE ROOT UN-MASK (2026-07-03, artifacts/offtree_resolve_design.md
+    /// §3/§8): bitmask of action indices to OR into the ABSTRACTED legal mask at the ROOT node ONLY
+    /// (`depth == 0` in `cfv` — the root state's actor is always the hero seat, so depth==0 is a
+    /// complete and precise trigger; it mirrors the Python `_root_extra_key` root-only mechanism).
+    /// Every un-masked bit is still ANDed with FULL engine legality (`core::legal_action_mask`), so
+    /// an engine-illegal action (e.g. 2x pot > stack) can never enter the tree. Interior nodes keep
+    /// the static keep-list untouched. The same bits widen `solve`'s root extraction mask so the
+    /// served child is not zeroed at extraction. 0 = no widening, byte-identical to today. GTO
+    /// `solve` path only; `solve_exploit` NEVER reads it (its Ctx hard-codes 0 and its FFI does not
+    /// expose the param — firewall, defense in depth, mirroring leaf_biased/serve_final_iterate).
+    pub root_unmask: u32,
 }
 
 /// Immutable per-solve context handed down the recursion.
@@ -204,6 +215,10 @@ struct Ctx<'a> {
     /// R2 — cached scfg.leaf_bias_mult (only read when leaf_biased; forced to the 5.0 default on the
     /// exploit Ctx, where it is never read anyway).
     leaf_bias_mult: f64,
+    /// STAGE-1 — cached scfg.root_unmask (root-only OR-mask, full-legal-ANDed, applied at depth==0
+    /// in `cfv`; 0 = byte-identical). The exploit CtxExploit wraps a base Ctx built with this
+    /// FORCED 0 (firewall: solve_exploit's tree can never be widened).
+    root_unmask: u32,
 }
 
 /// Mutable per-solve tables (regrets + strategy sums keyed by infoset, leaf-value cache keyed by
@@ -2167,7 +2182,21 @@ fn cfv<const N: usize>(
         return leaf_value(env, hero, ctx, tab, t);
     }
     let actor = actor_i as usize;
-    let legal = abstracted_legal(env, actor, ctx.pcfg);
+    let mut legal = abstracted_legal(env, actor, ctx.pcfg);
+    // STAGE-1 ROOT UN-MASK (root_unmask, artifacts/offtree_resolve_design.md §3/§8): at the ROOT
+    // node ONLY (depth == 0 — the root actor is always the hero seat), OR the un-mask bits into the
+    // abstracted keep-list, ANDed with FULL engine legality so an engine-illegal action can never
+    // enter. Applies in BOTH the traverser and non-traverser branches below by position (in
+    // two-sided mode the root actor samples from its own regret-match over the same widened mask).
+    // 0 (default) => byte-identical.
+    if depth == 0 && ctx.root_unmask != 0 {
+        let full = core::legal_action_mask(env, actor as i32);
+        for a in 0..NUM_ACTIONS {
+            if ctx.root_unmask >> a & 1 == 1 && full[a] {
+                legal[a] = true;
+            }
+        }
+    }
     if !any_legal(&legal) {
         return env.rewards[hero] as f64 / CHIP_UNIT;
     }
@@ -2312,6 +2341,8 @@ pub(crate) fn solve_rows<const N: usize>(
         // R2 — Pluribus biased continuation leaves (default OFF => the legacy uniform leaf).
         leaf_biased: scfg.leaf_biased_continuations,
         leaf_bias_mult: scfg.leaf_bias_mult,
+        // STAGE-1 — root-only un-mask (0 default => byte-identical; GTO path only).
+        root_unmask: scfg.root_unmask,
     };
     let root_key = infoset_key(root, hero);
     // TWO-SIDED traverser list: cycle over the LIVE seats (SEAT_LIVE) at the solve root; hero is always
@@ -2375,7 +2406,17 @@ pub fn solve<const N: usize>(
     scfg: &SubgameConfig,
     public_seed: u64,
 ) -> [f64; NUM_ACTIONS] {
-    let legal_root = abstracted_legal(root, hero, pcfg);
+    let mut legal_root = abstracted_legal(root, hero, pcfg);
+    // STAGE-1 ROOT UN-MASK: widen the EXTRACTION mask identically to the depth-0 widening inside
+    // `cfv` — the served child must not be zeroed at extraction (0 default => byte-identical).
+    if scfg.root_unmask != 0 {
+        let full = core::legal_action_mask(root, hero as i32);
+        for a in 0..NUM_ACTIONS {
+            if scfg.root_unmask >> a & 1 == 1 && full[a] {
+                legal_root[a] = true;
+            }
+        }
+    }
     let mut probs = [0.0f64; NUM_ACTIONS];
     if !any_legal(&legal_root) {
         return probs;
@@ -2587,6 +2628,10 @@ pub fn solve_exploit<const N: usize>(
             // and the exploit FFI does not expose the knob (lib.rs hard-codes it false).
             leaf_biased: false,
             leaf_bias_mult: 5.0,
+            // FIREWALL: root_unmask (Stage-1 river overbet / off-tree root widening) is a GTO-path
+            // knob; force 0 here regardless of scfg (defense in depth — the exploit FFI hard-codes
+            // it 0 too), so the certified exploit tree can never be widened at the root.
+            root_unmask: 0,
         },
         frozen,
         rnr,

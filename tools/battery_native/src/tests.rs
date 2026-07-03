@@ -484,6 +484,7 @@ mod subgame_n7 {
             leaf_biased_continuations: false, // R2 default OFF => legacy uniform leaf, byte-identical
             leaf_bias_mult: 5.0,     // R2 Pluribus multiplier (only read when the bool is ON)
             serve_final_iterate: false, // R5a default OFF => averaged extraction, byte-identical
+            root_unmask: 0,          // Stage-1 default 0 => no root widening, byte-identical
         }
     }
 
@@ -840,6 +841,73 @@ mod subgame_n7 {
         // The knob must actually move the served policy at this state (final != average here).
         let l1: f64 = (0..NUM_ACTIONS).map(|a| (probs_on[a] - probs_off[a]).abs()).sum();
         assert!(l1 > 1e-9, "final-iterate serve identical to the average — placebo knob? L1={l1}");
+    }
+
+    // STAGE-1 ZERO-GATE: root_unmask=0 (the default) MUST reproduce the pre-change solve
+    // bit-for-bit — the widening branch is never entered (`ctx.root_unmask != 0` guards it), so the
+    // traversal, extraction mask and served policy are untouched. Exercised with a RESTRICTED
+    // keep-list (bucket 6 dropped) so a keep-list violation would be visible as mass on index 9.
+    #[test]
+    fn n7_subgame_root_unmask_zero_byte_identical_and_keeps_mask() {
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = HashMap::new();
+        // Restricted menu: drop bet bucket 6 (2.0x pot, action index BET_BUCKET_START+6 == 9).
+        let mut pc = pcfg();
+        pc.allowed_pre[BET_BUCKET_START + 6] = false;
+        pc.allowed_post[BET_BUCKET_START + 6] = false;
+        let base = scfg(); // root_unmask: 0 (default)
+        let probs_base = subgame::solve::<7>(&env, hero, &bp, &pc, &base, 0xBADC0DE);
+        let zero = SubgameConfig { root_unmask: 0, ..scfg() };
+        let probs_zero = subgame::solve::<7>(&env, hero, &bp, &pc, &zero, 0xBADC0DE);
+        assert_eq!(
+            probs_base, probs_zero,
+            "root_unmask=0 must be byte-identical to the legacy (un-widened) solve"
+        );
+        assert!(
+            probs_base[BET_BUCKET_START + 6].abs() < 1e-12,
+            "keep-list-dropped bucket 6 must carry NO mass with root_unmask=0"
+        );
+    }
+
+    // STAGE-1 FEATURE-ON: un-masking a keep-list-dropped, fully-LEGAL bucket at the root must give
+    // it nonzero served mass (the CFR's first iterate is uniform over the widened legal set, so the
+    // averaged serve strictly includes it), stay a valid deterministic distribution, and an
+    // un-masked bit whose action is engine-ILLEGAL at the root (CHECK facing the blind preflop)
+    // must stay at exactly zero (the full-legality AND).
+    #[test]
+    fn n7_subgame_root_unmask_widens_root_and_ands_full_legality() {
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = HashMap::new();
+        let mut pc = pcfg();
+        pc.allowed_pre[BET_BUCKET_START + 6] = false;
+        pc.allowed_post[BET_BUCKET_START + 6] = false;
+        // Test premises: bucket 6 is fully-LEGAL at this root (only the keep-list drops it), and
+        // CHECK is engine-ILLEGAL (UTG faces the blind).
+        let full = legal_action_mask::<7>(&env, hero as i32);
+        assert!(full[BET_BUCKET_START + 6], "premise: 2x-pot bucket must be engine-legal here");
+        assert!(!full[crate::core::CHECK], "premise: CHECK must be engine-illegal facing the blind");
+        let unmask: u32 = (1u32 << (BET_BUCKET_START + 6)) | (1u32 << crate::core::CHECK);
+        let sc = SubgameConfig { root_unmask: unmask, ..scfg() };
+        let a = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 0xFEED5);
+        let b = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 0xFEED5);
+        assert_valid_root_probs(&env, hero, &a);
+        assert_eq!(a, b, "root_unmask solve must be deterministic for a fixed seed");
+        assert!(
+            a[BET_BUCKET_START + 6] > 0.0,
+            "un-masked fully-legal bucket 6 must receive served mass at the root, got {}",
+            a[BET_BUCKET_START + 6]
+        );
+        assert!(
+            a[crate::core::CHECK].abs() < 1e-12,
+            "un-masked but engine-ILLEGAL action must stay zero (full-legality AND), got {}",
+            a[crate::core::CHECK]
+        );
+        // And the widened solve must genuinely differ from the un-widened one (knob engaged).
+        let off = subgame::solve::<7>(&env, hero, &bp, &pc, &scfg(), 0xFEED5);
+        let l1: f64 = (0..NUM_ACTIONS).map(|x| (a[x] - off[x]).abs()).sum();
+        assert!(l1 > 1e-9, "root_unmask ON identical to OFF — placebo knob? L1={l1}");
     }
 
     // R2 CONSISTENCY GATE: the continuation-choice infoset is keyed by the seat + PUBLIC leaf context
@@ -1645,6 +1713,7 @@ mod range_reach_r1 {
             leaf_biased_continuations: false,
             leaf_bias_mult: 5.0,
             serve_final_iterate: false,
+            root_unmask: 0,
         }
     }
 

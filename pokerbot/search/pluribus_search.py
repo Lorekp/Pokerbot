@@ -213,6 +213,23 @@ class PluribusReBeLConfig:
     # do not combine this knob with AIVAT-capture measurement. Default False => the averaged serve,
     # byte-identical. Mirrored in the native GTO solve (subgame.rs serve_final_iterate).
     serve_final_iterate: bool = False
+    # STAGE-1 RIVER OVERBET ROOT MENU (2026-07-03, artifacts/offtree_resolve_design.md §3/§8). When
+    # True, a RIVER root where the hero is first-in or facing a check (to_call == 0) gains bet
+    # bucket 6 (2.0x pot) in the hero's ROOT action menu ONLY — the static postflop keep-list
+    # ((0,1,3,4,5): no overbet) is un-masked for that one child at the root infoset, interior nodes
+    # untouched. Reuses the existing off-tree root-only mechanism (_root_extra_key/_root_extra_post,
+    # consumed by _legal) on the Python loop, and threads root_unmask = 1 << (BET_BUCKET_START+6)
+    # through the native FFI (subgame.rs applies it at depth==0, full-legality ANDed, and widens the
+    # extraction mask so the served child is not zeroed). Regrets/strategy for the new child start
+    # at zero and are learned by the subgame CFR (Pluribus grafts actions from zero too); the
+    # starvation blueprint blend composes on top and pulls a starved Python serve's overbet toward 0
+    # (the SAFE direction — a starved solve never bluffs 2x pot on noise). Facing-a-bet rivers are
+    # the offtree/raise lane and are NOT touched. GTO path only (opponent_model must be None); the
+    # NATIVE exploit path hard-codes root_unmask=0 and its FFI does not expose the knob (firewall,
+    # defense in depth — leaf_biased/serve_final_iterate precedent). Gates: knob-effectiveness probe
+    # on BOTH paths (tests/test_river_overbet_knob.py), engine_ab_h2h zero-gate, golden byte-identity
+    # at default. Default False => the static keep-list everywhere, byte-identical.
+    river_overbet: bool = False
     client_bet_sizing: bool = True    # use the SAME action abstraction as training (blueprint keys hit)
     search_preflop: bool = False      # Pluribus: serve preflop from blueprint, search postflop only
     # A1 stack-agnostic preflop: the preflop blueprint is keyed on (hole, position) only and trained at
@@ -547,6 +564,12 @@ class PluribusReBeLSolver:
         self._root_extra_key: str | None = None
         self._root_extra_post: np.ndarray | None = None
         self._offtree_inserted = False  # diagnostic: did an extra child enter the last solve
+        # Stage-1 river overbet diagnostics (per-solve): armed = the root menu gained bucket 6;
+        # native_fallback = the armed solve was served by the Python loop because the native call
+        # returned None (stale pyd / unsupported config) — surfaced LOUDLY per the BUG-4c dead-knob
+        # trap (a silent fallback would hide a broken native root_unmask from the battery).
+        self._river_overbet_armed = False
+        self._river_overbet_native_fallback = False
         self._regrets: dict[str, np.ndarray] = {}
         self._strategy_sum: dict[str, np.ndarray] = {}
         self._bp_cache: dict[str, np.ndarray] = {}  # blueprint probs by infoset key (within a solve)
@@ -1262,6 +1285,26 @@ class PluribusReBeLSolver:
                 self._root_extra_post = aug
                 self._offtree_inserted = True
 
+        # STAGE-1 RIVER OVERBET ROOT MENU (config.river_overbet, GTO path only — see the config
+        # comment + artifacts/offtree_resolve_design.md §3/§8): at a RIVER root where the hero is
+        # first-in or facing a check (to_call == 0; the facing-a-bet case is the offtree/raise lane
+        # above, kept separate), add bet bucket 6 (2.0x pot) to the hero's ROOT menu via the SAME
+        # root-only mechanism (_root_extra_key/_root_extra_post). If the offtree insert also fired,
+        # OR the masks (start from the already-augmented post mask). Default False => never runs =>
+        # byte-identical.
+        self._river_overbet_armed = False
+        self._river_overbet_native_fallback = False
+        if (cfg.river_overbet and self.opponent_model is None
+                and self._allowed_post is not None and int(base_state.street) == 3):
+            _to_call = int(base_state.current_bet) - int(np.asarray(base_state.committed_street)[hero])
+            if _to_call <= 0:
+                aug = (self._root_extra_post if self._root_extra_post is not None
+                       else self._allowed_post).copy()
+                aug[BET_BUCKET_START + 6] = True
+                self._root_extra_key = self._infoset_key(base_state, hero)
+                self._root_extra_post = aug
+                self._river_overbet_armed = True
+
         legal = self._legal(base_state, hero)
         if not legal.any():
             probs = np.zeros(NUM_ACTIONS, dtype=np.float32)
@@ -1374,6 +1417,11 @@ class PluribusReBeLSolver:
                     # averaged extraction, byte-identical.
                     serve_final_iterate=bool(cfg.serve_final_iterate
                                              and self.opponent_model is None),
+                    # STAGE-1 river overbet: root-only un-mask of bet bucket 6 when armed above
+                    # (native mirrors the Python _root_extra_post widening; do NOT skip the native
+                    # path for this knob — unlike offtree today, native support is the point).
+                    root_unmask=((1 << (BET_BUCKET_START + 6))
+                                 if self._river_overbet_armed else 0),
                 )
 
             _fit = eff_budget_ms < _NATIVE_FIT_BUDGET_MS
@@ -1416,8 +1464,21 @@ class PluribusReBeLSolver:
                               "budget_used_ms": budget_ms,
                               # True iff the budget fit served fewer iterations than the target (never
                               # triggers the blueprint blend on this path — see the header note).
-                              "budget_bound": bool(iters_used < int(eff_max_iters))},
+                              "budget_bound": bool(iters_used < int(eff_max_iters)),
+                              # Stage-1 diagnostic: this native serve solved the widened river root.
+                              "river_overbet_armed": bool(self._river_overbet_armed)},
                 )
+            # BUG-4c DEAD-KNOB TRAP (loud, never silent): a river_overbet-armed solve that reached
+            # the native path but got None back (stale pyd without root_unmask / unsupported config)
+            # is about to fall back to the Python loop. The Python loop still serves the widened
+            # menu correctly (_root_extra_post), but a SILENT fallback would hide a broken native
+            # root_unmask from the battery/live — warn loudly + flag the serve's metadata.
+            if probs_n is None and self._river_overbet_armed:
+                self._river_overbet_native_fallback = True
+                print("[search] WARNING: river_overbet armed a NATIVE serve but the native call "
+                      "returned None (stale battery_native.pyd without root_unmask?) — serving the "
+                      "widened root from the Python loop instead (correct but ~25x slower). "
+                      "Rebuild/install the pyd.", flush=True)
 
         # NATIVE EXPLOIT FAST PATH (opt-in, POKERBOT_NATIVE_EXPLOIT): the exploit analogue of the GTO
         # native path. Engaged ONLY on the PURE frozen-read branch — opponent_model set AND
@@ -1623,6 +1684,11 @@ class PluribusReBeLSolver:
                 "budget_bound": budget_bound,
                 "budget_bound_count": float(self._budget_bound_count),
                 "offtree_inserted": bool(self._offtree_inserted),
+                # Stage-1 river overbet diagnostics: armed = the root menu gained bucket 6 this
+                # solve; native_fallback = the armed solve SHOULD have served natively but the
+                # native call returned None (loud warning already printed — BUG-4c dead-knob trap).
+                "river_overbet_armed": bool(self._river_overbet_armed),
+                "river_overbet_native_fallback": bool(self._river_overbet_native_fallback),
                 "served": "search",
             },
         )

@@ -623,6 +623,7 @@ mod py {
             leaf_biased_continuations: bool,
             leaf_bias_mult: f64,
             serve_final_iterate: bool,
+            root_unmask: u32,
         ) -> Vec<f64> {
             let s = flat::from_flat(&bytes_to_flat(state));
             let scfg = SubgameConfig {
@@ -652,6 +653,9 @@ mod py {
                 // R5a — final-iterate serving (default OFF at the Python caller => the averaged
                 // extraction, byte-identical).
                 serve_final_iterate,
+                // STAGE-1 — river overbet / off-tree ROOT un-mask bitmask (root-only, depth==0,
+                // full-legal-ANDed; 0 default at the Python caller => byte-identical).
+                root_unmask,
             };
             subgame::solve(&s, hero, &self.bp, &self.cfg, &scfg, public_seed).to_vec()
         }
@@ -690,6 +694,7 @@ mod py {
                 leaf_biased_continuations: false,
                 leaf_bias_mult: 5.0,
                 serve_final_iterate: false,
+                root_unmask: 0,
             };
             subgame::build_rtab(&s, hero, &self.bp, &self.cfg, &scfg).map(|rt| rt.to_flat())
         }
@@ -764,6 +769,11 @@ mod py {
                 // FFI — hard-code OFF (subgame.rs solve_exploit's extraction never reads the field
                 // either, defense in depth) so the certified averaged exploit serve is untouched.
                 serve_final_iterate: false,
+                // FIREWALL: root_unmask (Stage-1 river overbet / off-tree root widening) is a
+                // GTO-path knob, NOT exposed on the exploit FFI — hard-code 0 (subgame.rs
+                // additionally forces it 0 in the exploit Ctx, defense in depth) so the certified
+                // exploit tree can never be widened at the root.
+                root_unmask: 0,
             };
             // Reconstruct the FrozenTable from the parallel key lists + flat vals (chunked by 11).
             let n = keys_actor
