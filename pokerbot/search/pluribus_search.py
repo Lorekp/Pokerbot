@@ -130,8 +130,13 @@ class PluribusReBeLConfig:
     # the public history entering only the world sampler; the frozen-read exploit math is untouched).
     # NATIVE-ONLY (same precedent as range_aware/range_uniform_floor: the Python _cfv loop samples via
     # PBSTracker, uniform in the eval base arm — per-combo replay likelihoods are prohibitively slow
-    # in Python). Default OFF => byte/stat-identical.
-    range_reach_full: bool = False
+    # in Python). Live config inherits this default (native path; ~2ms/solve cost). The EXPLOIT path
+    # also consumes reach ranges (data-not-code, mechanism shared; value on that path unmeasured).
+    # ADOPTED 2026-07-03: pooled +163.12/deck CI[+110.3,+215.9] over 6000 decks, two independent
+    # seeds (artifacts/battery_r1_reach/); live inherits via config default (native path; ~2ms/solve
+    # cost). The exploit path also consumes reach ranges (data-not-code, mechanism shared; value on
+    # that path unmeasured — noted, acceptable).
+    range_reach_full: bool = True
     # ENSEMBLE PARALLELISM (2026-07-01, native GTO path only). Run this many INDEPENDENT CFR streams in
     # parallel inside the native solve (rayon), each with its OWN regret/strategy tables + its OWN RNG
     # (seed = public_seed ^ (stream_idx*ODD)), then MERGE by summing the per-stream ROOT strategy_sum before

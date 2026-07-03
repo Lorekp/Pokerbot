@@ -100,8 +100,9 @@ _DEPLOYED_BASELINE = {
     # R1 reach-consistent opponent root ranges: per-combo weight = blueprint REACH product along the
     # hand's observed public history (natively replayed + verified; falls back to fold-now/uniform on
     # an unverifiable history) instead of the fold-now proxy. Floored by range_uniform_floor.
-    # (False = fold-now proxy per range_aware, DEPLOYED default, byte-identical)
-    "range_reach_full": False,
+    # ADOPTED 2026-07-03: pooled +163.12/deck CI[+110.3,+215.9] over 6000 decks, two independent
+    # seeds (artifacts/battery_r1_reach/). (True = DEPLOYED default)
+    "range_reach_full": True,
     # BUG-1 leaf-cache hole-world integration: running mean over the first M visiting worlds
     # (4 = ADOPTED 2026-07-02 default, +146/deck CI-certified; 1 = legacy first-touch freeze)
     "leaf_cache_worlds": 4,
