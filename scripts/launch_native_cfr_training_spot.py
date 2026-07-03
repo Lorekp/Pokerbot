@@ -161,37 +161,67 @@ def _launch_with_fallback(ec2, run_kwargs: dict, *, instance_types: list[str], s
     raise SystemExit(f"all instance types exhausted ({instance_types}); last error: {last_err}")
 
 
-def user_data(*, bucket, prefix, region, code_key, run_subdir, iters, n_deals, num_buckets,
-              depth_edges, checkpoint_every, keep_alive=False, emd_frozen_rel="", emd_sha="",
-              river_ochs_rel="", river_ochs_sha="",
-              work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
-              wall_guard_secs=21600, awscli_zip="awscli-exe-linux-x86_64.zip") -> str:
-    run_prefix = f"{prefix}/{run_subdir}"
-    final = "echo BOOTSTRAP_DONE_KEEP_ALIVE" if keep_alive else "shutdown -h now"
+def user_data_stub(*, bucket, region, run_prefix, bootstrap_key, wall_guard_secs,
+                   awscli_zip="awscli-exe-linux-x86_64.zip") -> str:
+    """Tiny cloud-init user-data (EC2 hard-caps user-data at 16384 bytes; the full bootstrap
+    outgrew it once river-OCHS + resume logic landed). Contains ONLY: (1) STEP-0 dead-man cost
+    cap — inline VERBATIM so the box is cost-bounded even if the S3 fetch below fails; (2) AWS
+    CLI v2 install + fetch of the real bootstrap from S3 + exec. Bootstrap fetch failure =>
+    immediate shutdown (never an idle box)."""
     floor_min = wall_guard_secs // 60 + 5   # absolute logind floor, 5 min after the wall-guard unit
-    depth_csv = ",".join(str(float(x)) for x in (depth_edges or []))
-    # No output redirect (cloud-init captures stdout to /var/log/cloud-init-output.log, visible via
-    # get-console-output) — same lesson the SD-CFR launcher documents.
     return f"""#!/bin/bash
 set -uxo pipefail
-export HOME="${{HOME:-/root}}"   # cloud-init runs as root with HOME UNSET; under set -u a bare $HOME (rustup/cargo PATH) is FATAL and aborts the whole script
+export HOME="${{HOME:-/root}}"   # cloud-init runs as root with HOME UNSET; under set -u a bare $HOME is FATAL
 export DEBIAN_FRONTEND=noninteractive AWS_DEFAULT_REGION={region}
 mkdir -p /opt/pokerbot
 
-# ===================== STEP 0 -- DEAD-MAN COST CAP, ARMED FIRST (before apt/rustup/build) =====================
+# ===================== STEP 0 -- DEAD-MAN COST CAP, ARMED FIRST (before apt/fetch/anything) =====================
 # TWO independent on-box terminators so the box CANNOT outlive ~{floor_min} min no matter what fails below
 # (the documented 3h20m idle-bill fix; ported from launch_cpu128_probe_spot.py). These MUST be the first real
-# commands so they survive a crash anywhere downstream (incl. a set -u abort, an apt/rustup/cargo failure, or
-# a hung driver) AND a dead babysitter / powered-off laptop:
+# commands so they survive a crash anywhere downstream (incl. a failed bootstrap fetch) AND a dead
+# babysitter / powered-off laptop:
 #  0a) ABSOLUTE FLOOR: `shutdown -h +{floor_min}` is scheduled by systemd/logind ITSELF (not a child/sleep),
-#      immune to cloud-init cgroup teardown, needs no packages. THE guard the old single-`shutdown`-at-tail
-#      design lacked -- a crash before the tail used to idle-bill the box.
+#      immune to cloud-init cgroup teardown, needs no packages.
 #  0b) WALL-GUARD UNIT: a systemd-run transient unit (own cgroup; NO --oneshot, whose 90s
 #      DefaultTimeoutStartSec would reap the sleep) that at {wall_guard_secs}s sweeps the train log to S3 then
 #      shuts down (~5 min before 0a).
 /sbin/shutdown -h +{floor_min} "pokerbot native-cfr wall-guard absolute cost cap" || true
 systemd-run --unit=pokerbot-wallguard --collect -p TimeoutStartSec=infinity --no-block /bin/bash -c 'sleep {wall_guard_secs} ; sync ; timeout 120 aws s3 cp /var/log/native-cfr-train.log s3://{bucket}/{run_prefix}/logs/train.WALLGUARD.log --region {region} 2>/dev/null || true ; /sbin/shutdown -h now' || true
 echo "WALL_GUARD armed: absolute shutdown +{floor_min}min floor + pokerbot-wallguard unit at {wall_guard_secs}s"
+
+# ===================== STEP 1 -- fetch + exec the real bootstrap from S3 =====================
+# AWS CLI v2 (NOT apt awscli v1 — the documented botocore-breakage lesson lives in the bootstrap).
+apt-get update -qq
+apt-get install -y -qq curl unzip
+curl -fsSL "https://awscli.amazonaws.com/{awscli_zip}" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli --update
+hash -r
+aws s3 cp s3://{bucket}/{bootstrap_key} /tmp/bootstrap.sh --region {region} || {{ echo "FATAL: bootstrap fetch failed" ; sync ; /sbin/shutdown -h now ; exit 1 ; }}
+bash /tmp/bootstrap.sh
+"""
+
+
+def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_deals, num_buckets,
+                   depth_edges, checkpoint_every, keep_alive=False, emd_frozen_rel="", emd_sha="",
+                   river_ochs_rel="", river_ochs_sha="",
+                   work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
+                   wall_guard_secs=21600, awscli_zip="awscli-exe-linux-x86_64.zip") -> str:
+    """The full on-box bootstrap (was inline user-data until it exceeded EC2's 16KB cap).
+    Uploaded to S3 by main() and exec'd by user_data_stub(). Content is otherwise the proven
+    launcher script, byte-equivalent from `apt-get update` onward — STEP 0 (cost cap) lives in
+    the stub and is ALREADY ARMED when this runs. The AWS CLI v2 re-install below is idempotent
+    (--update) and kept so this script stays self-sufficient if ever run standalone."""
+    run_prefix = f"{prefix}/{run_subdir}"
+    final = "echo BOOTSTRAP_DONE_KEEP_ALIVE" if keep_alive else "shutdown -h now"
+    depth_csv = ",".join(str(float(x)) for x in (depth_edges or []))
+    # No output redirect (cloud-init captures stdout to /var/log/cloud-init-output.log, visible via
+    # get-console-output) — same lesson the SD-CFR launcher documents.
+    return f"""#!/bin/bash
+set -uxo pipefail
+export HOME="${{HOME:-/root}}"   # may run detached from the stub's shell; same set -u guard
+export DEBIAN_FRONTEND=noninteractive AWS_DEFAULT_REGION={region}
+mkdir -p /opt/pokerbot
 
 apt-get update -qq
 apt-get install -y -qq python3-pip python3-dev gzip curl unzip build-essential
@@ -508,7 +538,11 @@ def main() -> None:
     wall_guard_secs = max(1, int(args.max_hours * 3600))
     awscli_zip = "awscli-exe-linux-aarch64.zip" if args.arch == "arm64" else "awscli-exe-linux-x86_64.zip"
 
-    ud = user_data(
+    # EC2 caps user-data at 16384 bytes and the full bootstrap outgrew it (river-OCHS launch,
+    # 2026-07-03). Split: full bootstrap -> S3 (uploaded on EVERY launch, incl. --reuse-code
+    # relaunches — content is deterministic from the args, so a babysitter relaunch re-uploads
+    # the identical script); user-data = STEP-0 cost cap + fetch-and-exec stub.
+    bootstrap = bootstrap_body(
         bucket=args.bucket, prefix=args.prefix, region=args.region, code_key=code_key,
         run_subdir=run_subdir, iters=args.iters, n_deals=args.n_deals,
         num_buckets=args.num_buckets, depth_edges=depth_edges,
@@ -519,6 +553,18 @@ def main() -> None:
         dcfr_prune_threshold=args.dcfr_prune_threshold, dcfr_explore_frac=args.dcfr_explore_frac,
         wall_guard_secs=wall_guard_secs, awscli_zip=awscli_zip,
     )
+    bootstrap_key = f"{args.prefix}/{run_subdir}/code/bootstrap.sh"
+    s3.put_object(Bucket=args.bucket, Key=bootstrap_key, Body=bootstrap.encode("utf-8"))
+    print(f"Uploaded bootstrap ({len(bootstrap)} bytes) -> s3://{args.bucket}/{bootstrap_key}", flush=True)
+    ud = user_data_stub(
+        bucket=args.bucket, region=args.region, run_prefix=f"{args.prefix}/{run_subdir}",
+        bootstrap_key=bootstrap_key, wall_guard_secs=wall_guard_secs, awscli_zip=awscli_zip,
+    )
+    # EC2's 16384-byte cap applies to the BASE64-ENCODED user-data (that's how the original
+    # inline script tripped it at ~13.5KB raw = ~18KB encoded).
+    ud_b64_len = len(base64.b64encode(ud.encode("utf-8")))
+    if ud_b64_len > 16000:
+        raise SystemExit(f"user-data stub too large (base64 {ud_b64_len} bytes) — must stay under 16384")
     run_kwargs = dict(
         ImageId=ami,
         InstanceType=args.instance_type,
