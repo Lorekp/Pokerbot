@@ -29,8 +29,8 @@
 use std::collections::HashMap;
 
 use crate::core::{
-    self, EnvStateN, ALL_IN, BB_CHIPS, BET_BUCKET_START, FOLD, NUM_ACTIONS, SB_CHIPS, SEAT_FOLDED,
-    SEAT_LIVE,
+    self, EnvStateN, ALL_IN, BB_CHIPS, BET_BUCKET_START, FOLD, NUM_ACTIONS, SB_CHIPS, SEAT_ALLIN,
+    SEAT_FOLDED, SEAT_LIVE,
 };
 use crate::fingerprint::CHIP_UNIT;
 use crate::playout::{self, Blueprint, PlayoutConfig, Rng};
@@ -932,7 +932,7 @@ fn public_eq<const N: usize>(a: &EnvStateN<N>, b: &EnvStateN<N>) -> bool {
 /// `post_blinds_n` exactly (blinds from SB_CHIPS/BB_CHIPS clamped to stacks, antes to pot_dead +
 /// committed_total, all-in marking, UTG/HU first actor); the deck is stuffed with the observed board
 /// so `sample_chance` reveals exactly the real runout at each street close.
-fn replay_with_ante<const N: usize>(
+pub(crate) fn replay_with_ante<const N: usize>(
     root: &EnvStateN<N>,
     ante_each: &[i32; N],
 ) -> Option<Vec<ReplayStep<N>>> {
@@ -941,7 +941,70 @@ fn replay_with_ante<const N: usize>(
         return None;
     }
     let hist_len = hist_len as usize;
+    let mut s = rebuild_hand_start(root, ante_each)?;
 
+    // ---- forward replay with per-step verification ----
+    let mut steps: Vec<ReplayStep<N>> = Vec::with_capacity(hist_len);
+    for t in 0..hist_len {
+        let mut guard = 0;
+        while core::is_chance_node(&s) {
+            s = core::sample_chance(&s);
+            guard += 1;
+            if guard > 4 {
+                return None;
+            }
+        }
+        if s.done {
+            return None;
+        }
+        let seat = root.hist_seat[t];
+        let action = root.hist_action[t];
+        if seat < 0 || seat >= N as i32 || !(0..NUM_ACTIONS as i32).contains(&action) {
+            return None;
+        }
+        if s.action_seat != seat {
+            return None;
+        }
+        let full = core::legal_action_mask(&s, seat);
+        if !full[action as usize] {
+            return None;
+        }
+        steps.push((seat as usize, action as usize, s));
+        s = core::apply_action(&s, action as usize);
+        // The replayed engine re-records the action it just applied; the recorded (seat, action,
+        // amount) triple must reproduce the root's history entry exactly (amount mismatches catch a
+        // wrong start-state reconstruction immediately, e.g. mis-derived antes or blinds).
+        if s.hist_len as usize != t + 1
+            || s.hist_seat[t] != root.hist_seat[t]
+            || s.hist_action[t] != root.hist_action[t]
+            || s.hist_amount[t] != root.hist_amount[t]
+        {
+            return None;
+        }
+    }
+    let mut guard = 0;
+    while core::is_chance_node(&s) {
+        s = core::sample_chance(&s);
+        guard += 1;
+        if guard > 4 {
+            return None;
+        }
+    }
+    if !public_eq(&s, root) {
+        return None;
+    }
+    Some(steps)
+}
+
+/// Hand-start (pre-preflop-action) state reconstruction shared by every replay attempt: blinds from
+/// SB_CHIPS/BB_CHIPS clamped to stacks, antes to pot_dead + committed_total, all-in marking, UTG/HU
+/// first actor, deck stuffed with the observed board. Extracted VERBATIM from `replay_with_ante`
+/// (Stage 2a refactor) so the amount-faithful replay reuses the identical, already-certified
+/// construction — behavior of the legacy attempts is unchanged.
+fn rebuild_hand_start<const N: usize>(
+    root: &EnvStateN<N>,
+    ante_each: &[i32; N],
+) -> Option<EnvStateN<N>> {
     // ---- hand-start reconstruction ----
     let mut status0 = [core::SEAT_EMPTY; N];
     for i in 0..N {
@@ -1032,7 +1095,7 @@ fn replay_with_ante<const N: usize>(
         }
     }
 
-    let mut s = EnvStateN::<N> {
+    Some(EnvStateN::<N> {
         holes: [[-1i32; 2]; N],
         board: [-1i32; core::MAX_BOARD],
         seat_status: status0,
@@ -1058,16 +1121,360 @@ fn replay_with_ante<const N: usize>(
         done: false,
         rewards: [0i32; N],
         pending_deal: false,
-    };
+    })
+}
 
-    // ---- forward replay with per-step verification ----
+// --------------------------------------------------------------------------------------------------
+// Stage 2a — AMOUNT-FAITHFUL history replay (offtree_resolve_design.md §2.3a, live-critical).
+//
+// WHY: live histories record the client's TRUE amounts — bet/raise entries carry the bet-TO street
+// TOTAL (normalized_to_state.py Action.amount_bb -> state_bridge.py `_bb_to_chips`), and calls carry
+// whatever the client sent (a total, or 0) — while `replay_with_ante` requires every replayed step's
+// ENGINE-recomputed amount (`to_call + max(cur_bet, f32_trunc(pot*frac)) - committed`, core.rs
+// action_amount) to equal the recorded one. These never agree on real client sizes, so the certified
+// R1 reach conditioning (`range_reach_full`) silently fell back to the uniform deal on 100% of live
+// states (Stage-0 telemetry, artifacts/live_reach_replay_telemetry.md). The functions below replay
+// COMMITTING THE RECORDED AMOUNT for bet-family actions (fold/check/call/all-in amounts are
+// engine-FORCED — computed from the state, the recorded value is ignored) and re-verify with:
+//   * per-step action-CLASS legality (actor match, live seat, reopen rule, actually-aggressive,
+//     full-raise-or-all-in),
+//   * per-seat chip conservation (commit clamps to stack; negative/zero increments refused),
+//   * the SAME final `public_eq` acceptance gate against the root's true public fields (pot,
+//     committed, stacks, street, ...). NO epsilon: ANY inconsistency returns None and the caller
+//     falls through to the legacy attempts and then the legacy range fallback (uniform deal) — the
+//     miskey lesson: a wrong reach weight is worse than uniform, every path stays fail-closed.
+// core.rs is FROZEN: the divergent-amount apply below locally mirrors `core::apply_action`
+// (precedent: `first_live_after_rs`); whenever the recorded amount EQUALS the engine-recomputed one
+// the step is delegated to `core::apply_action` verbatim (engine-history passthrough), so
+// engine-generated histories reproduce byte-identical steps — and therefore byte-identical reach
+// tables — through this new first attempt.
+// --------------------------------------------------------------------------------------------------
+
+/// `core::live_count` twin (private in frozen core.rs): counts CONTESTING seats — SEAT_LIVE
+/// **or** SEAT_ALLIN (an all-in seat still contests the pot; only folded/empty seats drop out).
+fn live_count_rs<const N: usize>(seat_status: &[i8; N]) -> i32 {
+    let mut n = 0;
+    for i in 0..N {
+        if seat_status[i] == SEAT_LIVE || seat_status[i] == SEAT_ALLIN {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// `core::pot_for_sizing` twin (private in frozen core.rs).
+fn pot_for_sizing_rs<const N: usize>(s: &EnvStateN<N>) -> i32 {
+    let mut p = s.pot_dead;
+    for i in 0..N {
+        p += s.committed_street[i];
+    }
+    p
+}
+
+/// `core::bucket_prod` twin: f32-truncate bet target `np.int32(np.float32(pot) * frac)`.
+#[inline]
+fn bucket_prod_rs(pot: i32, frac: f32) -> i32 {
+    ((pot as f32) * frac) as i32
+}
+
+/// `core::action_amount` twin (private in frozen core.rs): the ENGINE-computed commit increment for
+/// `action` by `seat` at `s` — the amount `core::apply_action` would commit and record.
+fn engine_action_amount_rs<const N: usize>(s: &EnvStateN<N>, seat: usize, action: usize) -> i32 {
+    let committed = s.committed_street[seat];
+    let to_call = (s.current_bet - committed).max(0);
+    let stack = s.stacks[seat];
+    let pot = pot_for_sizing_rs(s);
+    if action == core::CALL {
+        return to_call;
+    }
+    if action == ALL_IN {
+        return stack;
+    }
+    if (BET_BUCKET_START..ALL_IN).contains(&action) {
+        let frac = core::BET_BUCKETS_F32[action - BET_BUCKET_START];
+        let prod = bucket_prod_rs(pot, frac);
+        let target = s.current_bet.max(prod);
+        let bucket_val = (target - committed).max(0);
+        return to_call + bucket_val;
+    }
+    0
+}
+
+/// `core::street_complete` twin (private in frozen core.rs).
+fn street_complete_rs<const N: usize>(s: &EnvStateN<N>) -> bool {
+    let cur = s.current_bet;
+    let mut n_can_act = 0;
+    let mut matched = true;
+    let mut all_acted = true;
+    for i in 0..N {
+        if s.seat_status[i] == SEAT_LIVE {
+            n_can_act += 1;
+            if s.committed_street[i] < cur {
+                matched = false;
+            }
+            if !s.acted[i] {
+                all_acted = false;
+            }
+        }
+    }
+    let back_to_aggressor = s.action_seat == s.last_aggressor;
+    let no_aggressor = s.last_aggressor < 0;
+    (n_can_act == 0) || (matched && all_acted && (back_to_aggressor || no_aggressor))
+}
+
+/// `core::run_out` twin (private in frozen core.rs): deal the remaining board from the deck.
+fn run_out_rs<const N: usize>(s: &mut EnvStateN<N>) {
+    let mut ptr = s.deck_ptr as usize;
+    for _ in 0..core::MAX_BOARD {
+        let nb = s.board.iter().filter(|&&c| c >= 0).count();
+        if nb < core::MAX_BOARD {
+            s.board[nb] = s.deck[ptr];
+            ptr += 1;
+        }
+    }
+    s.deck_ptr = ptr as i32;
+    s.street = core::STREET_TERMINAL;
+    s.pending_deal = false;
+}
+
+/// `core::close_street` twin (private in frozen core.rs).
+fn close_street_rs<const N: usize>(s: &mut EnvStateN<N>) {
+    let mut pot_dead = s.pot_dead;
+    for i in 0..N {
+        pot_dead += s.committed_street[i];
+    }
+    s.pot_dead = pot_dead;
+    s.committed_street = [0; N];
+    s.current_bet = 0;
+    s.pending_deal = true;
+    s.action_seat = -1;
+    let actors = s.seat_status.iter().any(|&st| st == SEAT_LIVE);
+    if !actors && s.street < core::STREET_RIVER {
+        run_out_rs(s);
+    }
+}
+
+/// Apply one recorded history step, committing the RECORDED amount for bet-family actions.
+///
+///   * fold / check / call / all-in: the amount is engine-FORCED (no free parameter) — computed
+///     from the state via `core::apply_action`; the recorded value is deliberately IGNORED (live
+///     records call amounts as bet-TO totals; the engine stores the increment — telemetry finding 2).
+///   * bet-family (buckets 3..=9) whose recorded amount EQUALS the engine-recomputed one: delegated
+///     to `core::apply_action` verbatim (engine-history passthrough — bit-identical semantics).
+///   * bet-family with a DIVERGENT recorded amount: the commit increment is interpreted per
+///     `total_convention` (true: recorded is the bet-TO street total, the live convention =>
+///     inc = recorded - committed_street; false: recorded IS the increment), clamped to stack, and
+///     applied with min-raise/reopen state recomputed from the TRUE committed totals — a local
+///     mirror of the frozen `core::apply_action` body (chip flow, acted/full-raise reset,
+///     current_bet/min_raise/last_aggressor/last_raise_full, street close, run-out, next actor).
+///
+/// Returns None on ANY class-legality or chip-conservation violation: dead/folded actor, reopen
+/// rule violated, non-positive increment (this includes a total below the seat's already-committed
+/// chips), a "bet" that does not exceed the standing bet (call-for-less corruption), or a short
+/// raise that is not an all-in. Terminal steps mark `done` and zero rewards (the replay REJECTS a
+/// history that terminates before the root, so settle amounts are never consumed).
+pub(crate) fn apply_action_recorded<const N: usize>(
+    s_in: &EnvStateN<N>,
+    action: usize,
+    recorded: i32,
+    total_convention: bool,
+) -> Option<EnvStateN<N>> {
+    if s_in.action_seat < 0 || s_in.action_seat >= N as i32 || action >= NUM_ACTIONS {
+        return None;
+    }
+    let seat = s_in.action_seat as usize;
+    let full = core::legal_action_mask(s_in, seat as i32);
+    let engine_amt = engine_action_amount_rs(s_in, seat, action);
+
+    // Engine-forced classes + exact-amount passthrough: the frozen engine IS the semantics.
+    if action < BET_BUCKET_START || action == ALL_IN || recorded == engine_amt {
+        if !full[action] {
+            return None; // exact class legality per the engine mask.
+        }
+        return Some(core::apply_action(s_in, action));
+    }
+
+    // ---- bet-family with a divergent recorded amount ----
+    let mut s = *s_in;
+    if s.seat_status[seat] != SEAT_LIVE {
+        return None;
+    }
+    let committed = s.committed_street[seat];
+    let to_call = (s.current_bet - committed).max(0);
+    let reopen_ok = !s.acted[seat] || s.last_raise_full || to_call == 0;
+    if !reopen_ok {
+        return None; // facing a non-full raise the seat already acted on: cannot re-raise.
+    }
+    if recorded < 0 {
+        return None;
+    }
+    let inc = if total_convention {
+        recorded - committed // live bet-TO total => chips added this action.
+    } else {
+        recorded
+    };
+    if inc <= 0 {
+        return None; // chip conservation: a bet must add chips (total below committed refused).
+    }
+    let amount = inc.min(s.stacks[seat]); // clamp to stack (mirrors core::commit).
+    if amount <= 0 {
+        return None;
+    }
+    // commit (core::commit twin: stack/committed flow + all-in marking).
+    s.stacks[seat] -= amount;
+    s.committed_street[seat] += amount;
+    s.committed_total[seat] += amount;
+    if s.stacks[seat] <= 0 {
+        s.seat_status[seat] = SEAT_ALLIN;
+    }
+
+    let prev_bet = s_in.current_bet;
+    let new_street_bet = s.committed_street[seat];
+    if new_street_bet <= prev_bet {
+        return None; // recorded "bet/raise" does not exceed the standing bet: corrupt data.
+    }
+    let full_raise = new_street_bet >= prev_bet + s.min_raise;
+    if !full_raise && s.stacks[seat] > 0 {
+        return None; // a short raise is only legal as an all-in.
+    }
+    s.acted[seat] = true;
+    if full_raise {
+        s.acted = [false; N];
+        s.acted[seat] = true;
+    }
+    // raised == true here by the new_street_bet > prev_bet check above.
+    let raise_size = new_street_bet - prev_bet;
+    s.current_bet = new_street_bet;
+    s.min_raise = BB_CHIPS.max(raise_size);
+    s.last_aggressor = seat as i32;
+    s.last_raise_full = full_raise;
+
+    let idx = s.hist_len as usize;
+    if idx < core::MAX_HISTORY {
+        s.hist_seat[idx] = seat as i32;
+        s.hist_action[idx] = action as i32;
+        s.hist_amount[idx] = amount;
+    }
+    s.hist_len = ((idx + 1).min(core::MAX_HISTORY)) as i32;
+
+    let n_live = live_count_rs(&s.seat_status);
+    let mut terminal = n_live <= 1;
+    if terminal {
+        s.street = core::STREET_TERMINAL;
+        s.pending_deal = false;
+    } else if street_complete_rs(&s) {
+        close_street_rs(&mut s);
+    }
+    terminal = terminal || s.street >= core::STREET_TERMINAL || n_live <= 1;
+    s.action_seat = if terminal || s.pending_deal {
+        -1
+    } else {
+        first_live_after_rs(&s.seat_status, s.action_seat)
+    };
+    s.done = terminal;
+    s.rewards = [0; N]; // never consumed: a mid-replay terminal is rejected by the caller.
+    Some(s)
+}
+
+/// The engine's street-close rule (`core::street_complete`) checks `action_seat ==
+/// last_aggressor` BEFORE the actor advances, so after a bet-call(-call) sequence the action
+/// returns to the AGGRESSOR, who must CHECK to close the street — a synthetic "aggressor option"
+/// node that engine-generated histories contain but REAL live histories never record (real poker
+/// closes the street on the last call). True exactly when the replay stands at that node: the
+/// actor is the last aggressor, faces no bet, and every live seat has matched and acted — i.e.
+/// the actor's CHECK closes the street and commits nothing.
+fn phantom_check_applicable<const N: usize>(s: &EnvStateN<N>) -> bool {
+    if s.done || core::is_chance_node(s) {
+        return false;
+    }
+    let actor = s.action_seat;
+    if actor < 0 || actor >= N as i32 || actor != s.last_aggressor {
+        return false;
+    }
+    let a = actor as usize;
+    if s.seat_status[a] != SEAT_LIVE {
+        return false;
+    }
+    if (s.current_bet - s.committed_street[a]).max(0) != 0 {
+        return false;
+    }
+    for i in 0..N {
+        if s.seat_status[i] == SEAT_LIVE && (s.committed_street[i] < s.current_bet || !s.acted[i]) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Apply the phantom aggressor-option CHECK via the frozen engine, then ROLL BACK its history
+/// entry (restore the slot, decrement hist_len): the inserted action is synthetic — the live
+/// root's hist_len counts only RECORDED actions, and keeping the counts aligned preserves the
+/// full final `public_eq` (including hist_len) with zero relaxation. The check itself commits no
+/// chips; its only effects are the street close + deal bookkeeping, which is exactly the bridge
+/// a live history needs. The blueprint keying never reads the hist arrays (playout::fp_key ->
+/// fingerprint state scalars), so the rollback has no keying side effects.
+fn apply_phantom_check<const N: usize>(s: &EnvStateN<N>) -> Option<EnvStateN<N>> {
+    let full = core::legal_action_mask(s, s.action_seat);
+    if !full[core::CHECK] {
+        return None;
+    }
+    let before_len = s.hist_len;
+    let idx = before_len as usize;
+    if idx >= core::MAX_HISTORY {
+        return None; // cannot keep recorded counts aligned past MAX_HISTORY — refuse.
+    }
+    let mut out = core::apply_action(s, core::CHECK);
+    if out.hist_len as usize != idx + 1 {
+        return None;
+    }
+    out.hist_seat[idx] = -1;
+    out.hist_action[idx] = -1;
+    out.hist_amount[idx] = 0;
+    out.hist_len = before_len;
+    Some(out)
+}
+
+/// Amount-faithful forward replay (Stage 2a): identical skeleton to `replay_with_ante` — same
+/// hand-start reconstruction, same actor/bounds checks, same chance handling, same FINAL
+/// `public_eq` acceptance — but each step is applied via `apply_action_recorded` under the given
+/// amount convention, and the per-step "recorded amount must equal the engine-recomputed amount"
+/// verification is REPLACED by the class-legality + chip-conservation checks inside it.
+/// `insert_phantom_checks`: when true, the replay inserts the engine's synthetic
+/// aggressor-option CHECK (see `phantom_check_applicable`) wherever the engine requires it —
+/// before a recorded step whose street the engine has not closed yet, and after the last
+/// recorded step while the replay is still on an earlier street than the root. Attempted only
+/// AFTER the plain pass fails, so engine-generated histories (which record the closing action)
+/// never take it.
+fn replay_recorded<const N: usize>(
+    root: &EnvStateN<N>,
+    ante_each: &[i32; N],
+    total_convention: bool,
+    insert_phantom_checks: bool,
+) -> Option<Vec<ReplayStep<N>>> {
+    let hist_len = root.hist_len;
+    if root.done || !(0..=core::MAX_HISTORY as i32).contains(&hist_len) {
+        return None;
+    }
+    let hist_len = hist_len as usize;
+    let mut s = rebuild_hand_start(root, ante_each)?;
+
     let mut steps: Vec<ReplayStep<N>> = Vec::with_capacity(hist_len);
     for t in 0..hist_len {
         let mut guard = 0;
-        while core::is_chance_node(&s) {
-            s = core::sample_chance(&s);
+        loop {
+            while core::is_chance_node(&s) {
+                s = core::sample_chance(&s);
+                guard += 1;
+                if guard > 12 {
+                    return None;
+                }
+            }
+            if !(insert_phantom_checks && phantom_check_applicable(&s)) {
+                break;
+            }
+            s = apply_phantom_check(&s)?;
             guard += 1;
-            if guard > 4 {
+            if guard > 12 {
                 return None;
             }
         }
@@ -1082,28 +1489,27 @@ fn replay_with_ante<const N: usize>(
         if s.action_seat != seat {
             return None;
         }
-        let full = core::legal_action_mask(&s, seat);
-        if !full[action as usize] {
-            return None;
-        }
         steps.push((seat as usize, action as usize, s));
-        s = core::apply_action(&s, action as usize);
-        // The replayed engine re-records the action it just applied; the recorded (seat, action,
-        // amount) triple must reproduce the root's history entry exactly (amount mismatches catch a
-        // wrong start-state reconstruction immediately, e.g. mis-derived antes or blinds).
-        if s.hist_len as usize != t + 1
-            || s.hist_seat[t] != root.hist_seat[t]
-            || s.hist_action[t] != root.hist_action[t]
-            || s.hist_amount[t] != root.hist_amount[t]
-        {
+        s = apply_action_recorded(&s, action as usize, root.hist_amount[t], total_convention)?;
+        if s.hist_len as usize != t + 1 {
             return None;
         }
     }
     let mut guard = 0;
-    while core::is_chance_node(&s) {
-        s = core::sample_chance(&s);
+    loop {
+        while core::is_chance_node(&s) {
+            s = core::sample_chance(&s);
+            guard += 1;
+            if guard > 12 {
+                return None;
+            }
+        }
+        if !(insert_phantom_checks && s.street < root.street && phantom_check_applicable(&s)) {
+            break;
+        }
+        s = apply_phantom_check(&s)?;
         guard += 1;
-        if guard > 4 {
+        if guard > 12 {
             return None;
         }
     }
@@ -1113,13 +1519,95 @@ fn replay_with_ante<const N: usize>(
     Some(steps)
 }
 
-/// Replay the root's recorded public history, deriving per-seat antes from the chip identity
-/// `ante[i] = committed_total[i] - blind[i] - Σ recorded amounts of seat i` (exact for every normal
-/// hand; a clamped call-for-less overstates the recorded amount, driving the derived ante negative —
-/// in that case retry with zero antes, which is exact for the ante-free cash regimes this serves).
-/// Every attempt is fully verified (per-step + final public equality), so a wrong guess can never
-/// produce states — only a None (=> the caller falls back to the legacy range behavior).
+/// Stage 2a entry: amount-faithful replay attempts, tried BEFORE the legacy engine-amount attempts
+/// (design §2.3a / §6 Stage 2). Convention order is total-then-increment (live records bet-TO
+/// street totals; engine-shaped increments are the fallback reading); each convention tries the
+/// derived-ante identity first (exact for engine histories — where every step takes the
+/// `core::apply_action` passthrough and reproduces the legacy steps bit-for-bit), then zero antes
+/// (exact for the ante-free live cash regimes; the totals convention breaks the increment-sum
+/// identity, so its derived antes are usually refused and zero antes carry the live path). Every
+/// attempt is fully verified per-step + final `public_eq`; a wrong convention or ante guess can
+/// only produce None, never a mis-keyed table.
+pub(crate) fn replay_recorded_amounts<const N: usize>(root: &EnvStateN<N>) -> Option<Vec<ReplayStep<N>>> {
+    let hist_len = root.hist_len;
+    if root.done || !(0..=core::MAX_HISTORY as i32).contains(&hist_len) {
+        return None;
+    }
+    let hl = hist_len as usize;
+    // Derived-ante identity (mirrors the legacy derivation in `replay_public_states`): valid only
+    // under the increment reading of the recorded amounts, but exact for engine histories.
+    let mut status0 = [core::SEAT_EMPTY; N];
+    for i in 0..N {
+        if root.seat_status[i] != core::SEAT_EMPTY {
+            status0[i] = SEAT_LIVE;
+        }
+    }
+    let mut stacks0 = [0i64; N];
+    for i in 0..N {
+        stacks0[i] = root.stacks[i] as i64 + root.committed_total[i] as i64;
+    }
+    let sb = nth_live_after_rs(&status0, root.button, 1);
+    let bb = nth_live_after_rs(&status0, root.button, 2);
+    if sb < 0 || bb < 0 || sb == bb {
+        return None;
+    }
+    let mut blind = [0i64; N];
+    blind[sb as usize] = (SB_CHIPS as i64).min(stacks0[sb as usize].max(0));
+    blind[bb as usize] = (BB_CHIPS as i64).min(stacks0[bb as usize].max(0));
+    let mut hist_commit = [0i64; N];
+    for t in 0..hl {
+        let seat = root.hist_seat[t];
+        if seat < 0 || seat >= N as i32 {
+            return None;
+        }
+        hist_commit[seat as usize] += root.hist_amount[t].max(0) as i64;
+    }
+    let mut ante = [0i32; N];
+    let mut derived_ok = true;
+    let mut any_nonzero = false;
+    for i in 0..N {
+        let a = root.committed_total[i] as i64 - blind[i] - hist_commit[i];
+        if a < 0 {
+            derived_ok = false;
+            break;
+        }
+        if a > 0 {
+            any_nonzero = true;
+        }
+        ante[i] = a as i32;
+    }
+    for &total_convention in &[true, false] {
+        for &phantom in &[false, true] {
+            if derived_ok {
+                if let Some(v) = replay_recorded(root, &ante, total_convention, phantom) {
+                    return Some(v);
+                }
+            }
+            if !derived_ok || any_nonzero {
+                if let Some(v) = replay_recorded(root, &[0i32; N], total_convention, phantom) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Replay the root's recorded public history. Stage 2a: the AMOUNT-FAITHFUL attempts run FIRST
+/// (they replay the client's true recorded amounts — the live path; engine histories take the
+/// per-step engine passthrough inside them and reproduce the legacy steps bit-for-bit). The legacy
+/// engine-amount attempts are KEPT as the fallback chain, deriving per-seat antes from the chip
+/// identity `ante[i] = committed_total[i] - blind[i] - Σ recorded amounts of seat i` (exact for
+/// every normal hand; a clamped call-for-less overstates the recorded amount, driving the derived
+/// ante negative — in that case retry with zero antes, which is exact for the ante-free cash
+/// regimes this serves). Every attempt is fully verified (per-step + final public equality), so a
+/// wrong guess can never produce states — only a None (=> the caller falls back to the legacy
+/// range behavior).
 pub(crate) fn replay_public_states<const N: usize>(root: &EnvStateN<N>) -> Option<Vec<ReplayStep<N>>> {
+    // Stage 2a — amount-faithful attempts FIRST (fully verified; None falls through to legacy).
+    if let Some(v) = replay_recorded_amounts(root) {
+        return Some(v);
+    }
     let hist_len = root.hist_len;
     if root.done || !(0..=core::MAX_HISTORY as i32).contains(&hist_len) {
         return None;

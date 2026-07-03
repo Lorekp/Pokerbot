@@ -1798,3 +1798,228 @@ mod range_reach_r1 {
         assert!((ssum - 1.0).abs() < 1e-6, "root probs must sum to 1");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stage 2a — amount-faithful history replay (offtree_resolve_design.md §2.3a): the recorded-amount
+// replay must (1) reproduce the legacy engine-amount replay BIT-FOR-BIT on engine histories
+// (per-step core::apply_action passthrough), (2) accept the LIVE recording conventions — call
+// amounts as bet-TO street totals (engine-forced, ignored) and bet/raise amounts as bet-TO street
+// totals (interpreted) — yielding the SAME public decision states, and (3) stay fail-closed (None)
+// on amounts inconsistent with the root's true chips (the miskey lesson: wrong > uniform is never
+// an option; corrupted data must fall back to the uniform deal).
+// ---------------------------------------------------------------------------
+mod stage2a_amount_faithful {
+    use super::*;
+    use crate::subgame;
+
+    /// 6-max 100bb identity-deck 3-bet hand (verified against np_engine): UTG (seat 3) opens
+    /// bucket idx 4 (engine amount 250 -> bet-to 250), seats 4/5/0/1 fold, BB (seat 2) 3-bets
+    /// bucket idx 5 (engine amount 650 -> bet-to 750), seat 3 CALLS (engine amount 500 -> bet-to
+    /// 750), BB checks the option to close preflop; flop deals.
+    /// hist_amount = [250,0,0,0,0,650,500,0]. Returns the flop root (BB first to act).
+    fn scripted_3bet_root() -> EnvStateN<6> {
+        let stacks = [100 * BB_CHIPS; 6];
+        let occ = [true; 6];
+        let mut deck = [0i32; 52];
+        for (i, d) in deck.iter_mut().enumerate() {
+            *d = i as i32;
+        }
+        let mut env = init_hand_n::<6>(0, &stacks, &occ, 0, &deck, [0u32, 0u32]);
+        let script: [(i32, usize); 8] = [
+            (3, BET_BUCKET_START + 4), // UTG opens 1.0-pot bucket -> commits 250
+            (4, FOLD),
+            (5, FOLD),
+            (0, FOLD),
+            (1, FOLD),
+            (2, BET_BUCKET_START + 5), // BB 3-bets 1.5-pot bucket -> commits 650 (bet-to 750)
+            (3, CALL),                 // calls 500 (bet-to 750)
+            (2, CHECK),                // aggressor's closing option (engine street-close rule)
+        ];
+        for (seat, action) in script {
+            assert!(!is_chance_node(&env), "unexpected chance node mid-script");
+            assert_eq!(env.action_seat, seat, "script actor mismatch");
+            env = apply_action(&env, action);
+        }
+        while is_chance_node(&env) {
+            env = sample_chance(&env);
+        }
+        assert_eq!(env.street, STREET_FLOP);
+        assert_eq!(env.action_seat, 2, "BB acts first on the flop");
+        assert_eq!(env.hist_len, 8);
+        assert_eq!(&env.hist_amount[..8], &[250, 0, 0, 0, 0, 650, 500, 0]);
+        env
+    }
+
+    /// The public state at the BB 3-bet decision (hist step 5), reconstructed via the verified
+    /// legacy replay — used as the base state for the direct `apply_action_recorded` assertions.
+    fn bb_3bet_decision_state() -> EnvStateN<6> {
+        let root = scripted_3bet_root();
+        let steps = subgame::replay_with_ante(&root, &[0i32; 6]).expect("legacy replay");
+        let (seat, action, st) = steps[5];
+        assert_eq!((seat, action), (2, BET_BUCKET_START + 5));
+        assert_eq!(st.committed_street[2], 100, "BB blind committed before the 3-bet");
+        assert_eq!(st.current_bet, 250);
+        st
+    }
+
+    // (1) ENGINE-CONVENTION PASSTHROUGH: on an engine-generated history the recorded-amount replay
+    // (which runs FIRST in replay_public_states) must equal the legacy replay BIT-FOR-BIT — same
+    // snapshots, same order — so reach tables are byte-identical either way.
+    #[test]
+    fn recorded_replay_engine_passthrough_bit_identical() {
+        let root = scripted_3bet_root();
+        let legacy = subgame::replay_with_ante(&root, &[0i32; 6]).expect("legacy replay");
+        let recorded = subgame::replay_recorded_amounts(&root).expect("recorded replay");
+        assert_eq!(recorded, legacy, "recorded-amount replay must reproduce legacy bit-for-bit");
+        let chain = subgame::replay_public_states(&root).expect("full chain");
+        assert_eq!(chain, legacy, "replay_public_states must be unchanged on engine histories");
+    }
+
+    // (2a) CALL-TOTAL CONVENTION (telemetry finding 2): live records a call's bet-TO street total
+    // (750) where the engine records the increment (500). Call amounts are engine-FORCED: the
+    // replay must succeed and reproduce the SAME public decision states as the pristine history.
+    #[test]
+    fn recorded_replay_call_total_convention() {
+        let root = scripted_3bet_root();
+        let pristine = subgame::replay_with_ante(&root, &[0i32; 6]).expect("legacy replay");
+        let mut live = root;
+        live.hist_amount[6] = 750; // seat 3's call recorded as bet-TO total (engine inc = 500)
+        let steps = subgame::replay_public_states(&live).expect("call-total must replay");
+        assert_eq!(steps, pristine, "call-total replay must yield identical decision states");
+        // Arbitrary recorded call amounts are ignored (engine-forced) — still replays.
+        let mut junk = root;
+        junk.hist_amount[6] = 123_456;
+        assert!(subgame::replay_public_states(&junk).is_some(), "call amount is engine-forced");
+    }
+
+    // (2b) BET-TOTAL CONVENTION (design section 0.2): live records a raise's bet-TO street total
+    // (750) where the engine records the increment (650; BB's 100 blind is the difference). The
+    // replay must interpret the total, recompute min-raise/reopen from true committed totals, and
+    // yield identical public decision states + an f64-identical reach table.
+    #[test]
+    fn recorded_replay_bet_total_convention() {
+        let root = scripted_3bet_root();
+        let pristine = subgame::replay_with_ante(&root, &[0i32; 6]).expect("legacy replay");
+        let mut live = root;
+        live.hist_amount[5] = 750; // BB 3-bet recorded as bet-TO total (engine inc = 650)
+        live.hist_amount[6] = 750; // call as total too (the live recorder is uniform)
+        let steps = subgame::replay_public_states(&live).expect("bet-total must replay");
+        assert_eq!(steps, pristine, "bet-total replay must yield identical decision states");
+        // Reach tables byte-identical between the two encodings of the SAME hand.
+        use crate::playout::{Blueprint, PlayoutConfig};
+        let pc = PlayoutConfig {
+            allowed_pre: [true; NUM_ACTIONS],
+            allowed_post: [true; NUM_ACTIONS],
+            bias_mult: 5.0,
+            bias_floor: 0.0,
+            max_depth: 24,
+            num_buckets: 200,
+            emd: None,
+        };
+        let mut bp: Blueprint = std::collections::HashMap::new();
+        // Pin a row at the BB 3-bet decision so the table is non-trivial.
+        let st5 = pristine[5].2;
+        let mut keyed = st5;
+        keyed.holes[2][0] = 20;
+        keyed.holes[2][1] = 21;
+        let mut row = [0.0f64; NUM_ACTIONS];
+        row[BET_BUCKET_START + 5] = 0.7;
+        row[CALL] = 0.3;
+        bp.insert(pc.fp_key(&keyed, 2), row);
+        let known = {
+            let mut k = [false; 52];
+            for c in [4usize, 5, 12, 13, 14] {
+                k[c] = true;
+            }
+            k
+        };
+        let a = subgame::build_range_table_reach(&root, 3, &known, &bp, &pc).expect("pristine");
+        let b = subgame::build_range_table_reach(&live, 3, &known, &bp, &pc).expect("live-conv");
+        assert_eq!(
+            a.to_flat(),
+            b.to_flat(),
+            "reach tables must be identical across amount encodings"
+        );
+    }
+
+    // (2c) PHANTOM AGGRESSOR-OPTION CHECK (live street-close mismatch): the engine's
+    // street_complete rule returns the action to the aggressor after a bet-call sequence, so
+    // engine histories contain a closing CHECK that REAL live histories never record. A
+    // live-shaped history (closing check stripped + bet/call amounts as bet-TO totals) must
+    // replay via phantom insertion and reproduce the pristine decision states (minus the
+    // synthetic node, which live never records).
+    #[test]
+    fn recorded_replay_phantom_closing_check_insertion() {
+        let root = scripted_3bet_root();
+        let pristine = subgame::replay_with_ante(&root, &[0i32; 6]).expect("legacy replay");
+        assert_eq!(pristine.len(), 8);
+        assert_eq!((pristine[7].0, pristine[7].1), (2, CHECK), "step 7 is the closing option");
+        // Live-shaped root: same public state, history without the synthetic closing check and
+        // with live-convention amounts (bet-TO street totals).
+        let mut live = root;
+        live.hist_len = 7;
+        live.hist_seat[7] = -1;
+        live.hist_action[7] = -1;
+        live.hist_amount[7] = 0;
+        live.hist_amount[5] = 750; // BB 3-bet as bet-TO total
+        live.hist_amount[6] = 750; // call as bet-TO total
+        let steps = subgame::replay_public_states(&live).expect("phantom insertion must bridge");
+        assert_eq!(steps.len(), 7, "exactly the recorded decisions are reconstructed");
+        for k in 0..7 {
+            let (es, ea, est) = pristine[k];
+            let (ls, la, lst) = steps[k];
+            assert_eq!((ls, la), (es, ea), "step {k} actor/action");
+            // Public decision states identical except the hist bookkeeping (same arrays here,
+            // since the phantom is the LAST pristine entry): full equality must hold.
+            assert_eq!(lst, est, "step {k} snapshot");
+        }
+    }
+
+    // (3) FAIL-CLOSED: an amount inconsistent with the root's true chips (the +7 perturbation —
+    // the live_reach_replay_perturb canary) must be REFUSED under every interpretation: a wrong
+    // reach weight is worse than uniform.
+    #[test]
+    fn recorded_replay_inconsistent_amount_is_none() {
+        let root = scripted_3bet_root();
+        let mut bad = root;
+        bad.hist_amount[5] += 7; // neither a valid increment nor a valid bet-TO total
+        assert!(
+            subgame::replay_public_states(&bad).is_none(),
+            "chips inconsistent with the root must fail closed"
+        );
+    }
+
+    // (4) apply_action_recorded direct semantics: passthrough equality, forced-call equality,
+    // total-interpretation equality, and the chip-conservation / short-raise refusals.
+    #[test]
+    fn apply_action_recorded_conventions_and_conservation() {
+        let st = bb_3bet_decision_state();
+        let a = BET_BUCKET_START + 5;
+        let engine = apply_action(&st, a);
+        // Engine passthrough: recorded == engine increment (650).
+        assert_eq!(
+            subgame::apply_action_recorded(&st, a, 650, true).expect("passthrough"),
+            engine
+        );
+        // Total convention: recorded bet-TO 750 => same committed state (inc = 750 - 100 = 650).
+        assert_eq!(
+            subgame::apply_action_recorded(&st, a, 750, true).expect("total"),
+            engine
+        );
+        // Chip conservation: a total BELOW the seat's committed chips is refused.
+        assert!(subgame::apply_action_recorded(&st, a, 40, true).is_none());
+        // A "raise" that does not exceed the standing bet is refused (increment reading of 40).
+        assert!(subgame::apply_action_recorded(&st, a, 40, false).is_none());
+        // A short raise that is not an all-in is refused (increment 250 -> bet-to 350 < min 400).
+        assert!(subgame::apply_action_recorded(&st, a, 250, false).is_none());
+        // Forced call: recorded total is ignored, engine semantics applied.
+        let root = scripted_3bet_root();
+        let steps = subgame::replay_with_ante(&root, &[0i32; 6]).expect("legacy replay");
+        let (seat6, act6, st6) = steps[6];
+        assert_eq!((seat6, act6), (3, CALL));
+        assert_eq!(
+            subgame::apply_action_recorded(&st6, CALL, 750, true).expect("forced call"),
+            apply_action(&st6, CALL)
+        );
+    }
+}
