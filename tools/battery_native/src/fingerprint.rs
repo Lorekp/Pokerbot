@@ -433,6 +433,60 @@ pub fn fingerprint_fast_depth<const N: usize>(
     fingerprint_from_bucket(s, seat, bucket, depth_edges)
 }
 
+// ---------------------------------------------------------------------------
+// EXPERIMENT (preflop mispricing diagnosis, 2026-07-03): opt-in preflop HISTORY key extension.
+//
+// Root-cause finding: the 6-byte betting_abstraction_key ALIASES strategically distinct preflop
+// histories into one infoset (folded-to-hero == after-a-limper; BB-vs-UTG-open == BB-vs-BTN-open;
+// facing-4bet-jam == facing-limp-trap-jam). The trained equilibrium of that aliased game is the
+// ultra-tight/limpy/trap-heavy preflop (AA open-limps BTN 93%). This opt-in extension appends
+// b"H" + [n_limps_before_first_raise, n_raises (cap 3), first_raiser_pos_enum + 1] to PREFLOP keys
+// so the trainer can distinguish those histories. Gated by POKERBOT_PREFLOP_HIST_KEY=1 read ONCE;
+// default OFF is byte-identical to the shipped key space (golden digest tests unaffected).
+// TRAIN/SERVE SKEW WARNING: a checkpoint trained with this ON must be served with matching keying;
+// it is an EXPERIMENT knob, not wired into any serve stamp yet.
+// ---------------------------------------------------------------------------
+
+pub fn preflop_hist_key_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("POKERBOT_PREFLOP_HIST_KEY").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+/// [n_calls_before_first_raise (cap 3), n_raises (cap 3), first_raiser_pos_enum + 1 (0 = none)].
+/// Caller is preflop-only (street==0), so every history entry is a preflop action; blind posts are
+/// not history entries (`init_hand_n` starts hist_len=0). Folds/checks are ignored.
+pub fn preflop_hist_bytes<const N: usize>(s: &EnvStateN<N>) -> [u8; 3] {
+    let mut n_calls: u8 = 0;
+    let mut n_raises: u8 = 0;
+    let mut opener_seat: i32 = -1;
+    let len = (s.hist_len.max(0) as usize).min(crate::core::MAX_HISTORY);
+    for i in 0..len {
+        let a = s.hist_action[i];
+        if a == crate::core::CALL as i32 {
+            if n_raises == 0 && n_calls < 3 {
+                n_calls += 1;
+            }
+        } else if a >= crate::core::BET_BUCKET_START as i32 && a <= crate::core::ALL_IN as i32 {
+            if n_raises == 0 {
+                opener_seat = s.hist_seat[i];
+            }
+            if n_raises < 3 {
+                n_raises += 1;
+            }
+        }
+    }
+    let opener_pos: i32 = if opener_seat >= 0 {
+        let offset = (((opener_seat - s.button) % N as i32 + N as i32) % N as i32) as usize;
+        pos_by_offset::<N>(offset)
+    } else {
+        -1
+    };
+    [n_calls, n_raises, (opener_pos + 1) as u8]
+}
+
 /// The digest for an ALREADY-RESOLVED postflop bucket id (or `bucket < 0` => the preflop `b"w"`
 /// branch, including the depth byte when enabled). Pure code motion out of `fingerprint_fast_depth`
 /// — the message assembly is byte-identical to the pre-refactor body (golden digest tests pin it).
@@ -464,6 +518,10 @@ pub fn fingerprint_from_bucket<const N: usize>(
             let dbucket = bucket_edge(effective_depth_bb(s), depth_edges);
             msg.push(b'D');
             msg.push(dbucket);
+        }
+        if preflop_hist_key_enabled() {
+            msg.push(b'H');
+            msg.extend_from_slice(&preflop_hist_bytes(s));
         }
     }
     msg.push(b'S');
@@ -554,6 +612,10 @@ pub fn fingerprint_fast_depth_memo<const N: usize>(
             let dbucket = bucket_edge(effective_depth_bb(s), depth_edges);
             msg.push(b'D');
             msg.push(dbucket);
+        }
+        if preflop_hist_key_enabled() {
+            msg.push(b'H');
+            msg.extend_from_slice(&preflop_hist_bytes(s));
         }
     }
     msg.push(b'S');
