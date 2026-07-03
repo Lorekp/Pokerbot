@@ -46,7 +46,10 @@ def _run_h2h(baseline_spec: str, arm_spec: str, name: str, decks: int, seed: int
     sharder = os.path.join(here, "h2h_sharded.py")
 
     # Shard each A/B run across worker processes (CRN-exact; see h2h_sharded.py).
-    shards = int(os.environ.get("POKERBOT_H2H_SHARDS", "4"))
+    # Default 6: measured knee on this 6-core box post EMD-native port (240 decks, seed 60321:
+    # 4 shards 121s / 6 shards 101s / 8 shards 100s — artifacts/shard_scaling_s{4,6,8}.json).
+    # The old 4-shard ceiling was measured when 8s Python solves saturated rayon; stale since 197862a.
+    shards = int(os.environ.get("POKERBOT_H2H_SHARDS", "6"))
     cmd = [
         sys.executable, "-u", sharder,
         "--shards", str(shards),
