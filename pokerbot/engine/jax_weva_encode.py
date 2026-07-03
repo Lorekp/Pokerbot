@@ -184,6 +184,19 @@ def compute_postflop_bucket(hole_ids: Any, board_ids: Any) -> int:
 
         return fast_made_hand_bucket((h[0], h[1]), tuple(board), _POSTFLOP_NUM_BUCKETS)
     if _POSTFLOP_MODE == "emd":
+        # Blueprint-v2 river OCHS (POKERBOT_RIVER_OCHS): the river is keyed by the OCHS
+        # nearest-centroid bucket the TRAINER wrote river rows under — checked BEFORE the frozen
+        # flop/turn lookup (which never covers the river) so the river cannot silently fall
+        # through to the made-hand mirror bucket (same id space, WRONG semantics — a wrong-row
+        # HIT, worse than a miss). Unset (the deployed bp_emd_k160_1 regime) => unchanged.
+        if len(board) == 5:
+            from pokerbot.encoding.river_ochs import get_river_ochs
+
+            _ochs = get_river_ochs()
+            if _ochs is not None:
+                b = _ochs.bucket((h[0], h[1]), board)
+                if b >= 0:
+                    return b
         frozen = _get_emd_frozen_lookup()
         if frozen is not None:
             bucket = int(frozen.bucket([h[0], h[1]], list(board)))
@@ -236,6 +249,17 @@ def active_abstraction_config() -> dict:
         cfg["postflop_emd_frozen_miss_count"] = int(_EMD_FROZEN_MISS_COUNT)
         cfg["postflop_emd_frozen_fail_on_miss"] = bool(_emd_fail_on_miss())
         cfg["postflop_emd_frozen_mirror_fallback"] = bool(_emd_mirror_fallback())
+        # Blueprint-v2 river OCHS: emitted ONLY when enabled so the default stamp stays
+        # byte-identical to pre-river-OCHS checkpoints (the depth_bucketed pattern). The serve
+        # guard (check_blueprint_serve_env) also does an explicit two-sided default-False check.
+        river_ochs_path = os.environ.get("POKERBOT_RIVER_OCHS", "")
+        if river_ochs_path:
+            cfg["river_ochs"] = True
+            cfg["river_ochs_path"] = river_ochs_path
+            cfg["river_ochs_sha256"] = ""
+            if os.path.exists(river_ochs_path):
+                with open(river_ochs_path, "rb") as f:
+                    cfg["river_ochs_sha256"] = hashlib.sha256(f.read()).hexdigest()
     # Depth-aware blueprint (A2): emit the stamp fields ONLY when enabled, so the default (off) stamp stays
     # byte-identical to legacy non-depth checkpoints (and the golden config). The serve guard
     # (check_blueprint_serve_env) compares these with a `.get(default=False)` so a missing key reads as off.

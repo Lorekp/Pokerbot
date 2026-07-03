@@ -201,6 +201,14 @@ def check_blueprint_serve_env(*, strict: bool = False, expected: dict | None = N
                 f"depth_bucketed mismatch (trained={expected.get('depth_bucketed', False)}, "
                 f"serve={cfg.get('depth_bucketed', False)}) — set POKERBOT_DEPTH_BUCKETS to match the "
                 "snapshot, else every preflop node misses")
+        # River-OCHS guard (blueprint-v2), two-sided with a False default like depth_bucketed. This
+        # skew is WORSE than a miss: river-OCHS bucket ids share the made-hand mirror's id space, so
+        # a mismatch makes every river lookup HIT a wrong-semantics row (silently wrong strategy).
+        if bool(expected.get("river_ochs", False)) != bool(cfg.get("river_ochs", False)):
+            problems.append(
+                f"river_ochs mismatch (trained={expected.get('river_ochs', False)}, "
+                f"serve={cfg.get('river_ochs', False)}) — set POKERBOT_RIVER_OCHS to the snapshot's "
+                "table (or unset it for a pre-river-OCHS snapshot); a skew HITS wrong river rows")
     if problems:
         msg = f"blueprint serve MISCONFIGURED: {'; '.join(problems)}. active={cfg}"
         if strict:
