@@ -80,7 +80,9 @@ def main() -> int:
     from pokerbot.engine.jax_weva_encode import _POSTFLOP_NUM_BUCKETS
     import engine_ab_h2h as ab
 
-    n_states = int(sys.argv[1]) if len(sys.argv) > 1 else 30
+    _args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    resume = "--resume" in sys.argv[1:]
+    n_states = int(_args[0]) if _args else 30
 
     if not _ns.native_subgame_available():
         _ns.enable()
@@ -137,9 +139,35 @@ def main() -> int:
             e = apply_action_np(e, a)
     log(f"collected {len(states)} flop/turn states (flop {got[1]}, turn {got[2]}) from {d} deals")
 
+    # ---- resume-from-partial: the collection walk above is DETERMINISTIC (fixed default_rng
+    # seed + fixed PRNGKey per deal + fixed want_per_street for a given n_states), verified by
+    # bit-identical state metrics across independent runs. Reloaded results must match on deal
+    # id at their index; any mismatch aborts the resume and restarts the leg cleanly.
+    done: dict[int, dict] = {}
+    if resume and os.path.exists(OUT):
+        try:
+            prev = json.load(open(OUT))
+            for r in prev.get("results", []):
+                done[int(r["state"])] = r
+        except Exception:
+            done = {}
+        for dsi, r in sorted(done.items()):
+            if dsi >= len(states) or int(states[dsi]["deal"]) != int(r["deal"]) \
+                    or int(states[dsi]["street"]) != int(r["street"]):
+                log(f"resume MISMATCH at state {dsi} (deal {r['deal']}) — "
+                    f"collection not reproducible, restarting leg cleanly")
+                done = {}
+                break
+        if done:
+            log(f"resume: {len(done)} states already measured "
+                f"(indices {sorted(done)}), skipping them")
+
     results = []
     t_all = time.time()
     for si, st in enumerate(states):
+        if si in done:
+            results.append(done[si])
+            continue
         env, hero = st["env"], st["hero"]
         t0 = time.time()
         pi_dep = np.asarray(pf_dep(env, hero), dtype=np.float64)

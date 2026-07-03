@@ -424,7 +424,7 @@ class RiverCFR:
 # SOLVE: per collected state, reference equilibrium + deployed-serve EV loss
 # ---------------------------------------------------------------------------
 
-def solve(max_states: int) -> int:
+def solve(max_states: int, resume: bool = False) -> int:
     from pokerbot.engine.np_engine import evaluate_seven
     from pokerbot.search import native_solver as _ns
     from pokerbot.search.pluribus_search import set_native_subgame
@@ -461,11 +461,37 @@ def solve(max_states: int) -> int:
         idxs = np.linspace(0, len(states) - 1, max_states).round().astype(int)
         states = [states[i] for i in sorted(set(int(i) for i in idxs))]
 
+    # ---- resume-from-partial: state selection above is DETERMINISTIC (fixed pkl on disk,
+    # stable sort by pot_bb, linspace pick), so completed indices can be reloaded verbatim.
+    # Safety: every reloaded result's deal id must match the reselected state at that index;
+    # any mismatch aborts the resume and restarts the leg cleanly.
+    done: dict[int, dict] = {}
+    if resume and os.path.exists(OUT_JSON):
+        try:
+            prev = json.load(open(OUT_JSON))
+            for r in prev.get("results", []):
+                done[int(r["state"])] = r
+        except Exception:
+            done = {}
+        for dsi, r in sorted(done.items()):
+            if dsi >= len(states) or int(states[dsi]["deal"]) != int(r["deal"]) \
+                    or int(states[dsi]["hero"]) != int(r["hero"]):
+                log(f"resume MISMATCH at state {dsi} (deal {r['deal']}) — "
+                    f"selection not reproducible, restarting leg cleanly")
+                done = {}
+                break
+        if done:
+            log(f"resume: {len(done)} states already solved "
+                f"(indices {sorted(done)}), skipping them")
+
     results = []
     floor = float(sv.config.range_uniform_floor)  # deployed 0.25
     t_all = time.time()
 
     for si, st in enumerate(states):
+        if si in done:
+            results.append(done[si])
+            continue
         env, hero, opp = st["env"], st["hero"], st["opp"]
         t0 = time.time()
         board = [int(c) for c in np.asarray(env.board) if int(c) >= 0]
@@ -604,6 +630,8 @@ def solve(max_states: int) -> int:
 
 
 if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "collect"
-    n = int(sys.argv[2]) if len(sys.argv) > 2 else (70 if cmd == "collect" else 50)
-    sys.exit(collect(n) if cmd == "collect" else solve(n))
+    _args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    _resume = "--resume" in sys.argv[1:]
+    cmd = _args[0] if _args else "collect"
+    n = int(_args[1]) if len(_args) > 1 else (70 if cmd == "collect" else 50)
+    sys.exit(collect(n) if cmd == "collect" else solve(n, resume=_resume))
