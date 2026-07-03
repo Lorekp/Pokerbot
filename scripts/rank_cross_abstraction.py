@@ -48,7 +48,8 @@ def _load(path: str) -> dict:
     return {bytes(k): np.asarray(v, dtype=np.float64) for k, v in inner.items()}
 
 
-def _arm_env(base, *, mode, num_buckets, emd_frozen, workers, river_ochs="") -> dict:
+def _arm_env(base, *, mode, num_buckets, emd_frozen, workers, river_ochs="",
+             preflop_hist_key=False) -> dict:
     """Serve env for one arm (set by the parent for the subprocess; baked at the child's pokerbot import)."""
     env = dict(base)
     env["POKERBOT_BETTING_ABSTRACTION"] = "1"
@@ -67,6 +68,15 @@ def _arm_env(base, *, mode, num_buckets, emd_frozen, workers, river_ochs="") -> 
         # blueprint-v2 river OCHS: the arm's river keys come from the OCHS table the arm's
         # blueprint trained under (a skew would HIT wrong-semantics river rows, not miss).
         env["POKERBOT_RIVER_OCHS"] = os.path.abspath(river_ochs)
+    else:
+        env.pop("POKERBOT_RIVER_OCHS", None)  # never leak the parent's env into a non-OCHS arm
+    if preflop_hist_key:
+        # blueprint-v3 preflop history key: the arm's PREFLOP keys carry the b"H" bytes its
+        # blueprint trained under (skew in either direction = 100% preflop miss -> uniform, and the
+        # arm's <50% coverage gate fails loud).
+        env["POKERBOT_PREFLOP_HIST_KEY"] = "1"
+    else:
+        env.pop("POKERBOT_PREFLOP_HIST_KEY", None)  # arm env is fully determined by the arm's args
     return env
 
 
@@ -95,12 +105,12 @@ def _arm_main(args) -> int:
 
 
 def _run_arm(blueprint, *, mode, num_buckets, emd_frozen, decks, seed, workers, label,
-             river_ochs="") -> dict:
+             river_ochs="", preflop_hist_key=False) -> dict:
     out = tempfile.mktemp(suffix=f"_{label}.json")
     cmd = [sys.executable, os.path.abspath(__file__), "--arm", "--blueprint", blueprint,
            "--decks", str(decks), "--seed", str(seed), "--out", out, "--label", label]
     env = _arm_env(os.environ, mode=mode, num_buckets=num_buckets, emd_frozen=emd_frozen,
-                   workers=workers, river_ochs=river_ochs)
+                   workers=workers, river_ochs=river_ochs, preflop_hist_key=preflop_hist_key)
     print(f"[xrank] launching arm {label} ({mode}/K{num_buckets}) ...", flush=True)
     r = subprocess.run(cmd, env=env, capture_output=True, text=True)
     for line in r.stdout.splitlines():
@@ -131,6 +141,10 @@ def main() -> int:
     ap.add_argument("--b"); ap.add_argument("--b-mode", default="emd"); ap.add_argument("--b-num-buckets", type=int, default=160); ap.add_argument("--b-emd-frozen", default="")
     ap.add_argument("--a-river-ochs", default="", help="ROCHS table for arm A (blueprint-v2 river OCHS)")
     ap.add_argument("--b-river-ochs", default="", help="ROCHS table for arm B (blueprint-v2 river OCHS)")
+    ap.add_argument("--a-preflop-hist-key", action="store_true",
+                    help="arm A trained with POKERBOT_PREFLOP_HIST_KEY=1 (blueprint-v3)")
+    ap.add_argument("--b-preflop-hist-key", action="store_true",
+                    help="arm B trained with POKERBOT_PREFLOP_HIST_KEY=1 (blueprint-v3, e.g. bp3_prefhist_1)")
     ap.add_argument("--label-a", default="A"); ap.add_argument("--label-b", default="B")
     ap.add_argument("--out-json", default=None)
     args = ap.parse_args()
@@ -143,10 +157,10 @@ def main() -> int:
           flush=True)
     da = _run_arm(args.a, mode=args.a_mode, num_buckets=args.a_num_buckets, emd_frozen=args.a_emd_frozen,
                   decks=args.decks, seed=args.seed, workers=args.workers, label=args.label_a,
-                  river_ochs=args.a_river_ochs)
+                  river_ochs=args.a_river_ochs, preflop_hist_key=args.a_preflop_hist_key)
     db = _run_arm(args.b, mode=args.b_mode, num_buckets=args.b_num_buckets, emd_frozen=args.b_emd_frozen,
                   decks=args.decks, seed=args.seed, workers=args.workers, label=args.label_b,
-                  river_ochs=args.b_river_ochs)
+                  river_ochs=args.b_river_ochs, preflop_hist_key=args.b_preflop_hist_key)
 
     # both arms used the SAME roster (default_pool_roster is deterministic) -> pair by archetype.
     if list(da["per"]) != list(db["per"]):

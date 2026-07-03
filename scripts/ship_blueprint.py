@@ -487,6 +487,13 @@ def main(argv: list[str] | None = None) -> int:
                          "bucket the trainer wrote river rows under (a skew HITS wrong-semantics river "
                          "rows — the stamp guard + sha sidecar gate enforce the match). Leave unset for "
                          "pre-river-OCHS blueprints (e.g. the deployed bp_emd_k160_1).")
+    ap.add_argument("--preflop-hist-key", action="store_true",
+                    help="ship a blueprint-v3 preflop-history-key blueprint (trained with "
+                         "POKERBOT_PREFLOP_HIST_KEY=1, e.g. bp3_prefhist_1): sets the SAME env so the "
+                         "serve twin appends the identical b'H' preflop bytes the trainer keyed rows "
+                         "under. The stamp records preflop_hist_key=True and the two-sided serve guard "
+                         "fails LOUD on any skew (either direction = 100% preflop miss -> uniform "
+                         "preflop). Leave unset for all pre-hist blueprints.")
     args = ap.parse_args(argv)
 
     # Apply EMD/bucket overrides into the serve-abstraction env BEFORE _set_serve_env (which only
@@ -514,6 +521,10 @@ def main(argv: list[str] | None = None) -> int:
         if not rochs_path.exists():
             ap.error(f"--river-ochs {args.river_ochs} not found")
         SERVE_ABSTRACTION_ENV["POKERBOT_RIVER_OCHS"] = str(rochs_path.resolve())
+    if args.preflop_hist_key:
+        # Exact-match semantics: only the literal "1" enables (both the Python twin and the Rust
+        # OnceLock read it that way). Baked at import like every other abstraction flag.
+        SERVE_ABSTRACTION_ENV["POKERBOT_PREFLOP_HIST_KEY"] = "1"
 
     # MUST set serve env BEFORE importing pokerbot (the encoder bakes the flags at import).
     _set_serve_env()

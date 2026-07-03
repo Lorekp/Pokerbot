@@ -154,6 +154,120 @@ python scripts\ship_blueprint.py --revert     # restores the .bak (bp_emd_k160_1
 
 (plus revert any env-default commits, mirroring the documented dab000a rollback).
 
+---
+
+# Blueprint-v3 launch package — `bp3_prefhist_1` (preflop HISTORY key)
+
+Design of record: `artifacts/preflop_mispricing_diagnosis.md` (root cause: preflop betting-state
+infoset ALIASING; causal E5 A/B — aliased arm BTN 8.5% inverted / AA-limp 91% vs hist arm BTN
+23.9% normal-monotone / AA-limp 54% at matched 20k iters).
+
+**What this trains**: the `bp2_riverochs_1` config VERBATIM (EMD-K160 flop/turn + river-OCHS K160
++ CFR+ n_deals=200 + work_steal + 40k convergence floor + 62k backstop) PLUS one change:
+`POKERBOT_PREFLOP_HIST_KEY=1` on the box, so the trainer keys PREFLOP infosets with 3 extra bytes
+`[n_limps, n_raises, opener_pos+1]` (fingerprint.rs, env-gated). Preflop rows grow ~7x (~350-700k;
+table still small); throughput ~unchanged; same ~$15-40 spot cost envelope as bp2.
+
+**Train/serve contract**: the key is SHARED train/serve. A hist-trained checkpoint MUST be served
+with `POKERBOT_PREFLOP_HIST_KEY=1` (and vice versa: the deployed non-hist blueprints keep serving
+with it UNSET, byte-identical). The Python serve twin (`jax_weva_fast.preflop_hist_bytes` + the
+`b"H"` digest branch), the stamp (`active_abstraction_config()["preflop_hist_key"]`), the
+two-sided serve guard (`lbr.check_blueprint_serve_env`), and the ship gate
+(`ship_blueprint.py --preflop-hist-key`) enforce this; a skew in either direction fails LOUD
+(100% preflop miss).
+
+## B0. Pre-flight (1 minute, no cost)
+
+```powershell
+# bp2 pre-flight (section 0 above: EMD blob + river table + sha sidecars + river parity), PLUS:
+python -m pytest tests\test_preflop_hist_key_parity.py -q     # 2 passed (rust==python==layout,
+                                                              #  512+ states, BOTH env states)
+```
+
+## B1. Launch (Terminal 1 — babysitter; leave it running)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\blueprint2\bp3_prefhist_babysitter.ps1
+```
+
+(A thin wrapper: `blueprint2_babysitter.ps1 -Run bp3_prefhist_1 -PreflopHistKey -WorkSteal` —
+everything in sections 1-3 above applies verbatim, including watch_blueprint2.ps1.)
+New expected console milestone after `RAYON_NUM_THREADS=...`: `PREFLOP_HIST_KEY=1`.
+
+## B2. MID-RUN KILL GATE at 10-20k iters (~$5 sunk decision point)
+
+When the ladder shows ~10-20k iters (checkpoints land every 500), run in a second terminal:
+
+```powershell
+python scripts\blueprint2\check_prefhist_kill_gates.py
+```
+
+It downloads the latest `bp3_prefhist_1` ladder checkpoint (+ a half-iters trend baseline), runs
+the Leg-A direct-key extraction under the hist key space, and evaluates the pre-registered gates
+(diagnosis section 6.4, calibrated to the local 20k A/B): positional monotonicity NORMAL (no
+inversion, BTN>UTG), BTN open >= 15%, AA-BTN-limp <= 60% (falling-trend clause advisory before
+30k, hard after — the E5 positive control rises 21.6%→53.7% over 5k→20k), BB-vs-BTN-open fold
+<= 75%. It prints every number and a PASS/KILL verdict.
+
+On **KILL**: terminate the box + stop the babysitter — do NOT fund the run to the backstop:
+
+```powershell
+aws ec2 terminate-instances --instance-ids <iid> --region eu-central-1
+```
+
+Re-run the same command near the end of the run (trend clause is hard from 30k).
+
+## B3. After the run — download + final gate
+
+```powershell
+aws s3 cp s3://video-processing-6789/pokerbot/prod6000/native_cfr/bp3_prefhist_1/checkpoints/latest.nlcfr `
+    runs\native_cfr\bp3_prefhist_1.nlcfr --region eu-central-1
+```
+
+**THE GATE** — 8k-deck CRN-paired ranking vs the DEPLOYED `bp_emd_k160_1` (per-arm subprocess;
+arm B needs BOTH the river-OCHS table AND the hist key — its per-arm env sets both):
+
+```powershell
+python scripts\rank_cross_abstraction.py `
+  --a runs\native_cfr\bp_emd_k160_1.nlcfr  --a-mode emd --a-num-buckets 160 `
+  --a-emd-frozen data\abstraction\emd_frozen_flop_turn_160_r400.emdfrzn `
+  --b runs\native_cfr\bp3_prefhist_1.nlcfr --b-mode emd --b-num-buckets 160 `
+  --b-emd-frozen data\abstraction\emd_frozen_flop_turn_160_r400.emdfrzn `
+  --b-river-ochs data\abstraction\river_ochs_160.rochs `
+  --b-preflop-hist-key `
+  --decks 8000 --seed 11 --workers 10 `
+  --label-a bp_emd_k160_1 --label-b bp3_prefhist_1 `
+  --out-json artifacts\rank_bp3prefhist_vs_emdk160_8k.json
+```
+
+**Promotion requires**: verdict `bp3_prefhist_1 STRONGER (95% CI excludes 0)` at n=8000. Anything
+else = NO promotion (a wider, monotone preflop that gate-fails stays unpromoted — the gate
+decides, not chart-distance). Optional mechanism check first: rerun B2's kill-gate script with
+`--checkpoint runs\native_cfr\bp3_prefhist_1.nlcfr` (trend clause hard at final iters).
+
+## B4. Ship gates + promotion (only after B3 passes)
+
+```powershell
+# all serve-skew gates (strict stamp cross-check now incl. preflop_hist_key + river_ochs), NO activation:
+python scripts\ship_blueprint.py --checkpoint runs\native_cfr\bp3_prefhist_1.nlcfr `
+    --name bp3_prefhist_1 --river-ochs data\abstraction\river_ochs_160.rochs --preflop-hist-key
+
+# promote (after the gate output reads PASS):
+python scripts\ship_blueprint.py --checkpoint runs\native_cfr\bp3_prefhist_1.nlcfr `
+    --name bp3_prefhist_1 --river-ochs data\abstraction\river_ochs_160.rochs --preflop-hist-key --activate
+```
+
+IMPORTANT after `--activate`: every deployed-serve consumer must now run with BOTH
+`POKERBOT_RIVER_OCHS=data/abstraction/river_ochs_160.rochs` AND `POKERBOT_PREFLOP_HIST_KEY=1`
+in addition to the existing EMD env (the two-sided stamp guards fail loud — never silent — on
+any omission). Update the live_coach / eval preamble defaults the same way the dab000a promotion
+updated the EMD flags, and **re-smoke live play-money before trusting autoplay** (standing rule).
+Native serve fast paths stay FAIL-CLOSED under the river-OCHS env (no native river-OCHS serve
+keying yet) — the Python twin serves, same regime as bp2 would have.
+
+Rollback: `python scripts\ship_blueprint.py --revert` (+ revert the env-default commits),
+mirroring 4e above.
+
 ## Troubleshooting
 
 * Babysitter exits `max launches reached`: repeated capacity failure — rerun with

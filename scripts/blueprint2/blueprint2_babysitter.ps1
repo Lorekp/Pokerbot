@@ -25,6 +25,9 @@ param(
   [string]$DepthEdges = "",           # non-depth blueprint (depth randomization deliberately deferred)
   [int]$CheckpointEvery = 500,
   # --- LEVERS ---
+  [switch]$PreflopHistKey,            # blueprint-v3: pass --preflop-hist-key (POKERBOT_PREFLOP_HIST_KEY=1
+                                      #   on the box; the aliasing fix). Serve MUST then use the same env
+                                      #   (ship_blueprint --preflop-hist-key). Use via bp3_prefhist_babysitter.ps1.
   [switch]$WorkSteal,                 # pass --work-steal (+33% deals/s @64c measured; pass it)
   [switch]$Dcfr,                      # NOT recommended (CFR+ > DCFR at iter16000 for 6-max)
   [double]$DcfrPruneThreshold = -300000.0,
@@ -163,6 +166,7 @@ function Invoke-Launch {
   if ($EmdFrozen)  { $argsList += @("--emd-frozen", $EmdFrozen) }
   if ($RiverOchs)  { $argsList += @("--river-ochs", $RiverOchs) }
   if ($DepthEdges) { $argsList += @("--depth-edges", $DepthEdges) }
+  if ($PreflopHistKey) { $argsList += "--preflop-hist-key" }
   if ($WorkSteal)  { $argsList += "--work-steal" }
   if ($Dcfr)       { $argsList += @("--dcfr", "--dcfr-prune-threshold", $DcfrPruneThreshold,
                                     "--dcfr-explore-frac", $DcfrExploreFrac) }
@@ -179,7 +183,7 @@ function Invoke-Launch {
 }
 
 $capH = [int]($MAXSEC / 3600)
-$leverTxt = (@(if ($WorkSteal) { "work_steal" }; if ($Dcfr) { "dcfr" }) -join "+"); if (-not $leverTxt) { $leverTxt = "NONE (baseline)" }
+$leverTxt = (@(if ($PreflopHistKey) { "preflop_hist_key" }; if ($WorkSteal) { "work_steal" }; if ($Dcfr) { "dcfr" }) -join "+"); if (-not $leverTxt) { $leverTxt = "NONE (baseline)" }
 Write-Host "=== blueprint-v2 babysitter: $Run ===" -ForegroundColor Cyan
 Write-Host "    target=$Iters it  n_deals=$NDeals  flop/turn=EMD K$NumBuckets  river=OCHS ($([System.IO.Path]::GetFileName($RiverOchs)))"
 Write-Host "    LEVERS=$leverTxt" -ForegroundColor Green
@@ -274,6 +278,7 @@ if ($convergedStop) {
   $resume = "python scripts\launch_native_cfr_training_spot.py --run-subdir $Run --iters $Iters --n-deals $NDeals --num-buckets $NumBuckets"
   if ($EmdFrozen) { $resume += " --emd-frozen $EmdFrozen" }
   if ($RiverOchs) { $resume += " --river-ochs $RiverOchs" }
+  if ($PreflopHistKey) { $resume += " --preflop-hist-key" }
   if ($WorkSteal) { $resume += " --work-steal" }
   Write-Host "  $resume"
 }

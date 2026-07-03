@@ -204,7 +204,7 @@ bash /tmp/bootstrap.sh
 
 def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_deals, num_buckets,
                    depth_edges, checkpoint_every, keep_alive=False, emd_frozen_rel="", emd_sha="",
-                   river_ochs_rel="", river_ochs_sha="",
+                   river_ochs_rel="", river_ochs_sha="", preflop_hist_key=False,
                    work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
                    wall_guard_secs=21600, awscli_zip="awscli-exe-linux-x86_64.zip") -> str:
     """The full on-box bootstrap (was inline user-data until it exceeded EC2's 16KB cap).
@@ -215,6 +215,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
     run_prefix = f"{prefix}/{run_subdir}"
     final = "echo BOOTSTRAP_DONE_KEEP_ALIVE" if keep_alive else "shutdown -h now"
     depth_csv = ",".join(str(float(x)) for x in (depth_edges or []))
+    hist_flag = "1" if preflop_hist_key else "0"
     # No output redirect (cloud-init captures stdout to /var/log/cloud-init-output.log, visible via
     # get-console-output) — same lesson the SD-CFR launcher documents.
     return f"""#!/bin/bash
@@ -272,6 +273,13 @@ PHYS_CORES=$(lscpu -p=SOCKET,CORE | grep -v '^#' | sort -u | wc -l)
 if [ -z "${{RAYON_NUM_THREADS:-}}" ]; then export RAYON_NUM_THREADS=$PHYS_CORES; fi
 echo "RAYON_NUM_THREADS=$RAYON_NUM_THREADS (physical cores=$PHYS_CORES, nproc=$(nproc); SMT-off per cpu128 probe verdict)"
 export PYTHONPATH=/opt/pokerbot RUST_BACKTRACE=1
+# Blueprint-v3 preflop HISTORY key. When 1, fingerprint.rs (env-gated, read once per process)
+# appends b"H"+[n_limps,n_raises,opener_pos+1] to every PREFLOP infoset key, so strategically
+# distinct preflop histories stop aliasing (artifacts/preflop_mispricing_diagnosis.md). The
+# checkpoint MUST then be served with POKERBOT_PREFLOP_HIST_KEY=1 (ship_blueprint --preflop-hist-key
+# stamps + guards it). "0" is byte-identical to the shipped key space.
+export POKERBOT_PREFLOP_HIST_KEY={hist_flag}
+echo "PREFLOP_HIST_KEY=$POKERBOT_PREFLOP_HIST_KEY"
 
 # S2: verify the shipped EMD frozen blob matches its known sha256 BEFORE training. A same-K CORRUPTED blob
 # (truncated S3 round-trip) -> wrong potential-aware buckets -> a broken blueprint that the convergence-stop
@@ -479,6 +487,13 @@ def main() -> None:
                         "unchanged) and the checkpoint MUST be served with POKERBOT_RIVER_OCHS pointing at "
                         "the SAME table (stamp-guarded; a skew HITS wrong-semantics river rows). "
                         "Empty = the deployed made-hand mirror river.")
+    p.add_argument("--preflop-hist-key", action="store_true",
+                   help="blueprint-v3 (bp3_prefhist_1): export POKERBOT_PREFLOP_HIST_KEY=1 on the box so "
+                        "the trainer keys PREFLOP infosets with the extra b'H'+[n_limps,n_raises,"
+                        "opener_pos] bytes (fingerprint.rs, env-gated) — the fix for the preflop "
+                        "betting-state ALIASING root cause (artifacts/preflop_mispricing_diagnosis.md). "
+                        "The checkpoint MUST then be served with the same env: ship it via "
+                        "ship_blueprint.py --preflop-hist-key (stamp + two-sided serve guard).")
     p.add_argument("--work-steal", action="store_true",
                    help="atomic deal-counter + rayon::broadcast scheduler (closes the deep-deal load "
                         "imbalance; +33%% deals/s @64c measured). Statistically-equivalent, default OFF.")
@@ -549,6 +564,7 @@ def main() -> None:
         checkpoint_every=args.checkpoint_every, keep_alive=args.keep_alive,
         emd_frozen_rel=args.emd_frozen, emd_sha=emd_sha,
         river_ochs_rel=args.river_ochs, river_ochs_sha=river_ochs_sha,
+        preflop_hist_key=args.preflop_hist_key,
         work_steal=args.work_steal, dcfr=args.dcfr,
         dcfr_prune_threshold=args.dcfr_prune_threshold, dcfr_explore_frac=args.dcfr_explore_frac,
         wall_guard_secs=wall_guard_secs, awscli_zip=awscli_zip,
