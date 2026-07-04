@@ -81,15 +81,34 @@ def _plog(msg: str) -> None:
 # rollout mode
 # ---------------------------------------------------------------------------------------------
 def _configure_env(args) -> None:
+    """Bake the serve env for the checkpoint's key space BEFORE any pokerbot import.
+
+    Defaults reproduce the bp3 regime exactly (EMD-K160 + river-OCHS + preflop hist-key).
+    blueprint-v4 Stage 0 (G5, design doc §7.1.4) passes --key-mode fullhist and, for the
+    made-hand arms, --postflop-mode fast --num-buckets 200|1000."""
     os.environ["POKERBOT_BETTING_ABSTRACTION"] = "1"
     os.environ["POKERBOT_POSTFLOP_BUCKETS"] = "1"
     os.environ["POKERBOT_PREFLOP_LOSSLESS"] = "1"
-    os.environ["POKERBOT_POSTFLOP_NUM_BUCKETS"] = "160"
-    os.environ["POKERBOT_POSTFLOP_MODE"] = "emd"
-    os.environ["POKERBOT_POSTFLOP_EMD_FROZEN"] = os.path.abspath(args.emd_frozen)
-    os.environ["POKERBOT_EMD_FROZEN_MIRROR_FALLBACK"] = "1"
-    os.environ["POKERBOT_RIVER_OCHS"] = os.path.abspath(args.river_ochs)
-    os.environ["POKERBOT_PREFLOP_HIST_KEY"] = "1"
+    os.environ["POKERBOT_POSTFLOP_NUM_BUCKETS"] = str(args.num_buckets)
+    if args.postflop_mode == "emd":
+        os.environ["POKERBOT_POSTFLOP_MODE"] = "emd"
+        os.environ["POKERBOT_POSTFLOP_EMD_FROZEN"] = os.path.abspath(args.emd_frozen)
+        os.environ["POKERBOT_EMD_FROZEN_MIRROR_FALLBACK"] = "1"
+        os.environ["POKERBOT_RIVER_OCHS"] = os.path.abspath(args.river_ochs)
+    else:  # made-hand ("fast") — the Stage-0 K200/K1000 attribution arms
+        os.environ["POKERBOT_POSTFLOP_MODE"] = "fast"
+        os.environ["POKERBOT_ALLOW_MADE_HAND_BUCKETS"] = "1"
+        os.environ.pop("POKERBOT_RIVER_OCHS", None)
+        os.environ.pop("POKERBOT_POSTFLOP_EMD_FROZEN", None)
+    if args.key_mode == "prefhist":
+        os.environ["POKERBOT_PREFLOP_HIST_KEY"] = "1"
+        os.environ.pop("POKERBOT_FULLHIST_KEY", None)
+    elif args.key_mode == "fullhist":
+        os.environ["POKERBOT_FULLHIST_KEY"] = "1"
+        os.environ.pop("POKERBOT_PREFLOP_HIST_KEY", None)
+    else:  # summary — no history key extension
+        os.environ.pop("POKERBOT_PREFLOP_HIST_KEY", None)
+        os.environ.pop("POKERBOT_FULLHIST_KEY", None)
 
 
 class AbortHand(Exception):
@@ -117,7 +136,8 @@ def _rollout_main(args) -> int:
     snap = {bytes(k): np.asarray(avg_strategy(row), dtype=np.float64)
             for k, row in ck["strat"].items()}
     del ck
-    _plog(f"{tag} snapshot {len(snap):,} infosets; env emd/160 + river-OCHS + hist-key")
+    _plog(f"{tag} snapshot {len(snap):,} infosets; env {args.postflop_mode}/{args.num_buckets} "
+          f"key-mode={args.key_mode}")
 
     agents = {s: TabularBlueprintAgent(snap, random.Random(1000 + s)) for s in range(6)}
 
@@ -438,6 +458,10 @@ def main() -> int:
     r.add_argument("--runouts", type=int, default=128)
     r.add_argument("--emd-frozen", default="data/abstraction/emd_frozen_flop_turn_160_r400.emdfrzn")
     r.add_argument("--river-ochs", default="data/abstraction/river_ochs_160.rochs")
+    # blueprint-v4 Stage-0 env adaptation (defaults reproduce the bp3 regime byte-for-byte):
+    r.add_argument("--key-mode", choices=("prefhist", "fullhist", "summary"), default="prefhist")
+    r.add_argument("--postflop-mode", choices=("emd", "fast"), default="emd")
+    r.add_argument("--num-buckets", type=int, default=160)
     r.add_argument("--out", required=True)
 
     w = sub.add_parser("rows")
