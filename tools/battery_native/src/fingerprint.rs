@@ -460,6 +460,54 @@ pub fn preflop_hist_key_enabled() -> bool {
     })
 }
 
+// ---------------------------------------------------------------------------
+// EXPERIMENT (blueprint-v4 Stage 0, 2026-07-04): opt-in FULL action-HISTORY key extension.
+//
+// Design of record: artifacts/blueprint_pluribus_grade_design.md §7.1 (Stage-0 causal mini-proof).
+// The bp3 campaign proved the 6-byte betting-STATE summary key causally warps equilibria and that
+// de-aliased PREFLOP keys alone are insufficient (the POSTFLOP rows stay aliased: limped vs raised
+// pots collide, initiative/sequence invisible — bp3_gate_verdict.md, bp3_forced_response_probe.md).
+// This opt-in extension appends, on EVERY street (both the preflop b"w" and postflop b"B" branches):
+//     b"A" + street(1 byte) + one raw engine action id byte per hist_action[0..hist_len]
+// i.e. exact in-abstraction action-history keying (perfect recall of abstracted actions — the
+// Pluribus construction). NO street separators inside the byte run: the engine's abstract tree is
+// DETERMINISTIC (fixed 100bb stacks, deterministic blinds/dealing order), so the (current-street,
+// action-prefix) pair identifies the node's street boundaries unambiguously; the leading street
+// byte pins the current street explicitly (per-entry streets are not stored in EnvStateN).
+// The b"S"+betting6 tail is kept UNCHANGED (harmless redundancy; keeps the default-OFF layout
+// golden-identical and keeps preflop_root_diag-style direct-key extraction reusable).
+//
+// Gated by POKERBOT_FULLHIST_KEY=1 read ONCE (OnceLock); default OFF is byte-identical to the
+// shipped key space (golden digest tests unaffected).
+// TRAIN/SERVE SKEW WARNING: a checkpoint trained with this ON must be served with matching keying
+// (Python twin: jax_weva_fast.full_hist_bytes + the b"A" branch in
+// jax_weva_encode.NLHEEncodeBundle._digest, parity-gated by scripts/probe_fullhist_key_parity.py +
+// tests/test_fullhist_key_parity.py). native_caps() advertises "full_hist_key" so stale .pyds can
+// fail closed. This is the Stage-0 EXPERIMENTAL key (the bp3 POKERBOT_PREFLOP_HIST_KEY pattern),
+// NOT the Stage-1 infoset.rs module.
+// ---------------------------------------------------------------------------
+
+pub fn full_hist_key_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("POKERBOT_FULLHIST_KEY").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+/// Append the full-history segment: b"A" + current street byte + raw action-id bytes.
+/// Caps at the engine's MAX_HISTORY (the engine itself stops recording past it — documented,
+/// accepted aliasing of astronomically rare saturated tails).
+#[inline]
+fn push_full_hist_bytes<const N: usize>(s: &EnvStateN<N>, msg: &mut Vec<u8>) {
+    msg.push(b'A');
+    msg.push(s.street as u8);
+    let len = (s.hist_len.max(0) as usize).min(crate::core::MAX_HISTORY);
+    for i in 0..len {
+        msg.push(s.hist_action[i] as u8);
+    }
+}
+
 /// [n_calls_before_first_raise (cap 3), n_raises (cap 3), first_raiser_pos_enum + 1 (0 = none)].
 /// Caller is preflop-only (street==0), so every history entry is a preflop action; blind posts are
 /// not history entries (`init_hand_n` starts hist_len=0). Folds/checks are ignored.
@@ -528,6 +576,10 @@ pub fn fingerprint_from_bucket<const N: usize>(
             msg.push(b'H');
             msg.extend_from_slice(&preflop_hist_bytes(s));
         }
+    }
+    // blueprint-v4 Stage 0: full action-history segment (both branches; see block comment above).
+    if full_hist_key_enabled() {
+        push_full_hist_bytes(s, &mut msg);
     }
     msg.push(b'S');
     msg.extend_from_slice(&betting_state);
@@ -623,6 +675,10 @@ pub fn fingerprint_fast_depth_memo<const N: usize>(
             msg.extend_from_slice(&preflop_hist_bytes(s));
         }
     }
+    // blueprint-v4 Stage 0: full action-history segment (both branches; see block comment above).
+    if full_hist_key_enabled() {
+        push_full_hist_bytes(s, &mut msg);
+    }
     msg.push(b'S');
     msg.extend_from_slice(&betting_state);
     digest_msg_memoed(msg, memo)
@@ -637,6 +693,10 @@ pub fn fingerprint_fast_depth_postflop_bucket<const N: usize>(
     let mut msg: Vec<u8> = Vec::with_capacity(1 + 4 + 1 + 6);
     msg.push(b'B');
     msg.extend_from_slice(&bucket.to_le_bytes());
+    // blueprint-v4 Stage 0: full action-history segment (see block comment above).
+    if full_hist_key_enabled() {
+        push_full_hist_bytes(s, &mut msg);
+    }
     msg.push(b'S');
     msg.extend_from_slice(&betting_state);
     let d = blake2b(16, b"", &msg);
@@ -655,6 +715,10 @@ pub fn fingerprint_fast_depth_postflop_bucket_memo<const N: usize>(
     let mut msg: Vec<u8> = Vec::with_capacity(1 + 4 + 1 + 6);
     msg.push(b'B');
     msg.extend_from_slice(&bucket.to_le_bytes());
+    // blueprint-v4 Stage 0: full action-history segment (see block comment above).
+    if full_hist_key_enabled() {
+        push_full_hist_bytes(s, &mut msg);
+    }
     msg.push(b'S');
     msg.extend_from_slice(&betting_state);
     digest_msg_memoed(msg, memo)

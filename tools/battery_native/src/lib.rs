@@ -369,6 +369,10 @@ mod py {
             // blueprint-v3: fingerprint.rs carries the env-gated (POKERBOT_PREFLOP_HIST_KEY=1)
             // 3-byte preflop history key; native_solver fails closed on binaries without this.
             "preflop_hist_key".to_string(),
+            // blueprint-v4 Stage 0: fingerprint.rs carries the env-gated (POKERBOT_FULLHIST_KEY=1)
+            // full action-history key segment on every street (design doc §7.1; default-off
+            // byte-identical). Stale .pyds without this cap must not serve a fullhist checkpoint.
+            "full_hist_key".to_string(),
         ]
     }
 

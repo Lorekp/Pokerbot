@@ -271,6 +271,27 @@ def preflop_hist_bytes(state: EnvState | Any) -> bytes:
     return bytes((n_calls, n_raises, opener_pos + 1))
 
 
+def full_hist_bytes(state: EnvState | Any) -> bytes:
+    """Serve twin of ``fingerprint.rs::push_full_hist_bytes`` (the ``POKERBOT_FULLHIST_KEY=1``
+    blueprint-v4 Stage-0 FULL action-history key extension — design of record
+    artifacts/blueprint_pluribus_grade_design.md §7.1). Layout (the digest prepends ``b"A"``):
+
+        street(1 byte) + one raw engine action-id byte per ``hist_action[0..hist_len]``
+
+    Appended on EVERY street (both the preflop ``b"w"`` and postflop ``b"B"`` digest branches) so
+    strategically distinct betting HISTORIES stop aliasing (perfect recall of abstracted actions —
+    the Pluribus construction). No street separators inside the byte run: the abstract tree is
+    deterministic, so (current street, action prefix) is unambiguous; the leading street byte pins
+    the current street explicitly. Capped at the engine's MAX_HISTORY exactly like the Rust
+    (saturated tails alias — astronomically rare, documented, accepted). Semantics MUST stay
+    byte-identical to fingerprint.rs (parity-gated by tests/test_fullhist_key_parity.py)."""
+    hl = int(np.asarray(state.hist_len))
+    hist_action = np.asarray(state.hist_action)
+    n = max(0, min(hl, int(hist_action.shape[0])))
+    street = int(np.asarray(state.street)) & 0xFF
+    return bytes([street] + [int(hist_action[i]) & 0xFF for i in range(n)])
+
+
 def encode_actions_numpy(
     *,
     holes: np.ndarray,
@@ -424,11 +445,17 @@ def encode_nlhe_bundle_fast(
     _ = oop_range, ip_range
     spot_scope = encode_spot_scope_numpy(spot_class)
     policy_position = fuse_position_scope(position, spot_scope)
-    from pokerbot.engine.jax_weva_encode import _DEPTH_BUCKETS, _PREFLOP_HIST_KEY, compute_postflop_bucket
+    from pokerbot.engine.jax_weva_encode import (
+        _DEPTH_BUCKETS,
+        _FULLHIST_KEY,
+        _PREFLOP_HIST_KEY,
+        compute_postflop_bucket,
+    )
 
     bucket = compute_postflop_bucket(holes[seat], board)
     dbucket = depth_bucket(state) if _DEPTH_BUCKETS else -1  # hashed preflop only; -1 => not hashed
     phist = preflop_hist_bytes(state) if (_PREFLOP_HIST_KEY and bucket < 0) else b""
+    fhist = full_hist_bytes(state) if _FULLHIST_KEY else b""  # blueprint-v4: hashed on ALL streets
     return NLHEEncodeBundle(
         weva_id=weva_id,
         cards=cards,
@@ -441,6 +468,7 @@ def encode_nlhe_bundle_fast(
         betting_state=betting_abstraction_key(state, seat),
         depth_bucket=dbucket,
         preflop_hist=phist,
+        full_hist=fhist,
     )
 
 
@@ -460,6 +488,7 @@ def fingerprint_fast(state: EnvState | Any, seat: int, *, weva_table: np.ndarray
     from pokerbot.engine.jax_weva_encode import (
         _BETTING_ABSTRACTION,
         _DEPTH_BUCKETS,
+        _FULLHIST_KEY,
         _PREFLOP_HIST_KEY,
         NLHEEncodeBundle,
         compute_postflop_bucket,
@@ -489,11 +518,14 @@ def fingerprint_fast(state: EnvState | Any, seat: int, *, weva_table: np.ndarray
     # preflop b"w" branch (bucket < 0) — the only place the bytes are hashed. Serve twin of the
     # trainer's fingerprint.rs preflop_hist_bytes (byte-identical; parity-gated).
     phist = preflop_hist_bytes(state) if (_PREFLOP_HIST_KEY and bucket < 0) else b""
+    # Full-history key (blueprint-v4 Stage 0): hashed on ALL streets when the flag is on. Serve
+    # twin of the trainer's fingerprint.rs push_full_hist_bytes (byte-identical; parity-gated).
+    fhist = full_hist_bytes(state) if _FULLHIST_KEY else b""
     return NLHEEncodeBundle(
         weva_id=weva_id, cards=_FP_FAST_EMPTY, actions=_FP_FAST_EMPTY, position=_FP_FAST_EMPTY,
         spot_scope=_FP_FAST_EMPTY, policy_position=_FP_FAST_EMPTY, postflop_bucket_id=bucket,
         history_key=history_key, betting_state=betting_state, depth_bucket=dbucket,
-        preflop_hist=phist,
+        preflop_hist=phist, full_hist=fhist,
     ).fingerprint()
 
 

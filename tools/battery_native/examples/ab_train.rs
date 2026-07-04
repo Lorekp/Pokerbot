@@ -1,15 +1,34 @@
-//! f32_regret strategy-delta A/B harness (local, free). Trains the 6-max CFR+ blueprint for a fixed
-//! number of iterations at a FIXED seed and writes the NLCFR001 checkpoint to `argv[1]`. Build it once
-//! WITHOUT `--features f32_regret` (f64 baseline) and once WITH it (f32 regret rows): the two runs share
-//! an identical deal/RNG schedule and cfg, so the ONLY difference is the persistent regret precision.
-//! `scripts/f32_regret_strategy_delta.py` then parses both blobs and reports the per-infoset average-
-//! strategy L1 delta against the verdict's ship-gate thresholds (median<=1e-4, max<=1e-2, no edge-bearing
-//! line collapse). This is the cheap, real-6-max preliminary to the full cloud T=62000 ship-gate.
+//! Local blueprint mini-trainer (f32_regret strategy-delta harness, extended for the blueprint-v4
+//! Stage-0 causal mini-proof — artifacts/blueprint_pluribus_grade_design.md §7.1).
 //!
-//! NOTE: pure-Rust example (no `python` feature) — uses the public trainer API only. The on-disk blob is
-//! f64 for BOTH builds (cross-precision-portable), so the Python diff needs no native import.
+//! Trains the 6-max CFR+ (or DCFR+RBP) blueprint for a fixed number of iterations at a FIXED seed
+//! and writes NLCFR001 checkpoints. The Stage-0 arms drive it purely via env (all default to the
+//! ORIGINAL harness behavior when unset — the f32 A/B usage is unchanged):
+//!
+//!   POKERBOT_FULLHIST_KEY=1      read by fingerprint.rs (OnceLock) — the Stage-0 keying arm.
+//!   POKERBOT_AB_NUM_BUCKETS      made-hand postflop bucket count (default 200; K1000 arms).
+//!   POKERBOT_AB_DCFR=1           DCFR(1.5,0,2) + negative-regret pruning (threshold -300k bb,
+//!                                explore 0.05 — the Pluribus-rule gated trainer mode).
+//!   POKERBOT_AB_EMD_FROZEN=path  EMD frozen flop/turn lookup (HE160 arm).
+//!   POKERBOT_AB_RIVER_OCHS=path  river OCHS table (HE160 arm).
+//!   POKERBOT_AB_CHECKPOINTS      comma list of iteration counts to checkpoint at (e.g.
+//!                                "5000,10000,20000,30000,35000,40000,45000"). Files are written
+//!                                next to <out> as iter_XXXXXX.nlcfr (the bp3 ladder shape).
+//!   POKERBOT_AB_RESUME=1         resume from the LATEST iter_*.nlcfr next to <out> (kill-safe:
+//!                                a restarted arm continues from its last checkpoint).
+//!   POKERBOT_WORKSTEAL=1         dynamic deal scheduler (statistically equivalent, +33% wall).
+//!
+//! Usage: ab_train.exe <out.nlcfr> <iters> <n_deals> [batch_deals]
+//!
+//! NOTE: pure-Rust example (no `python` feature) — uses the public trainer API only. The on-disk
+//! blob is f64 for BOTH builds (cross-precision-portable), so Python diffing needs no native import.
 
-use battery_native::trainer::{allowed_mask, serialize, NlheTables, TrainerCfg};
+use battery_native::trainer::{allowed_mask, deserialize, serialize, NlheTables, TrainerCfg};
+use std::sync::Arc;
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).map(|v| v == "1").unwrap_or(false)
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -24,10 +43,34 @@ fn main() {
         .or_else(|| std::env::var("POKERBOT_BATCH_DEALS").ok().and_then(|s| s.parse().ok()))
         .unwrap_or(0);
 
-    // Representative deployed cfg (mirrors trainer::tests::test_cfg) — made-hand bucketer (emd_frozen
-    // None) for speed; the regret-precision A/B is abstraction-agnostic (both arms use the identical cfg).
+    let num_buckets: i32 = std::env::var("POKERBOT_AB_NUM_BUCKETS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+    let dcfr = env_flag("POKERBOT_AB_DCFR");
+    let work_steal = env_flag("POKERBOT_WORKSTEAL");
+    let emd_frozen = match std::env::var("POKERBOT_AB_EMD_FROZEN") {
+        Ok(p) if !p.is_empty() => Some(
+            battery_native::emd::load_shared(&p).expect("load POKERBOT_AB_EMD_FROZEN"),
+        ),
+        _ => None,
+    };
+    let river_ochs = match std::env::var("POKERBOT_AB_RIVER_OCHS") {
+        Ok(p) if !p.is_empty() => Some(Arc::new(
+            battery_native::river_ochs::RiverOchs::load_path(&p)
+                .expect("load POKERBOT_AB_RIVER_OCHS"),
+        )),
+        _ => None,
+    };
+    let mut checkpoints: Vec<u64> = std::env::var("POKERBOT_AB_CHECKPOINTS")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    checkpoints.sort_unstable();
+
+    // Representative deployed cfg (mirrors trainer::tests::test_cfg); Stage-0 arms override via env.
     let cfg = TrainerCfg {
-        num_buckets: 200,
+        num_buckets,
         depth_edges: vec![],
         allowed_pre: allowed_mask(&[4, 5, 6]),
         allowed_post: allowed_mask(&[0, 1, 3, 4, 5]),
@@ -36,13 +79,13 @@ fn main() {
         n_seats: 6,
         prune_threshold: f64::NEG_INFINITY,
         fast_merge: false,
-        emd_frozen: None,
+        emd_frozen,
         batch_deals,
-        work_steal: false,
-        dcfr: false,
+        work_steal,
+        dcfr,
         dcfr_prune_threshold: -300_000.0,
         dcfr_explore_frac: 0.05,
-        river_ochs: None,
+        river_ochs,
     };
 
     let precision = if cfg!(feature = "f32_regret") {
@@ -50,23 +93,89 @@ fn main() {
     } else {
         "f64"
     };
+    let fullhist = env_flag("POKERBOT_FULLHIST_KEY");
     eprintln!(
-        "[ab_train] precision={precision} iters={iters} n_deals={n_deals} batch_deals={batch_deals} -> {out_path}",
+        "[ab_train] precision={precision} iters={iters} n_deals={n_deals} batch_deals={batch_deals} \
+         num_buckets={num_buckets} dcfr={dcfr} work_steal={work_steal} fullhist={fullhist} \
+         emd={} ochs={} ckpts={:?} -> {out_path}",
+        cfg.emd_frozen.is_some(),
+        cfg.river_ochs.is_some(),
+        checkpoints,
     );
 
+    let out_dir = std::path::Path::new(out_path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    if !out_dir.as_os_str().is_empty() {
+        let _ = std::fs::create_dir_all(&out_dir);
+    }
+    let ckpt_path = |it: u64| out_dir.join(format!("iter_{:06}.nlcfr", it));
+
+    // Resume: newest iter_*.nlcfr in the out dir (<= iters). The trainer's deal schedule is a pure
+    // function of (base_seed, iters_done, deal index), so resume reproduces the exact remaining run.
     let mut tab = NlheTables::new();
+    if env_flag("POKERBOT_AB_RESUME") {
+        let mut best: Option<(u64, std::path::PathBuf)> = None;
+        if let Ok(rd) = std::fs::read_dir(&out_dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if let Some(numpart) = name
+                    .strip_prefix("iter_")
+                    .and_then(|s| s.strip_suffix(".nlcfr"))
+                {
+                    if let Ok(it) = numpart.parse::<u64>() {
+                        if it <= iters && best.as_ref().map(|(b, _)| it > *b).unwrap_or(true) {
+                            best = Some((it, e.path()));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((it, p)) = best {
+            let blob = std::fs::read(&p).expect("read resume checkpoint");
+            tab = deserialize(&blob).expect("deserialize resume checkpoint");
+            eprintln!(
+                "[ab_train] RESUMED from {} (iters_done={}, expected {})",
+                p.display(),
+                tab.iters_done,
+                it
+            );
+        } else {
+            eprintln!("[ab_train] resume requested but no iter_*.nlcfr found; starting fresh");
+        }
+    }
+
+    let already = tab.iters_done;
     let t0 = std::time::Instant::now();
     let mut last = t0;
-    for i in 1..=iters {
+    for i in (already + 1)..=iters {
         tab.train_iteration(&cfg);
-        // Heartbeat ~every 2s so a long run is visibly progressing (the user's logging rule).
-        if last.elapsed().as_secs_f64() >= 2.0 {
-            let done = i as f64 / iters as f64;
-            let rate = i as f64 / t0.elapsed().as_secs_f64();
+        if checkpoints.binary_search(&i).is_ok() {
+            let blob = serialize(&tab);
+            let p = ckpt_path(i);
+            let tmp = p.with_extension("nlcfr.tmp");
+            std::fs::write(&tmp, &blob).expect("write checkpoint tmp");
+            std::fs::rename(&tmp, &p).expect("rename checkpoint");
             eprintln!(
-                "[ab_train] {i}/{iters} ({:.1}%) {:.1} iters/s strat_rows={}",
-                done * 100.0,
+                "[ab_train] CHECKPOINT iter={} strat_rows={} bytes={} -> {}",
+                i,
+                tab.n_strat_infosets(),
+                blob.len(),
+                p.display()
+            );
+        }
+        // Heartbeat ~every 15s so a long run is visibly progressing (the user's logging rule).
+        if last.elapsed().as_secs_f64() >= 15.0 {
+            let done_this_run = (i - already) as f64;
+            let frac = i as f64 / iters as f64;
+            let rate = done_this_run / t0.elapsed().as_secs_f64();
+            let eta_s = (iters - i) as f64 / rate.max(1e-9);
+            eprintln!(
+                "[ab_train] {i}/{iters} ({:.1}%) {:.2} iters/s eta {:.1}m strat_rows={}",
+                frac * 100.0,
                 rate,
+                eta_s / 60.0,
                 tab.n_strat_infosets()
             );
             last = std::time::Instant::now();

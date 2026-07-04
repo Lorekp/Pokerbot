@@ -68,12 +68,18 @@ def combos(cls: int) -> int:
 
 
 HIST_KEY = False  # set by --hist-key: POKERBOT_PREFLOP_HIST_KEY=1 experiment key space
+FULL_HIST = False  # set by --full-hist: POKERBOT_FULLHIST_KEY=1 (blueprint-v4 Stage 0) key space
 
 
-def key_for(pos_enum: int, cls: int, betting: bytes, hist: bytes = b"\x00\x00\x00") -> bytes:
+def key_for(pos_enum: int, cls: int, betting: bytes, hist: bytes = b"\x00\x00\x00",
+            fullhist: bytes = b"") -> bytes:
     msg = b"w" + struct.pack("<i", pos_enum * 169 + cls)
     if HIST_KEY:
         msg += b"H" + hist
+    if FULL_HIST:
+        # blueprint-v4 Stage-0 A segment: street byte + raw engine action-id bytes (the exact
+        # fingerprint.rs::push_full_hist_bytes payload; the b"S"+betting6 tail is kept).
+        msg += b"A" + fullhist
     msg += b"S" + betting
     return hashlib.blake2b(msg, digest_size=16).digest()
 
@@ -108,6 +114,110 @@ def nodes():
                 bytes((0, 2, POS["BTN"] + 1))))
     out.append(("vs3bet_BTN_b", POS["BTN"], bytes((0, 2, 3, 4, 1, 1)), (FOLD, CALL) + RAISE_SET + (ALL_IN,),
                 bytes((0, 2, POS["BTN"] + 1))))
+    return out
+
+
+# ---- full-hist nodes (blueprint-v4 Stage 0): ENGINE-REPLAYED, exact by construction -----------
+# The bp3 lesson (kill-gate negative-control pattern): wrong-key-space extraction silently reads 0
+# rows. Under FULL action-history keying the node key needs the exact (street byte + action-id
+# bytes) payload AND the exact betting6 of the replayed state, so instead of hand-computing them we
+# REPLAY each canonical action sequence through the pure-Python engine (game-flow states only) and
+# read betting6/hist off the resulting state. Imports pokerbot lazily (only in --full-hist mode).
+# Node sequences use engine action ids: FOLD=0, CALL=2, sized raises 7/8/9 (keep-list buckets
+# 4/5/6 = 1.0/1.5/2.0 pot -> RFI raise-to 2.5/3.25/4bb), ALL_IN=10. button=0 => seats:
+# 0=BTN 1=SB 2=BB 3=UTG 4=HJ 5=CO; preflop first actor = UTG (seat 3).
+FULLHIST_NODE_SEQS = [
+    # (label, hero position name, action sequence from hand start)
+    ("rfi_UTG", "UTG", []),
+    ("rfi_HJ", "HJ", [0]),
+    ("rfi_CO", "CO", [0, 0]),
+    ("rfi_BTN", "BTN", [0, 0, 0]),
+    ("rfi_SB", "SB", [0, 0, 0, 0]),
+    # BTN after exactly one limper (three distinct rows under full-hist keying):
+    ("BTN_after_limp_UTG", "BTN", [2, 0, 0]),
+    ("BTN_after_limp_HJ", "BTN", [0, 2, 0]),
+    ("BTN_after_limp_CO", "BTN", [0, 0, 2]),
+    # vs a single sized open, folded to hero (per-size rows under full-hist keying):
+    ("vsopen_BB", "BB", [0, 0, 0, 7, 0]),          # BTN opens 2.5bb
+    ("vsopen_BB_325", "BB", [0, 0, 0, 8, 0]),      # BTN opens 3.25bb
+    ("vsopen_BB_400", "BB", [0, 0, 0, 9, 0]),      # BTN opens 4.0bb
+    ("vsopen_BB_vsUTG", "BB", [7, 0, 0, 0, 0]),    # UTG opens 2.5bb
+    ("vsopen_SB", "SB", [0, 0, 0, 7]),             # BTN opens 2.5bb, SB to act
+    ("vsopen_BTN", "BTN", [0, 0, 7]),              # CO opens 2.5bb, BTN to act
+    # hero (BTN) opened 2.5bb, SB folds, BB 3-bets (two 3-bet sizes):
+    ("vs3bet_BTN_3b7", "BTN", [0, 0, 0, 7, 0, 7]),
+    ("vs3bet_BTN_3b8", "BTN", [0, 0, 0, 7, 0, 8]),
+]
+
+
+def nodes_fullhist():
+    """Replay each canonical sequence -> (label, pos_enum, betting6, legal, hist3, fullhist)."""
+    import jax
+    import numpy as np
+    from pokerbot.engine.jax_engine import init_hand
+    from pokerbot.engine.np_engine import (
+        apply_action_np, is_chance_node_np, legal_action_mask_np, sample_chance_np,
+        to_numpy_state,
+    )
+
+    pot_edges = (3.0, 6.0, 12.0, 25.0, 50.0, 100.0, 200.0)
+    tocall_edges = (0.01, 0.34, 0.67, 1.01, 2.01)
+    spr_edges = (1.0, 2.5, 5.0, 10.0, 20.0)
+
+    def bucket(x, edges):
+        b = 0
+        for e in edges:
+            if x >= e:
+                b += 1
+            else:
+                break
+        return b
+
+    def betting6(env, seat):
+        committed = np.asarray(env.committed_street)
+        seat_status = np.asarray(env.seat_status)
+        stacks = np.asarray(env.stacks)
+        pot = int(np.asarray(env.pot_dead)) + int(committed.sum())
+        to_call = max(0, int(np.asarray(env.current_bet)) - int(committed[seat]))
+        live = [int(stacks[s]) for s in range(6) if int(seat_status[s]) not in (0, 1)]
+        eff = (min(live) if live else 0) / 100.0
+        pot_bb = pot / 100.0
+        last_agg = int(np.asarray(env.last_aggressor))
+        return bytes((
+            int(np.asarray(env.street)) & 7,
+            bucket(pot_bb, pot_edges),
+            bucket(to_call / max(pot, 1), tocall_edges),
+            bucket(eff / max(pot_bb, 1e-6), spr_edges),
+            1 if seat == int(np.asarray(env.button)) else 0,
+            1 if (last_agg >= 0 and last_agg != seat) else 0,
+        ))
+
+    pos_by_offset = (3, 4, 5, 0, 1, 2)
+    allowed_pre = {0, 1, 2, 7, 8, 9, 10}  # keep-list (4,5,6) trainer mask over engine ids
+    out = []
+    for label, pos_name, seq in FULLHIST_NODE_SEQS:
+        env = to_numpy_state(init_hand(jax.random.PRNGKey(0), button=0))
+        for a in seq:
+            while is_chance_node_np(env):
+                env = sample_chance_np(env)
+            env = apply_action_np(env, int(a))
+        while is_chance_node_np(env):
+            env = sample_chance_np(env)
+        seat = int(env.action_seat)
+        pe = pos_by_offset[(seat - int(np.asarray(env.button))) % 6]
+        assert pe == POS[pos_name], (
+            f"{label}: replay landed on pos {pe}, expected {pos_name}={POS[pos_name]}")
+        assert int(np.asarray(env.street)) == 0, f"{label}: replay left preflop"
+        hl = max(0, min(int(np.asarray(env.hist_len)), 64))
+        act = np.asarray(env.hist_action)
+        assert [int(act[i]) for i in range(hl)] == [int(a) for a in seq], (
+            f"{label}: recorded hist {[int(act[i]) for i in range(hl)]} != applied {seq}")
+        fullhist = bytes([int(np.asarray(env.street)) & 0xFF]
+                         + [int(act[i]) & 0xFF for i in range(hl)])
+        mask = legal_action_mask_np(env, seat)
+        legal = tuple(a for a in np.flatnonzero(mask) if int(a) in allowed_pre)
+        out.append((label, pe, betting6(env, seat), tuple(int(a) for a in legal),
+                    bytes((0, 0, 0)), fullhist))
     return out
 
 
@@ -151,11 +261,11 @@ def extract(ck, node_list, detail_classes):
     """Per checkpoint: per node -> avg + current aggregates and per-hand detail."""
     strat, cum = ck["strat"], ck["cum"]
     out = {}
-    for label, pe, betting, legal, hist in node_list:
+    for label, pe, betting, legal, hist, fullhist in node_list:
         avg_by, cur_by = {}, {}
         detail = {}
         for cls in range(169):
-            k = key_for(pe, cls, betting, hist)
+            k = key_for(pe, cls, betting, hist, fullhist)
             srow = strat.get(k)
             crow = cum.get(k)
             if srow is None and crow is None:
@@ -185,10 +295,10 @@ def extract(ck, node_list, detail_classes):
 def window_delta(ck1, ck2, node_list):
     """Row-normalized strat_sum delta = (t-weighted) CURRENT policy averaged over (t1, t2]."""
     out = {}
-    for label, pe, betting, legal, hist in node_list:
+    for label, pe, betting, legal, hist, fullhist in node_list:
         by = {}
         for cls in range(169):
-            k = key_for(pe, cls, betting, hist)
+            k = key_for(pe, cls, betting, hist, fullhist)
             r1 = ck1["strat"].get(k)
             r2 = ck2["strat"].get(k)
             if r2 is None:
@@ -211,18 +321,28 @@ def main() -> int:
     ap.add_argument("--no-detail", action="store_true")
     ap.add_argument("--hist-key", action="store_true",
                     help="checkpoint was trained with POKERBOT_PREFLOP_HIST_KEY=1")
+    ap.add_argument("--full-hist", action="store_true",
+                    help="checkpoint was trained with POKERBOT_FULLHIST_KEY=1 (blueprint-v4 "
+                         "Stage 0); nodes are engine-replayed exact-history keys")
     args = ap.parse_args()
-    global HIST_KEY
+    global HIST_KEY, FULL_HIST
     HIST_KEY = bool(args.hist_key)
+    FULL_HIST = bool(args.full_hist)
+    assert not (HIST_KEY and FULL_HIST), "--hist-key and --full-hist are mutually exclusive"
 
     detail = set() if args.no_detail else {
         CLASS_BY_NAME[h] for h in args.hands.split(",") if h in CLASS_BY_NAME}
-    node_list = nodes()
+    if FULL_HIST:
+        node_list = nodes_fullhist()
+    else:
+        node_list = [(label, pe, b, legal, h, b"") for label, pe, b, legal, h in nodes()]
     results = {"meta": {
         "nodes": {label: {"pos": pe, "betting6": list(b), "hist3": list(h),
+                          "fullhist": list(fh),
                           "legal": [ACTION_NAMES[a] for a in legal]}
-                  for label, pe, b, legal, h in node_list},
+                  for label, pe, b, legal, h, fh in node_list},
         "hist_key": HIST_KEY,
+        "full_hist": FULL_HIST,
         "open_sizes_bb_at_rfi": {"B1.0p": 2.5, "B1.5p": 3.25, "B2.0p": 4.0, "ALLIN": 100.0,
                                  "SB": [2.0, 2.75, 3.5]},
         "current=regret-matched cum_regret (CFR+ positive floor)": True,

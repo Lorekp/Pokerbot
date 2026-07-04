@@ -44,6 +44,14 @@ _DEPTH_BUCKETS = os.environ.get("POKERBOT_DEPTH_BUCKETS", "0").lower() not in (
 # (stamped in active_abstraction_config + two-sided serve guard, the river-OCHS pattern): a skew
 # misses EVERY preflop row -> uniform preflop fallback. Off (default) => digest byte-identical.
 _PREFLOP_HIST_KEY = os.environ.get("POKERBOT_PREFLOP_HIST_KEY", "") == "1"
+# Full-history key (blueprint-v4 Stage 0, POKERBOT_FULLHIST_KEY=1 — design of record
+# artifacts/blueprint_pluribus_grade_design.md §7.1): appends b"A" + street + the raw engine
+# action-id bytes of the WHOLE hand history to EVERY street's tabular key (preflop b"w" AND
+# postflop b"B" branches) = exact in-abstraction action-history keying (the Pluribus construction).
+# EXACT twin of fingerprint.rs::full_hist_key_enabled: ONLY the literal "1" enables (both sides),
+# read ONCE at import. Train and serve MUST agree — a skew misses EVERY row on every street.
+# Off (default) => digest byte-identical.
+_FULLHIST_KEY = os.environ.get("POKERBOT_FULLHIST_KEY", "") == "1"
 _GLOBAL_BUCKETER: Any = None
 # Inline card-abstraction mode: "fast" (one made-hand eval/node, ~2us — the per-node-affordable
 # default) vs "ehs" (Monte-Carlo EHS, accurate but ~ms/cold-key — only for offline precompute).
@@ -280,6 +288,10 @@ def active_abstraction_config() -> dict:
     # guard (check_blueprint_serve_env) also does an explicit two-sided default-False check.
     if _PREFLOP_HIST_KEY:
         cfg["preflop_hist_key"] = True
+    # Full-history key (blueprint-v4 Stage 0): emitted ONLY when enabled so the default stamp
+    # stays byte-identical (the preflop_hist_key/river_ochs pattern).
+    if _FULLHIST_KEY:
+        cfg["fullhist_key"] = True
     return cfg
 
 
@@ -350,6 +362,27 @@ class NLHEEncodeBundle:
     # (b"H" + bytes, after the depth byte, before the betting bytes — the exact fingerprint.rs order).
     # b"" + flag off => not hashed (digest byte-identical). See jax_weva_fast.preflop_hist_bytes().
     preflop_hist: bytes = b""
+    # FULL action-history extension (POKERBOT_FULLHIST_KEY=1, blueprint-v4 Stage 0):
+    # street byte + raw engine action-id bytes of the whole hand, hashed into EVERY street's key
+    # ONLY when the flag is on (b"A" + bytes, after the card segment [+depth/preflop-hist bytes],
+    # before the betting bytes — the exact fingerprint.rs message order). Always non-empty when
+    # populated (the leading street byte), so b"" + flag on = not populated => FAIL LOUD below.
+    # b"" + flag off => not hashed (digest byte-identical). See jax_weva_fast.full_hist_bytes().
+    full_hist: bytes = b""
+
+    def _hash_full_hist(self, h) -> None:
+        """The b"A" full-history segment (blueprint-v4). FAIL LOUD if the caller did not populate
+        the twin bytes: silently hashing without them would key non-fullhist rows (the exact
+        train/serve skew this flag guards against — the preflop_hist pattern, every street)."""
+        if not _FULLHIST_KEY:
+            return
+        if len(self.full_hist) < 1:
+            raise RuntimeError(
+                "POKERBOT_FULLHIST_KEY=1 but NLHEEncodeBundle.full_hist is not populated — pass "
+                "jax_weva_fast.full_hist_bytes(state) when building the bundle (a silent skip "
+                "would key wrong rows on every street)")
+        h.update(b"A")
+        h.update(self.full_hist)
 
     def _digest(self, person: bytes) -> bytes:
         h = hashlib.blake2b(digest_size=16, person=person)
@@ -362,6 +395,7 @@ class NLHEEncodeBundle:
             if self.postflop_bucket_id >= 0:
                 h.update(b"B")
                 h.update(int(self.postflop_bucket_id).to_bytes(4, "little", signed=True))
+                self._hash_full_hist(h)  # blueprint-v4: b"A" segment (only when flag on)
                 h.update(b"S")
                 h.update(self.betting_state)
             else:
@@ -389,6 +423,7 @@ class NLHEEncodeBundle:
                             "the bundle (a silent skip would key wrong preflop rows)")
                     h.update(b"H")
                     h.update(self.preflop_hist)
+                self._hash_full_hist(h)  # blueprint-v4: b"A" segment (only when flag on)
                 if weva_encoder._PREFLOP_LOSSLESS and weva_encoder._PREFLOP_LOSSLESS_BETTING:
                     h.update(b"H")
                     h.update(self.history_key)
@@ -483,11 +518,13 @@ def encode_nlhe_weva_bundle(
         betting_abstraction_key,
         betting_history_key,
         depth_bucket,
+        full_hist_bytes,
         preflop_hist_bytes,
     )
 
     dbucket = depth_bucket(state) if _DEPTH_BUCKETS else -1
     phist = preflop_hist_bytes(state) if (_PREFLOP_HIST_KEY and bucket < 0) else b""
+    fhist = full_hist_bytes(state) if _FULLHIST_KEY else b""  # blueprint-v4: all streets
     return NLHEEncodeBundle(
         weva_id=int(enc["weva_id"]),
         cards=np.asarray(enc["cards"], dtype=np.float32),
@@ -500,6 +537,7 @@ def encode_nlhe_weva_bundle(
         betting_state=betting_abstraction_key(state, seat),
         depth_bucket=dbucket,
         preflop_hist=phist,
+        full_hist=fhist,
     )
 
 
