@@ -29,6 +29,35 @@ def _load_ship():
     return m
 
 
+def _pin_serve_config(monkeypatch):
+    """Pin the BAKED serve config so the gate tests are import-order independent.
+
+    ``jax_weva_encode`` bakes the POKERBOT_* abstraction env into module constants AT IMPORT. If any
+    other test module in the same pytest process imports pokerbot first (with no abstraction env set),
+    betting_abstraction=False is baked and ship_blueprint._set_serve_env() — a setdefault that runs
+    only later, inside the test — can no longer re-bake it. validate_serve's check (a) then fires
+    ("set POKERBOT_BETTING_ABSTRACTION=1 ...") before the check each test actually targets.
+
+    Monkeypatching the baked constants (the same pattern as test_cash_serve_gate._set_serve_env)
+    makes ``active_abstraction_config()`` — and therefore both ``_stamp_for_snapshot()`` and the
+    check (a) cross-check, which read the SAME live config — deterministic under any import order.
+    The gate's fail-closed semantics are untouched; only the test process's baked env is pinned.
+    """
+    from pokerbot.encoding import weva_encoder
+    from pokerbot.engine import jax_weva_encode as enc
+
+    monkeypatch.setattr(enc, "_BETTING_ABSTRACTION", True)
+    monkeypatch.setattr(enc, "_POSTFLOP_BUCKETS_ENABLED", True)
+    monkeypatch.setattr(enc, "_POSTFLOP_MODE", "fast")
+    monkeypatch.setattr(enc, "_POSTFLOP_NUM_BUCKETS", 200)
+    monkeypatch.setattr(enc, "_DEPTH_BUCKETS", False)
+    monkeypatch.setattr(weva_encoder, "_PREFLOP_LOSSLESS", True)
+    # validate_serve's check (0) (EMD frozen-blob SHA256) reads this env var directly. It is
+    # orthogonal to the checks under test, and the fast-mode config above carries no EMD stamp
+    # fields — drop it so the tests stay hermetic even after another test ran _set_serve_env().
+    monkeypatch.delenv("POKERBOT_POSTFLOP_EMD_FROZEN", raising=False)
+
+
 def _tiny_real_snapshot(ship) -> dict:
     """A minimal but real {fingerprint -> row} table: one key fingerprinted from a fresh 6-max env.
 
@@ -53,7 +82,7 @@ def _tiny_real_snapshot(ship) -> dict:
 def test_gate_refuses_mismatched_stamp(monkeypatch):
     """A snapshot whose stamp disagrees with the active serve config must be REFUSED."""
     ship = _load_ship()
-    ship._set_serve_env()  # bake the serve flags (idempotent; this process may already have them)
+    _pin_serve_config(monkeypatch)
 
     snap = _tiny_real_snapshot(ship)
     # Active serve config is preflop_lossless=True; hand it a stamp that says False -> strict mismatch.
@@ -67,10 +96,10 @@ def test_gate_refuses_mismatched_stamp(monkeypatch):
     assert "MISMATCH" in str(ei.value) or "abstraction" in str(ei.value).lower()
 
 
-def test_gate_refuses_empty_snapshot():
+def test_gate_refuses_empty_snapshot(monkeypatch):
     """An empty/too-small table must be REFUSED (the infoset floor)."""
     ship = _load_ship()
-    ship._set_serve_env()
+    _pin_serve_config(monkeypatch)
     active = ship._stamp_for_snapshot()
     with pytest.raises(ship.ValidationError) as ei:
         ship.validate_serve({}, active)

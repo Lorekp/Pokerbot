@@ -40,7 +40,10 @@ PROGRESS_LOG = os.path.join(ART, "bpv4_stage0_progress.log")
 STATE_FILE = os.path.join(ART, "bpv4_stage0_state.json")
 EXE = os.path.join(_ROOT, "tools", "battery_native", "target", "release", "examples",
                    "ab_train.exe")
-CHECKPOINTS = "5000,10000,20000,30000,35000,40000,45000"
+# Early points (1k/2500) added after H200's uniform-phase row explosion (55.8M rows @1.4k iters,
+# 16.35GiB transient RSS): if the 60%-RAM guard stops a full-hist arm early, the run must still
+# leave evidence at SOME checkpoint (design §7.1.2: partial evidence beats OOM).
+CHECKPOINTS = "1000,2500,5000,10000,15000,20000,25000,30000,35000,40000,45000"
 EMD_FROZEN = os.path.join(_ROOT, "data", "abstraction", "emd_frozen_flop_turn_160_r400.emdfrzn")
 RIVER_OCHS = os.path.join(_ROOT, "data", "abstraction", "river_ochs_160.rochs")
 
