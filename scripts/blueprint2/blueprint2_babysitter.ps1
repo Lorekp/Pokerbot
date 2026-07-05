@@ -74,6 +74,10 @@ param(
   [switch]$OnDemand,
   # --- storm + wall guards (verbatim from the proven babysitter) ---
   [int]$MaxLaunch = 12,
+  [int]$MaxNoCkptRelaunches = 3,      # CHURN-ABORT (2026-07-05, user directive after 5 boxes burned
+                                      #   with zero ckpts): abort if this many launches IN A ROW die
+                                      #   without a single NEW checkpoint landing in S3 (marker-based
+                                      #   iters). Every further relaunch in a capacity storm is burn.
   [int]$MinRelaunchGapSec = 600,
   [int]$BootWaitSec = 300,
   [int]$PollSec = 180,
@@ -116,6 +120,8 @@ $MAXSEC     = $MaxHours * 3600
 $start      = Get-Date
 $launches   = 0
 $lastLaunch = [datetime]::MinValue
+$doneAtLastLaunch = [int64]-1   # iters at the moment of the previous launch (churn-abort baseline)
+$noCkptRelaunches = 0           # consecutive relaunches with no new checkpoint since the prior launch
 $tracked    = ""
 $prevBox    = ""
 $convergedStop = $false
@@ -262,7 +268,7 @@ $leverTxt = (@(if ($PreflopHistKey) { "preflop_hist_key" }; if ($FullHistKey) { 
 Write-Host "=== blueprint-v2 babysitter: $Run ===" -ForegroundColor Cyan
 Write-Host "    target=$Iters it  n_deals=$NDeals  flop/turn=EMD K$NumBuckets  river=OCHS ($([System.IO.Path]::GetFileName($RiverOchs)))"
 Write-Host "    LEVERS=$leverTxt" -ForegroundColor Green
-Write-Host "    caps: ${capH}h wall / $MaxLaunch launches / >=${MinRelaunchGapSec}s between launches"
+Write-Host "    caps: ${capH}h wall / $MaxLaunch launches / >=${MinRelaunchGapSec}s between launches / churn-abort after $MaxNoCkptRelaunches no-ckpt relaunches"
 Write-Host "    convergence-stop=$(-not $NoConvergeStop) (threshold=$ConvThreshold, K=$ConvK, MIN-ITERS FLOOR=$ConvMinIters)"
 Write-Host "    resume: a relaunch reuses --run-subdir '$Run' so the new box loads s3://$Bucket/$LATEST"
 
@@ -319,6 +325,22 @@ while ($true) {
 
   # 4) NO live box and target NOT reached -> preemption (or never-launched). Relaunch, with storm guards.
   if ($launches -ge $MaxLaunch) { Write-Host "STOP: max launches ($MaxLaunch) reached (storm guard)."; break }
+  # 4a) CHURN-ABORT: the box that just died saved NO new checkpoint since its own launch -> streak++.
+  # A streak of $MaxNoCkptRelaunches means capacity is being reclaimed faster than the checkpoint
+  # cadence; every further relaunch is pure burn. Abort loudly instead (S3 state is preserved).
+  if ($launches -gt 0) {
+    if ($done -le $doneAtLastLaunch) {
+      $noCkptRelaunches++
+      Write-Host "  churn guard: box died with NO new checkpoint (iters still $doneTxt); no-progress streak = $noCkptRelaunches/$MaxNoCkptRelaunches" -ForegroundColor Yellow
+      if ($noCkptRelaunches -ge $MaxNoCkptRelaunches) {
+        Write-Host "ABORT: $MaxNoCkptRelaunches consecutive launches died without saving a single new checkpoint (spot capacity storm). NOT relaunching -- switch instance type/region (spotpick chain) or -OnDemand, then rerun this babysitter to resume from S3." -ForegroundColor Red
+        Stop-Run
+        break
+      }
+    } else {
+      $noCkptRelaunches = 0
+    }
+  }
   $sinceLast = ((Get-Date) - $lastLaunch).TotalSeconds
   if ($launches -gt 0 -and $sinceLast -lt $MinRelaunchGapSec) {
     $wait = [int]($MinRelaunchGapSec - $sinceLast)
@@ -328,6 +350,7 @@ while ($true) {
   }
   $reason = if ($done -ge 0) { "preempted at $done/$Iters -> resume from S3" } else { "no box + no ckpt -> initial launch" }
   Write-Host "  no live box; $reason. Launching #$($launches+1)..." -ForegroundColor Cyan
+  $doneAtLastLaunch = $done
   $id = Invoke-Launch
   $lastLaunch = Get-Date
   $launches++
