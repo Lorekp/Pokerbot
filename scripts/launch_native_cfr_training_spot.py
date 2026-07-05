@@ -207,7 +207,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
                    river_ochs_rel="", river_ochs_sha="", preflop_hist_key=False,
                    fullhist_key=False, mrr=False,
                    work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
-                   v3=None,
+                   v3=None, row_budget=None,
                    wall_guard_secs=21600, awscli_zip="awscli-exe-linux-x86_64.zip") -> str:
     """The full on-box bootstrap (was inline user-data until it exceeded EC2's 16KB cap).
     Uploaded to S3 by main() and exec'd by user_data_stub(). Content is otherwise the proven
@@ -241,7 +241,8 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
     # gated exactly like ``fullhist_block``: with ``v3=None`` all three placeholders render as "" (each is
     # attached as a SUFFIX to an existing line, so the off-path emits zero extra bytes) and the bootstrap
     # is byte-for-byte the Stage-0 script (sha-compared in the v3 session). When set, ``v3`` is a dict:
-    #   lcfr(bool), lcfr_d, lcfr_w, prune_c(float|None), prune_start(int|None), prune_explore,
+    #   lcfr(bool), signed_regrets(bool — arm 2: pruning without the LCFR discount), lcfr_d, lcfr_w,
+    #   prune_c(float|None), prune_start(int|None), prune_explore,
     #   regret_floor(float|None), snapshot_avg(bool), snap_start(int), cov_hands(int), regstats(bool)
     # The env exports are read ONCE by trainer.rs (V3Cfg::from_env — the SAME OnceLock the local ab_train
     # path reads, so cloud and local runs train identically); the driver extras use the v3 pymethods
@@ -252,6 +253,8 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
         exports = [
             f"export POKERBOT_LCFR={'1' if v3.get('lcfr') else '0'}",
             'echo "LCFR=$POKERBOT_LCFR"',
+            f"export POKERBOT_SIGNED_REGRETS={'1' if v3.get('signed_regrets') else '0'}",
+            'echo "SIGNED_REGRETS=$POKERBOT_SIGNED_REGRETS"',
             f"export POKERBOT_LCFR_D={int(v3.get('lcfr_d', 250))}",
             f"export POKERBOT_LCFR_W={int(v3.get('lcfr_w', 10000))}",
         ]
@@ -309,13 +312,36 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "        rows, nneg, npos, p50, p90, p99, p999, nmax, pp99, pmax = t.regret_stats()\n"
             "        print(f\"REGSTATS iters_done={it} rows={rows} neg_vals={nneg} pos_vals={npos} \"\n"
             "              f\"neg_p50={p50:.3e} neg_p90={p90:.3e} neg_p99={p99:.3e} neg_p999={p999:.3e} \"\n"
-            "              f\"neg_max={nmax:.3e} pos_p99={pp99:.3e} pos_max={pmax:.3e}\", flush=True)"
+            "              f\"neg_max={nmax:.3e} pos_p99={pp99:.3e} pos_max={pmax:.3e}\", flush=True)\n"
+            "    # v3-closeout LESSON (bpv4_v3_closeout.md): upload the train log AT EVERY CHECKPOINT,\n"
+            "    # not only at run end -- the v3 K1 hard-terminate killed the box before the end-of-run\n"
+            "    # log upload, losing every COVERAGE/REGSTATS line (recovered only by an offline\n"
+            "    # re-probe session). The tee'd log file is read as-written-so-far; a checkpoint-lag\n"
+            "    # tail is caught by the next checkpoint's upload. Retry then continue -- never crash.\n"
+            "    for attempt in range(1, 4):\n"
+            "        try:\n"
+            "            s3.upload_file(\"/var/log/native-cfr-train.log\", BUCKET,\n"
+            "                           RUN_PREFIX + \"/logs/train.log\")\n"
+            "            print(f\"TRAINLOG uploaded at iters_done={it}\", flush=True)\n"
+            "            break\n"
+            "        except Exception as e:\n"
+            "            print(f\"TRAINLOG UPLOAD FAIL attempt={attempt}/3: {e!r}\", flush=True)\n"
+            "            time.sleep(min(30, 5 * attempt))"
         )
         v3_ckpt_call = "\n        _v3_ckpt_extras(t)"
     else:
         v3_env_block = ""
         v3_driver_fns = ""
         v3_ckpt_call = ""
+    # G8 RAM backstop OVERRIDE (arm-2 lesson: the v3 amendment pre-registered ROW_BUDGET=550M but no
+    # export existed, so the driver silently ran its 400M default — a knob-effectiveness gap of exactly
+    # the tree-divergence-dead-knobs kind). ``row_budget=None`` renders "" (byte-identical bootstrap);
+    # an int exports POKERBOT_ROW_BUDGET, which the driver's module-scope read picks up.
+    if row_budget is not None:
+        row_budget_env = (f"\nexport POKERBOT_ROW_BUDGET={int(row_budget)}"
+                          '\necho "ROW_BUDGET=$POKERBOT_ROW_BUDGET"')
+    else:
+        row_budget_env = ""
     # Checkpoint uploader. The fullhist+M-RR arm's ``save_bytes()`` blob is ~30-55 GB, which EXCEEDS
     # S3's 5 GiB single-PutObject HARD LIMIT — a bare ``put_object(Body=blob)`` 400s EntityTooLarge and
     # crashes the run at the FIRST checkpoint (no durable checkpoint => spot auto-resume permanently
@@ -528,7 +554,7 @@ export PYTHONPATH=/opt/pokerbot RUST_BACKTRACE=1
 # stamps + guards it). "0" is byte-identical to the shipped key space.
 export POKERBOT_PREFLOP_HIST_KEY={hist_flag}
 echo "PREFLOP_HIST_KEY=$POKERBOT_PREFLOP_HIST_KEY"
-{fullhist_block}{v3_env_block}
+{fullhist_block}{v3_env_block}{row_budget_env}
 # S2: verify the shipped EMD frozen blob matches its known sha256 BEFORE training. A same-K CORRUPTED blob
 # (truncated S3 round-trip) -> wrong potential-aware buckets -> a broken blueprint that the convergence-stop
 # (abstraction-agnostic) cannot catch and only the final ranking gate would; the ctor's num_buckets==K check
@@ -769,6 +795,11 @@ def main() -> None:
     p.add_argument("--v3-lcfr", action="store_true",
                    help="v3: Pluribus LCFR trainer mode (POKERBOT_LCFR=1 on the box). Mutually "
                         "exclusive with --dcfr (DCFR takes precedence if both are set).")
+    p.add_argument("--v3-signed-regrets", action="store_true",
+                   help="arm-2 (artifacts/blueprint_v4_arm2_amendment.md): POKERBOT_SIGNED_REGRETS=1 "
+                        "on the box — signed regrets + deep regret floor + hard pruning WITHOUT the "
+                        "LCFR discount; CFR+ w=t linear averaging kept. Mutually exclusive with "
+                        "--v3-lcfr and --dcfr.")
     p.add_argument("--v3-lcfr-d", type=int, default=250,
                    help="v3: LCFR discount interval D in iterations (Pluribus: 10 wall-minutes)")
     p.add_argument("--v3-lcfr-w", type=int, default=10000,
@@ -791,6 +822,12 @@ def main() -> None:
     p.add_argument("--v3-cov-hands", type=int, default=2048,
                    help="v3: on-policy coverage probe hands at each checkpoint (0 disables); the "
                         "COVERAGE log line feeds the pre-registered coverage gates")
+    p.add_argument("--row-budget", type=int, default=None,
+                   help="G8 RAM backstop: export POKERBOT_ROW_BUDGET on the box (rows in the guarded "
+                        "map — max(strat,cum) under v3 snapshot_avg, strat otherwise). Omit = the "
+                        "driver's 400M default and a byte-identical bootstrap. The v3 amendment's "
+                        "550M was pre-registered but never exported (found in arm-2 prep) — always "
+                        "pass this explicitly for fullhist arms.")
     p.add_argument("--v3-regstats", action="store_true",
                    help="v3: print REGSTATS regret-percentile lines at checkpoint cadence")
     args = p.parse_args()
@@ -842,13 +879,21 @@ def main() -> None:
     # sha-compared against the pre-v3 render). snap_start default = 8% of the target iters
     # (Pluribus's 800-of-11520-minute discard-early rule, iteration-denominated).
     v3_cfg = None
-    if args.v3_lcfr or args.v3_snapshot_avg:
-        if args.v3_prune_c is not None and not args.v3_lcfr:
-            p.error("--v3-prune-c requires --v3-lcfr (hard pruning needs signed regrets)")
-        if args.dcfr and args.v3_lcfr:
-            p.error("--v3-lcfr and --dcfr are mutually exclusive trainer modes")
+    if args.v3_lcfr or args.v3_signed_regrets or args.v3_snapshot_avg:
+        if args.v3_prune_c is not None and not (args.v3_lcfr or args.v3_signed_regrets):
+            p.error("--v3-prune-c requires --v3-lcfr or --v3-signed-regrets "
+                    "(hard pruning needs signed regrets)")
+        if args.v3_lcfr and args.v3_signed_regrets:
+            p.error("--v3-lcfr and --v3-signed-regrets are mutually exclusive trainer modes "
+                    "(LCFR already implies signed regrets; arm 2 is the no-discount decomposition)")
+        if args.dcfr and (args.v3_lcfr or args.v3_signed_regrets):
+            p.error("--v3-lcfr/--v3-signed-regrets and --dcfr are mutually exclusive trainer modes")
+        if args.v3_signed_regrets and args.v3_prune_start is None and args.v3_prune_c is not None:
+            p.error("--v3-signed-regrets with --v3-prune-c requires an explicit --v3-prune-start "
+                    "(the trainer's W/2 default is an LCFR-window quantity; arm 2 has no LCFR window)")
         v3_cfg = dict(
-            lcfr=args.v3_lcfr, lcfr_d=args.v3_lcfr_d, lcfr_w=args.v3_lcfr_w,
+            lcfr=args.v3_lcfr, signed_regrets=args.v3_signed_regrets,
+            lcfr_d=args.v3_lcfr_d, lcfr_w=args.v3_lcfr_w,
             prune_c=args.v3_prune_c, prune_start=args.v3_prune_start,
             prune_explore=args.v3_prune_explore, regret_floor=args.v3_regret_floor,
             snapshot_avg=args.v3_snapshot_avg,
@@ -877,7 +922,7 @@ def main() -> None:
         fullhist_key=args.fullhist_key, mrr=args.mrr,
         work_steal=args.work_steal, dcfr=args.dcfr,
         dcfr_prune_threshold=args.dcfr_prune_threshold, dcfr_explore_frac=args.dcfr_explore_frac,
-        v3=v3_cfg,
+        v3=v3_cfg, row_budget=args.row_budget,
         wall_guard_secs=wall_guard_secs, awscli_zip=awscli_zip,
     )
     bootstrap_key = f"{args.prefix}/{run_subdir}/code/bootstrap.sh"

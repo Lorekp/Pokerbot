@@ -42,6 +42,9 @@ param(
   # ---  rendered bootstrap is byte-identical, sha-compared). Use via bpv4_v3_babysitter.ps1.
   [switch]$V3Lcfr,                    # --v3-lcfr (POKERBOT_LCFR=1: signed regrets + LCFR discount +
                                       #   unweighted averaging). Mutually exclusive with -Dcfr.
+  [switch]$V3SignedRegrets,           # --v3-signed-regrets (POKERBOT_SIGNED_REGRETS=1: arm-2 signed
+                                      #   regrets + floor + hard pruning, NO LCFR discount, w=t
+                                      #   averaging kept). Mutually exclusive with -V3Lcfr / -Dcfr.
   [int]$V3LcfrD = 250,                # --v3-lcfr-d (discount interval, iterations)
   [int]$V3LcfrW = 10000,              # --v3-lcfr-w (discount window, iterations)
   [string]$V3PruneC = "",             # --v3-prune-c (hard prune threshold, bb; "" = pruning off)
@@ -52,6 +55,8 @@ param(
   [string]$V3SnapStart = "",          # --v3-snap-start ("" = 8% of --iters)
   [int]$V3CovHands = 2048,            # --v3-cov-hands (COVERAGE line cadence; 0 disables)
   [switch]$V3Regstats,                # --v3-regstats (REGSTATS percentile lines)
+  [long]$RowBudget = 0,               # --row-budget (POKERBOT_ROW_BUDGET G8 RAM backstop; 0 = omit =
+                                      #   driver 400M default + byte-identical bootstrap)
   # --- box / market ---
   [string]$InstanceType = "",          # "" = AUTO-PICK cheapest spot-available type via spotpick
   [int]$Vcpus = 128,
@@ -199,14 +204,24 @@ function Invoke-Launch {
     if ($V3PruneStart)  { $argsList += @("--v3-prune-start", $V3PruneStart) }
     if ($V3RegretFloor) { $argsList += @("--v3-regret-floor", $V3RegretFloor) }
   }
+  if ($V3SignedRegrets) {
+    # arm 2 (artifacts/blueprint_v4_arm2_amendment.md): signed regrets + floor + hard pruning
+    # WITHOUT the LCFR discount; w=t averaging kept. Mutually exclusive with -V3Lcfr (the
+    # launcher p.error()s if both are passed through).
+    $argsList += @("--v3-signed-regrets", "--v3-prune-explore", $V3PruneExplore)
+    if ($V3PruneC)      { $argsList += @("--v3-prune-c", $V3PruneC) }
+    if ($V3PruneStart)  { $argsList += @("--v3-prune-start", $V3PruneStart) }
+    if ($V3RegretFloor) { $argsList += @("--v3-regret-floor", $V3RegretFloor) }
+  }
   if ($V3SnapshotAvg) {
     $argsList += "--v3-snapshot-avg"
     if ($V3SnapStart) { $argsList += @("--v3-snap-start", $V3SnapStart) }
   }
-  if ($V3Lcfr -or $V3SnapshotAvg) {
+  if ($V3Lcfr -or $V3SignedRegrets -or $V3SnapshotAvg) {
     $argsList += @("--v3-cov-hands", $V3CovHands)
     if ($V3Regstats) { $argsList += "--v3-regstats" }
   }
+  if ($RowBudget -gt 0) { $argsList += @("--row-budget", $RowBudget) }
   if ($Spotpick)   { $argsList += "--spotpick" }
   if ($OnDemand)   { $argsList += "--on-demand" }
   if ($CrateSrc)   { $argsList += @("--crate-src", $CrateSrc) }
@@ -220,7 +235,7 @@ function Invoke-Launch {
 }
 
 $capH = [int]($MAXSEC / 3600)
-$leverTxt = (@(if ($PreflopHistKey) { "preflop_hist_key" }; if ($FullHistKey) { "fullhist_key" }; if ($Mrr) { "mrr" }; if ($WorkSteal) { "work_steal" }; if ($Dcfr) { "dcfr" }; if ($V3Lcfr) { "v3_lcfr(D=$V3LcfrD,W=$V3LcfrW,C=$V3PruneC)" }; if ($V3SnapshotAvg) { "v3_snapshot_avg" }) -join "+"); if (-not $leverTxt) { $leverTxt = "NONE (baseline)" }
+$leverTxt = (@(if ($PreflopHistKey) { "preflop_hist_key" }; if ($FullHistKey) { "fullhist_key" }; if ($Mrr) { "mrr" }; if ($WorkSteal) { "work_steal" }; if ($Dcfr) { "dcfr" }; if ($V3Lcfr) { "v3_lcfr(D=$V3LcfrD,W=$V3LcfrW,C=$V3PruneC)" }; if ($V3SignedRegrets) { "v3_signed_regrets(C=$V3PruneC,start=$V3PruneStart)" }; if ($V3SnapshotAvg) { "v3_snapshot_avg" }) -join "+"); if (-not $leverTxt) { $leverTxt = "NONE (baseline)" }
 Write-Host "=== blueprint-v2 babysitter: $Run ===" -ForegroundColor Cyan
 Write-Host "    target=$Iters it  n_deals=$NDeals  flop/turn=EMD K$NumBuckets  river=OCHS ($([System.IO.Path]::GetFileName($RiverOchs)))"
 Write-Host "    LEVERS=$leverTxt" -ForegroundColor Green
