@@ -409,6 +409,11 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
     # footprint eventually crosses the box's memory and the OS OOM-kills the run BEFORE a checkpoint lands
     # (which would permanently break spot auto-resume). Row count is a deterministic, allocation-free proxy
     # for committed memory.
+    # v3 + snapshot_avg: the strat map (t.n_infosets()) is preflop-bounded (~60M rows) while
+    # cum_regret keeps growing -- the G8 RAM backstop must watch BOTH maps or it never fires.
+    # ``rows_expr`` renders as the ORIGINAL text when v3 is off (byte-identity, sha-compared).
+    rows_expr = ("max(t.n_infosets(), t.n_cum_infosets())"
+                 if (v3 and v3.get("snapshot_avg")) else "t.n_infosets()")
     if fullhist_key or mrr:
         row_budget_const = (
             "\n"
@@ -434,7 +439,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "        # threshold as the post-chunk check; the loaded checkpoint is already durable so we do\n"
             "        # NOT re-serialize (avoids the ~55-90GB blob) -- print + break, fall through to the\n"
             "        # end-of-run log upload + on-box dead-man shutdown (NO hard crash).\n"
-            "        if ROW_BUDGET > 0 and t.n_infosets() >= ROW_BUDGET:\n"
+            f"        if ROW_BUDGET > 0 and {rows_expr} >= ROW_BUDGET:\n"
             "            print(f\"ROW_BUDGET_STOP (resume/pre-train) budget={ROW_BUDGET} \"\n"
             "                  f\"rows={t.n_infosets()} iters_done={t.iters_done()} -- already at/past \"\n"
             "                  f\"budget on entry, stopping cleanly (no new chunk; last checkpoint already \"\n"
@@ -448,7 +453,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "        # is the same strat-row accessor the PROGRESS/CKPT prints use. NEVER hard-crash: write a\n"
             "        # FINAL checkpoint via the SAME multipart _upload (versioned + latest) and break so the\n"
             "        # driver falls through to its end-of-run log upload + the on-box dead-man shutdown.\n"
-            "        if ROW_BUDGET > 0 and t.n_infosets() >= ROW_BUDGET:\n"
+            f"        if ROW_BUDGET > 0 and {rows_expr} >= ROW_BUDGET:\n"
             "            _upload(t.save_bytes(), t.iters_done())\n"
             "            print(f\"ROW_BUDGET_STOP budget={ROW_BUDGET} rows={t.n_infosets()} \"\n"
             "                  f\"iters_done={t.iters_done()} -- wrote FINAL checkpoint (versioned + latest), \"\n"

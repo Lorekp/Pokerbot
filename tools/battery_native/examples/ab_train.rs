@@ -299,7 +299,10 @@ fn main() {
         // then exit(0) so the run records status at this checkpoint instead of an external rc1 kill.
         // Placed AFTER the fixed-checkpoint block so a stop can land at ANY iter (the crash at iter
         // 2040 fell BETWEEN fixed checkpoints 1000 and 2500).
-        if row_cap > 0 && (tab.n_strat_infosets() as u64) >= row_cap {
+        // v3 note: under POKERBOT_SNAPSHOT_AVG the strat map is preflop-bounded (~60M) while
+        // cum_regret keeps growing — the cap must watch BOTH maps. max == strat for every legacy
+        // config (measured strat > cum on all Stage-0 arms), so pre-v3 behavior is unchanged.
+        if row_cap > 0 && (tab.n_strat_infosets().max(tab.n_cum_infosets()) as u64) >= row_cap {
             let blob = serialize(&tab);
             let p = ckpt_path(i);
             let tmp = p.with_extension("nlcfr.tmp");

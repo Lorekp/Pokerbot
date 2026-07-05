@@ -1302,6 +1302,18 @@ mod py {
             self.tab.n_strat_infosets()
         }
 
+        /// blueprint-v4 v3: cum_regret row count. Under POKERBOT_SNAPSHOT_AVG the strat map is
+        /// preflop-bounded while cum keeps growing, so RAM backstops must watch
+        /// max(n_infosets, n_cum_infosets). (Hogwild path: the shared table has one row kind, so
+        /// n_infosets already covers it — return the same count.)
+        fn n_cum_infosets(&self) -> usize {
+            #[cfg(feature = "hogwild")]
+            if let Some(h) = &self.hog {
+                return h.table.n_occupied();
+            }
+            self.tab.n_cum_infosets()
+        }
+
         /// True if this trainer instance is running the hogwild (shared-table) path. False = fork-merge.
         fn is_hogwild(&self) -> bool {
             #[cfg(feature = "hogwild")]

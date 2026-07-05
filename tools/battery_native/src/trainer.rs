@@ -494,6 +494,14 @@ impl NlheTables {
         self.total_strat_len()
     }
 
+    /// Number of distinct infosets with a cum_regret row. Under v3 `snapshot_avg` (no postflop
+    /// strat_sum) THIS is the growing table — every RAM backstop must watch
+    /// `max(n_strat_infosets, n_cum_infosets)`, not strat alone (strat is preflop-bounded ~60M
+    /// under snapshot_avg while cum keeps growing).
+    pub fn n_cum_infosets(&self) -> usize {
+        self.total_cum_len()
+    }
+
     /// Total cum_regret rows across all shards.
     fn total_cum_len(&self) -> usize {
         self.shards.iter().map(|s| s.cum_regret.len()).sum()
