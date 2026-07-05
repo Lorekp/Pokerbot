@@ -940,6 +940,158 @@ fn dcfr_enabled(cfg: &TrainerCfg) -> bool {
     cfg.dcfr || env_on
 }
 
+/// blueprint-v4 **v3 trainer schedule** (Pluribus-faithful LCFR + hard negative-regret pruning +
+/// snapshot averaging — amendment doc `artifacts/blueprint_v4_amendment_v3.md`; primary source
+/// `artifacts/pluribus_blueprint_spec_full.md` §1). ALL knobs default-OFF => the trainer is
+/// BYTE-IDENTICAL to the shipped CFR+ path (pinned goldens: ab_train 20it/64nd sha256
+/// `69ba34fb…` base config, `74a3bafa…` fullhist+MRR config — recorded pre-change in the v3
+/// session, re-verified after). Env-gated (read ONCE per process, same OnceLock convention as
+/// `POKERBOT_MRR`); unit tests bypass the env via `NlheTables::train_iteration_v3(&cfg, &V3Cfg{..})`.
+///
+/// The three Pluribus trainer deltas this encodes (all ITERATION-denominated — Pluribus's schedule
+/// is wall-clock-denominated, which does not transfer across hardware; the mapping rationale is in
+/// the amendment doc §2):
+///   1. **LCFR discounting** (`lcfr`, `lcfr_d` = D, `lcfr_w` = W): every D iterations for the first
+///      W iterations, ALL regrets and average-strategy rows are multiplied in place by
+///      (t/D)/((t/D)+1) — Pluribus P-supp p.14 with minutes -> iterations. In `lcfr` mode regrets
+///      are SIGNED (no CFR+ positive floor; floored at `regret_floor` instead) and the
+///      average-strategy accumulation is UNWEIGHTED (w=1, not w=t): linear weighting comes from the
+///      periodic discount during the LCFR phase, exactly as in Pluribus — CFR+'s w=t linear
+///      averaging on top of LCFR discounting would double-apply linearity.
+///   2. **Hard negative-regret pruning** (`prune_c` = C in bb, `prune_start`, `prune_explore`):
+///      from iteration `prune_start`, ~95% of iterations (per-ITERATION coin, deterministic in the
+///      iteration seed) skip traverser actions whose regret <= C, never on the final street and
+///      never for terminal-leading actions (the existing RULE 1a/1b/2/3 machinery); ~5% explore
+///      fully so pruned actions can revive. `regret_floor` (default C*31/30, mirroring Pluribus's
+///      -3.1e8 floor vs -3.0e8 threshold) bounds regret below so unpruning stays reachable.
+///   3. **Snapshot averaging** (`snapshot_avg`): postflop strat_sum rows are NOT accumulated
+///      (in-memory average is kept for the PREFLOP round only, as Pluribus keeps it for round 1
+///      only); the postflop blueprint is the offline average of periodic CURRENT-strategy snapshots
+///      (`serialize_current_strategy` at the checkpoint cadence + the `snap_avg` offline tool).
+///      This removes the postflop strat_sum map — at H200@20k that map held 347.7M rows vs
+///      cum_regret's 184.1M, and the M-RR census bounds PREFLOP strat rows at ~60M — i.e. most of
+///      the 400M-row/256GB wall was the postflop average this mode eliminates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct V3Cfg {
+    /// Pluribus linear-CFR trainer mode: signed regrets + LCFR discount schedule + unweighted
+    /// strat accumulation. `false` => CFR+ (positive floor, w=t) — byte-identical legacy.
+    pub lcfr: bool,
+    /// LCFR discount interval D in ITERATIONS (Pluribus: 10 minutes). 0 disables discount events
+    /// (mode still keeps signed regrets when `lcfr` is true).
+    pub lcfr_d: u64,
+    /// LCFR discount window W in ITERATIONS (Pluribus: 400 minutes): no discount events after W.
+    pub lcfr_w: u64,
+    /// Hard negative-regret prune threshold C, in the trainer's bb regret units (Pluribus:
+    /// -3.0e8 in THEIR chip units — see the amendment doc for the calibration that produced our
+    /// default). NEG_INFINITY = pruning off. Only consulted when `lcfr` is true (CFR+ keeps
+    /// regrets >= 0 so a finite C would be inert anyway).
+    pub prune_c: f64,
+    /// First iteration at which pruning may fire (Pluribus: minute 200 of 400 = half the LCFR
+    /// window). Regrets must warm before deeply-negative is meaningful.
+    pub prune_start: u64,
+    /// Fraction of iterations that EXPLORE fully (no pruning) so pruned actions can revive
+    /// (Pluribus: 5%).
+    pub prune_explore: f64,
+    /// Floor on stored regret in `lcfr` mode (Pluribus: -3.1e8 vs C=-3.0e8, i.e. C*31/30). Keeps
+    /// pruned actions unprune-able and bounds the negative tail. NEG_INFINITY = no floor.
+    pub regret_floor: f64,
+    /// Pluribus rounds-2-4 snapshot averaging: skip postflop strat_sum accumulation (round-1
+    /// average stays in memory); postflop blueprint = offline average of current-strategy
+    /// snapshots.
+    pub snapshot_avg: bool,
+}
+
+impl Default for V3Cfg {
+    /// The INERT config: every field off => `train_iteration_v3(cfg, &V3Cfg::default())` is
+    /// byte-identical to the legacy `train_iteration`.
+    fn default() -> Self {
+        V3Cfg {
+            lcfr: false,
+            lcfr_d: 0,
+            lcfr_w: 0,
+            prune_c: f64::NEG_INFINITY,
+            prune_start: 0,
+            prune_explore: 0.05,
+            regret_floor: f64::NEG_INFINITY,
+            snapshot_avg: false,
+        }
+    }
+}
+
+impl V3Cfg {
+    /// True when any v3 behavior is enabled (used by the batched-MLP fallback guard: the batched
+    /// path replicates the LEGACY float ops verbatim and does not support the v3 modes).
+    pub fn active(&self) -> bool {
+        self.lcfr || self.snapshot_avg
+    }
+
+    /// Read the v3 schedule from the environment (the launcher/ab_train surface):
+    ///   POKERBOT_LCFR=1           enable the Pluribus LCFR trainer mode
+    ///   POKERBOT_LCFR_D           discount interval D iters (default 250)
+    ///   POKERBOT_LCFR_W           discount window W iters (default 10000)
+    ///   POKERBOT_PRUNE_C          hard prune threshold C in bb (default off; try the calibrated
+    ///                             default from the amendment doc)
+    ///   POKERBOT_PRUNE_START      first prune iteration (default W/2, Pluribus's 200/400 ratio)
+    ///   POKERBOT_PRUNE_EXPLORE    explore fraction (default 0.05)
+    ///   POKERBOT_REGRET_FLOOR     regret floor in bb (default C*31/30 when C finite)
+    ///   POKERBOT_SNAPSHOT_AVG=1   enable no-postflop-strat_sum + snapshot averaging
+    pub fn from_env() -> V3Cfg {
+        fn envf(name: &str) -> Option<f64> {
+            std::env::var(name).ok().and_then(|s| s.parse().ok())
+        }
+        fn envu(name: &str) -> Option<u64> {
+            std::env::var(name).ok().and_then(|s| s.parse().ok())
+        }
+        fn envb(name: &str) -> bool {
+            std::env::var(name)
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        }
+        let lcfr = envb("POKERBOT_LCFR");
+        let lcfr_d = envu("POKERBOT_LCFR_D").unwrap_or(250);
+        let lcfr_w = envu("POKERBOT_LCFR_W").unwrap_or(10_000);
+        let prune_c = envf("POKERBOT_PRUNE_C").unwrap_or(f64::NEG_INFINITY);
+        let prune_start = envu("POKERBOT_PRUNE_START").unwrap_or(lcfr_w / 2);
+        let prune_explore = envf("POKERBOT_PRUNE_EXPLORE").unwrap_or(0.05);
+        let regret_floor = envf("POKERBOT_REGRET_FLOOR").unwrap_or(if prune_c.is_finite() {
+            prune_c * (31.0 / 30.0)
+        } else {
+            f64::NEG_INFINITY
+        });
+        V3Cfg {
+            lcfr,
+            lcfr_d,
+            lcfr_w,
+            prune_c,
+            prune_start,
+            prune_explore,
+            regret_floor,
+            snapshot_avg: envb("POKERBOT_SNAPSHOT_AVG"),
+        }
+    }
+}
+
+/// Process-wide v3 schedule from env, read once (same OnceLock convention as `mrr_enabled`).
+/// Default (no env set) is `V3Cfg::default()` == fully inert.
+fn v3_env() -> &'static V3Cfg {
+    use std::sync::OnceLock;
+    static V3: OnceLock<V3Cfg> = OnceLock::new();
+    V3.get_or_init(V3Cfg::from_env)
+}
+
+/// Per-iteration v3 traversal context threaded through `one_traversal` (a Copy 2-bool struct so the
+/// hot-path cost is nil). `V3Iter::default()` (both false) preserves the legacy float ops exactly:
+/// `unweighted_strat=false` selects `w = t as f64` (the identical expression the old code computed)
+/// and `strat_pre_only=false` never skips a strat_sum write.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct V3Iter {
+    /// LCFR mode: average-strategy increments are unweighted (w=1); linear weighting comes from the
+    /// periodic discount instead of CFR+'s w=t.
+    pub unweighted_strat: bool,
+    /// snapshot_avg mode: accumulate strat_sum ONLY at preflop (street 0) nodes.
+    pub strat_pre_only: bool,
+}
+
 /// DCFR (Discounted CFR, Brown & Sandholm 2019) discount factors for iteration `t` (>= 1). Returns
 /// `(pos, neg, strat)`: positive cum_regret is multiplied by `t^alpha/(t^alpha+1)`, negative by
 /// `t^beta/(t^beta+1)`, and strat_sum by `(t/(t+1))^gamma`. (alpha,beta,gamma)=(1.5,0,2) — the
@@ -1008,16 +1160,29 @@ fn dcfr_prune_node_allowed(street: i32, eff_prune: f64) -> bool {
 /// seed) returns NEG_INFINITY so EVERY action is re-explored (a deeply-negative action can revive); on the
 /// other ~95% returns the deeply-negative `cfg.dcfr_prune_threshold` so RBP fires. Decided ONCE per
 /// iteration (not per action).
+///
+/// v3 LCFR mode (`v3.lcfr` ON, `dcfr` OFF): the SAME per-iteration explore coin, but with the v3 hard
+/// prune constants — from iteration `v3.prune_start`, non-explore iterations prune at `v3.prune_c`
+/// (finite => hard pruning active; regrets are signed in this mode so it actually fires). Before
+/// `prune_start`, or with `prune_c = NEG_INFINITY`, pruning stays off. DCFR takes precedence if both
+/// are (mis)configured on.
 #[inline]
-fn effective_prune_threshold(cfg: &TrainerCfg, iter_seed: u64) -> f64 {
-    if !dcfr_enabled(cfg) {
-        return cfg.prune_threshold;
+fn effective_prune_threshold(cfg: &TrainerCfg, iter_seed: u64, t: u64, v3: &V3Cfg) -> f64 {
+    if dcfr_enabled(cfg) {
+        return if dcfr_is_explore_iter(iter_seed, cfg.dcfr_explore_frac) {
+            f64::NEG_INFINITY
+        } else {
+            cfg.dcfr_prune_threshold
+        };
     }
-    if dcfr_is_explore_iter(iter_seed, cfg.dcfr_explore_frac) {
-        f64::NEG_INFINITY
-    } else {
-        cfg.dcfr_prune_threshold
+    if v3.lcfr && v3.prune_c.is_finite() && t >= v3.prune_start.max(1) {
+        return if dcfr_is_explore_iter(iter_seed, v3.prune_explore) {
+            f64::NEG_INFINITY
+        } else {
+            v3.prune_c
+        };
     }
+    cfg.prune_threshold
 }
 
 #[inline]
@@ -1500,13 +1665,14 @@ fn one_traversal<const N: usize>(
     t: u64,
     memo: &mut FpMemo,
     eff_prune: f64,
+    v3i: V3Iter,
 ) -> f64 {
     if env.done {
         return env.rewards[hero] as f64 / CHIP_UNIT;
     }
     if core::is_chance_node(env) {
         let child = core::sample_chance(env);
-        return one_traversal(&child, hero, cfg, read, local, rng, t, memo, eff_prune);
+        return one_traversal(&child, hero, cfg, read, local, rng, t, memo, eff_prune, v3i);
     }
     // Post-chance terminal: `sample_chance` advances a checked/called river to STREET_TERMINAL with
     // action_seat=-1, done=FALSE, and STALE rewards=[0,...] (the engine fills `rewards` only on the
@@ -1562,8 +1728,14 @@ fn one_traversal<const N: usize>(
         // worker adds; the iteration merge sums all workers' deltas into the persistent table.
         // LEVER 6(b) (FMA strat_sum AXPY) — TRIED AND REVERTED with levers 5/6(a): same finding (stat-
         // equiv but flipped the marginal LBR smoke, ~0% wall). Scalar byte-identical-to-original form.
-        let w = t as f64;
-        {
+        //
+        // v3 (default-off): `strat_pre_only` (snapshot_avg mode) skips the postflop strat_sum write
+        // entirely — the round-1 (preflop) average stays in memory, rounds 2-4 are served from
+        // offline-averaged snapshots (Pluribus P-supp p.15). `unweighted_strat` (LCFR mode) uses w=1:
+        // linear weighting comes from the periodic LCFR discount, not CFR+'s w=t. With `V3Iter::
+        // default()` this block computes EXACTLY the legacy `w = t as f64` accumulation.
+        if !v3i.strat_pre_only || env.street == 0 {
+            let w = if v3i.unweighted_strat { 1.0 } else { t as f64 };
             let ss = local.strat_sum.entry(key).or_insert(ZEROS);
             for a in 0..NUM_ACTIONS {
                 if legal[a] {
@@ -1574,7 +1746,7 @@ fn one_traversal<const N: usize>(
         let u = rng.next_f64();
         let a = sample_action_compact(&strat, &lidx, ln, u);
         let child = trainer_apply(env, a);
-        return one_traversal(&child, hero, cfg, read, local, rng, t, memo, eff_prune);
+        return one_traversal(&child, hero, cfg, read, local, rng, t, memo, eff_prune, v3i);
     }
 
     // Hero node: branch ALL abstracted-legal actions, CFR+ regret update. Regrets are read from the
@@ -1619,7 +1791,8 @@ fn one_traversal<const N: usize>(
                 if terminal_leading {
                     // RULE 1b: action leads DIRECTLY to a terminal — never prune; evaluate its cheap leaf.
                     record_prune_event(env.street, false, true);
-                    av[a] = one_traversal(&child, hero, cfg, read, local, rng, t, memo, eff_prune);
+                    av[a] =
+                        one_traversal(&child, hero, cfg, read, local, rng, t, memo, eff_prune, v3i);
                 } else {
                     record_prune_event(env.street, true, false);
                     pruned[a] = true; // skip the (non-terminal) subtree + its showdowns; backfilled below.
@@ -1627,7 +1800,7 @@ fn one_traversal<const N: usize>(
                 continue;
             }
             let child = trainer_apply(env, a);
-            av[a] = one_traversal(&child, hero, cfg, read, local, rng, t, memo, eff_prune);
+            av[a] = one_traversal(&child, hero, cfg, read, local, rng, t, memo, eff_prune, v3i);
         }
         // ev over the explored actions (pruned lanes have strat==0 so contribute nothing yet). Scalar
         // form, matching the main (RBP-off) path's byte-identical math.
@@ -1655,7 +1828,7 @@ fn one_traversal<const N: usize>(
     for i in 0..ln {
         let a = lidx[i];
         let child = trainer_apply(env, a);
-        av[a] = one_traversal(&child, hero, cfg, read, local, rng, t, memo, eff_prune);
+        av[a] = one_traversal(&child, hero, cfg, read, local, rng, t, memo, eff_prune, v3i);
     }
     // LEVER 6(a) (FMA hero EV dot-product + regret delta) — TRIED AND REVERTED with lever 5: the
     // `mul_add`/masked-11-wide form was statistically equivalent but tipped the same marginal LBR
@@ -2143,6 +2316,7 @@ fn one_traversal_profile<const N: usize>(
     stats: &mut TraverseStats,
     depth: u64,
     eff_prune: f64,
+    v3i: V3Iter,
 ) -> f64 {
     stats.nodes += 1;
     stats.max_depth = stats.max_depth.max(depth);
@@ -2165,6 +2339,7 @@ fn one_traversal_profile<const N: usize>(
             stats,
             depth + 1,
             eff_prune,
+            v3i,
         );
     }
     if env.street >= core::STREET_TERMINAL {
@@ -2209,8 +2384,9 @@ fn one_traversal_profile<const N: usize>(
     if actor != hero {
         stats.opponent_nodes += 1;
         let strat = regret_match(&regrets, &legal);
-        let w = t as f64;
-        {
+        // v3 twin of the `one_traversal` strat site (default-off => legacy `w = t as f64` exactly).
+        if !v3i.strat_pre_only || env.street == 0 {
+            let w = if v3i.unweighted_strat { 1.0 } else { t as f64 };
             let ss = local.strat_sum.entry(key).or_insert(ZEROS);
             for a in 0..NUM_ACTIONS {
                 if legal[a] {
@@ -2235,6 +2411,7 @@ fn one_traversal_profile<const N: usize>(
             stats,
             depth + 1,
             eff_prune,
+            v3i,
         );
     }
 
@@ -2265,6 +2442,7 @@ fn one_traversal_profile<const N: usize>(
                         stats,
                         depth + 1,
                         eff_prune,
+                        v3i,
                     );
                 } else {
                     pruned[a] = true;
@@ -2286,6 +2464,7 @@ fn one_traversal_profile<const N: usize>(
                 stats,
                 depth + 1,
                 eff_prune,
+                v3i,
             );
         }
         let mut ev = 0.0;
@@ -2324,6 +2503,7 @@ fn one_traversal_profile<const N: usize>(
             stats,
             depth + 1,
             eff_prune,
+            v3i,
         );
     }
     let mut ev = 0.0;
@@ -2349,11 +2529,19 @@ impl NlheTables {
     /// trained blueprint keyed for other seat counts, and the engine/fingerprint are only smoke-validated
     /// at N in {6,7}). Mutates `self` in place so a checkpoint can be taken between iterations.
     pub fn train_iteration(&mut self, cfg: &TrainerCfg) {
+        self.train_iteration_v3(cfg, v3_env());
+    }
+
+    /// `train_iteration` with the v3 schedule passed EXPLICITLY (unit tests / harnesses that must not
+    /// touch the process-global env OnceLock). `train_iteration(cfg)` == `train_iteration_v3(cfg,
+    /// v3_env())`, and `train_iteration_v3(cfg, &V3Cfg::default())` is byte-identical to the legacy
+    /// trainer (pinned ab_train goldens).
+    pub fn train_iteration_v3(&mut self, cfg: &TrainerCfg, v3: &V3Cfg) {
         match cfg.n_seats {
-            7 => self.train_iteration_n::<7>(cfg),
+            7 => self.train_iteration_n_v3::<7>(cfg, v3),
             // 6 is the default + the deployed path; any unrecognized width also routes here so the
             // trainer never silently produces keys for a seat count nothing serves.
-            _ => self.train_iteration_n::<6>(cfg),
+            _ => self.train_iteration_n_v3::<6>(cfg, v3),
         }
     }
 
@@ -2380,6 +2568,10 @@ impl NlheTables {
     /// `NlheTables` itself is seat-independent (keyed by the 16-byte fingerprint), so no per-N table type
     /// is needed — only the deal/recursion width changes.
     pub fn train_iteration_n<const N: usize>(&mut self, cfg: &TrainerCfg) {
+        self.train_iteration_n_v3::<N>(cfg, v3_env())
+    }
+
+    pub fn train_iteration_n_v3<const N: usize>(&mut self, cfg: &TrainerCfg, v3: &V3Cfg) {
         let t = self.iters_done + 1;
         let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
         // EFFECTIVE per-iteration prune threshold (CHANGE B / Pluribus rule 2 — the prune/explore choice is
@@ -2388,14 +2580,23 @@ impl NlheTables {
         // read-regret >= 0) => BYTE-IDENTICAL. DCFR: on a ~95% prune-iteration use the deeply-negative
         // `dcfr_prune_threshold`; on a ~5% explore-iteration use NEG_INFINITY so every action is re-
         // explored and a pruned action can REVIVE. The explore decision is deterministic in `iter_seed`.
-        let eff_prune = effective_prune_threshold(cfg, iter_seed);
+        // v3 LCFR mode: same coin with `v3.prune_c` / `v3.prune_explore` from `v3.prune_start`.
+        let eff_prune = effective_prune_threshold(cfg, iter_seed, t, v3);
+        let v3i = V3Iter {
+            unweighted_strat: v3.lcfr,
+            strat_pre_only: v3.snapshot_avg,
+        };
         let read: &NlheTables = self;
-        let partials = Self::collect_partials_n::<N>(cfg, read, t, iter_seed, eff_prune);
+        let partials = Self::collect_partials_n::<N>(cfg, read, t, iter_seed, eff_prune, v3i);
         self.merge_partials(cfg, partials);
         if dcfr_enabled(cfg) {
             // DCFR (CHANGE B): keep SIGNED regret and DISCOUNT it (no positive floor) so the prune hook's
             // negative-regret signal survives. Replaces `floor_cum_regret` for this iteration.
             self.apply_dcfr_discount(t);
+        } else if v3.lcfr {
+            // v3 LCFR (Pluribus): keep SIGNED regret, clamp at `regret_floor`, and on schedule apply the
+            // (t/D)/((t/D)+1) discount to ALL regrets and average-strategy rows.
+            self.apply_lcfr(t, v3);
         } else {
             // CFR+ default: positive-regret floor (byte-identical to today).
             self.floor_cum_regret();
@@ -2409,6 +2610,7 @@ impl NlheTables {
         t: u64,
         iter_seed: u64,
         eff_prune: f64,
+        v3i: V3Iter,
     ) -> Vec<NlheTables> {
         // WORK-STEALING PATH (CHANGE A): when enabled (cfg.work_steal OR env POKERBOT_WORKSTEAL=1), pull
         // deals dynamically off a shared atomic counter across exactly `current_num_threads()` workers so
@@ -2416,7 +2618,7 @@ impl NlheTables {
         // the batched MLP path — work-steal uses the recursive `one_traversal`; the two are mutually
         // exclusive here (work-steal takes precedence; a future merge could batch within a worker).
         if work_steal_enabled(cfg) {
-            return Self::collect_partials_n_worksteal::<N>(cfg, read, t, iter_seed, eff_prune);
+            return Self::collect_partials_n_worksteal::<N>(cfg, read, t, iter_seed, eff_prune, v3i);
         }
         // BATCHED MLP PATH: when `cfg.batch_deals >= 2` AND RBP is OFF (the production regime), step
         // `B` independent deals in lockstep so their cum_regret probes overlap (see `run_batch`). The
@@ -2426,8 +2628,14 @@ impl NlheTables {
         // batch's per-deal `LocalDelta`s are folded into the task accumulator in ASCENDING deal order
         // (`run_batch`), exactly as the recursive `.fold` does one deal at a time. Result: BYTE-IDENTICAL
         // merged table. A finite effective prune threshold (RBP on, e.g. DCFR mode) is NOT supported
-        // batched and falls through to the recursive fold below.
-        if cfg.batch_deals >= 2 && !eff_prune.is_finite() {
+        // batched and falls through to the recursive fold below. Likewise the v3 modes (LCFR unweighted
+        // strat / snapshot_avg pre-only strat) are NOT replicated in the batched state machine — any
+        // active v3 iter falls back to the recursive path (`batched_falls_back_under_v3` pins this).
+        if cfg.batch_deals >= 2
+            && !eff_prune.is_finite()
+            && !v3i.unweighted_strat
+            && !v3i.strat_pre_only
+        {
             return Self::collect_partials_n_batched::<N>(cfg, read, t, iter_seed);
         }
         // Each rayon worker borrows a PROCESS-PERSISTENT, thread-local blake2b-digest memo (`FP_MEMO`).
@@ -2477,7 +2685,7 @@ impl NlheTables {
                     let memo = &mut *cell.borrow_mut();
                     for hero in 0..N {
                         one_traversal::<N>(
-                            &root, hero, cfg, read, &mut local, &mut rng, t, memo, eff_prune,
+                            &root, hero, cfg, read, &mut local, &mut rng, t, memo, eff_prune, v3i,
                         );
                     }
                 });
@@ -2523,6 +2731,7 @@ impl NlheTables {
         t: u64,
         iter_seed: u64,
         eff_prune: f64,
+        v3i: V3Iter,
     ) -> Vec<NlheTables> {
         let n_deals = cfg.n_deals_per_iter;
         let next_deal = AtomicUsize::new(0);
@@ -2560,7 +2769,7 @@ impl NlheTables {
                     let mut local = LocalDelta::default();
                     for hero in 0..N {
                         one_traversal::<N>(
-                            &root, hero, cfg, read, &mut local, &mut rng, t, memo, eff_prune,
+                            &root, hero, cfg, read, &mut local, &mut rng, t, memo, eff_prune, v3i,
                         );
                     }
                     accumulate_local_into(&mut acc, local);
@@ -2626,6 +2835,7 @@ impl NlheTables {
         t: u64,
         iter_seed: u64,
         eff_prune: f64,
+        v3i: V3Iter,
     ) -> (Vec<NlheTables>, TraverseStats) {
         // The profile twin keeps the STATIC scheduler regardless of `work_steal` (the dynamic scheduler is
         // a pure-throughput change, not a measurement change; the profile counters must reflect a stable,
@@ -2653,7 +2863,7 @@ impl NlheTables {
                         for hero in 0..N {
                             one_traversal_profile::<N>(
                                 &root, hero, cfg, read, &mut local, &mut rng, t, memo, &mut acc_stats,
-                                0, eff_prune,
+                                0, eff_prune, v3i,
                             );
                         }
                         acc_stats.fp_memo_new_entries += memo.len().saturating_sub(before) as u64;
@@ -2759,6 +2969,53 @@ impl NlheTables {
         });
     }
 
+    /// v3 LCFR (Pluribus P-supp p.14, iteration-denominated) — the per-iteration regret pass used IN
+    /// PLACE OF `floor_cum_regret` when `v3.lcfr` is ON. Two things happen here:
+    ///   1. **Signed-regret floor**: every cum_regret entry is clamped BELOW at `v3.regret_floor`
+    ///      (Pluribus: -3.1e8 vs prune C=-3.0e8 — "easier to unprune actions that were initially
+    ///      pruned but later improved" + overflow protection). NO positive floor — negatives survive,
+    ///      which is what makes the hard prune threshold meaningful.
+    ///   2. **LCFR discount event** (only when `t % D == 0 && t <= W && D > 0`): ALL cum_regret entries
+    ///      (both signs, the SAME factor — this is LCFR, not DCFR's sign-split) and ALL strat_sum
+    ///      entries are multiplied by k/(k+1) where k = t/D. Successive events give an increment added
+    ///      in discount-window j the asymptotic weight j/(n+1) — i.e. linear weighting in window index,
+    ///      the periodic-in-place-multiply approximation of Linear CFR that Pluribus used (their D =
+    ///      10 wall-minutes, W = 400 wall-minutes; ours is iteration-denominated because wall-clock
+    ///      schedules do not transfer across hardware — amendment doc §2 has the mapping).
+    /// Per-element ops are order-independent (scale + clamp), so parallel-over-shards is safe, exactly
+    /// like `floor_cum_regret` / `apply_dcfr_discount`. Never reached when `v3.lcfr` is false.
+    fn apply_lcfr(&mut self, t: u64, v3: &V3Cfg) {
+        let event = v3.lcfr_d > 0 && t <= v3.lcfr_w && t % v3.lcfr_d == 0;
+        let factor = if event {
+            let k = (t / v3.lcfr_d) as f64;
+            k / (k + 1.0)
+        } else {
+            1.0
+        };
+        let floor = v3.regret_floor;
+        self.shards.par_iter_mut().for_each(|sh| {
+            for row in sh.cum_regret.values_mut() {
+                for a in 0..NUM_ACTIONS {
+                    let mut r = row[a] as f64;
+                    if event {
+                        r *= factor;
+                    }
+                    if r < floor {
+                        r = floor;
+                    }
+                    row[a] = r as RegretT;
+                }
+            }
+            if event {
+                for row in sh.strat_sum.values_mut() {
+                    for a in 0..NUM_ACTIONS {
+                        row[a] *= factor;
+                    }
+                }
+            }
+        });
+    }
+
     fn train_iteration_n_profile<const N: usize>(&mut self, cfg: &TrainerCfg) -> TrainIterProfile {
         let total_start = Instant::now();
         let t = self.iters_done + 1;
@@ -2769,11 +3026,16 @@ impl NlheTables {
         // strategy from this immutable borrow; workers write only their deltas into a fresh empty
         // `local`. Borrow `self` immutably for the snapshot so no per-iteration full clone is needed.
         let read: &NlheTables = self;
-        let eff_prune = effective_prune_threshold(cfg, iter_seed);
+        let v3 = v3_env();
+        let eff_prune = effective_prune_threshold(cfg, iter_seed, t, v3);
+        let v3i = V3Iter {
+            unweighted_strat: v3.lcfr,
+            strat_pre_only: v3.snapshot_avg,
+        };
 
         let traverse_start = Instant::now();
         let (partials, stats) =
-            Self::collect_partials_n_profile::<N>(cfg, read, t, iter_seed, eff_prune);
+            Self::collect_partials_n_profile::<N>(cfg, read, t, iter_seed, eff_prune, v3i);
         let traverse_ms = traverse_start.elapsed().as_secs_f64() * 1000.0;
 
         let partials_len = partials.len();
@@ -2785,10 +3047,12 @@ impl NlheTables {
         let merge_ms = merge_start.elapsed().as_secs_f64() * 1000.0;
 
         // The `floor_ms` slot times the per-iteration regret pass: the CFR+ floor by default, OR the DCFR
-        // discount when `dcfr` is ON (CHANGE B). Same wall-time accounting either way.
+        // discount when `dcfr` is ON (CHANGE B), OR the v3 LCFR floor+discount. Same accounting either way.
         let floor_start = Instant::now();
         if dcfr_enabled(cfg) {
             self.apply_dcfr_discount(t);
+        } else if v3.lcfr {
+            self.apply_lcfr(t, v3);
         } else {
             self.floor_cum_regret();
         }
@@ -3056,6 +3320,474 @@ pub fn deserialize(b: &[u8]) -> Option<NlheTables> {
     read_map_into_shards(b, &mut p, &mut t.shards, MapKind::Strat)?;
     t.iters_done = iters_done;
     Some(t)
+}
+
+// --------------------------------------------------------------------------------------------------
+// blueprint-v4 v3 — CURRENT-STRATEGY SNAPSHOTS (Pluribus rounds-2-4 snapshot averaging) + the
+// streaming offline averager, and the ON-POLICY COVERAGE probe (first-class metric per the Stage-0
+// verdict §3.1: H200@20k missed 71.7% of its own postflop lookups — runs must be sized by coverage,
+// and the trainer must REPORT it at checkpoint cadence).
+// --------------------------------------------------------------------------------------------------
+
+pub const SNAP_MAGIC: &[u8; 8] = b"NLSNAP01";
+const SNAP_ROW_BYTES: usize = 16 + 4 * NUM_ACTIONS; // key16 + 11 f32 probs
+const NLCFR_ROW_BYTES: u64 = 16 + 8 * NUM_ACTIONS as u64; // key16 + 11 f64
+
+/// Serialize the CURRENT strategy — the regret-matched positive part of every cum_regret row — as an
+/// `NLSNAP01` blob: magic, iters_done u64, n_rows u64, then (16-byte key, 11 x f32 LE probs) in ONE
+/// global ascending key order (same sort discipline as `serialize`, so streams k-way-merge). Rows are
+/// probabilities in [0,1]: positive regrets normalized over all 11 lanes (illegal lanes carry regret 0
+/// by construction, so this equals regret-matching over the legal set whenever any positive mass
+/// exists). A row with NO positive mass is stored ALL-ZERO — the current strategy there is
+/// uniform-over-legal, which cannot be reconstructed from the key alone (the legal mask needs the
+/// state); the offline averager SKIPS zero rows (serve falls back on a miss, same as an absent row).
+/// f32 is ample for probabilities and halves the snapshot's disk/upload footprint (60 B/row).
+pub fn serialize_current_strategy(tab: &NlheTables) -> Vec<u8> {
+    let n = tab.total_cum_len();
+    let mut out = Vec::with_capacity(24 + n * SNAP_ROW_BYTES);
+    out.extend_from_slice(SNAP_MAGIC);
+    out.extend_from_slice(&tab.iters_done.to_le_bytes());
+    out.extend_from_slice(&(n as u64).to_le_bytes());
+    let mut pairs: Vec<(&[u8; 16], [f32; NUM_ACTIONS])> = tab
+        .iter_all_cum()
+        .map(|(k, r)| {
+            let rr = widen_r(r);
+            let mut pos = [0.0f64; NUM_ACTIONS];
+            let mut s = 0.0;
+            for a in 0..NUM_ACTIONS {
+                let v = rr[a].max(0.0);
+                pos[a] = v;
+                s += v;
+            }
+            let mut row = [0.0f32; NUM_ACTIONS];
+            if s > 0.0 {
+                for a in 0..NUM_ACTIONS {
+                    row[a] = (pos[a] / s) as f32;
+                }
+            }
+            (k, row)
+        })
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, row) in pairs {
+        out.extend_from_slice(&k[..]);
+        for &v in &row {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Streaming reader for an `NLSNAP01` blob (any `Read`; the offline tool wraps `BufReader<File>`,
+/// tests wrap `Cursor<Vec<u8>>`). Rows come back in the blob's global ascending key order; O(1) memory.
+pub struct SnapshotStream<R: std::io::Read> {
+    pub iters_done: u64,
+    pub n_rows: u64,
+    read_rows: u64,
+    rdr: R,
+}
+
+impl<R: std::io::Read> SnapshotStream<R> {
+    pub fn open(mut rdr: R) -> Result<Self, String> {
+        let mut hdr = [0u8; 24];
+        rdr.read_exact(&mut hdr).map_err(|e| format!("snapshot header: {e}"))?;
+        if &hdr[0..8] != SNAP_MAGIC {
+            return Err("bad snapshot magic (want NLSNAP01)".into());
+        }
+        let iters_done = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+        let n_rows = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
+        Ok(SnapshotStream { iters_done, n_rows, read_rows: 0, rdr })
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn next_row(&mut self) -> Result<Option<([u8; 16], [f32; NUM_ACTIONS])>, String> {
+        if self.read_rows >= self.n_rows {
+            return Ok(None);
+        }
+        let mut buf = [0u8; SNAP_ROW_BYTES];
+        self.rdr
+            .read_exact(&mut buf)
+            .map_err(|e| format!("snapshot row {}: {e}", self.read_rows))?;
+        self.read_rows += 1;
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&buf[0..16]);
+        let mut row = [0.0f32; NUM_ACTIONS];
+        for a in 0..NUM_ACTIONS {
+            row[a] = f32::from_le_bytes(buf[16 + 4 * a..20 + 4 * a].try_into().unwrap());
+        }
+        Ok(Some((key, row)))
+    }
+}
+
+/// Streaming reader for the STRAT section of an `NLCFR001` checkpoint (skips the cum_regret section
+/// with a relative seek, so a 100 GB blob is never loaded). Under `snapshot_avg` training the strat
+/// section holds ONLY the preflop (round-1) in-memory average — exactly the rows Pluribus serves from
+/// the true average.
+pub struct NlcfrStratStream<R: std::io::Read + std::io::Seek> {
+    pub iters_done: u64,
+    pub n_rows: u64,
+    read_rows: u64,
+    rdr: R,
+}
+
+impl<R: std::io::Read + std::io::Seek> NlcfrStratStream<R> {
+    pub fn open(mut rdr: R) -> Result<Self, String> {
+        let mut hdr = [0u8; 24];
+        rdr.read_exact(&mut hdr).map_err(|e| format!("nlcfr header: {e}"))?;
+        if &hdr[0..8] != b"NLCFR001" {
+            return Err("bad checkpoint magic (want NLCFR001)".into());
+        }
+        let iters_done = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+        let cum_len = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
+        rdr.seek(std::io::SeekFrom::Current((cum_len * NLCFR_ROW_BYTES) as i64))
+            .map_err(|e| format!("nlcfr cum-section seek: {e}"))?;
+        let mut nb = [0u8; 8];
+        rdr.read_exact(&mut nb).map_err(|e| format!("nlcfr strat len: {e}"))?;
+        let n_rows = u64::from_le_bytes(nb);
+        Ok(NlcfrStratStream { iters_done, n_rows, read_rows: 0, rdr })
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn next_row(&mut self) -> Result<Option<([u8; 16], [f64; NUM_ACTIONS])>, String> {
+        if self.read_rows >= self.n_rows {
+            return Ok(None);
+        }
+        let mut buf = [0u8; 16 + 8 * NUM_ACTIONS];
+        self.rdr
+            .read_exact(&mut buf)
+            .map_err(|e| format!("nlcfr strat row {}: {e}", self.read_rows))?;
+        self.read_rows += 1;
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&buf[0..16]);
+        let mut row = [0.0f64; NUM_ACTIONS];
+        for a in 0..NUM_ACTIONS {
+            row[a] = f64::from_le_bytes(buf[16 + 8 * a..24 + 8 * a].try_into().unwrap());
+        }
+        Ok(Some((key, row)))
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SnapAvgStats {
+    pub rows_out: u64,
+    pub rows_from_ckpt: u64,
+    pub rows_from_snaps: u64,
+    /// Keys whose every snapshot row was all-zero (no positive regret in any snapshot) — dropped.
+    pub zero_rows_skipped: u64,
+}
+
+/// Offline snapshot averaging (Pluribus P-supp p.15 / Jackson 2016): k-way streaming merge of sorted
+/// `NLSNAP01` snapshot streams + (optionally) the final checkpoint's strat section, writing an
+/// `NLCFR001` blob whose cum section is EMPTY and whose strat section is the final blueprint:
+///   * a key present in the CHECKPOINT strat stream (the preflop round-1 true average) is emitted
+///     verbatim from the checkpoint — the in-memory average takes precedence over snapshots;
+///   * any other key is the UNIFORM (per-Pluribus) mean of its non-zero snapshot rows, over the
+///     snapshots in which it appears with positive mass (a lazily-allocated row simply doesn't exist
+///     in earlier snapshots; an all-zero row means "no positive regret yet" — both are skipped);
+///   * keys with only zero rows are dropped (serve treats them as a miss and falls back, which is
+///     strictly more honest than serving a fabricated uniform row without the legal mask).
+/// Output rows are normalized probabilities; downstream `snapshot()` row-normalization is then the
+/// identity, so every existing NLCFR001 consumer (extractors, probes, the mmap index) reads it
+/// unchanged. O(1) memory in the row count.
+pub fn average_snapshots<R1, R2, W>(
+    snaps: &mut [SnapshotStream<R1>],
+    mut ckpt: Option<&mut NlcfrStratStream<R2>>,
+    out: &mut W,
+    iters_done: u64,
+) -> Result<SnapAvgStats, String>
+where
+    R1: std::io::Read,
+    R2: std::io::Read + std::io::Seek,
+    W: std::io::Write + std::io::Seek,
+{
+    use std::io::SeekFrom;
+    let mut stats = SnapAvgStats::default();
+    // Header with a strat-count placeholder (fixed up by a final seek — the count is only known after
+    // the merge). Cum section: length 0 (the final blueprint carries no regrets).
+    out.write_all(b"NLCFR001").map_err(|e| e.to_string())?;
+    out.write_all(&iters_done.to_le_bytes()).map_err(|e| e.to_string())?;
+    out.write_all(&0u64.to_le_bytes()).map_err(|e| e.to_string())?; // cum len = 0
+    let strat_len_pos = out.stream_position().map_err(|e| e.to_string())?;
+    out.write_all(&0u64.to_le_bytes()).map_err(|e| e.to_string())?; // strat len placeholder
+
+    // Stream heads. Ascending-order violations => corrupt input => hard error.
+    let mut heads: Vec<Option<([u8; 16], [f32; NUM_ACTIONS])>> = Vec::with_capacity(snaps.len());
+    for s in snaps.iter_mut() {
+        heads.push(s.next_row()?);
+    }
+    let mut ckpt_head: Option<([u8; 16], [f64; NUM_ACTIONS])> = match ckpt.as_mut() {
+        Some(c) => c.next_row()?,
+        None => None,
+    };
+    let mut last_key: Option<[u8; 16]> = None;
+
+    loop {
+        // Minimum key across all live heads.
+        let mut min_key: Option<[u8; 16]> = ckpt_head.as_ref().map(|(k, _)| *k);
+        for h in heads.iter().flatten() {
+            min_key = Some(match min_key {
+                Some(m) if m <= h.0 => m,
+                _ => h.0,
+            });
+        }
+        let Some(key) = min_key else { break };
+        if let Some(lk) = last_key {
+            if key <= lk {
+                return Err("input streams not strictly ascending (corrupt snapshot/ckpt)".into());
+            }
+        }
+        last_key = Some(key);
+
+        // Gather + advance every snapshot head at `key`.
+        let mut acc = [0.0f64; NUM_ACTIONS];
+        let mut n_present = 0u64;
+        for (i, h) in heads.iter_mut().enumerate() {
+            if let Some((k, row)) = h {
+                if *k == key {
+                    let s: f32 = row.iter().sum();
+                    if s > 0.0 {
+                        for a in 0..NUM_ACTIONS {
+                            acc[a] += row[a] as f64;
+                        }
+                        n_present += 1;
+                    }
+                    *h = snaps[i].next_row()?;
+                }
+            }
+        }
+        // Checkpoint (preflop average) takes precedence at `key`.
+        if let Some((k, row)) = &ckpt_head {
+            if *k == key {
+                out.write_all(&key[..]).map_err(|e| e.to_string())?;
+                for &v in row {
+                    out.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
+                }
+                stats.rows_out += 1;
+                stats.rows_from_ckpt += 1;
+                ckpt_head = match ckpt.as_mut() {
+                    Some(c) => c.next_row()?,
+                    None => None,
+                };
+                continue;
+            }
+        }
+        if n_present == 0 {
+            stats.zero_rows_skipped += 1;
+            continue;
+        }
+        out.write_all(&key[..]).map_err(|e| e.to_string())?;
+        for a in 0..NUM_ACTIONS {
+            let v = acc[a] / n_present as f64;
+            out.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
+        }
+        stats.rows_out += 1;
+        stats.rows_from_snaps += 1;
+    }
+
+    // Fix up the strat-count placeholder.
+    let end = out.stream_position().map_err(|e| e.to_string())?;
+    out.seek(SeekFrom::Start(strat_len_pos)).map_err(|e| e.to_string())?;
+    out.write_all(&stats.rows_out.to_le_bytes()).map_err(|e| e.to_string())?;
+    out.seek(SeekFrom::Start(end)).map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())?;
+    Ok(stats)
+}
+
+// --------------------------------------------------------------------------------------------------
+// ON-POLICY COVERAGE probe — the d57d020 diagnostic made cheap enough for checkpoint cadence.
+// --------------------------------------------------------------------------------------------------
+
+/// Per-street on-policy coverage from `coverage_probe`. Streets index 0..=3 = preflop/flop/turn/river.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CoverageStats {
+    pub hands: u64,
+    pub decisions: [u64; 4],
+    pub misses: [u64; 4],
+    /// Hands that reached a FULL 5-card board with ZERO postflop decision nodes — the preflop-all-in
+    /// runout share (the Stage-0 verdict's postflop-starvation signature: H200@20k had 65% here).
+    pub preflop_allin_runouts: u64,
+}
+
+impl CoverageStats {
+    pub fn miss_rate(&self, street: usize) -> f64 {
+        if self.decisions[street] == 0 {
+            0.0
+        } else {
+            self.misses[street] as f64 / self.decisions[street] as f64
+        }
+    }
+    /// Aggregate postflop (flop+turn+river) on-policy miss rate — the pre-registered coverage-gate
+    /// quantity.
+    pub fn postflop_miss_rate(&self) -> f64 {
+        let d: u64 = self.decisions[1..4].iter().sum();
+        let m: u64 = self.misses[1..4].iter().sum();
+        if d == 0 {
+            0.0
+        } else {
+            m as f64 / d as f64
+        }
+    }
+    pub fn preflop_allin_runout_rate(&self) -> f64 {
+        if self.hands == 0 {
+            0.0
+        } else {
+            self.preflop_allin_runouts as f64 / self.hands as f64
+        }
+    }
+}
+
+/// ON-POLICY coverage probe: play `n_hands` blueprint-vs-blueprint hands where EVERY seat plays the
+/// CURRENT strategy (regret-matched cum_regret — the table snapshots serve; uniform-over-legal on a
+/// miss) and count, per street, how many of the strategy's OWN lookups hit the trained table. This is
+/// the `bpv4_onpolicy_coverage.py` (d57d020) diagnostic moved into the trainer so it can run at
+/// checkpoint cadence for ~ms cost (read-only on the table; the RNG is derived from `(seed, hand)`
+/// and never touches the training RNG schedule). Uses the SAME `abstracted_legal` (incl. the
+/// process-global M-RR env) and fingerprint dispatch as training, so a miss here is a genuine
+/// on-policy train-table miss, not a key-space artifact. NOTE the reference table is `cum_regret`
+/// (current strategy): under `snapshot_avg` there IS no postflop strat_sum, and the current-strategy
+/// table is what snapshot averaging serves — the Python diagnostic measured average-strategy (strat)
+/// coverage instead; at H200@20k the two row sets differ (184M vs 348M rows) so absolute levels are
+/// not directly comparable, trends and gates must be registered against THIS metric.
+pub fn coverage_probe(
+    tab: &NlheTables,
+    cfg: &TrainerCfg,
+    n_hands: u64,
+    seed: u64,
+) -> CoverageStats {
+    let mut stats = CoverageStats::default();
+    let mut memo: FpMemo = FpMemo::default();
+    for h in 0..n_hands {
+        // Same per-deal seed shape as training (pure function of (seed, h)), distinct stream.
+        let deal_seed = seed
+            .wrapping_add(h.wrapping_mul(0x100000001b3))
+            .rotate_left(17);
+        let mut rng = Rng::seed_from_u64(deal_seed);
+        let mut env = deal_root::<{ NUM_PLAYERS }>(&mut rng, h);
+        let mut had_postflop_decision = false;
+        loop {
+            if env.done {
+                break;
+            }
+            if core::is_chance_node(&env) {
+                env = core::sample_chance(&env);
+                continue;
+            }
+            if env.street >= core::STREET_TERMINAL || env.action_seat < 0 {
+                break;
+            }
+            let actor = env.action_seat as usize;
+            let legal = abstracted_legal(&env, actor, cfg);
+            if !any_legal(&legal) {
+                break;
+            }
+            let key = fingerprint_fast_depth_memo_emd(
+                &env,
+                actor,
+                cfg.num_buckets,
+                &cfg.depth_edges,
+                cfg.emd_frozen.as_deref(),
+                cfg.river_ochs.as_deref(),
+                &mut memo,
+            );
+            let st = (env.street.clamp(0, 3)) as usize;
+            stats.decisions[st] += 1;
+            if st > 0 {
+                had_postflop_decision = true;
+            }
+            let row = tab.shards[shard_of(&key)].cum_regret.get(&key);
+            let strat = match row {
+                Some(r) => regret_match(&widen_r(r), &legal),
+                None => {
+                    stats.misses[st] += 1;
+                    uniform_over_legal(&legal)
+                }
+            };
+            let a = sample_action(&strat, &legal, rng.next_f64());
+            env = trainer_apply(&env, a);
+        }
+        stats.hands += 1;
+        let nb = env.board.iter().filter(|&&c| c >= 0).count();
+        if !had_postflop_decision && nb == 5 {
+            stats.preflop_allin_runouts += 1;
+        }
+    }
+    stats
+}
+
+// --------------------------------------------------------------------------------------------------
+// REGRET-SCALE stats — the hard-prune-C calibration instrument (log10 histogram pass, O(rows), no
+// allocation proportional to the table). Drives the POKERBOT_PRUNE_C default derivation.
+// --------------------------------------------------------------------------------------------------
+
+/// Percentile summary of the stored regret values (negative tail by |value|, plus the positive tail).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RegStats {
+    pub rows: u64,
+    pub neg_vals: u64,
+    pub pos_vals: u64,
+    /// Negative-tail |value| percentiles: p50, p90, p99, p99.9 and the maximum |negative|.
+    pub neg_p50: f64,
+    pub neg_p90: f64,
+    pub neg_p99: f64,
+    pub neg_p999: f64,
+    pub neg_max: f64,
+    pub pos_p99: f64,
+    pub pos_max: f64,
+}
+
+/// One pass over every cum_regret value, binning |v| into a fixed log10 histogram (1e-9..1e12, 0.05
+/// decades/bin) per sign; percentiles are read off the histogram (bin upper edge — ~12% resolution,
+/// ample for calibrating an order-of-magnitude prune threshold).
+pub fn regret_stats(tab: &NlheTables) -> RegStats {
+    const BINS: usize = 420; // 21 decades * 20 bins
+    const LO: f64 = -9.0; // log10 lower edge
+    let mut neg = [0u64; BINS];
+    let mut pos = [0u64; BINS];
+    let mut st = RegStats::default();
+    for (_, row) in tab.iter_all_cum() {
+        st.rows += 1;
+        for a in 0..NUM_ACTIONS {
+            let v = row[a] as f64;
+            if v == 0.0 {
+                continue;
+            }
+            let mag = v.abs();
+            let b = (((mag.log10() - LO) * 20.0) as isize).clamp(0, BINS as isize - 1) as usize;
+            if v < 0.0 {
+                neg[b] += 1;
+                st.neg_vals += 1;
+                if mag > st.neg_max {
+                    st.neg_max = mag;
+                }
+            } else {
+                pos[b] += 1;
+                st.pos_vals += 1;
+                if mag > st.pos_max {
+                    st.pos_max = mag;
+                }
+            }
+        }
+    }
+    let pctl = |hist: &[u64; BINS], total: u64, q: f64| -> f64 {
+        if total == 0 {
+            return 0.0;
+        }
+        let target = (q * total as f64).ceil() as u64;
+        let mut cum = 0u64;
+        for (b, &c) in hist.iter().enumerate() {
+            cum += c;
+            if cum >= target {
+                return 10f64.powf(LO + (b as f64 + 1.0) / 20.0);
+            }
+        }
+        10f64.powf(LO + BINS as f64 / 20.0)
+    };
+    st.neg_p50 = pctl(&neg, st.neg_vals, 0.50);
+    st.neg_p90 = pctl(&neg, st.neg_vals, 0.90);
+    st.neg_p99 = pctl(&neg, st.neg_vals, 0.99);
+    st.neg_p999 = pctl(&neg, st.neg_vals, 0.999);
+    st.pos_p99 = pctl(&pos, st.pos_vals, 0.99);
+    st
 }
 
 // --------------------------------------------------------------------------------------------------
@@ -3981,8 +4713,8 @@ mod tests {
                 let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
                 let ep = cfg.prune_threshold;
                 let partials = match n_seats {
-                    7 => NlheTables::collect_partials_n::<7>(&cfg, &read, t, iter_seed, ep),
-                    _ => NlheTables::collect_partials_n::<6>(&cfg, &read, t, iter_seed, ep),
+                    7 => NlheTables::collect_partials_n::<7>(&cfg, &read, t, iter_seed, ep, V3Iter::default()),
+                    _ => NlheTables::collect_partials_n::<6>(&cfg, &read, t, iter_seed, ep, V3Iter::default()),
                 };
 
                 // Sharded merge (the real default path).
@@ -4089,12 +4821,12 @@ mod tests {
                 let ep_bat = cfg_bat.prune_threshold;
                 let (rec_partials, bat_partials) = match n_seats {
                     7 => (
-                        NlheTables::collect_partials_n::<7>(&cfg_rec, &read, t, iter_seed, ep_rec),
-                        NlheTables::collect_partials_n::<7>(&cfg_bat, &read, t, iter_seed, ep_bat),
+                        NlheTables::collect_partials_n::<7>(&cfg_rec, &read, t, iter_seed, ep_rec, V3Iter::default()),
+                        NlheTables::collect_partials_n::<7>(&cfg_bat, &read, t, iter_seed, ep_bat, V3Iter::default()),
                     ),
                     _ => (
-                        NlheTables::collect_partials_n::<6>(&cfg_rec, &read, t, iter_seed, ep_rec),
-                        NlheTables::collect_partials_n::<6>(&cfg_bat, &read, t, iter_seed, ep_bat),
+                        NlheTables::collect_partials_n::<6>(&cfg_rec, &read, t, iter_seed, ep_rec, V3Iter::default()),
+                        NlheTables::collect_partials_n::<6>(&cfg_bat, &read, t, iter_seed, ep_bat, V3Iter::default()),
                     ),
                 };
 
@@ -4161,8 +4893,8 @@ mod tests {
         let iter_seed = cfg_rec.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
         let ep_rec = cfg_rec.prune_threshold;
         let ep_bat = cfg_bat.prune_threshold;
-        let rec_partials = NlheTables::collect_partials_n::<6>(&cfg_rec, &read, t, iter_seed, ep_rec);
-        let bat_partials = NlheTables::collect_partials_n::<6>(&cfg_bat, &read, t, iter_seed, ep_bat);
+        let rec_partials = NlheTables::collect_partials_n::<6>(&cfg_rec, &read, t, iter_seed, ep_rec, V3Iter::default());
+        let bat_partials = NlheTables::collect_partials_n::<6>(&cfg_bat, &read, t, iter_seed, ep_bat, V3Iter::default());
 
         let mut rec = NlheTables::new();
         rec.merge_partials(&cfg_rec, rec_partials);
@@ -4265,8 +4997,12 @@ mod tests {
             .find("/// Run one CFR+ iteration and return coarse phase timings")
             .expect("train_iteration_profile source");
         let dispatch = &src[dispatch_start..profile_start];
-        assert!(dispatch.contains("self.train_iteration_n::<7>(cfg)"));
-        assert!(dispatch.contains("self.train_iteration_n::<6>(cfg)"));
+        // v3: `train_iteration` == `train_iteration_v3(cfg, v3_env())` (env default = inert), and the
+        // seat dispatch lives in `train_iteration_v3`. The guard's intent is unchanged: the default
+        // path must reach the PLAIN per-seat iteration, never the profile twin.
+        assert!(dispatch.contains("self.train_iteration_v3(cfg, v3_env())"));
+        assert!(dispatch.contains("self.train_iteration_n_v3::<7>(cfg, v3)"));
+        assert!(dispatch.contains("self.train_iteration_n_v3::<6>(cfg, v3)"));
         assert!(!dispatch.contains("train_iteration_profile"));
         assert!(!dispatch.contains("train_iteration_n_profile"));
 
@@ -4635,7 +5371,7 @@ mod tests {
         let t = 1u64;
         let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
         let ep = cfg.prune_threshold;
-        let partials = NlheTables::collect_partials_n_worksteal::<6>(&cfg, &read, t, iter_seed, ep);
+        let partials = NlheTables::collect_partials_n_worksteal::<6>(&cfg, &read, t, iter_seed, ep, V3Iter::default());
         // One partial per rayon worker thread.
         assert!(!partials.is_empty(), "work-steal produced no partials");
         // Sum the strat rows across partials -> at least one infoset trained (deals were actually run).
@@ -4644,7 +5380,7 @@ mod tests {
 
         // Re-run: the merged infoset SET is scheduler-order-invariant (deals are a pure fn of the seed), so
         // a second work-steal collect merges to the same key count.
-        let p2 = NlheTables::collect_partials_n_worksteal::<6>(&cfg, &read, t, iter_seed, ep);
+        let p2 = NlheTables::collect_partials_n_worksteal::<6>(&cfg, &read, t, iter_seed, ep, V3Iter::default());
         let mut m1 = NlheTables::new();
         m1.merge_partials(&cfg, partials);
         m1.floor_cum_regret();
@@ -4816,6 +5552,7 @@ mod tests {
                 for hero in 0..6 {
                     one_traversal::<6>(
                         &root, hero, &cfg, &read, &mut local, &mut rng, t, memo, eff_prune,
+                        V3Iter::default(),
                     );
                 }
             }
@@ -4863,7 +5600,7 @@ mod tests {
         let n = 20000u64;
         for t in 1..=n {
             let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
-            let ep = effective_prune_threshold(&cfg, iter_seed);
+            let ep = effective_prune_threshold(&cfg, iter_seed, t, &V3Cfg::default());
             let is_explore = dcfr_is_explore_iter(iter_seed, cfg.dcfr_explore_frac);
             if is_explore {
                 explore_count += 1;
@@ -4933,7 +5670,7 @@ mod tests {
 
         let run = |t: u64| -> PruneProbe {
             let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
-            let eff_prune = effective_prune_threshold(&cfg, iter_seed);
+            let eff_prune = effective_prune_threshold(&cfg, iter_seed, t, &V3Cfg::default());
             prune_probe_reset();
             FP_MEMO.with(|cell| {
                 let memo = &mut *cell.borrow_mut();
@@ -4947,6 +5684,7 @@ mod tests {
                     for hero in 0..6 {
                         one_traversal::<6>(
                             &root, hero, &cfg, &read, &mut local, &mut rng, t, memo, eff_prune,
+                            V3Iter::default(),
                         );
                     }
                 }
@@ -4966,4 +5704,495 @@ mod tests {
             "prune iteration t={prune_t} pruned nothing — cannot contrast with explore"
         );
     }
+
+    // ==============================================================================================
+    // blueprint-v4 v3 trainer-schedule tests (LCFR + hard prune + snapshot averaging + coverage).
+    // Every knob is exercised through the EXPLICIT `V3Cfg`/`V3Iter` parameters (never the process-
+    // global env OnceLock, which other tests must not be poisoned by). Byte-identity-when-off is
+    // pinned three ways: (a) `v3_default_is_inert_byte_identical` below (train_iteration_v3(default)
+    // == the dispatcher path in-process), (b) the pre/post-change ab_train golden SHAs recorded in
+    // the v3 session (69ba34fb... base / 74a3bafa... fullhist+MRR), (c) the pre-existing byte-gates
+    // (dispatch_n6/batched/sharded-merge) which all still pass.
+    // ==============================================================================================
+
+    /// Golden inertness: the v3-parameterized iteration with `V3Cfg::default()` serializes byte-for-
+    /// byte identically to the legacy `train_iteration` dispatcher (which reads the -- unset -- env).
+    #[test]
+    fn v3_default_is_inert_byte_identical() {
+        let cfg = test_cfg(64);
+        let mut a = NlheTables::new();
+        let mut b = NlheTables::new();
+        let v3 = V3Cfg::default();
+        for _ in 0..4 {
+            a.train_iteration(&cfg);
+            b.train_iteration_v3(&cfg, &v3);
+        }
+        assert_eq!(serialize(&a), serialize(&b), "V3Cfg::default() not inert");
+    }
+
+    /// `apply_lcfr` semantics on a hand-built table: (1) a discount iteration multiplies BOTH signs
+    /// of cum_regret and every strat_sum lane by k/(k+1); (2) a non-discount iteration leaves values
+    /// untouched except the floor clamp; (3) the floor clamps below; (4) after `lcfr_w` no discount.
+    #[test]
+    fn lcfr_discount_and_floor_semantics() {
+        let key1 = [1u8; 16];
+        let key2 = [2u8; 16];
+        let mut tab = NlheTables::new();
+        {
+            let sh = &mut tab.shards[shard_of(&key1)];
+            let mut r = ZEROS_R;
+            r[0] = 10.0 as RegretT;
+            r[1] = -4.0 as RegretT;
+            sh.cum_regret.insert(key1, r);
+        }
+        {
+            let sh = &mut tab.shards[shard_of(&key2)];
+            let mut ss = ZEROS;
+            ss[2] = 6.0;
+            sh.strat_sum.insert(key2, ss);
+        }
+        let v3 = V3Cfg {
+            lcfr: true,
+            lcfr_d: 10,
+            lcfr_w: 30,
+            regret_floor: -3.0,
+            ..V3Cfg::default()
+        };
+        // t=20 => k = 2 => factor 2/3, applied to +10 / -4 / strat 6; then floor(-3) clamps -4*2/3
+        // = -2.6667 (above the floor, no clamp).
+        tab.apply_lcfr(20, &v3);
+        let r1 = widen_r(tab.shards[shard_of(&key1)].cum_regret.get(&key1).unwrap());
+        assert!((r1[0] - 10.0 * (2.0 / 3.0)).abs() < 1e-12, "pos regret discount: {}", r1[0]);
+        assert!((r1[1] - (-4.0 * (2.0 / 3.0))).abs() < 1e-12, "neg regret discount: {}", r1[1]);
+        let s2 = *tab.shards[shard_of(&key2)].strat_sum.get(&key2).unwrap();
+        assert!((s2[2] - 6.0 * (2.0 / 3.0)).abs() < 1e-12, "strat discount: {}", s2[2]);
+        // t=21: NOT a discount event; only the floor applies. Push a value below the floor first.
+        {
+            let sh = &mut tab.shards[shard_of(&key1)];
+            let r = sh.cum_regret.get_mut(&key1).unwrap();
+            r[3] = -100.0 as RegretT;
+        }
+        let before_pos = r1[0];
+        tab.apply_lcfr(21, &v3);
+        let r1b = widen_r(tab.shards[shard_of(&key1)].cum_regret.get(&key1).unwrap());
+        assert_eq!(r1b[0], before_pos, "non-event iteration must not discount");
+        assert_eq!(r1b[3], -3.0, "floor must clamp -100 to regret_floor");
+        let s2b = *tab.shards[shard_of(&key2)].strat_sum.get(&key2).unwrap();
+        assert!((s2b[2] - 6.0 * (2.0 / 3.0)).abs() < 1e-12, "strat untouched on non-event");
+        // t=40 > lcfr_w=30: no discount even though 40 % 10 == 0.
+        tab.apply_lcfr(40, &v3);
+        let r1c = widen_r(tab.shards[shard_of(&key1)].cum_regret.get(&key1).unwrap());
+        assert_eq!(r1c[0], before_pos, "discount fired past lcfr_w");
+    }
+
+    /// LCFR mode keeps SIGNED regrets (vs CFR+'s positive floor) and accumulates the average strategy
+    /// UNWEIGHTED: from an identical (empty) start at iteration t=5, the traversals are identical
+    /// (strategy reads see the same regrets), so the LCFR arm's strat_sum row must equal the CFR+
+    /// arm's row divided by w=t=5, and the CFR+ regrets must be the positive part of the LCFR ones.
+    #[test]
+    fn lcfr_signed_regret_and_unweighted_strat() {
+        let cfg = test_cfg(64);
+        let mut classic = NlheTables::new();
+        let mut lin = NlheTables::new();
+        classic.iters_done = 4; // next iteration is t=5
+        lin.iters_done = 4;
+        let v3 = V3Cfg {
+            lcfr: true,
+            lcfr_d: 0, // no discount events -- isolates the weighting + sign behavior
+            ..V3Cfg::default()
+        };
+        classic.train_iteration_v3(&cfg, &V3Cfg::default());
+        lin.train_iteration_v3(&cfg, &v3);
+        // strat_sum: classic w=5, lcfr w=1 -- same visits, same per-visit probs.
+        let mut strat_rows = 0usize;
+        for (k, row) in lin.iter_all_strat() {
+            let c = classic.shards[shard_of(k)]
+                .strat_sum
+                .get(k)
+                .expect("strat key set must match");
+            for a in 0..NUM_ACTIONS {
+                assert!(
+                    (c[a] - 5.0 * row[a]).abs() <= 1e-9 * c[a].abs().max(1.0),
+                    "strat weight mismatch at lane {a}: classic {} vs 5*lcfr {}",
+                    c[a],
+                    5.0 * row[a]
+                );
+            }
+            strat_rows += 1;
+        }
+        assert!(strat_rows > 0, "no strat rows trained");
+        assert_eq!(strat_rows, classic.total_strat_len(), "strat key sets differ");
+        // regrets: identical pre-floor sums => classic == max(lcfr, 0); and some negative survived.
+        let mut saw_negative = false;
+        for (k, row) in lin.iter_all_cum() {
+            let widened = widen_r(row);
+            let c = widen_r(
+                classic.shards[shard_of(k)]
+                    .cum_regret
+                    .get(k)
+                    .expect("cum key set must match"),
+            );
+            for a in 0..NUM_ACTIONS {
+                if widened[a] < 0.0 {
+                    saw_negative = true;
+                }
+                assert_eq!(c[a], widened[a].max(0.0), "classic must be the positive part");
+            }
+        }
+        assert!(saw_negative, "LCFR mode floored negatives away (should keep signed regret)");
+    }
+
+    /// v3 hard pruning fires under the LCFR schedule and honors the Pluribus rules: never on the
+    /// river, never a terminal-leading action, only from `prune_start`, and the floor bounds stored
+    /// regret. Mirrors `rbp_never_prunes_last_betting_round` but drives the v3 (non-DCFR) path.
+    #[test]
+    fn v3_hard_prune_fires_with_pluribus_rules() {
+        let mut cfg = test_cfg(48);
+        cfg.base_seed = 0xB0B0;
+        // A LENIENT threshold so a short run can reach it: C = -0.05 bb. (Production C comes from the
+        // amendment-doc calibration; the rules under test are threshold-magnitude-independent.)
+        let v3 = V3Cfg {
+            lcfr: true,
+            lcfr_d: 0,
+            prune_c: -0.05,
+            prune_start: 3,
+            prune_explore: 0.0, // every eligible iteration prunes => deterministic assertion
+            regret_floor: -0.05 * (31.0 / 30.0),
+            ..V3Cfg::default()
+        };
+        let mut tab = NlheTables::new();
+        // Warm 2 iterations (below prune_start: eff_prune must stay -inf).
+        for t in 1..=2u64 {
+            let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
+            assert_eq!(
+                effective_prune_threshold(&cfg, iter_seed, t, &v3),
+                f64::NEG_INFINITY,
+                "pruning before prune_start"
+            );
+            tab.train_iteration_v3(&cfg, &v3);
+        }
+        // From t=3 the threshold is C on every iteration (explore_frac 0). Warm a few more so
+        // regrets actually cross C.
+        for _ in 0..6 {
+            tab.train_iteration_v3(&cfg, &v3);
+        }
+        // NB: train_iteration_v3 fans over rayon; PRUNE_PROBE is per-thread. Run one more iteration
+        // single-threaded through one_traversal directly so the probe observes it.
+        let t = tab.iters_done + 1;
+        let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
+        let eff_prune = effective_prune_threshold(&cfg, iter_seed, t, &v3);
+        assert_eq!(eff_prune, v3.prune_c, "prune threshold must be C from prune_start");
+        prune_probe_reset();
+        let read = &tab;
+        FP_MEMO.with(|cell| {
+            let memo = &mut *cell.borrow_mut();
+            for d in 0..48u64 {
+                let deal_seed = iter_seed
+                    .wrapping_add(d.wrapping_mul(0x100000001b3))
+                    .rotate_left(17);
+                let mut rng = Rng::seed_from_u64(deal_seed);
+                let root = deal_root::<6>(&mut rng, d);
+                let mut local = LocalDelta::default();
+                for hero in 0..6 {
+                    one_traversal::<6>(
+                        &root,
+                        hero,
+                        &cfg,
+                        read,
+                        &mut local,
+                        &mut rng,
+                        t,
+                        memo,
+                        eff_prune,
+                        V3Iter { unweighted_strat: true, strat_pre_only: false },
+                    );
+                }
+            }
+        });
+        let probe = prune_probe_get();
+        assert!(probe.pruned_total > 0, "v3 hard prune never fired (C=-0.05, 8 warm iters)");
+        assert_eq!(probe.pruned_on_river_or_later, 0, "RULE 1a violated: pruned on river");
+        assert_eq!(probe.terminal_leading_pruned, 0, "RULE 1b violated: pruned terminal-leading");
+        // Floor: every stored regret must be >= regret_floor after the iteration passes.
+        for (_, row) in tab.iter_all_cum() {
+            for a in 0..NUM_ACTIONS {
+                assert!(
+                    (row[a] as f64) >= v3.regret_floor - 1e-12,
+                    "regret {} below floor {}",
+                    row[a],
+                    v3.regret_floor
+                );
+            }
+        }
+    }
+
+    /// `effective_prune_threshold` v3 paths: off before prune_start, C on prune iterations,
+    /// NEG_INFINITY on explore iterations, DCFR precedence, inert when lcfr off.
+    #[test]
+    fn effective_prune_threshold_v3_paths() {
+        let cfg = test_cfg(8);
+        let v3 = V3Cfg {
+            lcfr: true,
+            prune_c: -1000.0,
+            prune_start: 100,
+            prune_explore: 1.0, // always explore
+            ..V3Cfg::default()
+        };
+        assert_eq!(
+            effective_prune_threshold(&cfg, 7, 50, &v3),
+            f64::NEG_INFINITY,
+            "before prune_start"
+        );
+        assert_eq!(
+            effective_prune_threshold(&cfg, 7, 200, &v3),
+            f64::NEG_INFINITY,
+            "explore_frac=1 must always explore"
+        );
+        let v3p = V3Cfg { prune_explore: 0.0, ..v3 };
+        assert_eq!(effective_prune_threshold(&cfg, 7, 200, &v3p), -1000.0, "prune iteration");
+        let v3off = V3Cfg { lcfr: false, ..v3p };
+        assert_eq!(
+            effective_prune_threshold(&cfg, 7, 200, &v3off),
+            cfg.prune_threshold,
+            "lcfr off => legacy threshold"
+        );
+        let mut cfg_dcfr = test_cfg(8);
+        cfg_dcfr.dcfr = true;
+        cfg_dcfr.dcfr_explore_frac = 0.0;
+        assert_eq!(
+            effective_prune_threshold(&cfg_dcfr, 7, 200, &v3p),
+            cfg_dcfr.dcfr_prune_threshold,
+            "DCFR takes precedence over v3"
+        );
+    }
+
+    /// snapshot_avg mode: cum_regret must be BYTE-IDENTICAL to the default run (strat_sum is never
+    /// read during training), the strat_sum row set must shrink (postflop rows skipped), and every
+    /// retained row must be byte-equal to the default run's row for the same key (preflop rows are
+    /// accumulated identically).
+    #[test]
+    fn snapshot_avg_drops_postflop_strat_keeps_cum_identical() {
+        let cfg = test_cfg(128);
+        let mut full = NlheTables::new();
+        let mut snap = NlheTables::new();
+        let v3 = V3Cfg { snapshot_avg: true, ..V3Cfg::default() };
+        for _ in 0..4 {
+            full.train_iteration_v3(&cfg, &V3Cfg::default());
+            snap.train_iteration_v3(&cfg, &v3);
+        }
+        // cum sections byte-identical.
+        let sf = serialize(&full);
+        let ss = serialize(&snap);
+        let cum_len = u64::from_le_bytes(sf[16..24].try_into().unwrap());
+        assert_eq!(
+            u64::from_le_bytes(ss[16..24].try_into().unwrap()),
+            cum_len,
+            "cum row counts differ"
+        );
+        let cum_end = 24 + (cum_len as usize) * (16 + 8 * NUM_ACTIONS);
+        assert_eq!(sf[..cum_end], ss[..cum_end], "cum sections differ (strat skip leaked)");
+        // strat: strictly smaller, and retained rows byte-equal.
+        assert!(
+            snap.total_strat_len() < full.total_strat_len(),
+            "snapshot_avg dropped nothing ({} vs {})",
+            snap.total_strat_len(),
+            full.total_strat_len()
+        );
+        assert!(snap.total_strat_len() > 0, "snapshot_avg kept no preflop rows");
+        for (k, row) in snap.iter_all_strat() {
+            let f = full.shards[shard_of(k)]
+                .strat_sum
+                .get(k)
+                .expect("retained strat key missing from full run");
+            assert_eq!(row, f, "retained (preflop) strat row differs from full run");
+        }
+    }
+
+    /// `serialize_current_strategy` roundtrip: header sane, rows globally ascending, count == cum
+    /// rows, and each row equals the positive-part-normalized cum row (zero row iff no positive mass).
+    #[test]
+    fn snapshot_current_strategy_roundtrip() {
+        let cfg = test_cfg(64);
+        let mut tab = NlheTables::new();
+        for _ in 0..3 {
+            tab.train_iteration_v3(&cfg, &V3Cfg::default());
+        }
+        let blob = serialize_current_strategy(&tab);
+        let mut rd = SnapshotStream::open(std::io::Cursor::new(&blob)).expect("open snapshot");
+        assert_eq!(rd.iters_done, 3);
+        assert_eq!(rd.n_rows as usize, tab.total_cum_len());
+        let mut prev: Option<[u8; 16]> = None;
+        let mut n = 0u64;
+        while let Some((k, row)) = rd.next_row().expect("row") {
+            if let Some(pk) = prev {
+                assert!(k > pk, "snapshot keys not strictly ascending");
+            }
+            prev = Some(k);
+            let cum = widen_r(tab.shards[shard_of(&k)].cum_regret.get(&k).expect("cum row"));
+            let s: f64 = cum.iter().map(|v| v.max(0.0)).sum();
+            if s > 0.0 {
+                for a in 0..NUM_ACTIONS {
+                    let want = (cum[a].max(0.0) / s) as f32;
+                    assert!(
+                        (row[a] - want).abs() <= 1e-6,
+                        "prob mismatch lane {a}: {} vs {}",
+                        row[a],
+                        want
+                    );
+                }
+            } else {
+                assert!(row.iter().all(|&v| v == 0.0), "no-positive-mass row must be all-zero");
+            }
+            n += 1;
+        }
+        assert_eq!(n, rd.n_rows);
+    }
+
+    /// Offline snapshot averaging: hand-built snapshots + checkpoint exercise the merge rules --
+    /// uniform mean over present non-zero rows, checkpoint (round-1 average) precedence, zero-row
+    /// skipping -- and the output must be a loadable NLCFR001 blob with an empty cum section.
+    #[test]
+    fn snap_avg_streaming_merge_rules() {
+        use std::io::Cursor;
+        let ka = [1u8; 16]; // in both snapshots
+        let kb = [2u8; 16]; // snapshot 1 only
+        let kc = [3u8; 16]; // zero in both snapshots => dropped
+        let kd = [4u8; 16]; // in ckpt AND snapshot 2 => ckpt wins
+        let mk_snap = |iters: u64, rows: Vec<([u8; 16], [f32; NUM_ACTIONS])>| -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(SNAP_MAGIC);
+            out.extend_from_slice(&iters.to_le_bytes());
+            out.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+            for (k, row) in rows {
+                out.extend_from_slice(&k[..]);
+                for &v in &row {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            out
+        };
+        let row = |vals: &[(usize, f32)]| -> [f32; NUM_ACTIONS] {
+            let mut r = [0.0f32; NUM_ACTIONS];
+            for &(i, v) in vals {
+                r[i] = v;
+            }
+            r
+        };
+        let s1 = mk_snap(
+            10,
+            vec![(ka, row(&[(0, 1.0)])), (kb, row(&[(1, 0.5), (2, 0.5)])), (kc, row(&[]))],
+        );
+        let s2 = mk_snap(
+            20,
+            vec![(ka, row(&[(0, 0.5), (1, 0.5)])), (kc, row(&[])), (kd, row(&[(2, 1.0)]))],
+        );
+        // Checkpoint: cum EMPTY (irrelevant), strat holds kd (the "preflop average" row).
+        let mut ckpt_tab = NlheTables::new();
+        {
+            let sh = &mut ckpt_tab.shards[shard_of(&kd)];
+            let mut r = ZEROS;
+            r[5] = 42.0;
+            sh.strat_sum.insert(kd, r);
+        }
+        ckpt_tab.iters_done = 20;
+        let ckpt_blob = serialize(&ckpt_tab);
+        let mut snaps = vec![
+            SnapshotStream::open(Cursor::new(&s1)).unwrap(),
+            SnapshotStream::open(Cursor::new(&s2)).unwrap(),
+        ];
+        let mut ckpt = NlcfrStratStream::open(Cursor::new(&ckpt_blob)).unwrap();
+        let mut out = Cursor::new(Vec::<u8>::new());
+        let stats = average_snapshots(&mut snaps, Some(&mut ckpt), &mut out, 20).expect("average");
+        assert_eq!(stats.rows_out, 3, "ka, kb, kd");
+        assert_eq!(stats.rows_from_ckpt, 1);
+        assert_eq!(stats.rows_from_snaps, 2);
+        assert_eq!(stats.zero_rows_skipped, 1, "kc dropped");
+        let tab = deserialize(&out.into_inner()).expect("output must be loadable NLCFR001");
+        assert_eq!(tab.iters_done, 20);
+        assert_eq!(tab.total_cum_len(), 0, "final blueprint carries no regrets");
+        assert_eq!(tab.total_strat_len(), 3);
+        let ra = tab.shards[shard_of(&ka)].strat_sum.get(&ka).unwrap();
+        assert!((ra[0] - 0.75).abs() < 1e-6 && (ra[1] - 0.25).abs() < 1e-6, "mean of snapshots");
+        let rb = tab.shards[shard_of(&kb)].strat_sum.get(&kb).unwrap();
+        assert!((rb[1] - 0.5).abs() < 1e-6, "single-snapshot mean is the row itself");
+        let rdd = tab.shards[shard_of(&kd)].strat_sum.get(&kd).unwrap();
+        assert_eq!(rdd[5], 42.0, "checkpoint strat row must win over the snapshot");
+    }
+
+    /// Coverage probe: an EMPTY table misses every lookup; training reduces the preflop miss rate;
+    /// the probe is deterministic in (table, seed) and never mutates the table.
+    #[test]
+    fn coverage_probe_empty_then_trained() {
+        let cfg = test_cfg(64);
+        let empty = NlheTables::new();
+        let c0 = coverage_probe(&empty, &cfg, 64, 0xC0FFEE);
+        assert_eq!(c0.hands, 64);
+        assert!(c0.decisions[0] > 0, "no preflop decisions probed");
+        assert_eq!(c0.misses, c0.decisions, "empty table must miss everything");
+        let mut tab = NlheTables::new();
+        for _ in 0..20 {
+            tab.train_iteration_v3(&cfg, &V3Cfg::default());
+        }
+        let before = serialize(&tab);
+        let c1 = coverage_probe(&tab, &cfg, 64, 0xC0FFEE);
+        let c2 = coverage_probe(&tab, &cfg, 64, 0xC0FFEE);
+        assert_eq!(serialize(&tab), before, "probe mutated the table");
+        assert_eq!(
+            (c1.decisions, c1.misses, c1.preflop_allin_runouts),
+            (c2.decisions, c2.misses, c2.preflop_allin_runouts),
+            "probe not deterministic"
+        );
+        assert!(
+            c1.miss_rate(0) < 1.0,
+            "trained table still misses 100% preflop on-policy ({}/{})",
+            c1.misses[0],
+            c1.decisions[0]
+        );
+    }
+
+    /// The batched-MLP path must FALL BACK to the recursive path when any v3 iter mode is active
+    /// (the batched state machine replicates only the legacy float ops). Proven by byte-equality of
+    /// the batched-cfg run against the recursive run under the same v3 config.
+    #[test]
+    fn batched_falls_back_under_v3() {
+        let mut cfg_bat = test_cfg(96);
+        cfg_bat.batch_deals = 8;
+        let cfg_rec = test_cfg(96);
+        let v3 = V3Cfg { snapshot_avg: true, ..V3Cfg::default() };
+        let mut a = NlheTables::new();
+        let mut b = NlheTables::new();
+        for _ in 0..3 {
+            a.train_iteration_v3(&cfg_bat, &v3);
+            b.train_iteration_v3(&cfg_rec, &v3);
+        }
+        assert_eq!(
+            serialize(&a),
+            serialize(&b),
+            "batched path did not fall back under v3 (or fallback diverges)"
+        );
+    }
+
+    /// `regret_stats` histogram-percentile sanity on a hand-built table (the C-calibration tool).
+    #[test]
+    fn regret_stats_percentiles_sane() {
+        let mut tab = NlheTables::new();
+        for i in 0..100u8 {
+            let mut k = [0u8; 16];
+            k[0] = i;
+            let mut r = ZEROS_R;
+            r[0] = -((i as f64) + 1.0) as RegretT; // negatives -1..-100
+            r[1] = 5.0 as RegretT;
+            tab.shards[shard_of(&k)].cum_regret.insert(k, r);
+        }
+        let st = regret_stats(&tab);
+        assert_eq!(st.rows, 100);
+        assert_eq!(st.neg_vals, 100);
+        assert_eq!(st.pos_vals, 100);
+        assert_eq!(st.neg_max, 100.0);
+        // Histogram-resolution (~12%) checks around the true percentiles (p50 ~ 50, p90 ~ 90).
+        assert!(st.neg_p50 > 35.0 && st.neg_p50 < 70.0, "neg_p50 {}", st.neg_p50);
+        assert!(st.neg_p90 > 70.0 && st.neg_p90 < 120.0, "neg_p90 {}", st.neg_p90);
+        assert!(st.pos_p99 > 3.5 && st.pos_p99 < 7.0, "pos_p99 {}", st.pos_p99);
+    }
 }
+

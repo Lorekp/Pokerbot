@@ -38,6 +38,20 @@ param(
   [switch]$Dcfr,                      # NOT recommended (CFR+ > DCFR at iter16000 for 6-max)
   [double]$DcfrPruneThreshold = -300000.0,
   [double]$DcfrExploreFrac = 0.05,
+  # --- blueprint-v4 v3 trainer schedule (artifacts/blueprint_v4_amendment_v3.md; all off => the
+  # ---  rendered bootstrap is byte-identical, sha-compared). Use via bpv4_v3_babysitter.ps1.
+  [switch]$V3Lcfr,                    # --v3-lcfr (POKERBOT_LCFR=1: signed regrets + LCFR discount +
+                                      #   unweighted averaging). Mutually exclusive with -Dcfr.
+  [int]$V3LcfrD = 250,                # --v3-lcfr-d (discount interval, iterations)
+  [int]$V3LcfrW = 10000,              # --v3-lcfr-w (discount window, iterations)
+  [string]$V3PruneC = "",             # --v3-prune-c (hard prune threshold, bb; "" = pruning off)
+  [string]$V3PruneStart = "",         # --v3-prune-start ("" = W/2 default inside the trainer)
+  [double]$V3PruneExplore = 0.05,     # --v3-prune-explore (Pluribus 5%)
+  [string]$V3RegretFloor = "",        # --v3-regret-floor ("" = C*31/30 default inside the trainer)
+  [switch]$V3SnapshotAvg,             # --v3-snapshot-avg (no postflop strat_sum + NLSNAP01 snapshots)
+  [string]$V3SnapStart = "",          # --v3-snap-start ("" = 8% of --iters)
+  [int]$V3CovHands = 2048,            # --v3-cov-hands (COVERAGE line cadence; 0 disables)
+  [switch]$V3Regstats,                # --v3-regstats (REGSTATS percentile lines)
   # --- box / market ---
   [string]$InstanceType = "",          # "" = AUTO-PICK cheapest spot-available type via spotpick
   [int]$Vcpus = 128,
@@ -178,6 +192,21 @@ function Invoke-Launch {
   if ($WorkSteal)  { $argsList += "--work-steal" }
   if ($Dcfr)       { $argsList += @("--dcfr", "--dcfr-prune-threshold", $DcfrPruneThreshold,
                                     "--dcfr-explore-frac", $DcfrExploreFrac) }
+  if ($V3Lcfr) {
+    $argsList += @("--v3-lcfr", "--v3-lcfr-d", $V3LcfrD, "--v3-lcfr-w", $V3LcfrW,
+                   "--v3-prune-explore", $V3PruneExplore)
+    if ($V3PruneC)      { $argsList += @("--v3-prune-c", $V3PruneC) }
+    if ($V3PruneStart)  { $argsList += @("--v3-prune-start", $V3PruneStart) }
+    if ($V3RegretFloor) { $argsList += @("--v3-regret-floor", $V3RegretFloor) }
+  }
+  if ($V3SnapshotAvg) {
+    $argsList += "--v3-snapshot-avg"
+    if ($V3SnapStart) { $argsList += @("--v3-snap-start", $V3SnapStart) }
+  }
+  if ($V3Lcfr -or $V3SnapshotAvg) {
+    $argsList += @("--v3-cov-hands", $V3CovHands)
+    if ($V3Regstats) { $argsList += "--v3-regstats" }
+  }
   if ($Spotpick)   { $argsList += "--spotpick" }
   if ($OnDemand)   { $argsList += "--on-demand" }
   if ($CrateSrc)   { $argsList += @("--crate-src", $CrateSrc) }
@@ -191,7 +220,7 @@ function Invoke-Launch {
 }
 
 $capH = [int]($MAXSEC / 3600)
-$leverTxt = (@(if ($PreflopHistKey) { "preflop_hist_key" }; if ($FullHistKey) { "fullhist_key" }; if ($Mrr) { "mrr" }; if ($WorkSteal) { "work_steal" }; if ($Dcfr) { "dcfr" }) -join "+"); if (-not $leverTxt) { $leverTxt = "NONE (baseline)" }
+$leverTxt = (@(if ($PreflopHistKey) { "preflop_hist_key" }; if ($FullHistKey) { "fullhist_key" }; if ($Mrr) { "mrr" }; if ($WorkSteal) { "work_steal" }; if ($Dcfr) { "dcfr" }; if ($V3Lcfr) { "v3_lcfr(D=$V3LcfrD,W=$V3LcfrW,C=$V3PruneC)" }; if ($V3SnapshotAvg) { "v3_snapshot_avg" }) -join "+"); if (-not $leverTxt) { $leverTxt = "NONE (baseline)" }
 Write-Host "=== blueprint-v2 babysitter: $Run ===" -ForegroundColor Cyan
 Write-Host "    target=$Iters it  n_deals=$NDeals  flop/turn=EMD K$NumBuckets  river=OCHS ($([System.IO.Path]::GetFileName($RiverOchs)))"
 Write-Host "    LEVERS=$leverTxt" -ForegroundColor Green
@@ -290,6 +319,13 @@ if ($convergedStop) {
   if ($FullHistKey) { $resume += " --fullhist-key" }
   if ($Mrr) { $resume += " --mrr" }
   if ($WorkSteal) { $resume += " --work-steal" }
+  if ($V3Lcfr) { $resume += " --v3-lcfr --v3-lcfr-d $V3LcfrD --v3-lcfr-w $V3LcfrW"
+    if ($V3PruneC) { $resume += " --v3-prune-c $V3PruneC" }
+    if ($V3PruneStart) { $resume += " --v3-prune-start $V3PruneStart" } }
+  if ($V3SnapshotAvg) { $resume += " --v3-snapshot-avg"
+    if ($V3SnapStart) { $resume += " --v3-snap-start $V3SnapStart" } }
+  if ($V3Lcfr -or $V3SnapshotAvg) { $resume += " --v3-cov-hands $V3CovHands"
+    if ($V3Regstats) { $resume += " --v3-regstats" } }
   Write-Host "  $resume"
 }
 if ($final -ge 0 -and ($convergedStop -or $final -ge $Iters)) {

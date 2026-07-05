@@ -285,6 +285,32 @@ def _rollout_main(args) -> int:
 
         policies = {0: early_policy(0), 1: early_policy(1), 2: early_policy(2),
                     3: hero_policy, 4: agents[4], 5: agents[5]}
+        # blueprint-v4 v3 G5 INSTRUMENT REBUILD (--postflop-field checkcall; amendment doc section 5,
+        # Stage-0 verdict section 7-B): replace EVERY seat's POSTFLOP play (hero included -- his
+        # forced node action is preflop, protected by the node guard) with a SYMMETRIC FIXED
+        # check-preferring/call-otherwise continuation field. Rationale: at H200@20k the blueprint
+        # postflop lookup missed ~92% (probe) / ~72% (on-policy) -- the "frozen field" the EV
+        # rollout measured was ~uniform-random postflop noise, so G5's EV comparison was
+        # coverage-BLOCKED. Under a fixed symmetric field the preflop response game (100% key
+        # coverage on BOTH arms) stays trained while postflop collapses to pure equity
+        # realization -- the SAME field for both arms and for every forced arm, so the
+        # EV(open)-EV(limp) contrast is well-defined at ANY postflop coverage. What it gives up:
+        # postflop SKILL differences (positional betting leverage) are erased, so G5-checkcall is
+        # a LOWER-BOUND instrument for the open's value (opens realize extra EV postflop via
+        # initiative; limps do not). Default "blueprint" = byte-identical legacy behavior.
+        if args.postflop_field == "checkcall":
+            def _postflop_fixed(seat, pol):
+                def wrapped(state):
+                    if len(state.board) > 0:
+                        legal = state.legal_actions(seat)
+                        for want in (ActionType.CHECK, ActionType.CALL):
+                            for a in legal:
+                                if a.action_type == want:
+                                    return a
+                        return legal[0]  # defensive; CHECK/CALL is legal at every postflop node
+                    return pol(state)
+                return wrapped
+            policies = {s: _postflop_fixed(s, pol) for s, pol in policies.items()}
         settle = lambda s, nb: equity_allin_settle(  # noqa: E731
             s, nb, n_runouts=args.runouts, rng=random.Random(settle_seed))
         try:
@@ -373,6 +399,7 @@ def _rollout_main(args) -> int:
         "mode": "rollout", "hand": hand, "blueprint": args.blueprint, "seed": args.seed,
         "start": args.start, "deals": reached, "tried": tried,
         "reach_rate": reached / max(1, tried), "runouts": args.runouts,
+        "postflop_field": args.postflop_field,
         "adapter_fallback_rate": fb / max(1, dc),
         "bp_coverage": bp_cov,
         "deltas_bb": out, "meta": meta,
@@ -585,6 +612,14 @@ def main() -> int:
                         "abstracted_legal_mrr keep-lists mirrored in lbr.make_blueprint_policy) — "
                         "REQUIRED for fullhist+M-RR-trained arms (train/probe menu skew otherwise). "
                         "Default off = byte-identical bp3/summary behavior.")
+    r.add_argument("--postflop-field", choices=("blueprint", "checkcall"), default="blueprint",
+                   help="postflop continuation field for the EV rollout. 'blueprint' (default) = the "
+                        "legacy frozen-blueprint field (byte-identical behavior; coverage-gated by "
+                        "--max-postflop-miss). 'checkcall' = the v3 G5 instrument: EVERY seat plays "
+                        "a SYMMETRIC fixed check/call policy postflop, so the EV(open)-EV(limp) "
+                        "contrast measures the TRAINED preflop response economics under pure equity "
+                        "realization and stays well-defined at any postflop coverage (the fix for "
+                        "the Stage-0 G5 coverage-BLOCK; amendment doc section 5).")
     r.add_argument("--snapshot-index", default=None,
                    help="dir built by bpv4_nlcfr_index.py — mmap-backed snapshot lookup instead of the "
                         "full in-RAM load (REQUIRED for the 55 GB cloud fullhist blobs). Default None "

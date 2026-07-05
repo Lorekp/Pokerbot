@@ -207,6 +207,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
                    river_ochs_rel="", river_ochs_sha="", preflop_hist_key=False,
                    fullhist_key=False, mrr=False,
                    work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
+                   v3=None,
                    wall_guard_secs=21600, awscli_zip="awscli-exe-linux-x86_64.zip") -> str:
     """The full on-box bootstrap (was inline user-data until it exceeded EC2's 16KB cap).
     Uploaded to S3 by main() and exec'd by user_data_stub(). Content is otherwise the proven
@@ -235,6 +236,86 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
         )
     else:
         fullhist_block = ""
+    # blueprint-v4 v3 TRAINER SCHEDULE (LCFR + hard negative-regret pruning + snapshot averaging +
+    # coverage metric — artifacts/blueprint_v4_amendment_v3.md). ADDITIVE + default-off BYTE-IDENTICAL,
+    # gated exactly like ``fullhist_block``: with ``v3=None`` all three placeholders render as "" (each is
+    # attached as a SUFFIX to an existing line, so the off-path emits zero extra bytes) and the bootstrap
+    # is byte-for-byte the Stage-0 script (sha-compared in the v3 session). When set, ``v3`` is a dict:
+    #   lcfr(bool), lcfr_d, lcfr_w, prune_c(float|None), prune_start(int|None), prune_explore,
+    #   regret_floor(float|None), snapshot_avg(bool), snap_start(int), cov_hands(int), regstats(bool)
+    # The env exports are read ONCE by trainer.rs (V3Cfg::from_env — the SAME OnceLock the local ab_train
+    # path reads, so cloud and local runs train identically); the driver extras use the v3 pymethods
+    # (save_current_strategy_bytes / coverage / regret_stats) added to NlheCFRTrainer in the same
+    # commit-series, uploading NLSNAP01 snapshots next to each checkpoint and printing the
+    # COVERAGE/REGSTATS lines the kill-gate + babysitter grep.
+    if v3:
+        exports = [
+            f"export POKERBOT_LCFR={'1' if v3.get('lcfr') else '0'}",
+            'echo "LCFR=$POKERBOT_LCFR"',
+            f"export POKERBOT_LCFR_D={int(v3.get('lcfr_d', 250))}",
+            f"export POKERBOT_LCFR_W={int(v3.get('lcfr_w', 10000))}",
+        ]
+        if v3.get("prune_c") is not None:
+            exports.append(f"export POKERBOT_PRUNE_C={float(v3['prune_c'])}")
+        if v3.get("prune_start") is not None:
+            exports.append(f"export POKERBOT_PRUNE_START={int(v3['prune_start'])}")
+        exports.append(f"export POKERBOT_PRUNE_EXPLORE={float(v3.get('prune_explore', 0.05))}")
+        if v3.get("regret_floor") is not None:
+            exports.append(f"export POKERBOT_REGRET_FLOOR={float(v3['regret_floor'])}")
+        exports.append(f"export POKERBOT_SNAPSHOT_AVG={'1' if v3.get('snapshot_avg') else '0'}")
+        exports.append('echo "SNAPSHOT_AVG=$POKERBOT_SNAPSHOT_AVG"')
+        v3_env_block = "\n" + "\n".join(exports)
+        v3_driver_fns = (
+            "\n\n"
+            "V3_SNAPSHOT_AVG = os.environ.get(\"POKERBOT_SNAPSHOT_AVG\", \"0\") == \"1\"\n"
+            f"V3_SNAP_START = {int(v3.get('snap_start', 0))}\n"
+            f"V3_COV_HANDS = {int(v3.get('cov_hands', 0))}\n"
+            f"V3_REGSTATS = {bool(v3.get('regstats', False))}\n"
+            "\n"
+            "def _v3_ckpt_extras(t):\n"
+            "    # v3 checkpoint-cadence extras (read-only on the table): NLSNAP01 snapshot upload\n"
+            "    # (rounds-2-4 averaging inputs), COVERAGE line (on-policy miss gates), REGSTATS line\n"
+            "    # (prune-C calibration). Failures RETRY then continue -- never crash the run.\n"
+            "    it = t.iters_done()\n"
+            "    if V3_SNAPSHOT_AVG and it >= V3_SNAP_START:\n"
+            "        import io as _io\n"
+            "        from boto3.s3.transfer import TransferConfig as _TC\n"
+            "        blob = t.save_current_strategy_bytes()\n"
+            "        key = RUN_PREFIX + f\"/snapshots/snap_{it:06d}.nlsnap\"\n"
+            "        last = None\n"
+            "        for attempt in range(1, 6):\n"
+            "            try:\n"
+            "                s3.upload_fileobj(_io.BytesIO(blob), BUCKET, key,\n"
+            "                                  Config=_TC(multipart_chunksize=256 * 1024 * 1024))\n"
+            "                print(f\"SNAPSHOT iters_done={it} -> s3://{BUCKET}/{key} ({len(blob)} bytes)\",\n"
+            "                      flush=True)\n"
+            "                break\n"
+            "            except Exception as e:\n"
+            "                last = e\n"
+            "                print(f\"SNAPSHOT UPLOAD FAIL attempt={attempt}/5: {e!r}\", flush=True)\n"
+            "                time.sleep(min(30, 5 * attempt))\n"
+            "        else:\n"
+            "            print(f\"SNAPSHOT UPLOAD GAVE UP iters_done={it}: {last!r} -- continuing\", flush=True)\n"
+            "    if V3_COV_HANDS > 0:\n"
+            "        hands, dec, mis, allin = t.coverage(V3_COV_HANDS, 0xC0FFEE ^ it)\n"
+            "        pct = lambda i: (100.0 * mis[i] / dec[i]) if dec[i] else 0.0\n"
+            "        pf_d, pf_m = sum(dec[1:4]), sum(mis[1:4])\n"
+            "        pf = (100.0 * pf_m / pf_d) if pf_d else 0.0\n"
+            "        print(f\"COVERAGE iters_done={it} hands={hands} miss% pre={pct(0):.1f} \"\n"
+            "              f\"flop={pct(1):.1f} turn={pct(2):.1f} river={pct(3):.1f} postflop={pf:.1f} \"\n"
+            "              f\"pre_allin_runout={100.0 * allin / max(hands, 1):.1f} decisions={dec}\",\n"
+            "              flush=True)\n"
+            "    if V3_REGSTATS:\n"
+            "        rows, nneg, npos, p50, p90, p99, p999, nmax, pp99, pmax = t.regret_stats()\n"
+            "        print(f\"REGSTATS iters_done={it} rows={rows} neg_vals={nneg} pos_vals={npos} \"\n"
+            "              f\"neg_p50={p50:.3e} neg_p90={p90:.3e} neg_p99={p99:.3e} neg_p999={p999:.3e} \"\n"
+            "              f\"neg_max={nmax:.3e} pos_p99={pp99:.3e} pos_max={pmax:.3e}\", flush=True)"
+        )
+        v3_ckpt_call = "\n        _v3_ckpt_extras(t)"
+    else:
+        v3_env_block = ""
+        v3_driver_fns = ""
+        v3_ckpt_call = ""
     # Checkpoint uploader. The fullhist+M-RR arm's ``save_bytes()`` blob is ~30-55 GB, which EXCEEDS
     # S3's 5 GiB single-PutObject HARD LIMIT — a bare ``put_object(Body=blob)`` 400s EntityTooLarge and
     # crashes the run at the FIRST checkpoint (no durable checkpoint => spot auto-resume permanently
@@ -442,7 +523,7 @@ export PYTHONPATH=/opt/pokerbot RUST_BACKTRACE=1
 # stamps + guards it). "0" is byte-identical to the shipped key space.
 export POKERBOT_PREFLOP_HIST_KEY={hist_flag}
 echo "PREFLOP_HIST_KEY=$POKERBOT_PREFLOP_HIST_KEY"
-{fullhist_block}
+{fullhist_block}{v3_env_block}
 # S2: verify the shipped EMD frozen blob matches its known sha256 BEFORE training. A same-K CORRUPTED blob
 # (truncated S3 round-trip) -> wrong potential-aware buckets -> a broken blueprint that the convergence-stop
 # (abstraction-agnostic) cannot catch and only the final ranking gate would; the ctor's num_buckets==K check
@@ -511,7 +592,7 @@ def _download_latest():
     except Exception:
         return None
 
-{ckpt_upload_fn}
+{ckpt_upload_fn}{v3_driver_fns}
 
 def main():
     # full ctor: (num_buckets, depth_edges, n_deals, n_seats, prune_threshold, fast_merge, emd_frozen_path,
@@ -542,7 +623,7 @@ def main():
         nxt = min(t.iters_done() + CKPT_EVERY, ITERS)
         step = nxt - t.iters_done()
         t.train(step){row_budget_block}
-        _upload(t.save_bytes(), t.iters_done())
+        _upload(t.save_bytes(), t.iters_done()){v3_ckpt_call}
         el = time.time() - t0
         done = t.iters_done() - start
         rate = done / el if el > 0 else 0.0
@@ -674,6 +755,39 @@ def main() -> None:
                    help="RBP floor (bb regret units) used when --dcfr is on")
     p.add_argument("--dcfr-explore-frac", type=float, default=0.05,
                    help="fraction of iters that explore all actions (no pruning) under --dcfr; Pluribus ~0.05")
+    # ---- blueprint-v4 v3 trainer schedule (artifacts/blueprint_v4_amendment_v3.md) ----
+    # All default-off => byte-identical bootstrap (sha-compared). --v3-lcfr enables the Pluribus
+    # Linear-CFR mode (signed regrets + iteration-denominated discount + unweighted averaging);
+    # --v3-prune-c enables hard negative-regret pruning (requires --v3-lcfr); --v3-snapshot-avg
+    # drops the postflop strat_sum (round-1 average stays in memory) and uploads NLSNAP01
+    # current-strategy snapshots at checkpoint cadence for the offline snap_avg averager.
+    p.add_argument("--v3-lcfr", action="store_true",
+                   help="v3: Pluribus LCFR trainer mode (POKERBOT_LCFR=1 on the box). Mutually "
+                        "exclusive with --dcfr (DCFR takes precedence if both are set).")
+    p.add_argument("--v3-lcfr-d", type=int, default=250,
+                   help="v3: LCFR discount interval D in iterations (Pluribus: 10 wall-minutes)")
+    p.add_argument("--v3-lcfr-w", type=int, default=10000,
+                   help="v3: LCFR discount window W in iterations (Pluribus: 400 wall-minutes)")
+    p.add_argument("--v3-prune-c", type=float, default=None,
+                   help="v3: hard negative-regret prune threshold C in bb (calibrated default in the "
+                        "amendment doc; omit = pruning off)")
+    p.add_argument("--v3-prune-start", type=int, default=None,
+                   help="v3: first prune iteration (default W/2 inside the trainer)")
+    p.add_argument("--v3-prune-explore", type=float, default=0.05,
+                   help="v3: fraction of iterations that explore fully (no pruning); Pluribus 5%%")
+    p.add_argument("--v3-regret-floor", type=float, default=None,
+                   help="v3: regret floor in bb (default C*31/30 inside the trainer)")
+    p.add_argument("--v3-snapshot-avg", action="store_true",
+                   help="v3: no-postflop-strat_sum + NLSNAP01 snapshot upload at checkpoint cadence "
+                        "(POKERBOT_SNAPSHOT_AVG=1); final blueprint = snap_avg.exe offline average")
+    p.add_argument("--v3-snap-start", type=int, default=None,
+                   help="v3: first snapshot iteration (default 8%% of --iters, Pluribus's 800/11520 "
+                        "discard-early rule)")
+    p.add_argument("--v3-cov-hands", type=int, default=2048,
+                   help="v3: on-policy coverage probe hands at each checkpoint (0 disables); the "
+                        "COVERAGE log line feeds the pre-registered coverage gates")
+    p.add_argument("--v3-regstats", action="store_true",
+                   help="v3: print REGSTATS regret-percentile lines at checkpoint cadence")
     args = p.parse_args()
 
     if args.num_buckets <= 0:
@@ -719,6 +833,26 @@ def main() -> None:
         else:
             print(f"WARN: {sha_path} missing -> on-box river-OCHS sha check SKIPPED (table unverified)",
                   flush=True)
+    # blueprint-v4 v3 config dict (None when no v3 flag is set => byte-identical bootstrap,
+    # sha-compared against the pre-v3 render). snap_start default = 8% of the target iters
+    # (Pluribus's 800-of-11520-minute discard-early rule, iteration-denominated).
+    v3_cfg = None
+    if args.v3_lcfr or args.v3_snapshot_avg:
+        if args.v3_prune_c is not None and not args.v3_lcfr:
+            p.error("--v3-prune-c requires --v3-lcfr (hard pruning needs signed regrets)")
+        if args.dcfr and args.v3_lcfr:
+            p.error("--v3-lcfr and --dcfr are mutually exclusive trainer modes")
+        v3_cfg = dict(
+            lcfr=args.v3_lcfr, lcfr_d=args.v3_lcfr_d, lcfr_w=args.v3_lcfr_w,
+            prune_c=args.v3_prune_c, prune_start=args.v3_prune_start,
+            prune_explore=args.v3_prune_explore, regret_floor=args.v3_regret_floor,
+            snapshot_avg=args.v3_snapshot_avg,
+            snap_start=(args.v3_snap_start if args.v3_snap_start is not None
+                        else int(args.iters * 0.08)),
+            cov_hands=args.v3_cov_hands, regstats=args.v3_regstats,
+        )
+        print(f"v3 trainer schedule ARMED: {v3_cfg}", flush=True)
+
     # B2: the on-box dead-man cost cap floor = --max-hours (absolute, independent of the babysitter/PC).
     wall_guard_secs = max(1, int(args.max_hours * 3600))
     awscli_zip = "awscli-exe-linux-aarch64.zip" if args.arch == "arm64" else "awscli-exe-linux-x86_64.zip"
@@ -738,6 +872,7 @@ def main() -> None:
         fullhist_key=args.fullhist_key, mrr=args.mrr,
         work_steal=args.work_steal, dcfr=args.dcfr,
         dcfr_prune_threshold=args.dcfr_prune_threshold, dcfr_explore_frac=args.dcfr_explore_frac,
+        v3=v3_cfg,
         wall_guard_secs=wall_guard_secs, awscli_zip=awscli_zip,
     )
     bootstrap_key = f"{args.prefix}/{run_subdir}/code/bootstrap.sh"

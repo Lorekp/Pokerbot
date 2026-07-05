@@ -1431,6 +1431,71 @@ mod py {
             PyBytes::new(py, &nlhe_trainer::serialize(&self.tab))
         }
 
+        /// blueprint-v4 v3 (snapshot averaging): serialize the CURRENT strategy (positive-part-
+        /// normalized cum_regret) as an NLSNAP01 blob — the rounds-2-4 snapshot the offline
+        /// `snap_avg` averager consumes (`trainer::serialize_current_strategy`; Pluribus P-supp
+        /// p.15). The cloud driver uploads one next to each checkpoint when POKERBOT_SNAPSHOT_AVG=1.
+        /// Not supported on the hogwild path (the v3 modes are fork-merge-only).
+        fn save_current_strategy_bytes<'py>(
+            &self,
+            py: Python<'py>,
+        ) -> PyResult<Bound<'py, PyBytes>> {
+            #[cfg(feature = "hogwild")]
+            if self.hog.is_some() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "save_current_strategy_bytes: unsupported on the hogwild path",
+                ));
+            }
+            Ok(PyBytes::new(py, &nlhe_trainer::serialize_current_strategy(&self.tab)))
+        }
+
+        /// blueprint-v4 v3 (coverage as a first-class metric): ON-POLICY coverage probe — play
+        /// `n_hands` self-play hands on the CURRENT strategy and count, per street, how many of the
+        /// strategy's own lookups hit the trained table (`trainer::coverage_probe`; the Stage-0
+        /// §3.1 on-policy diagnostic at checkpoint cadence). Returns
+        /// `(hands, decisions[4], misses[4], preflop_allin_runouts)`, streets ordered
+        /// preflop/flop/turn/river. Read-only; deterministic in (table, seed).
+        #[pyo3(signature = (n_hands=1024, seed=0xC0FFEE))]
+        fn coverage(
+            &self,
+            py: Python<'_>,
+            n_hands: u64,
+            seed: u64,
+        ) -> PyResult<(u64, Vec<u64>, Vec<u64>, u64)> {
+            #[cfg(feature = "hogwild")]
+            if self.hog.is_some() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "coverage: unsupported on the hogwild path",
+                ));
+            }
+            let (tab, cfg) = (&self.tab, &self.cfg);
+            let c = py.detach(|| nlhe_trainer::coverage_probe(tab, cfg, n_hands, seed));
+            Ok((c.hands, c.decisions.to_vec(), c.misses.to_vec(), c.preflop_allin_runouts))
+        }
+
+        /// blueprint-v4 v3 (hard-prune-C calibration): one-pass log-histogram percentiles of the
+        /// stored regrets (`trainer::regret_stats`). Returns
+        /// `(rows, neg_vals, pos_vals, neg_p50, neg_p90, neg_p99, neg_p999, neg_max, pos_p99,
+        /// pos_max)` — negative-tail magnitudes in bb. Read-only.
+        #[allow(clippy::type_complexity)]
+        fn regret_stats(
+            &self,
+            py: Python<'_>,
+        ) -> PyResult<(u64, u64, u64, f64, f64, f64, f64, f64, f64, f64)> {
+            #[cfg(feature = "hogwild")]
+            if self.hog.is_some() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "regret_stats: unsupported on the hogwild path",
+                ));
+            }
+            let tab = &self.tab;
+            let s = py.detach(|| nlhe_trainer::regret_stats(tab));
+            Ok((
+                s.rows, s.neg_vals, s.pos_vals, s.neg_p50, s.neg_p90, s.neg_p99, s.neg_p999,
+                s.neg_max, s.pos_p99, s.pos_max,
+            ))
+        }
+
         fn load_bytes(&mut self, blob: &[u8]) -> PyResult<bool> {
             match nlhe_trainer::deserialize(blob) {
                 Some(tab) => {
