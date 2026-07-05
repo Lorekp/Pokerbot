@@ -433,3 +433,52 @@ row with the un-thinned serve menu `allowed_post = (0,1,3,4,5)` and reads **no**
   `bpv4_stage0_gates.py`/`bpv4_kill_gate.py`) does **NOT** use `abstracted_legal` — it looks keys up
   directly in the checkpoint dict and all its gate nodes are **preflop** (untouched by M-RR), so
   extraction and every G1–G4/G6 number are **MRR-independent** and unaffected.
+
+---
+
+## Blueprint-v4 **v3** — Pluribus-faithful trainer schedule (bpv4_h200_v3)
+
+Design of record: `artifacts/blueprint_v4_amendment_v3.md` (PRE-REGISTERED gates/kills/decision rule
+— read it BEFORE launching; the numbers are committed there, not here). Stage-0 was CLOSED (Option A,
+commit 339826d); v3 tests the remaining Pluribus deltas — TRAINER SCHEDULE + TRAVERSAL COVERAGE — on
+the validated FULLHIST+M-RR keys.
+
+**Launch (one terminal, leave open):**
+
+    powershell -ExecutionPolicy Bypass -File scripts\blueprint2\bpv4_v3_babysitter.ps1
+
+This is `blueprint2_babysitter.ps1` with `-FullHistKey -Mrr -WorkSteal` plus the v3 knobs
+(`-V3Lcfr -V3LcfrD 250 -V3LcfrW 10000 -V3PruneC -30000 -V3PruneStart 5000 -V3SnapshotAvg
+-V3CovHands 2048 -V3Regstats`, iters 40000, checkpoints every 5000, c6i.32xlarge). All `--v3-*`
+launcher flags render ADDITIVELY: with none set the bootstrap is byte-for-byte the Stage-0 script
+(sha-compared: fullhist `974a84db…`, base `0ba7eea9…`).
+
+**What the box does differently under v3:**
+* trainer env: `POKERBOT_LCFR/_D/_W`, `POKERBOT_PRUNE_C/_START/_EXPLORE`, `POKERBOT_REGRET_FLOOR`,
+  `POKERBOT_SNAPSHOT_AVG` — read once by `trainer.rs::V3Cfg::from_env` (same code path as local
+  `ab_train`).
+* uploads `snapshots/snap_XXXXXX.nlsnap` (NLSNAP01 current-strategy snapshots) next to each
+  checkpoint from ~8% of the run; checkpoints are ~half Stage-0 size (no postflop strat_sum).
+* prints `COVERAGE iters_done=… postflop=…` (on-policy per-street miss — the C1-C3 gates) and
+  `REGSTATS iters_done=… neg_p999=…` (the iter-5000 C-calibration sanity clause) at every
+  checkpoint — grep these in get-console-output alongside the kill-gate runs at 10k/20k/30k.
+* the G8 ROW_BUDGET guard watches `max(t.n_infosets(), t.n_cum_infosets())` (under snapshot_avg the
+  strat map is preflop-bounded; cum is the growing one). Budget: 550M rows.
+
+**AFTER THE RUN** — build the servable blueprint by OFFLINE SNAPSHOT AVERAGING (the checkpoint alone
+is NOT the final blueprint under v3):
+
+    aws s3 cp ... checkpoints/iter_040000.nlcfr runs\native_cfr\bpv4_h200_v3\ --region eu-central-1
+    aws s3 cp ... snapshots\  runs\native_cfr\bpv4_h200_v3\snapshots\ --recursive
+    tools\battery_native\target\release\examples\snap_avg.exe ^
+        runs\native_cfr\bpv4_h200_v3\final_avg.nlcfr ^
+        runs\native_cfr\bpv4_h200_v3\iter_040000.nlcfr ^
+        runs\native_cfr\bpv4_h200_v3\snapshots\snap_*.nlsnap
+
+(preflop rows come from the checkpoint's round-1 in-memory average; postflop = uniform mean of the
+snapshots; output is a standard NLCFR001 blob every existing consumer reads). Then evaluate per the
+amendment §6: shape gates via `bpv4_stage0_gates.py`/`bpv4_kill_gate.py` (MRR-independent, preflop),
+G5′ via `bp3_forced_response_probe.py rollout … --key-mode fullhist --mrr --postflop-field checkcall`
+(the SYMMETRIC FIXED continuation field — the fix for the Stage-0 coverage-BLOCK above; the M-RR
+postflop-miss caveat in the previous section is MOOT under checkcall since no postflop blueprint
+lookups occur). Serve/eval env unchanged: `POKERBOT_FULLHIST_KEY=1 POKERBOT_MRR=1`.
