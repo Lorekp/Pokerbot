@@ -257,3 +257,78 @@ def n_live_players(state, *, hero: int | None = None) -> int:
             continue
         n += 1
     return max(2, n)
+
+
+# =========================================================================
+# P0 safety wiring (exploitation overhaul design §A3/§5) — live adapters
+# =========================================================================
+# The live serve keys per-villain safety lookups by SEAT (the pluribus solver's
+# ``gift_register.capped_max_alpha(actor, ...)`` / ``opponent_stability.get(actor)`` and
+# ``apply_live_value_sizing``'s ``vkey = state.last_aggressor`` all use the per-decision seat
+# index), but seats are not stable identities across hands/tables. These adapters resolve the
+# decision-time seat through the per-decision profiles dict ``{seat: OpponentStats}`` to the
+# SESSION-STABLE profile object (the same live object the post-hand outcome join updates —
+# ``PlayerProfileStore.get(uid)`` returns one shared object per uid per session), so stability and
+# gift budgets follow the PLAYER, not the chair. Both fail OPEN (missing seat/profile => neutral),
+# so a cold table is byte-identical to the unwired serve.
+
+
+class ProfileStabilityAdapter:
+    """Duck-typed ``StabilityTracker`` over a per-decision profiles dict ``{seat: OpponentStats}``.
+
+    ``opponent_stability(seat)`` returns ``bayes_exploit.villain_stability(profile)`` — the
+    frequency-read (fast/slow EWMA divergence) × outcome (F5 realized-PnL abandon) composite.
+    No separate action-stream feed is needed: the maintained profile already carries both signals
+    (closes audit F6 with the profile-derived tracker the F6 note's class-based alternative
+    duplicated). Unknown seat / no profile => 1.0 (trust the read, still bounded by the N-cap)."""
+
+    def __init__(self, profiles: dict | None) -> None:
+        self._profiles = profiles or {}
+
+    def opponent_stability(self, key) -> float:
+        prof = self._profiles.get(key)
+        if prof is None:
+            return 1.0
+        try:
+            from pokerbot.opponent.bayes_exploit import villain_stability
+            return float(villain_stability(prof))
+        except Exception:  # noqa: BLE001 — a broken read must never break the serve
+            return 1.0
+
+
+class SeatKeyedGiftRegister:
+    """Adapts a profile-identity-keyed ``GiftRegister`` to the serve's seat-keyed lookups.
+
+    The post-hand join credits gifts keyed by ``id(store.get(uid))`` (the session-stable shared
+    ``OpponentStats`` object). At decision time callers hold ``{seat: OpponentStats}`` from the
+    same store, so ``capped_max_alpha(seat, base)`` resolves seat -> profile -> ``id(profile)``
+    before delegating. Unknown seat => ``base`` unchanged (no relaxation — fail-safe). Only the
+    read side is seat-keyed; credits go through the wrapped register directly."""
+
+    def __init__(self, register, profiles: dict | None) -> None:
+        self._register = register
+        self._profiles = profiles or {}
+
+    @staticmethod
+    def profile_key(prof) -> int:
+        """The session-stable gift-budget key for a profile object (shared by the join side)."""
+        return id(prof)
+
+    def _resolve(self, key):
+        prof = self._profiles.get(key)
+        return None if prof is None else id(prof)
+
+    def capped_max_alpha(self, key, base_max_alpha: float) -> float:
+        k = self._resolve(key)
+        if k is None or self._register is None:
+            return float(base_max_alpha)
+        try:
+            return float(self._register.capped_max_alpha(k, base_max_alpha))
+        except Exception:  # noqa: BLE001 — a broken register must never break the serve
+            return float(base_max_alpha)
+
+    def available(self, key) -> float:
+        k = self._resolve(key)
+        if k is None or self._register is None:
+            return 0.0
+        return float(self._register.available(k))

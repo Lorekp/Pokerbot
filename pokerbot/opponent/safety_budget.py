@@ -98,6 +98,23 @@ class GiftRegister:
         return float(min(self.ceiling, float(base_max_alpha) + self.alpha_bonus(key)))
 
 
+# P0 safety wiring (exploitation overhaul design §A3): one PROCESS-scoped register shared by every
+# live advisor and the post-hand outcome join. A live coach process == one session (multi-table
+# coaches share the same PlayerProfileStore, so cross-table sharing keyed by profile identity is
+# correct — the same human's banked gifts follow them between tables). Batteries/tests that need
+# isolation construct their own ``GiftRegister`` and pass it explicitly (the advisor only falls
+# back to the session register when the caller passes none).
+_SESSION_REGISTER: GiftRegister | None = None
+
+
+def session_gift_register() -> GiftRegister:
+    """The process-scoped session ``GiftRegister`` (lazily constructed)."""
+    global _SESSION_REGISTER
+    if _SESSION_REGISTER is None:
+        _SESSION_REGISTER = GiftRegister()
+    return _SESSION_REGISTER
+
+
 def gift_from_qrow(q_row, taken_idx: int, legal_mask=None) -> float:
     """The EV the opponent surrendered at a decision = max legal Q − Q(taken), clamped ≥0. ``q_row`` is
     the leaf value net's per-action Q-row (see aivat.baseline_from_leaf_net / search leaf-Q)."""

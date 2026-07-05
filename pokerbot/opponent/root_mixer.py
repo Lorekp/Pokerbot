@@ -372,6 +372,13 @@ def apply_root_exploit_mixer(state, seat: int, probs: np.ndarray, profiles: dict
         if n_players is None:
             n_players = int(n_live_players(state, hero=seat))
         rnr_ceiling = float(default_exploit_cap(max(2, n_players)))
+        # P0 safety wiring: derive the villain key the same way apply_live_value_sizing does (the
+        # last-aggressor SEAT — the seat convention the solver's gift/stability lookups already
+        # use) so a caller that wires a tracker/register without knowing the selected villain
+        # (the live advisor) still gets per-villain clamping. villain_key=None with no tracker and
+        # no register is unchanged (stability 1.0, no gift) — byte-identical to the pre-P0 serve.
+        if villain_key is None and (stability_tracker is not None or gift_register is not None):
+            villain_key = getattr(state, "last_aggressor", None)
         stability = 1.0
         if stability_tracker is not None and villain_key is not None:
             try:
