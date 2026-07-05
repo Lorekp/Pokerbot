@@ -142,8 +142,10 @@ def build(blob: str, out_dir: str, check_n: int) -> int:
         off = strat_base + j * ROW
         blob_f.seek(off)
         key = blob_f.read(16)
-        a = int.from_bytes(key[:8], "big")
-        b = int.from_bytes(key[8:16], "big")
+        # np.uint64 casts are LOAD-BEARING (same as _IndexedSnap.get): a Python-int scalar degrades
+        # searchsorted to a full-array object-comparison scan (~0.9 s/call on 348M rows).
+        a = np.uint64(int.from_bytes(key[:8], "big"))
+        b = np.uint64(int.from_bytes(key[8:16], "big"))
         lo = int(np.searchsorted(A, a, "left"))
         hi = int(np.searchsorted(A, a, "right"))
         k = lo + int(np.searchsorted(B[lo:hi], b, "left"))

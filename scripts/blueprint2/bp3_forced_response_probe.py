@@ -176,8 +176,11 @@ class _IndexedSnap:
         if v is not self._MISS:
             return default if v is None else v
         np = self._np
-        a = int.from_bytes(key[:8], "big")
-        b = int.from_bytes(key[8:16], "big")
+        # np.uint64 casts are LOAD-BEARING: a plain Python int scalar sends numpy's NEP50 promotion
+        # down an object-comparison path and searchsorted degrades to a FULL 348M-element scan
+        # (~0.9 s/call, measured via cProfile); the uint64 scalar keeps it a true binary search (~30 µs).
+        a = np.uint64(int.from_bytes(key[:8], "big"))
+        b = np.uint64(int.from_bytes(key[8:16], "big"))
         lo = int(np.searchsorted(self._A, a, "left"))
         hi = int(np.searchsorted(self._A, a, "right"))
         out = None
