@@ -544,7 +544,9 @@ class PlayerProfileStore:
             dst.hud = dict(src.hud)
 
     def confidence(self, key: str) -> float:
-        s = self.get(key)
+        # P1 (audit F7): read a snapshot, not the live object — the hud dict is mutated in place by
+        # seed_from_hud on the recorder thread while this reader checks len(s.hud).
+        s = self.snapshot(key)
         base = min(1.0, s.hands / 50.0)
         # A server-HUD station (whole-history stats) raises confidence even with few locally observed
         # hands. FIX B2: the old FLAT 0.6 floor reached full HUD trust on hand ONE, so a single play-money

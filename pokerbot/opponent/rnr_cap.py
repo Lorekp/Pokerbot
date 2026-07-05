@@ -266,11 +266,12 @@ def n_live_players(state, *, hero: int | None = None) -> int:
 # ``gift_register.capped_max_alpha(actor, ...)`` / ``opponent_stability.get(actor)`` and
 # ``apply_live_value_sizing``'s ``vkey = state.last_aggressor`` all use the per-decision seat
 # index), but seats are not stable identities across hands/tables. These adapters resolve the
-# decision-time seat through the per-decision profiles dict ``{seat: OpponentStats}`` to the
-# SESSION-STABLE profile object (the same live object the post-hand outcome join updates —
-# ``PlayerProfileStore.get(uid)`` returns one shared object per uid per session), so stability and
-# gift budgets follow the PLAYER, not the chair. Both fail OPEN (missing seat/profile => neutral),
-# so a cold table is byte-identical to the unwired serve.
+# decision-time seat to the PLAYER: stability through the per-decision profiles dict
+# ``{seat: OpponentStats}`` (the profile carries its own stability signals, so snapshots work),
+# and gift budgets through a driver-supplied ``{seat: user_id}`` mapping (the persistent store
+# key the post-hand join credits — stable across seats/tables/snapshots). Both fail OPEN
+# (missing seat/profile/mapping => neutral), so a cold table is byte-identical to the unwired
+# serve.
 
 
 class ProfileStabilityAdapter:
@@ -297,26 +298,23 @@ class ProfileStabilityAdapter:
 
 
 class SeatKeyedGiftRegister:
-    """Adapts a profile-identity-keyed ``GiftRegister`` to the serve's seat-keyed lookups.
+    """Adapts a uid-keyed ``GiftRegister`` to the serve's seat-keyed lookups.
 
-    The post-hand join credits gifts keyed by ``id(store.get(uid))`` (the session-stable shared
-    ``OpponentStats`` object). At decision time callers hold ``{seat: OpponentStats}`` from the
-    same store, so ``capped_max_alpha(seat, base)`` resolves seat -> profile -> ``id(profile)``
-    before delegating. Unknown seat => ``base`` unchanged (no relaxation — fail-safe). Only the
-    read side is seat-keyed; credits go through the wrapped register directly."""
+    The post-hand join credits gifts keyed by the villain's persistent ``user_id`` string (the
+    PlayerProfileStore key — stable across seats, tables and profile SNAPSHOTS, unlike object
+    identity, which the F2 snapshot fix invalidates). At decision time callers hold seat keys, so
+    ``capped_max_alpha(seat, base)`` resolves seat -> uid via the driver-supplied ``keys`` mapping
+    ``{seat: user_id}`` before delegating. Unknown seat / no mapping => ``base`` unchanged (no
+    relaxation — fail-safe: gift-funded headroom only engages when the driver supplies villain
+    identities)."""
 
-    def __init__(self, register, profiles: dict | None) -> None:
+    def __init__(self, register, keys: dict | None) -> None:
         self._register = register
-        self._profiles = profiles or {}
-
-    @staticmethod
-    def profile_key(prof) -> int:
-        """The session-stable gift-budget key for a profile object (shared by the join side)."""
-        return id(prof)
+        self._keys = keys or {}
 
     def _resolve(self, key):
-        prof = self._profiles.get(key)
-        return None if prof is None else id(prof)
+        uid = self._keys.get(key)
+        return None if uid is None else str(uid)
 
     def capped_max_alpha(self, key, base_max_alpha: float) -> float:
         k = self._resolve(key)

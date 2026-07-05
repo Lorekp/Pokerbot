@@ -23,6 +23,12 @@ import numpy as np
 # clear MIN_RATIO, so the hero defers to the search policy vs lags.
 BLUFF_CATCH_MIN_CONF = 0.3
 BLUFF_CATCH_MIN_RATIO = 0.35
+# P1 evidence floor (design §5 P1; audit-F3 analog): the docstring above claims MIN_CONF ~= 3
+# reveals, but conf = n_eff/(n_eff+4) crosses 0.3 at n_eff ~1.7 — TWO reveals (or one exact-context
+# reveal plus street spillover) could arm a large-pot hero-call. Require this many RAW showdown
+# reveals (bluff+value, all contexts) before the read-gated bluff-catch may fire. Release-shrink
+# (the excess<0 branch) is exempt: it only moves TOWARD the base line (safe direction).
+BLUFF_CATCH_MIN_REVEALS = 3.0
 # Unopened-branch defer gate: if the villain RESPONDS to our bets more aggressively than baseline
 # by more than this (post[AGG]-pop[AGG] in the facing_bet read), skip the unopened tilt and defer
 # to the search policy — trap-mode vs an aggressive responder surrenders initiative (lag -1.1).
@@ -296,8 +302,10 @@ def apply_root_exploit_mixer(state, seat: int, probs: np.ndarray, profiles: dict
             # SHOWDOWN ground truth confirms the villain is bluff-heavy; otherwise add nothing
             # here and DEFER to the search policy. (The heuristic-base hero, which has no such
             # solver response, keeps its own inline bluff-catch and is unaffected — it wins 4/4.)
+            from pokerbot.opponent.bayes_exploit import bluff_evidence
             confirmed_bluffer = (bl is not None and bl[1] >= BLUFF_CATCH_MIN_CONF
-                                 and bl[0] > BLUFF_CATCH_MIN_RATIO)
+                                 and bl[0] > BLUFF_CATCH_MIN_RATIO
+                                 and bluff_evidence(prof) >= BLUFF_CATCH_MIN_REVEALS)
             if confirmed_bluffer:
                 # POT-ODDS-AWARE bluff-catching vs a CONFIRMED bluffer: a call still needs hs to
                 # beat the required equity of THIS bet size (don't pay off a big bet with air).
