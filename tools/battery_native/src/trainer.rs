@@ -6380,3 +6380,7 @@ mod tests {
     }
 }
 
+
+// cache-buster 2026-07-06: shifts the S3 build-cache key after an unauthorized artifact was
+// repeatedly re-seeded under the previous key by an unidentified local actor (see
+// artifacts/blueprint_v4_arm2_amendment.md sec 10 incident note). Comment-only; no code change.
