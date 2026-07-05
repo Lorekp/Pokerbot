@@ -148,6 +148,19 @@ _BP_COVERAGE_ON = os.environ.get("POKERBOT_BP_COVERAGE", "0") not in ("0", "", "
 _BP_COVERAGE: dict[int, list[int]] = {}  # street_int -> [hits, misses]
 _STREET_NAMES = {0: "preflop", 1: "flop", 2: "turn", 3: "river"}
 
+# blueprint-v4 M-RR serve twin (opt-in via POKERBOT_MRR — the R2 probe-fidelity port). A fullhist+M-RR
+# checkpoint (design blueprint_pluribus_grade_design_v2.md §4.2.2) was TRAINED under thinned postflop
+# menus (trainer::abstracted_legal_mrr): facing a live bet -> re-raise keep {1.0x pot}; turn/river
+# FIRST raise -> keep {0.5x, 1.0x pot}; flop first raise + preflop untouched (F/X/C/ALL_IN always
+# kept). Serving such a checkpoint on the UN-thinned menu lets a fingerprint MISS's uniform-legal
+# fallback pick a bet size the trainer never trained, walking the playout OFF the trained tree — every
+# subsequent fullhist key then misses too (the history is baked into the key), cascading uniform-random
+# play that biases any EV comparison. This mirror keeps probe/eval play inside the trained action tree.
+# Default OFF ⇒ byte-identical (mask untouched). Mirrors trainer.rs mrr_reraise_keep / mrr_tr_first_keep
+# (bucket ids 4 = 1.0x pot and 1 = 0.5x pot are both in the deployed post-list (0,1,3,4,5), so
+# intersecting the already-post-masked mask == the trainer's direct keep-list application).
+_MRR_ON = os.environ.get("POKERBOT_MRR", "0") not in ("0", "", "false", "False")
+
 
 def bp_coverage_reset() -> None:
     _BP_COVERAGE.clear()
@@ -368,11 +381,23 @@ def make_blueprint_policy(snapshot: dict[bytes, np.ndarray], *, client_bet_sizin
     weva = default_weva_bucket_table()
     allowed_pre = _build_allowed_action_mask((4, 5, 6)) if client_bet_sizing else None
     allowed_post = _build_allowed_action_mask((0, 1, 3, 4, 5)) if client_bet_sizing else None
+    # M-RR serve twin (POKERBOT_MRR, see module comment): postflop re-raise / turn-river first-raise
+    # keep-lists mirroring trainer.rs. None when off ⇒ the mask logic below is byte-identical.
+    mrr_reraise = _build_allowed_action_mask((4,)) if _MRR_ON else None
+    mrr_tr_first = _build_allowed_action_mask((1, 4)) if _MRR_ON else None
 
     def policy(env, seat: int) -> np.ndarray:
         mask = legal_action_mask_np(env, seat).astype(bool)
         if client_bet_sizing:
             mask = _apply_abstraction_mask(mask, int(env.street), allowed_pre, allowed_post).astype(bool)
+        if _MRR_ON and int(env.street) != 0:
+            # trainer::abstracted_legal_mrr node classification: "facing a live bet" == any raise here
+            # is a RE-raise (same predicate: current_bet > committed_street[seat]). F/X/C/ALL_IN are in
+            # every keep-list, so the masked set can never go empty.
+            if float(env.current_bet) > float(env.committed_street[seat]):
+                mask = mask & mrr_reraise
+            elif int(env.street) >= 2:
+                mask = mask & mrr_tr_first
         key = fingerprint_fast(env, seat, weva_table=weva)
         row = snapshot.get(key)
         if row is not None:

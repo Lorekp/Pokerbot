@@ -46,6 +46,7 @@ import argparse
 import json
 import math
 import os
+import struct
 import sys
 import time
 
@@ -98,6 +99,15 @@ def _configure_env(args) -> None:
     # arm-dependent way. Enabling coverage records hits/misses per street so the driver can gate on the real
     # skew signal. Recording only (a bool check per lookup) — does NOT change EV/CRN.
     os.environ["POKERBOT_BP_COVERAGE"] = "1"
+    # blueprint-v4 M-RR serve twin (R2 probe-fidelity port, lbr._MRR_ON — read AT IMPORT like the
+    # coverage env): a fullhist+M-RR-trained arm MUST be probed under the SAME thinned postflop menus
+    # it trained with, else a single miss's uniform fallback walks the playout off the trained action
+    # tree and every later fullhist key misses too (cascade). Summary arms trained the full menu —
+    # leave the flag off for them (byte-identical serve).
+    if getattr(args, "mrr", False):
+        os.environ["POKERBOT_MRR"] = "1"
+    else:
+        os.environ.pop("POKERBOT_MRR", None)
     if args.postflop_mode == "emd":
         os.environ["POKERBOT_POSTFLOP_MODE"] = "emd"
         os.environ["POKERBOT_POSTFLOP_EMD_FROZEN"] = os.path.abspath(args.emd_frozen)
@@ -123,6 +133,70 @@ class AbortHand(Exception):
     """UTG/HJ/CO did not fold -> the folded-to-BTN node was not reached; deal discarded."""
 
 
+class _IndexedSnap:
+    """mmap-backed ``{fingerprint(bytes) -> avg-strategy row}`` over an NLCFR001 blob + the sorted
+    (A,B,O) offset index built by ``bpv4_nlcfr_index.py``.
+
+    WHY: the blueprint-v4 Stage-0 CLOUD fullhist arm (bpv4_h200 @20k) has 347.7M strat rows / 55.3 GB
+    — the historical full in-RAM snapshot needs >100 GB and cannot run on the 31 GB local box. This
+    class serves the SAME mapping contract the in-RAM dict serves (``lbr.make_blueprint_policy`` only
+    calls ``snapshot.get(key)``; the probe log only calls ``len()``), with each lookup a binary search
+    over two mmapped uint64 arrays (numeric order == byte-lexicographic order because the build stores
+    the big-endian interpretation) + one 88-byte row read from the mmapped blob. Values reproduce
+    ``avg_strategy`` EXACTLY (row/sum; uniform 1/11 on an all-zero row) so hit/miss + coverage
+    semantics are byte-identical to the in-RAM path. Page cache is shared across shard processes.
+    A bounded per-process dict caches hot rows (preflop rows repeat every deal).
+    """
+
+    _MISS = object()
+    _CACHE_CAP = 500_000
+
+    def __init__(self, index_dir: str):
+        import mmap as _mmap
+
+        import numpy as np
+
+        meta = json.load(open(os.path.join(index_dir, "meta.json"), encoding="utf-8"))
+        self._n = int(meta["n_strat"])
+        self._np = np
+        self._A = np.memmap(os.path.join(index_dir, "A.bin"), dtype="<u8", mode="r")
+        self._B = np.memmap(os.path.join(index_dir, "B.bin"), dtype="<u8", mode="r")
+        self._O = np.memmap(os.path.join(index_dir, "O.bin"), dtype="<u8", mode="r")
+        assert len(self._A) == self._n == len(self._B) == len(self._O), "index length mismatch"
+        f = open(meta["blob"], "rb")
+        self._mm = _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ)
+        self._cache: dict[bytes, object] = {}
+        self.iters = int(meta["iters"])
+
+    def __len__(self) -> int:
+        return self._n
+
+    def get(self, key, default=None):
+        v = self._cache.get(key, self._MISS)
+        if v is not self._MISS:
+            return default if v is None else v
+        np = self._np
+        a = int.from_bytes(key[:8], "big")
+        b = int.from_bytes(key[8:16], "big")
+        lo = int(np.searchsorted(self._A, a, "left"))
+        hi = int(np.searchsorted(self._A, a, "right"))
+        out = None
+        if hi > lo:
+            j = lo + int(np.searchsorted(self._B[lo:hi], b, "left"))
+            if j < hi and int(self._B[j]) == b:
+                off = int(self._O[j])
+                row = struct.unpack_from("<11d", self._mm, off + 16)
+                tot = sum(row)
+                # EXACT avg_strategy semantics (f32_regret_strategy_delta.avg_strategy)
+                if tot > 0.0:
+                    out = np.asarray([x / tot for x in row], dtype=np.float64)
+                else:
+                    out = np.full(11, 1.0 / 11.0, dtype=np.float64)
+        if len(self._cache) < self._CACHE_CAP:
+            self._cache[key] = out
+        return default if out is None else out
+
+
 def _rollout_main(args) -> int:
     _configure_env(args)
     import random
@@ -139,11 +213,17 @@ def _rollout_main(args) -> int:
     import numpy as np
 
     tag = f"{args.hand}/s{args.start}"
-    _plog(f"{tag} loading {args.blueprint}")
-    ck = load_checkpoint(args.blueprint)
-    snap = {bytes(k): np.asarray(avg_strategy(row), dtype=np.float64)
-            for k, row in ck["strat"].items()}
-    del ck
+    if args.snapshot_index:
+        # blueprint-v4 Stage-0 CLOUD arm: 347.7M rows / 55.3 GB blob — mmap-backed lookup (the full
+        # in-RAM snapshot needs >100 GB). Values/coverage semantics identical to the in-RAM path.
+        _plog(f"{tag} mmap-index {args.snapshot_index} over {args.blueprint}")
+        snap = _IndexedSnap(args.snapshot_index)
+    else:
+        _plog(f"{tag} loading {args.blueprint}")
+        ck = load_checkpoint(args.blueprint)
+        snap = {bytes(k): np.asarray(avg_strategy(row), dtype=np.float64)
+                for k, row in ck["strat"].items()}
+        del ck
     _plog(f"{tag} snapshot {len(snap):,} infosets; env {args.postflop_mode}/{args.num_buckets} "
           f"key-mode={args.key_mode}")
 
@@ -497,6 +577,15 @@ def main() -> int:
     r.add_argument("--key-mode", choices=("prefhist", "fullhist", "summary"), default="prefhist")
     r.add_argument("--postflop-mode", choices=("emd", "fast"), default="emd")
     r.add_argument("--num-buckets", type=int, default=160)
+    r.add_argument("--mrr", action="store_true",
+                   help="serve under the M-RR thinned postflop menus (POKERBOT_MRR=1, the trainer's "
+                        "abstracted_legal_mrr keep-lists mirrored in lbr.make_blueprint_policy) — "
+                        "REQUIRED for fullhist+M-RR-trained arms (train/probe menu skew otherwise). "
+                        "Default off = byte-identical bp3/summary behavior.")
+    r.add_argument("--snapshot-index", default=None,
+                   help="dir built by bpv4_nlcfr_index.py — mmap-backed snapshot lookup instead of the "
+                        "full in-RAM load (REQUIRED for the 55 GB cloud fullhist blobs). Default None "
+                        "= historical in-RAM path, byte-identical.")
     r.add_argument("--out", required=True)
 
     w = sub.add_parser("rows")

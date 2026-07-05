@@ -48,6 +48,13 @@ def main() -> int:
     ap.add_argument("--parallel", type=int, default=6)
     ap.add_argument("--seed", type=int, default=13)
     ap.add_argument("--hands", default="AA,K9s")
+    ap.add_argument("--mrr", action="store_true",
+                    help="forward --mrr to every shard (M-RR thinned serve menus, POKERBOT_MRR=1) — "
+                         "set for every FULLHIST+M-RR-trained arm; leave off for summary controls.")
+    ap.add_argument("--snapshot-index", default=None,
+                    help="dir built by bpv4_nlcfr_index.py — forwarded to every shard so the 55 GB "
+                         "cloud fullhist blob is served via mmap binary-search instead of the full "
+                         "in-RAM load (which needs >100 GB). Default None = in-RAM path.")
     ap.add_argument("--max-postflop-miss", type=float, default=0.02,
                     help="fail a shard whose flop/turn/river fingerprint miss-rate exceeds this (the "
                          "fullhist train/probe skew signal adapter_fallback_rate cannot see). Default "
@@ -72,6 +79,10 @@ def main() -> int:
                    "--key-mode", args.key_mode, "--postflop-mode", args.postflop_mode,
                    "--num-buckets", str(args.num_buckets),
                    "--out", out]
+            if args.mrr:
+                cmd.append("--mrr")
+            if args.snapshot_index:
+                cmd += ["--snapshot-index", args.snapshot_index]
             jobs.append((hand, s, cmd, out))
 
     print(f"[{args.arm}] {len(jobs)} shard jobs to run ({len(outs)-len(jobs)} already done)",
