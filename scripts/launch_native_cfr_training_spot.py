@@ -86,7 +86,9 @@ def build_and_upload_code(s3, bucket: str, prefix: str, crate_src: str = "tools/
     return key
 
 
-def resolve_ubuntu_ami(ec2, arch: str) -> str:
+def resolve_ubuntu_ami(ec2, arch: str) -> tuple[str, str]:
+    """Returns (image_id, root_device_name) — the root device name is needed to override the root
+    volume size/throughput via BlockDeviceMappings (checkpoint staging for the detached uploader)."""
     name_arch = "amd64" if arch == "x86_64" else "arm64"
     resp = ec2.describe_images(
         Owners=["099720109477"],  # Canonical
@@ -99,7 +101,7 @@ def resolve_ubuntu_ami(ec2, arch: str) -> str:
     imgs = sorted(resp["Images"], key=lambda i: i["CreationDate"], reverse=True)
     if not imgs:
         raise SystemExit(f"no {arch} Ubuntu 22.04 AMI found in region")
-    return imgs[0]["ImageId"]
+    return imgs[0]["ImageId"], imgs[0].get("RootDeviceName", "/dev/sda1")
 
 
 # Spot-capacity errors worth trying the NEXT instance type for (vs a hard config/quota error, which
@@ -203,7 +205,7 @@ bash /tmp/bootstrap.sh
 
 
 def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_deals, num_buckets,
-                   depth_edges, checkpoint_every, keep_alive=False, emd_frozen_rel="", emd_sha="",
+                   depth_edges, checkpoint_every, gate_every=0, keep_alive=False, emd_frozen_rel="", emd_sha="",
                    river_ochs_rel="", river_ochs_sha="", preflop_hist_key=False,
                    fullhist_key=False, mrr=False,
                    work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
@@ -275,12 +277,16 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             f"V3_COV_HANDS = {int(v3.get('cov_hands', 0))}\n"
             f"V3_REGSTATS = {bool(v3.get('regstats', False))}\n"
             "\n"
-            "def _v3_ckpt_extras(t):\n"
+            "def _v3_ckpt_extras(t, gate=True):\n"
             "    # v3 checkpoint-cadence extras (read-only on the table): NLSNAP01 snapshot upload\n"
             "    # (rounds-2-4 averaging inputs), COVERAGE line (on-policy miss gates), REGSTATS line\n"
             "    # (prune-C calibration). Failures RETRY then continue -- never crash the run.\n"
+            "    # gate=False (a rolling resume-only checkpoint between gate-cadence points) skips the\n"
+            "    # snapshot/COVERAGE/REGSTATS extras so the PRE-REGISTERED measurement cadence (and the\n"
+            "    # snapshot-averaging density) is unchanged; the train.log upload still runs every time\n"
+            "    # (monitor freshness -- the v3-closeout lesson).\n"
             "    it = t.iters_done()\n"
-            "    if V3_SNAPSHOT_AVG and it >= V3_SNAP_START:\n"
+            "    if gate and V3_SNAPSHOT_AVG and it >= V3_SNAP_START:\n"
             "        import io as _io\n"
             "        from boto3.s3.transfer import TransferConfig as _TC\n"
             "        blob = t.save_current_strategy_bytes()\n"
@@ -299,7 +305,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "                time.sleep(min(30, 5 * attempt))\n"
             "        else:\n"
             "            print(f\"SNAPSHOT UPLOAD GAVE UP iters_done={it}: {last!r} -- continuing\", flush=True)\n"
-            "    if V3_COV_HANDS > 0:\n"
+            "    if gate and V3_COV_HANDS > 0:\n"
             "        hands, dec, mis, allin = t.coverage(V3_COV_HANDS, 0xC0FFEE ^ it)\n"
             "        pct = lambda i: (100.0 * mis[i] / dec[i]) if dec[i] else 0.0\n"
             "        pf_d, pf_m = sum(dec[1:4]), sum(mis[1:4])\n"
@@ -308,7 +314,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "              f\"flop={pct(1):.1f} turn={pct(2):.1f} river={pct(3):.1f} postflop={pf:.1f} \"\n"
             "              f\"pre_allin_runout={100.0 * allin / max(hands, 1):.1f} decisions={dec}\",\n"
             "              flush=True)\n"
-            "    if V3_REGSTATS:\n"
+            "    if gate and V3_REGSTATS:\n"
             "        rows, nneg, npos, p50, p90, p99, p999, nmax, pp99, pmax = t.regret_stats()\n"
             "        print(f\"REGSTATS iters_done={it} rows={rows} neg_vals={nneg} pos_vals={npos} \"\n"
             "              f\"neg_p50={p50:.3e} neg_p90={p90:.3e} neg_p99={p99:.3e} neg_p999={p999:.3e} \"\n"
@@ -328,7 +334,12 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "            print(f\"TRAINLOG UPLOAD FAIL attempt={attempt}/3: {e!r}\", flush=True)\n"
             "            time.sleep(min(30, 5 * attempt))"
         )
-        v3_ckpt_call = "\n        _v3_ckpt_extras(t)"
+        # fullhist path: rolling checkpoints run every CKPT_EVERY but the pre-registered v3
+        # measurement extras (snapshot/COVERAGE/REGSTATS) only at gate-cadence iters (_is_gate).
+        if fullhist_key or mrr:
+            v3_ckpt_call = "\n        _v3_ckpt_extras(t, _is_gate(t.iters_done()))"
+        else:
+            v3_ckpt_call = "\n        _v3_ckpt_extras(t)"
     else:
         v3_env_block = ""
         v3_driver_fns = ""
@@ -342,22 +353,60 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
                           '\necho "ROW_BUDGET=$POKERBOT_ROW_BUDGET"')
     else:
         row_budget_env = ""
-    # Checkpoint uploader. The fullhist+M-RR arm's ``save_bytes()`` blob is ~30-55 GB, which EXCEEDS
-    # S3's 5 GiB single-PutObject HARD LIMIT — a bare ``put_object(Body=blob)`` 400s EntityTooLarge and
-    # crashes the run at the FIRST checkpoint (no durable checkpoint => spot auto-resume permanently
-    # broken => real money burned for zero output). So when EITHER fullhist/M-RR flag is on we emit a
-    # MULTIPART uploader (upload_fileobj + server-side copy for the `latest` pointer) that also retries
-    # transient S3 errors instead of crash-exiting. This is ADDITIVE + default-off BYTE-IDENTICAL: with
-    # both flags off ``ckpt_upload_imports`` is "" and ``ckpt_upload_fn`` is the ORIGINAL two-put_object
-    # function verbatim, so the bp2/bp3 bootstrap is byte-for-byte unchanged (their small (<64 MB)
-    # checkpoints never needed multipart). Only the >5 GiB fullhist arms (which always set the flags)
-    # take the new path.
+    # Checkpoint machinery. The fullhist+M-RR arm's ``save_bytes()`` blob is ~3-58 GB, which EXCEEDS
+    # S3's 5 GiB single-PutObject HARD LIMIT, and a SYNCHRONOUS upload stalls training for minutes per
+    # checkpoint. SPOT-RESILIENCE redesign (arm-2 operational addendum, 2026-07-05; the bpv4_h200_arm2
+    # first attempt lost 5 boxes in <2h with ZERO checkpoints because the first checkpoint was due ~61
+    # min in while spot reclaims arrived ~69 min apart):
+    #   * serialize -> LOCAL disk write (fast, blocking; the launcher sizes the root gp3 volume via
+    #     --ckpt-volume-gb) -> DETACHED uploader process (/opt/pokerbot/ckpt_upload.py) so training
+    #     continues during the multi-GB S3 upload;
+    #   * the uploader writes a tiny `iter_XXXXXX.nlcfr.ok` JSON marker (size+sha256) ONLY AFTER the
+    #     S3 object is complete -- resume trusts markers exclusively, so a partial upload (reclaim
+    #     mid-upload) is invisible to resume;
+    #   * `latest.nlcfr` is NO LONGER written on this path (a 58 GB server-side copy per checkpoint,
+    #     and the babysitter used to DOWNLOAD it whole to read 16 header bytes); the babysitter now
+    #     reads progress from the marker names;
+    #   * S3 retention: the uploader keeps ALL gate-cadence checkpoints (GATE_EVERY, the pre-registered
+    #     ladder) + the newest KEEP_ROLLING others, deleting marker-first so resume never sees a
+    #     blobless marker. Local files are deleted after a durable upload.
+    # Legacy path (both flags off): every placeholder renders the ORIGINAL text (``ckpt_upload_fn`` is
+    # the ORIGINAL two-put_object function verbatim; ``_download_latest`` unchanged but now rendered
+    # AFTER the upload fn — semantically identical). The bootstrap SHELL gains the build-cache block on
+    # ALL paths (documented operational change; NOT byte-identical to pre-2026-07-05 renders).
     if fullhist_key or mrr:
-        ckpt_upload_imports = "\nimport io\nfrom boto3.s3.transfer import TransferConfig"
+        ckpt_upload_imports = "\nimport hashlib\nimport io\nimport json\nimport subprocess\nfrom boto3.s3.transfer import TransferConfig"
         ckpt_upload_fn = (
             "_XFER = TransferConfig(multipart_threshold=64 * 1024 * 1024,\n"
             "                       multipart_chunksize=256 * 1024 * 1024,\n"
             "                       max_concurrency=1, use_threads=False)\n"
+            "CKPT_DIR = \"/opt/pokerbot/ckpt\"\n"
+            "GATE_EVERY = " + str(int(gate_every)) + "  # pre-registered gate/snapshot cadence; 0 => every checkpoint is a gate\n"
+            "KEEP_ROLLING = 3  # newest non-gate checkpoints kept on S3 (gates are kept forever)\n"
+            "_UPLOADS = []\n"
+            "_SPAWN_KW = {\"start_new_session\": True} if os.name == \"posix\" else {}\n"
+            "\n"
+            "\n"
+            "def _is_gate(it):\n"
+            "    return GATE_EVERY <= 0 or it % GATE_EVERY == 0 or it >= ITERS\n"
+            "\n"
+            "\n"
+            "def _next_stop(cur):\n"
+            "    # next training-loop boundary = earliest of (next CKPT_EVERY multiple, next GATE_EVERY\n"
+            "    # multiple, ITERS) -- rolling resume checkpoints land every CKPT_EVERY AND the\n"
+            "    # pre-registered gate ladder (e.g. 2.5k/5k/.../20k for arm-2) is always hit exactly.\n"
+            "    nxt = ((cur // CKPT_EVERY) + 1) * CKPT_EVERY\n"
+            "    if GATE_EVERY > 0:\n"
+            "        nxt = min(nxt, ((cur // GATE_EVERY) + 1) * GATE_EVERY)\n"
+            "    return min(nxt, ITERS)\n"
+            "\n"
+            "\n"
+            "def _sha256_file(path):\n"
+            "    h = hashlib.sha256()\n"
+            "    with open(path, \"rb\") as f:\n"
+            "        for chunk in iter(lambda: f.read(1 << 24), b\"\"):\n"
+            "            h.update(chunk)\n"
+            "    return h.hexdigest()\n"
             "\n"
             "\n"
             "class _BlobReader(io.RawIOBase):\n"
@@ -389,26 +438,63 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "        return self._pos\n"
             "\n"
             "\n"
-            "def _upload(blob, iters_done):\n"
-            "    # versioned per-iter checkpoint + a `latest` pointer. The fullhist+M-RR blob is ~30-55 GB,\n"
-            "    # which EXCEEDS S3's 5 GiB single-PutObject hard limit; a bare put_object(Body=blob) would\n"
-            "    # 400 EntityTooLarge and crash the run at the FIRST checkpoint. Use the multipart managed\n"
-            "    # transfer, and point `latest` at the just-uploaded object via a server-side multipart COPY\n"
-            "    # (no second 55 GB network upload). Retry transient S3 errors; NEVER crash the whole run on\n"
-            "    # an upload blip (the on-box dead-man caps still bound cost; the next checkpoint may succeed).\n"
+            "def _upload_sync(blob, iters_done):\n"
+            "    # In-RAM multipart upload + marker: the fallback when the local ckpt volume is\n"
+            "    # unavailable/full. Retry transient S3 errors; NEVER crash the run on an upload blip.\n"
             "    key = RUN_PREFIX + f\"/checkpoints/iter_{iters_done:06d}.nlcfr\"\n"
             "    last = None\n"
             "    for attempt in range(1, 6):\n"
             "        try:\n"
             "            s3.upload_fileobj(_BlobReader(blob), BUCKET, key, Config=_XFER)\n"
-            "            s3.copy({\"Bucket\": BUCKET, \"Key\": key}, BUCKET, LATEST_KEY, Config=_XFER)\n"
-            "            print(f\"CKPT iters_done={iters_done} -> s3://{BUCKET}/{key} ({len(blob)} bytes, multipart)\", flush=True)\n"
+            "            sha = hashlib.sha256(blob).hexdigest()\n"
+            "            s3.put_object(Bucket=BUCKET, Key=key + \".ok\",\n"
+            "                          Body=json.dumps({\"iters_done\": iters_done, \"bytes\": len(blob),\n"
+            "                                           \"sha256\": sha}).encode())\n"
+            "            print(f\"CKPT iters_done={iters_done} -> s3://{BUCKET}/{key} ({len(blob)} bytes, multipart SYNC + marker)\", flush=True)\n"
             "            return\n"
             "        except Exception as e:\n"
             "            last = e\n"
             "            print(f\"CKPT UPLOAD FAIL attempt={attempt}/5 iters_done={iters_done}: {e!r}\", flush=True)\n"
             "            time.sleep(min(30, 5 * attempt))\n"
-            "    print(f\"CKPT UPLOAD GAVE UP after 5 attempts iters_done={iters_done}: {last!r} -- continuing\", flush=True)"
+            "    print(f\"CKPT UPLOAD GAVE UP after 5 attempts iters_done={iters_done}: {last!r} -- continuing\", flush=True)\n"
+            "\n"
+            "\n"
+            "def _upload(blob, iters_done, wait=False):\n"
+            "    # Local durable write, then DETACHED S3 upload (training continues; ckpt_upload.py writes\n"
+            "    # the .ok marker AFTER the upload completes and prunes rolling checkpoints). wait=True\n"
+            "    # (row-budget stop / end-of-run) blocks until this checkpoint's upload is durable.\n"
+            "    t0 = time.time()\n"
+            "    try:\n"
+            "        os.makedirs(CKPT_DIR, exist_ok=True)\n"
+            "        path = os.path.join(CKPT_DIR, f\"iter_{iters_done:06d}.nlcfr\")\n"
+            "        with open(path + \".tmp\", \"wb\") as f:\n"
+            "            f.write(blob)\n"
+            "            f.flush()\n"
+            "            os.fsync(f.fileno())\n"
+            "        os.replace(path + \".tmp\", path)\n"
+            "    except OSError as e:\n"
+            "        print(f\"CKPT local write failed ({e!r}) -- falling back to SYNC in-RAM upload\", flush=True)\n"
+            "        _upload_sync(blob, iters_done)\n"
+            "        return\n"
+            "    print(f\"CKPT_LOCAL iters_done={iters_done} bytes={len(blob)} write={time.time() - t0:.1f}s -> {path}\", flush=True)\n"
+            "    args = [sys.executable, \"/opt/pokerbot/ckpt_upload.py\", path, str(iters_done)]\n"
+            "    if wait:\n"
+            "        rc = subprocess.call(args)\n"
+            "        print(f\"CKPT_UPLOAD_SYNC iters_done={iters_done} rc={rc}\", flush=True)\n"
+            "    else:\n"
+            "        logf = open(\"/var/log/ckpt_upload.log\", \"ab\")\n"
+            "        _UPLOADS.append(subprocess.Popen(args, stdout=logf, stderr=subprocess.STDOUT,\n"
+            "                                         **_SPAWN_KW))\n"
+            "    for pr in [p for p in _UPLOADS if p.poll() is not None]:\n"
+            "        _UPLOADS.remove(pr)\n"
+            "\n"
+            "\n"
+            "def _ckpt(t):\n"
+            "    # serialize (the only in-process training pause besides the local write) + hand off.\n"
+            "    t0 = time.time()\n"
+            "    blob = t.save_bytes()\n"
+            "    print(f\"CKPT_SERIALIZE iters_done={t.iters_done()} bytes={len(blob)} wall={time.time() - t0:.1f}s\", flush=True)\n"
+            "    _upload(blob, t.iters_done())"
         )
     else:
         ckpt_upload_imports = ""
@@ -480,7 +566,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "        # FINAL checkpoint via the SAME multipart _upload (versioned + latest) and break so the\n"
             "        # driver falls through to its end-of-run log upload + the on-box dead-man shutdown.\n"
             f"        if ROW_BUDGET > 0 and {rows_expr} >= ROW_BUDGET:\n"
-            "            _upload(t.save_bytes(), t.iters_done())\n"
+            "            _upload(t.save_bytes(), t.iters_done(), wait=True)\n"
             "            print(f\"ROW_BUDGET_STOP budget={ROW_BUDGET} rows={t.n_infosets()} \"\n"
             "                  f\"iters_done={t.iters_done()} -- wrote FINAL checkpoint (versioned + latest), \"\n"
             "                  f\"stopping cleanly (G8 partial evidence, design 7.1.2)\", flush=True)\n"
@@ -490,6 +576,158 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
         row_budget_const = ""
         row_budget_pre = ""
         row_budget_block = ""
+    # ---- spot-resilience template variables (fullhist path only; legacy renders keep the ORIGINAL
+    # text verbatim so bp2/bp3 drivers stay byte-identical) ----
+    if fullhist_key or mrr:
+        # Resume = newest checkpoint WITH a verified .ok marker (size+sha256) -- NEVER a partial
+        # upload. Legacy `latest` pointer stays as a last-resort fallback (pre-marker runs).
+        download_latest_fn = (
+            "def _download_latest():\n"
+            "    try:\n"
+            "        pg = s3.get_paginator(\"list_objects_v2\").paginate(\n"
+            "            Bucket=BUCKET, Prefix=RUN_PREFIX + \"/checkpoints/\")\n"
+            "        oks = sorted(o[\"Key\"] for page in pg for o in page.get(\"Contents\", [])\n"
+            "                     if o[\"Key\"].endswith(\".nlcfr.ok\"))\n"
+            "    except Exception as e:\n"
+            "        print(f\"RESUME marker list failed: {e!r}\", flush=True)\n"
+            "        oks = []\n"
+            "    for mk in reversed(oks):  # iter_%06d zero-padding => lexicographic == numeric\n"
+            "        try:\n"
+            "            meta = json.loads(s3.get_object(Bucket=BUCKET, Key=mk)[\"Body\"].read())\n"
+            "            key = mk[:-3]\n"
+            "            os.makedirs(CKPT_DIR, exist_ok=True)\n"
+            "            path = os.path.join(CKPT_DIR, \"resume.nlcfr\")\n"
+            "            s3.download_file(BUCKET, key, path)\n"
+            "            if os.path.getsize(path) != int(meta[\"bytes\"]):\n"
+            "                raise ValueError(f\"size {os.path.getsize(path)} != {meta['bytes']}\")\n"
+            "            sha = _sha256_file(path)\n"
+            "            if sha != meta[\"sha256\"]:\n"
+            "                raise ValueError(f\"sha {sha} != {meta['sha256']}\")\n"
+            "            with open(path, \"rb\") as f:\n"
+            "                blob = f.read()\n"
+            "            os.remove(path)\n"
+            "            print(f\"RESUME verified s3://{BUCKET}/{key} bytes={meta['bytes']} \"\n"
+            "                  f\"sha256={sha[:12]}..\", flush=True)\n"
+            "            return blob\n"
+            "        except Exception as e:\n"
+            "            print(f\"RESUME candidate {mk} rejected: {e!r} -- trying next\", flush=True)\n"
+            "    try:  # legacy pointer fallback (pre-marker runs only)\n"
+            "        return s3.get_object(Bucket=BUCKET, Key=LATEST_KEY)[\"Body\"].read()\n"
+            "    except Exception:\n"
+            "        return None"
+        )
+        next_stop_expr = "_next_stop(t.iters_done())"
+        ckpt_stmt = "_ckpt(t)"
+        # end-of-run: block on in-flight detached uploads BEFORE the driver exits -- the bootstrap
+        # shuts the box down right after the driver, which would otherwise kill the final upload.
+        ckpt_wait_block = (
+            "\n    for pr in list(_UPLOADS):\n"
+            "        if pr.poll() is None:\n"
+            "            print(f\"WAITING for in-flight checkpoint upload pid={pr.pid}\", flush=True)\n"
+            "        pr.wait()"
+        )
+    else:
+        download_latest_fn = (
+            "def _download_latest():\n"
+            "    try:\n"
+            "        obj = s3.get_object(Bucket=BUCKET, Key=LATEST_KEY)\n"
+            "        return obj[\"Body\"].read()\n"
+            "    except Exception:\n"
+            "        return None"
+        )
+        next_stop_expr = "min(t.iters_done() + CKPT_EVERY, ITERS)"
+        ckpt_stmt = "_upload(t.save_bytes(), t.iters_done())"
+        ckpt_wait_block = ""
+    # v3 arms: print the EFFECTIVE prune config right after the LEVERS line. The LEVERS line's
+    # `prune=` value is the INERT dcfr-mode knob (cfg.dcfr_prune_threshold, IGNORED when dcfr=False
+    # -- trainer.rs effective_prune_threshold), which confused the arm-2 monitor (`prune=-300000.0`
+    # while POKERBOT_PRUNE_C=-50000 governed). Renders "" when v3 is off (byte-identical).
+    if v3:
+        v3_banner = (
+            "\n    print(\"V3 effective: signed_regrets=%s lcfr=%s PRUNE_C=%s prune_start=%s \"\n"
+            "          \"explore=%s floor=%s [NOTE: the LEVERS dcfr 'prune=' value above is the inert \"\n"
+            "          \"dcfr-mode knob, ignored when dcfr=False]\" % (\n"
+            "        os.environ.get(\"POKERBOT_SIGNED_REGRETS\", \"0\"),\n"
+            "        os.environ.get(\"POKERBOT_LCFR\", \"0\"),\n"
+            "        os.environ.get(\"POKERBOT_PRUNE_C\", \"(off)\"),\n"
+            "        os.environ.get(\"POKERBOT_PRUNE_START\", \"(W/2 default)\"),\n"
+            "        os.environ.get(\"POKERBOT_PRUNE_EXPLORE\", \"0.05\"),\n"
+            "        os.environ.get(\"POKERBOT_REGRET_FLOOR\", \"(C*31/30 default)\")), flush=True)"
+        )
+    else:
+        v3_banner = ""
+    # Detached checkpoint uploader (fullhist path): spawned per checkpoint by the driver; writes the
+    # .ok marker only AFTER a complete upload, prunes rolling checkpoints (keeps ALL gate-cadence +
+    # newest KEEP_ROLLING others; marker deleted FIRST so resume never sees a blobless marker), then
+    # deletes its local file. Renders "" (no extra bytes) on the legacy path.
+    if fullhist_key or mrr:
+        ckpt_uploader_file = (
+            "cat > /opt/pokerbot/ckpt_upload.py <<'UPEOF'\n"
+            "import hashlib, json, os, re, sys, time\n"
+            "import boto3\n"
+            "from boto3.s3.transfer import TransferConfig\n"
+            "\n"
+            "BUCKET = \"" + bucket + "\"\n"
+            "RUN_PREFIX = \"" + run_prefix + "\"\n"
+            "REGION = \"" + region + "\"\n"
+            "GATE_EVERY = " + str(int(gate_every)) + "\n"
+            "KEEP_ROLLING = 3\n"
+            "\n"
+            "path, it = sys.argv[1], int(sys.argv[2])\n"
+            "s3 = boto3.client(\"s3\", region_name=REGION)\n"
+            "key = RUN_PREFIX + f\"/checkpoints/iter_{it:06d}.nlcfr\"\n"
+            "size = os.path.getsize(path)\n"
+            "h = hashlib.sha256()\n"
+            "with open(path, \"rb\") as f:\n"
+            "    for chunk in iter(lambda: f.read(1 << 24), b\"\"):\n"
+            "        h.update(chunk)\n"
+            "sha = h.hexdigest()\n"
+            "cfgx = TransferConfig(multipart_threshold=64 * 1024 * 1024,\n"
+            "                      multipart_chunksize=256 * 1024 * 1024,\n"
+            "                      max_concurrency=8, use_threads=True)\n"
+            "t0 = time.time()\n"
+            "last = None\n"
+            "for attempt in range(1, 6):\n"
+            "    try:\n"
+            "        s3.upload_file(path, BUCKET, key, Config=cfgx)\n"
+            "        s3.put_object(Bucket=BUCKET, Key=key + \".ok\",\n"
+            "                      Body=json.dumps({\"iters_done\": it, \"bytes\": size,\n"
+            "                                       \"sha256\": sha}).encode())\n"
+            "        print(f\"CKPT_UPLOADED iters_done={it} bytes={size} sha256={sha[:12]}.. \"\n"
+            "              f\"wall={time.time() - t0:.0f}s -> s3://{BUCKET}/{key}\", flush=True)\n"
+            "        break\n"
+            "    except Exception as e:\n"
+            "        last = e\n"
+            "        print(f\"CKPT_UPLOAD FAIL attempt={attempt}/5 iter={it}: {e!r}\", flush=True)\n"
+            "        time.sleep(min(60, 10 * attempt))\n"
+            "else:\n"
+            "    print(f\"CKPT_UPLOAD GAVE UP iter={it}: {last!r}\", flush=True)\n"
+            "    sys.exit(1)\n"
+            "try:\n"
+            "    pg = s3.get_paginator(\"list_objects_v2\").paginate(\n"
+            "        Bucket=BUCKET, Prefix=RUN_PREFIX + \"/checkpoints/\")\n"
+            "    iters = []\n"
+            "    for page in pg:\n"
+            "        for o in page.get(\"Contents\", []):\n"
+            "            m = re.search(r\"iter_(\\d+)\\.nlcfr\\.ok$\", o[\"Key\"])\n"
+            "            if m:\n"
+            "                iters.append(int(m.group(1)))\n"
+            "    rolling = sorted(i for i in iters if GATE_EVERY > 0 and i % GATE_EVERY != 0)\n"
+            "    for i in (rolling[:-KEEP_ROLLING] if len(rolling) > KEEP_ROLLING else []):\n"
+            "        k = RUN_PREFIX + f\"/checkpoints/iter_{i:06d}.nlcfr\"\n"
+            "        s3.delete_object(Bucket=BUCKET, Key=k + \".ok\")  # marker FIRST\n"
+            "        s3.delete_object(Bucket=BUCKET, Key=k)\n"
+            "        print(f\"CKPT_PRUNED iter={i}\", flush=True)\n"
+            "except Exception as e:\n"
+            "    print(f\"CKPT_PRUNE skipped: {e!r}\", flush=True)\n"
+            "try:\n"
+            "    os.remove(path)\n"
+            "except OSError:\n"
+            "    pass\n"
+            "UPEOF"
+        )
+    else:
+        ckpt_uploader_file = ""
     # No output redirect (cloud-init captures stdout to /var/log/cloud-init-output.log, visible via
     # get-console-output) — same lesson the SD-CFR launcher documents.
     return f"""#!/bin/bash
@@ -531,10 +769,48 @@ export PYO3_PYTHON=$(python3 -c 'import sys;print(sys.executable)')
 # no AVX512 => no downclock, measured small net gain. The .so is built AND run on this same box and
 # never ships to a different-CPU host, so AVX2/FMA is always present (no SIGILL). Set via RUSTFLAGS on
 # the build line so it applies even though the tarball include-list omits tools/battery_native/.cargo/.
-RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --features python --lib --manifest-path tools/battery_native/Cargo.toml
-# The cdylib is target/release/libbattery_native.so; import it as `battery_native`.
-SO=$(ls tools/battery_native/target/release/libbattery_native.so 2>/dev/null || ls tools/battery_native/target/release/battery_native.so 2>/dev/null)
-cp "$SO" /opt/pokerbot/battery_native.so
+#
+# BUILD CACHE (spot-resilience, 2026-07-05): the lto=fat/codegen-units=1 release build takes ~65 min,
+# which the bpv4_h200_arm2 first attempt paid FIVE times (spot reclaims every ~69 min => zero training
+# output). After a successful build the .so is uploaded to the shared build_cache/ S3 prefix keyed by
+# sha256(DECOMPRESSED code tar | RUSTFLAGS | features | rustc -V | uname -m) — the gzip envelope is
+# excluded because Python's tarfile stamps a fresh gzip mtime on every upload (same sources would
+# otherwise never cache-hit). x86-64-v3 (AVX2+FMA, no AVX512) runs on every type in the spotpick
+# 128-vCPU chain (c6a/c6i/c6in/c6id/m6i/c7a), so a fallback-type relaunch still hits the cache.
+# On boot: try the cache first (sha256-verified; corrupt/missing => source build). Relaunch-to-training
+# drops from ~65 min to ~2-5 min on a hit.
+BUILD_RUSTFLAGS="-C target-cpu=x86-64-v3"
+CODE_SHA=$(gzip -dc /tmp/code.tar.gz | sha256sum | awk '{{print $1}}')
+BUILD_KEY=$(printf '%s|%s|%s|%s|%s' "$CODE_SHA" "$BUILD_RUSTFLAGS" "python:lib" "$(rustc -V)" "$(uname -m)" | sha256sum | awk '{{print $1}}')
+CACHE_URI="s3://{bucket}/{prefix}/build_cache/$BUILD_KEY"
+echo "BUILD_CACHE key=$BUILD_KEY (code_sha=$CODE_SHA rustc=$(rustc -V) arch=$(uname -m))"
+CACHE_HIT=0
+if aws s3 cp "$CACHE_URI/battery_native.so" /opt/pokerbot/battery_native.so --region {region} 2>/dev/null \
+   && aws s3 cp "$CACHE_URI/battery_native.so.sha256" /tmp/bn_so.sha --region {region} 2>/dev/null; then
+  WANT=$(awk '{{print $1}}' /tmp/bn_so.sha)
+  GOT=$(sha256sum /opt/pokerbot/battery_native.so | awk '{{print $1}}')
+  if [ -n "$WANT" ] && [ "$WANT" = "$GOT" ]; then
+    CACHE_HIT=1
+    echo "BUILD_CACHE HIT sha256=$GOT -- skipping the ~65 min source build"
+  else
+    echo "BUILD_CACHE CORRUPT (want=$WANT got=$GOT) -- falling back to source build"
+    rm -f /opt/pokerbot/battery_native.so
+  fi
+else
+  echo "BUILD_CACHE MISS -- source build"
+fi
+if [ "$CACHE_HIT" != "1" ]; then
+  RUSTFLAGS="$BUILD_RUSTFLAGS" cargo build --release --features python --lib --manifest-path tools/battery_native/Cargo.toml
+  # The cdylib is target/release/libbattery_native.so; import it as `battery_native`.
+  SO=$(ls tools/battery_native/target/release/libbattery_native.so 2>/dev/null || ls tools/battery_native/target/release/battery_native.so 2>/dev/null)
+  cp "$SO" /opt/pokerbot/battery_native.so
+  # Populate the cache: .so FIRST, sha marker SECOND (a marker never exists without its blob; a torn
+  # blob fails the sha verify on the next boot). Non-fatal on failure (the box's own build proceeds).
+  sha256sum /opt/pokerbot/battery_native.so | awk '{{print $1}}' > /tmp/bn_so.sha
+  ( aws s3 cp /opt/pokerbot/battery_native.so "$CACHE_URI/battery_native.so" --region {region} \
+    && aws s3 cp /tmp/bn_so.sha "$CACHE_URI/battery_native.so.sha256" --region {region} \
+    && echo "BUILD_CACHE UPLOADED -> $CACHE_URI" ) || echo "BUILD_CACHE upload failed (non-fatal)"
+fi
 ls -la /opt/pokerbot/battery_native.so
 
 # RAYON FANOUT: pin to PHYSICAL cores, NOT logical (SMT). The cpu128 probe (2026-06-28,
@@ -580,7 +856,7 @@ if [ -n "$ROCHS_SHA" ] && [ -n "$ROCHS_REL" ]; then
   fi
   echo "river-OCHS table sha256 OK: $ACT"
 fi
-
+{ckpt_uploader_file}
 cat > /opt/pokerbot/drive_native_cfr.py <<'PYEOF'
 import os, sys, time, traceback
 import boto3{ckpt_upload_imports}
@@ -616,14 +892,9 @@ DCFR_EXPLORE_FRAC = {dcfr_explore_frac}
 s3 = boto3.client("s3", region_name=REGION)
 LATEST_KEY = RUN_PREFIX + "/checkpoints/latest.nlcfr"
 
-def _download_latest():
-    try:
-        obj = s3.get_object(Bucket=BUCKET, Key=LATEST_KEY)
-        return obj["Body"].read()
-    except Exception:
-        return None
-
 {ckpt_upload_fn}{v3_driver_fns}
+
+{download_latest_fn}
 
 def main():
     # full ctor: (num_buckets, depth_edges, n_deals, n_seats, prune_threshold, fast_merge, emd_frozen_path,
@@ -640,7 +911,7 @@ def main():
     if RIVER_OCHS_PATH:
         print(f"river-OCHS ACTIVE: {{RIVER_OCHS_PATH}} stamp={{t.river_ochs_stamp()}}", flush=True)
     print(f"LEVERS work_steal={{WORK_STEAL}} dcfr={{DCFR}} "
-          f"(prune={{DCFR_PRUNE_THRESHOLD}} explore={{DCFR_EXPLORE_FRAC}}) hogwild={{t.is_hogwild()}}", flush=True)
+          f"(prune={{DCFR_PRUNE_THRESHOLD}} explore={{DCFR_EXPLORE_FRAC}}) hogwild={{t.is_hogwild()}}", flush=True){v3_banner}
     blob = _download_latest()
     if blob is not None and t.load_bytes(blob):
         print(f"RESUMED from latest checkpoint at iters_done={{t.iters_done()}}", flush=True)
@@ -651,15 +922,15 @@ def main():
           f"depth_edges={{DEPTH_EDGES}}", flush=True)
     t0 = time.time()
     while t.iters_done() < ITERS:{row_budget_pre}
-        nxt = min(t.iters_done() + CKPT_EVERY, ITERS)
+        nxt = {next_stop_expr}
         step = nxt - t.iters_done()
         t.train(step){row_budget_block}
-        _upload(t.save_bytes(), t.iters_done()){v3_ckpt_call}
+        {ckpt_stmt}{v3_ckpt_call}
         el = time.time() - t0
         done = t.iters_done() - start
         rate = done / el if el > 0 else 0.0
         print(f"PROGRESS iters_done={{t.iters_done()}}/{{ITERS}} infosets={{t.n_infosets()}} "
-              f"elapsed={{el:.0f}}s rate={{rate:.3f}} it/s", flush=True)
+              f"elapsed={{el:.0f}}s rate={{rate:.3f}} it/s", flush=True){ckpt_wait_block}
     print(f"DONE iters_done={{t.iters_done()}} infosets={{t.n_infosets()}}", flush=True)
 
 if __name__ == "__main__":
@@ -712,8 +983,24 @@ def main() -> None:
     p.add_argument("--depth-edges", default="",
                    help="comma-sep depth-bucket edges for a depth-aware preflop key (e.g. '50,90,140'); "
                         "empty = non-depth blueprint")
-    p.add_argument("--checkpoint-every", type=int, default=500,
-                   help="checkpoint to S3 every N iters (preemption-bounded loss)")
+    p.add_argument("--checkpoint-every", "--ckpt-every", type=int, default=1000, dest="checkpoint_every",
+                   help="checkpoint every N iters (preemption-bounded loss). Default 1000 (arm-2 "
+                        "spot-resilience ops, 2026-07-05; was 500). On the fullhist/M-RR path these are "
+                        "ROLLING resume checkpoints: written to local disk then uploaded by a DETACHED "
+                        "process (training continues), marker-completed, pruned to the newest 3 + all "
+                        "--gate-every checkpoints.")
+    p.add_argument("--gate-every", type=int, default=0,
+                   help="pre-registered gate/measurement cadence in iters (fullhist/M-RR path only): "
+                        "gate-cadence checkpoints are KEPT forever (the amendment ladder, e.g. 2500 for "
+                        "bpv4_h200_arm2 => 2.5k/5k/.../20k) and the v3 extras (NLSNAP01 snapshot, "
+                        "COVERAGE, REGSTATS) run ONLY at gate iters, preserving the registered "
+                        "measurement/snapshot-averaging density. 0 = every checkpoint is a gate "
+                        "(legacy behavior).")
+    p.add_argument("--ckpt-volume-gb", type=int, default=None,
+                   help="root gp3 EBS volume size in GB (with 700 MiB/s provisioned throughput) for the "
+                        "local checkpoint staging dir the detached uploader reads from. Default: 400 when "
+                        "--fullhist-key/--mrr (blobs reach ~58 GB; uploader deletes local files after a "
+                        "durable upload), else AMI default (8 GB).")
     p.add_argument("--max-hours", type=float, default=6.0,
                    help="ON-BOX absolute dead-man cost cap (hours): the box self-terminates after this no "
                         "matter what (logind floor + systemd wall-guard), independent of the babysitter/PC. "
@@ -853,9 +1140,9 @@ def main() -> None:
     else:
         code_key = build_and_upload_code(s3, args.bucket, args.prefix, crate_src=crate_src,
                                          emd_frozen=args.emd_frozen, river_ochs=args.river_ochs)
-    ami = resolve_ubuntu_ami(ec2, args.arch)
-    print(f"AMI: {ami}  instance: {args.instance_type}  arch: {args.arch}  region: {args.region}",
-          flush=True)
+    ami, root_dev = resolve_ubuntu_ami(ec2, args.arch)
+    print(f"AMI: {ami} (root {root_dev})  instance: {args.instance_type}  arch: {args.arch}  "
+          f"region: {args.region}", flush=True)
 
     # S2: pass the EMD blob's expected sha256 (from its sidecar .sha256) so the box verifies it before training.
     emd_sha = ""
@@ -915,7 +1202,8 @@ def main() -> None:
         bucket=args.bucket, prefix=args.prefix, region=args.region, code_key=code_key,
         run_subdir=run_subdir, iters=args.iters, n_deals=args.n_deals,
         num_buckets=args.num_buckets, depth_edges=depth_edges,
-        checkpoint_every=args.checkpoint_every, keep_alive=args.keep_alive,
+        checkpoint_every=args.checkpoint_every, gate_every=args.gate_every,
+        keep_alive=args.keep_alive,
         emd_frozen_rel=args.emd_frozen, emd_sha=emd_sha,
         river_ochs_rel=args.river_ochs, river_ochs_sha=river_ochs_sha,
         preflop_hist_key=args.preflop_hist_key,
@@ -955,6 +1243,21 @@ def main() -> None:
         }],
         InstanceInitiatedShutdownBehavior="terminate",
     )
+    # Root-volume override: the fullhist/M-RR checkpoint path stages blobs (up to ~58 GB each) on
+    # local disk for the DETACHED uploader; the AMI's 8 GB root can't hold them. gp3 with 700 MiB/s
+    # provisioned throughput bounds the blocking local write to ~85 s at the largest blob
+    # (~$0.04+$0.03/h prorated — negligible vs the box). Default 400 GB on fullhist/M-RR arms.
+    ckpt_vol = args.ckpt_volume_gb
+    if ckpt_vol is None:
+        ckpt_vol = 400 if (args.fullhist_key or args.mrr) else 0
+    if ckpt_vol > 0:
+        run_kwargs["BlockDeviceMappings"] = [{
+            "DeviceName": root_dev,
+            "Ebs": {"VolumeSize": int(ckpt_vol), "VolumeType": "gp3", "Iops": 3000,
+                    "Throughput": 700, "DeleteOnTermination": True},
+        }]
+        print(f"root volume override: {ckpt_vol} GB gp3 @700 MiB/s ({root_dev}) for checkpoint staging",
+              flush=True)
     if not args.on_demand:
         run_kwargs["InstanceMarketOptions"] = {
             "MarketType": "spot",

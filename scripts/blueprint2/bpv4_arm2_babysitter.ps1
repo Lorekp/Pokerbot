@@ -22,8 +22,17 @@
 #       p999 (1 s.f.), relaunch from the 2500 checkpoint.
 #   * -NDeals 16384                    : the coverage lever (closeout sec 4.1). NOTE: passed
 #       EXPLICITLY -- the v3 wrapper relied on @args for n_deals; never again.
-#   * -Iters 20000 -CheckpointEvery 2500 : spec point 20k = 327.7M traversals (identical to the v3
-#       plan's 40k x 8192); 8 checkpoints + 8 snapshots (same averaging density as the v3 plan).
+#   * -Iters 20000 -CheckpointEvery 1000 -GateEvery 2500 : spec point 20k = 327.7M traversals
+#       (identical to the v3 plan's 40k x 8192). SPOT-RESILIENCE SPLIT (operational addendum,
+#       amendment sec 10; first attempt lost 5 boxes in <2h with ZERO checkpoints -- first ckpt due
+#       ~61 min in vs reclaims every ~69 min): ROLLING resume checkpoints every 1000 iters (local
+#       NVMe/gp3 write, DETACHED S3 upload + .ok marker, pruned to newest 3) while the PRE-REGISTERED
+#       gate ladder stays at 2500 (2.5k/5k/.../20k checkpoints kept forever, snapshots/COVERAGE/
+#       REGSTATS ONLY at gate iters => 8 snapshots, same averaging density as registered).
+#   * -CkptVolumeGb 400                : root gp3 (700 MiB/s) staging volume for the detached uploader.
+#   * -Spotpick                        : on a capacity error at launch, fall back down the 128-vCPU
+#       capacity-diverse chain (c6i/c6a/c6in/c6id/m6i/c7a -- all >=256 GB; the x86-64-v3 build-cache
+#       .so runs on all of them). c6i.32xlarge stays the head of the chain.
 #   * -V3SnapshotAvg -V3SnapStart 1600 : 8% of target (v3 rule verbatim).
 #   * -RowBudget 550000000             : G8 RAM backstop on max(strat,cum), NOW ACTUALLY EXPORTED
 #       (the v3 amendment registered 550M but no export existed -- the driver ran its 400M
@@ -71,7 +80,10 @@
     -NumBuckets 200 `
     -EmdFrozen "" `
     -RiverOchs "" `
-    -CheckpointEvery 2500 `
+    -CheckpointEvery 1000 `
+    -GateEvery 2500 `
+    -CkptVolumeGb 400 `
     -InstanceType "c6i.32xlarge" `
+    -Spotpick `
     -NoConvergeStop `
     @args

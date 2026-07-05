@@ -3271,7 +3271,13 @@ fn write_map_sharded<'a>(
     // f64-width for BOTH maps regardless of the in-memory cum precision.
     let mut pairs: Vec<(&[u8; 16], [f64; NUM_ACTIONS])> = all.collect();
     debug_assert_eq!(pairs.len(), total_len);
-    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    // PERF-ONLY (arm-2 spot-resilience ops, 2026-07-05): parallel unstable sort. Keys are UNIQUE
+    // (HashMap keys; `shard_of` routes each key to exactly one shard), so unstable-vs-stable cannot
+    // reorder equal elements and the blob stays BYTE-IDENTICAL to the serial `sort_by` (verified:
+    // ab_train smoke blob sha unchanged pre/post). Rationale: at the bpv4 fullhist scale (~655M
+    // rows, ~58 GB blob) the serial sort dominated the per-checkpoint training pause (~140 MB/s
+    // measured => ~7-10 min); with the S3 upload now detached, serialize IS the pause.
+    pairs.par_sort_unstable_by(|a, b| a.0.cmp(b.0));
     for (key, row) in pairs {
         out.extend_from_slice(&key[..]); // fixed 16-byte key (no length prefix needed)
         for &v in &row {

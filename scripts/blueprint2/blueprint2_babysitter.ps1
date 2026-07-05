@@ -24,6 +24,12 @@ param(
   [string]$RiverOchs = "data/abstraction/river_ochs_160.rochs",  # blueprint-v2 river OCHS table
   [string]$DepthEdges = "",           # non-depth blueprint (depth randomization deliberately deferred)
   [int]$CheckpointEvery = 500,
+  [int]$GateEvery = 0,                # --gate-every (fullhist arms: pre-registered gate/measurement
+                                      #   cadence; rolling checkpoints every -CheckpointEvery are
+                                      #   resume-only, pruned to newest 3 + all gate-cadence ones.
+                                      #   0 = omit = legacy: every checkpoint is a gate)
+  [int]$CkptVolumeGb = 0,             # --ckpt-volume-gb (root gp3 size for local checkpoint staging;
+                                      #   0 = omit = launcher default: 400 GB on fullhist/M-RR arms)
   # --- LEVERS ---
   [switch]$PreflopHistKey,            # blueprint-v3: pass --preflop-hist-key (POKERBOT_PREFLOP_HIST_KEY=1
                                       #   on the box; the aliasing fix). Serve MUST then use the same env
@@ -148,17 +154,32 @@ function Get-StateById([string]$id) {
   if ($s) { return $s.Trim() } else { return "" }
 }
 function Get-LatestItersDone {
-  $tmp = Join-Path $env:TEMP "bp2_latest_probe.nlcfr"
-  aws s3 cp "s3://$Bucket/$LATEST" $tmp --region $Region --no-progress 2>$null | Out-Null
+  # NEW (arm-2 spot-resilience ops, 2026-07-05): prefer the tiny iter_XXXXXX.nlcfr.ok markers the
+  # detached uploader writes AFTER each complete upload -- iters parsed from the KEY NAME, nothing
+  # downloaded. The old path downloaded the ENTIRE latest.nlcfr (up to ~58 GB on fullhist arms!)
+  # every poll just to read 16 header bytes. Markers also mean progress is only ever counted for
+  # DURABLE checkpoints (a partial upload has no marker).
+  $keys = (aws s3api list-objects-v2 --bucket $Bucket --prefix "$RUN_PREFIX/checkpoints/" `
+           --query "Contents[].Key" --output text --region $Region 2>$null)
+  if ($keys) {
+    $best = [int64]-1
+    foreach ($k in ($keys -split "\s+")) {
+      if ($k -match "iter_(\d+)\.nlcfr\.ok$") {
+        $v = [int64]$Matches[1]
+        if ($v -gt $best) { $best = $v }
+      }
+    }
+    if ($best -ge 0) { return $best }
+  }
+  # Legacy runs (no markers): read ONLY the 16-byte NLCFR001 header of latest.nlcfr via a ranged GET.
+  $tmp = Join-Path $env:TEMP "bp2_latest_probe.hdr"
+  aws s3api get-object --bucket $Bucket --key $LATEST --range "bytes=0-15" $tmp --region $Region 2>$null | Out-Null
   if (-not (Test-Path $tmp)) { return -1 }
   try {
-    $fs = [System.IO.File]::OpenRead($tmp)
-    try {
-      $buf = New-Object byte[] 16
-      if ($fs.Read($buf, 0, 16) -lt 16) { return -1 }
-      if ([System.Text.Encoding]::ASCII.GetString($buf, 0, 8) -ne "NLCFR001") { return -1 }
-      return [int64][System.BitConverter]::ToUInt64($buf, 8)
-    } finally { $fs.Close() }
+    $buf = [System.IO.File]::ReadAllBytes($tmp)
+    if ($buf.Length -lt 16) { return -1 }
+    if ([System.Text.Encoding]::ASCII.GetString($buf, 0, 8) -ne "NLCFR001") { return -1 }
+    return [int64][System.BitConverter]::ToUInt64($buf, 8)
   } catch { return -1 } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
 }
 function Stop-Run {
@@ -188,6 +209,8 @@ function Invoke-Launch {
     "--max-hours", ($MaxHours + 1),
     "--instance-type", $InstanceType, "--arch", $Arch
   )
+  if ($GateEvery -gt 0)    { $argsList += @("--gate-every", $GateEvery) }
+  if ($CkptVolumeGb -gt 0) { $argsList += @("--ckpt-volume-gb", $CkptVolumeGb) }
   if ($EmdFrozen)  { $argsList += @("--emd-frozen", $EmdFrozen) }
   if ($RiverOchs)  { $argsList += @("--river-ochs", $RiverOchs) }
   if ($DepthEdges) { $argsList += @("--depth-edges", $DepthEdges) }
@@ -327,7 +350,9 @@ if ($convergedStop) {
   Write-Host "Run COMPLETE (iters backstop)." -ForegroundColor Green
 } else {
   Write-Host "Run NOT complete (hit a cap or stall). The S3 latest checkpoint is preserved for a manual resume:" -ForegroundColor Yellow
-  $resume = "python scripts\launch_native_cfr_training_spot.py --run-subdir $Run --iters $Iters --n-deals $NDeals --num-buckets $NumBuckets"
+  $resume = "python scripts\launch_native_cfr_training_spot.py --run-subdir $Run --iters $Iters --n-deals $NDeals --num-buckets $NumBuckets --checkpoint-every $CheckpointEvery"
+  if ($GateEvery -gt 0) { $resume += " --gate-every $GateEvery" }
+  if ($CkptVolumeGb -gt 0) { $resume += " --ckpt-volume-gb $CkptVolumeGb" }
   if ($EmdFrozen) { $resume += " --emd-frozen $EmdFrozen" }
   if ($RiverOchs) { $resume += " --river-ochs $RiverOchs" }
   if ($PreflopHistKey) { $resume += " --preflop-hist-key" }
@@ -345,5 +370,7 @@ if ($convergedStop) {
 }
 if ($final -ge 0 -and ($convergedStop -or $final -ge $Iters)) {
   Write-Host "Download the final checkpoint, then follow README_LAUNCH.md 'AFTER THE RUN':" -ForegroundColor Green
-  Write-Host "  aws s3 cp s3://$Bucket/$LATEST runs\native_cfr\$Run.nlcfr --region $Region"
+  $finalKey = "$RUN_PREFIX/checkpoints/iter_{0:d6}.nlcfr" -f $final
+  Write-Host "  aws s3 cp s3://$Bucket/$finalKey runs\native_cfr\$Run.nlcfr --region $Region"
+  Write-Host "  (legacy runs without .ok markers keep the old pointer: s3://$Bucket/$LATEST)"
 }

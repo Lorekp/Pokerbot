@@ -283,16 +283,26 @@ fn main() {
     for i in (already + 1)..=iters {
         tab.train_iteration(&cfg);
         if checkpoints.binary_search(&i).is_ok() {
+            // Time serialize + local write separately (ops instrumentation for the cloud driver's
+            // checkpoint-pause budget: serialize+write is the ONLY training pause once the S3 upload
+            // is detached — see the arm-2 operational addendum). No effect on the blob bytes.
+            let t_ser = std::time::Instant::now();
             let blob = serialize(&tab);
+            let ser_s = t_ser.elapsed().as_secs_f64();
             let p = ckpt_path(i);
             let tmp = p.with_extension("nlcfr.tmp");
+            let t_wr = std::time::Instant::now();
             std::fs::write(&tmp, &blob).expect("write checkpoint tmp");
             std::fs::rename(&tmp, &p).expect("rename checkpoint");
+            let wr_s = t_wr.elapsed().as_secs_f64();
             eprintln!(
-                "[ab_train] CHECKPOINT iter={} strat_rows={} bytes={} -> {}",
+                "[ab_train] CHECKPOINT iter={} strat_rows={} bytes={} serialize_s={:.2} \
+                 write_s={:.2} -> {}",
                 i,
                 tab.n_strat_infosets(),
                 blob.len(),
+                ser_s,
+                wr_s,
                 p.display()
             );
             ckpt_extras(&tab, &cfg, i);
