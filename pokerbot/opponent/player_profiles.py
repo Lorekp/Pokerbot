@@ -28,6 +28,19 @@ from pokerbot.opponent.context import (
 from pokerbot.opponent.population_prior import context_prior as _context_prior
 from pokerbot.opponent.stats import OpponentStats
 
+
+def _prior_per_bin(stats: "OpponentStats", ck: str) -> list[float]:
+    """The ingest decay-floor prior for one context. P2 seam (design §A1): under
+    POKERBOT_ARCHETYPE_PRIOR the player-conditional archetype mixture; default OFF => exactly
+    the legacy ``population_prior.context_prior`` (byte-identical)."""
+    try:
+        from pokerbot.opponent.archetype_prior import enabled, prior_for
+        if enabled():
+            return prior_for(stats, ck)
+    except Exception:  # noqa: BLE001 — the prior seam must never break ingest
+        pass
+    return _context_prior(ck)
+
 DEFAULT_PATH = "data/player_profiles/profiles.json"
 # v1 = scalar-only; v2 adds per-context Dirichlet counts; v3 adds dual-timescale discounted counts
 # (ctx_fast/ctx_slow/ctx_last) for non-stationarity; v4 adds the BOCPD run-length (ctx_runlen);
@@ -601,7 +614,10 @@ class PlayerProfileStore:
             for ck, bins in (inc.get("_ctx") or {}).items():
                 s.add_ctx(ck, bins)  # lifetime cumulative counts (archetype / static posterior)
                 # dual-timescale discounted counts (non-stationarity); s.hands is now this hand's index
-                s.decay_and_add(ck, bins, _context_prior(ck), s.hands)
+                # P2 (POKERBOT_ARCHETYPE_PRIOR, default OFF until gate G-P2 passes): the decay
+                # floor becomes the player-conditional modern archetype-mixture prior instead of
+                # the IRC limit-era point prior. OFF => byte-identical ingest.
+                s.decay_and_add(ck, bins, _prior_per_bin(s, ck), s.hands)
             # Showdown-ground-truthed bluff/value evidence (v5). Same-hand second call decays by
             # Δ=0 ⇒ no double discount. Capture-confidence weighting (floor 0.5): the Mono-bridge
             # collector is exact (no field ⇒ 1.0); an OCR-sourced record carrying "confidence"
