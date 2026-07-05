@@ -984,6 +984,18 @@ pub struct V3Cfg {
     /// Pluribus linear-CFR trainer mode: signed regrets + LCFR discount schedule + unweighted
     /// strat accumulation. `false` => CFR+ (positive floor, w=t) — byte-identical legacy.
     pub lcfr: bool,
+    /// blueprint-v4 ARM-2 mode (`artifacts/blueprint_v4_arm2_amendment.md`): SIGNED regrets with
+    /// the deep `regret_floor` + hard negative-regret pruning, but **NO LCFR discount events and
+    /// NO averaging change** — strat accumulation stays CFR+'s w=t linear weighting. This is the
+    /// v3-closeout-mandated decomposition: pruning's coverage benefit (v3 postflop miss 61.3% vs
+    /// CFR+ 71.2% at 20k) WITHOUT LCFR's shape damage (the discount decays correctly-trained early
+    /// opening regrets, so v3 rebuilt the limp-trap FASTER than CFR+ — closeout §3). Ignored when
+    /// `lcfr` is true (LCFR mode already implies signed regrets; the two are mutually exclusive at
+    /// the launcher). No in-traversal float op changes under this flag (regret_matching already
+    /// reads `max(0,·)` and the floor is a post-merge pass), so the batched-path guard needs no new
+    /// term: a finite prune threshold already forces the recursive path, and before `prune_start`
+    /// the batched float ops are the verbatim legacy ones.
+    pub signed_regrets: bool,
     /// LCFR discount interval D in ITERATIONS (Pluribus: 10 minutes). 0 disables discount events
     /// (mode still keeps signed regrets when `lcfr` is true).
     pub lcfr_d: u64,
@@ -1015,6 +1027,7 @@ impl Default for V3Cfg {
     fn default() -> Self {
         V3Cfg {
             lcfr: false,
+            signed_regrets: false,
             lcfr_d: 0,
             lcfr_w: 0,
             prune_c: f64::NEG_INFINITY,
@@ -1030,11 +1043,13 @@ impl V3Cfg {
     /// True when any v3 behavior is enabled (used by the batched-MLP fallback guard: the batched
     /// path replicates the LEGACY float ops verbatim and does not support the v3 modes).
     pub fn active(&self) -> bool {
-        self.lcfr || self.snapshot_avg
+        self.lcfr || self.signed_regrets || self.snapshot_avg
     }
 
     /// Read the v3 schedule from the environment (the launcher/ab_train surface):
     ///   POKERBOT_LCFR=1           enable the Pluribus LCFR trainer mode
+    ///   POKERBOT_SIGNED_REGRETS=1 arm-2 mode: signed regrets + floor + pruning, NO discount,
+    ///                             w=t linear averaging kept (mutually exclusive with LCFR)
     ///   POKERBOT_LCFR_D           discount interval D iters (default 250)
     ///   POKERBOT_LCFR_W           discount window W iters (default 10000)
     ///   POKERBOT_PRUNE_C          hard prune threshold C in bb (default off; try the calibrated
@@ -1056,6 +1071,7 @@ impl V3Cfg {
                 .unwrap_or(false)
         }
         let lcfr = envb("POKERBOT_LCFR");
+        let signed_regrets = envb("POKERBOT_SIGNED_REGRETS");
         let lcfr_d = envu("POKERBOT_LCFR_D").unwrap_or(250);
         let lcfr_w = envu("POKERBOT_LCFR_W").unwrap_or(10_000);
         let prune_c = envf("POKERBOT_PRUNE_C").unwrap_or(f64::NEG_INFINITY);
@@ -1068,6 +1084,7 @@ impl V3Cfg {
         });
         V3Cfg {
             lcfr,
+            signed_regrets,
             lcfr_d,
             lcfr_w,
             prune_c,
@@ -1169,11 +1186,11 @@ fn dcfr_prune_node_allowed(street: i32, eff_prune: f64) -> bool {
 /// other ~95% returns the deeply-negative `cfg.dcfr_prune_threshold` so RBP fires. Decided ONCE per
 /// iteration (not per action).
 ///
-/// v3 LCFR mode (`v3.lcfr` ON, `dcfr` OFF): the SAME per-iteration explore coin, but with the v3 hard
-/// prune constants — from iteration `v3.prune_start`, non-explore iterations prune at `v3.prune_c`
-/// (finite => hard pruning active; regrets are signed in this mode so it actually fires). Before
-/// `prune_start`, or with `prune_c = NEG_INFINITY`, pruning stays off. DCFR takes precedence if both
-/// are (mis)configured on.
+/// v3 LCFR mode (`v3.lcfr` ON, `dcfr` OFF) or arm-2 signed-regrets mode (`v3.signed_regrets` ON):
+/// the SAME per-iteration explore coin, but with the v3 hard prune constants — from iteration
+/// `v3.prune_start`, non-explore iterations prune at `v3.prune_c` (finite => hard pruning active;
+/// regrets are signed in both modes so it actually fires). Before `prune_start`, or with
+/// `prune_c = NEG_INFINITY`, pruning stays off. DCFR takes precedence if both are (mis)configured on.
 #[inline]
 fn effective_prune_threshold(cfg: &TrainerCfg, iter_seed: u64, t: u64, v3: &V3Cfg) -> f64 {
     if dcfr_enabled(cfg) {
@@ -1183,7 +1200,7 @@ fn effective_prune_threshold(cfg: &TrainerCfg, iter_seed: u64, t: u64, v3: &V3Cf
             cfg.dcfr_prune_threshold
         };
     }
-    if v3.lcfr && v3.prune_c.is_finite() && t >= v3.prune_start.max(1) {
+    if (v3.lcfr || v3.signed_regrets) && v3.prune_c.is_finite() && t >= v3.prune_start.max(1) {
         return if dcfr_is_explore_iter(iter_seed, v3.prune_explore) {
             f64::NEG_INFINITY
         } else {
@@ -2601,9 +2618,12 @@ impl NlheTables {
             // DCFR (CHANGE B): keep SIGNED regret and DISCOUNT it (no positive floor) so the prune hook's
             // negative-regret signal survives. Replaces `floor_cum_regret` for this iteration.
             self.apply_dcfr_discount(t);
-        } else if v3.lcfr {
+        } else if v3.lcfr || v3.signed_regrets {
             // v3 LCFR (Pluribus): keep SIGNED regret, clamp at `regret_floor`, and on schedule apply the
-            // (t/D)/((t/D)+1) discount to ALL regrets and average-strategy rows.
+            // (t/D)/((t/D)+1) discount to ALL regrets and average-strategy rows. Arm-2 signed-regrets
+            // mode reaches the same pass but `apply_lcfr` fires NO discount events (`event` requires
+            // `v3.lcfr`), so it is floor-only: signed regrets survive, pruning stays meaningful, and
+            // the strat accumulation upstream kept CFR+'s w=t.
             self.apply_lcfr(t, v3);
         } else {
             // CFR+ default: positive-regret floor (byte-identical to today).
@@ -2991,9 +3011,13 @@ impl NlheTables {
     ///      10 wall-minutes, W = 400 wall-minutes; ours is iteration-denominated because wall-clock
     ///      schedules do not transfer across hardware — amendment doc §2 has the mapping).
     /// Per-element ops are order-independent (scale + clamp), so parallel-over-shards is safe, exactly
-    /// like `floor_cum_regret` / `apply_dcfr_discount`. Never reached when `v3.lcfr` is false.
+    /// like `floor_cum_regret` / `apply_dcfr_discount`. Reached when `v3.lcfr` (floor + scheduled
+    /// discount) OR `v3.signed_regrets` (arm 2: floor-only — `event` below requires `v3.lcfr`).
     fn apply_lcfr(&mut self, t: u64, v3: &V3Cfg) {
-        let event = v3.lcfr_d > 0 && t <= v3.lcfr_w && t % v3.lcfr_d == 0;
+        // Discount events require `v3.lcfr` explicitly: in arm-2 `signed_regrets` mode this pass is
+        // FLOOR-ONLY even though `lcfr_d`/`lcfr_w` carry their env defaults (250/10000) — the
+        // whole point of arm 2 is pruning WITHOUT the LCFR discount's early-regret decay.
+        let event = v3.lcfr && v3.lcfr_d > 0 && t <= v3.lcfr_w && t % v3.lcfr_d == 0;
         let factor = if event {
             let k = (t / v3.lcfr_d) as f64;
             k / (k + 1.0)
@@ -3059,7 +3083,7 @@ impl NlheTables {
         let floor_start = Instant::now();
         if dcfr_enabled(cfg) {
             self.apply_dcfr_discount(t);
-        } else if v3.lcfr {
+        } else if v3.lcfr || v3.signed_regrets {
             self.apply_lcfr(t, v3);
         } else {
             self.floor_cum_regret();
@@ -5850,6 +5874,98 @@ mod tests {
         assert!(saw_negative, "LCFR mode floored negatives away (should keep signed regret)");
     }
 
+    /// Arm-2 `signed_regrets` mode (blueprint_v4_arm2_amendment.md): signed regrets like LCFR mode,
+    /// but the average-strategy accumulation KEEPS CFR+'s w=t linear weighting. From an identical
+    /// (empty) start at t=5 the single iteration's traversals coincide (regret-matching reads
+    /// `max(0,·)` of an empty table either way), so the strat_sum table must be BYTE-IDENTICAL to
+    /// the classic CFR+ run (SAME w=t — contrast `lcfr_signed_regret_and_unweighted_strat`, where
+    /// the LCFR row is classic/5), while the cum table keeps signed values whose positive part
+    /// equals the classic table. NOTE: beyond one iteration the two arms genuinely diverge — signed
+    /// regret is vanilla-CFR regret memory (`max(0, raw+inc) != max(0, max(0,raw)+inc)`); an action
+    /// must dig out of its negative hole to revive. That memory is exactly what makes the hard prune
+    /// threshold meaningful, so a multi-iteration byte-compare is deliberately NOT asserted.
+    #[test]
+    fn signed_regrets_keeps_wt_strat_and_signed_cum() {
+        let cfg = test_cfg(64);
+        let mut classic = NlheTables::new();
+        let mut signed = NlheTables::new();
+        classic.iters_done = 4; // next iteration is t=5 (w = t = 5 on both arms)
+        signed.iters_done = 4;
+        let v3 = V3Cfg { signed_regrets: true, ..V3Cfg::default() };
+        classic.train_iteration_v3(&cfg, &V3Cfg::default());
+        signed.train_iteration_v3(&cfg, &v3);
+        // strat_sum: w=t on BOTH arms + identical traversals => byte-identical rows.
+        assert_eq!(
+            classic.total_strat_len(),
+            signed.total_strat_len(),
+            "strat key sets differ"
+        );
+        for (k, row) in signed.iter_all_strat() {
+            let c = classic.shards[shard_of(k)]
+                .strat_sum
+                .get(k)
+                .expect("strat key set must match");
+            for a in 0..NUM_ACTIONS {
+                assert_eq!(c[a], row[a], "w=t strat mismatch at lane {a}");
+            }
+        }
+        // cum: classic must be the positive part; some negative must survive (no CFR+ floor).
+        let mut saw_negative = false;
+        for (k, row) in signed.iter_all_cum() {
+            let widened = widen_r(row);
+            let c = widen_r(
+                classic.shards[shard_of(k)]
+                    .cum_regret
+                    .get(k)
+                    .expect("cum key set must match"),
+            );
+            for a in 0..NUM_ACTIONS {
+                if widened[a] < 0.0 {
+                    saw_negative = true;
+                }
+                assert_eq!(c[a], widened[a].max(0.0), "classic must be the positive part");
+            }
+        }
+        assert!(saw_negative, "signed_regrets mode floored negatives away");
+    }
+
+    /// Arm-2 `signed_regrets` mode fires NO LCFR discount events even when `lcfr_d`/`lcfr_w` carry
+    /// live values (they default to 250/10000 from the env reader): `apply_lcfr` must be FLOOR-ONLY.
+    #[test]
+    fn signed_regrets_never_discounts() {
+        let key1 = [1u8; 16];
+        let key2 = [2u8; 16];
+        let mut tab = NlheTables::new();
+        {
+            let sh = &mut tab.shards[shard_of(&key1)];
+            let mut r = ZEROS_R;
+            r[0] = 10.0 as RegretT;
+            r[1] = -4.0 as RegretT;
+            r[3] = -100.0 as RegretT;
+            sh.cum_regret.insert(key1, r);
+        }
+        {
+            let sh = &mut tab.shards[shard_of(&key2)];
+            let mut ss = ZEROS;
+            ss[2] = 6.0;
+            sh.strat_sum.insert(key2, ss);
+        }
+        let v3 = V3Cfg {
+            signed_regrets: true,
+            lcfr_d: 10, // would be a discount event at t=20 under lcfr mode
+            lcfr_w: 30,
+            regret_floor: -3.0,
+            ..V3Cfg::default()
+        };
+        tab.apply_lcfr(20, &v3); // t % lcfr_d == 0 and t <= lcfr_w — MUST still not discount
+        let r1 = widen_r(tab.shards[shard_of(&key1)].cum_regret.get(&key1).unwrap());
+        assert_eq!(r1[0], 10.0, "signed_regrets discounted a positive regret");
+        assert_eq!(r1[1], -3.0, "floor must clamp -4 to regret_floor");
+        assert_eq!(r1[3], -3.0, "floor must clamp -100 to regret_floor");
+        let s2 = *tab.shards[shard_of(&key2)].strat_sum.get(&key2).unwrap();
+        assert_eq!(s2[2], 6.0, "signed_regrets discounted a strat_sum row");
+    }
+
     /// v3 hard pruning fires under the LCFR schedule and honors the Pluribus rules: never on the
     /// river, never a terminal-leading action, only from `prune_start`, and the floor bounds stored
     /// regret. Mirrors `rbp_never_prunes_last_betting_round` but drives the v3 (non-DCFR) path.
@@ -5963,6 +6079,18 @@ mod tests {
             effective_prune_threshold(&cfg, 7, 200, &v3off),
             cfg.prune_threshold,
             "lcfr off => legacy threshold"
+        );
+        // Arm-2: signed_regrets alone (lcfr off) must activate the SAME v3 prune constants.
+        let v3sr = V3Cfg { signed_regrets: true, ..v3off };
+        assert_eq!(
+            effective_prune_threshold(&cfg, 7, 200, &v3sr),
+            -1000.0,
+            "signed_regrets must activate hard pruning"
+        );
+        assert_eq!(
+            effective_prune_threshold(&cfg, 7, 50, &v3sr),
+            f64::NEG_INFINITY,
+            "signed_regrets before prune_start"
         );
         let mut cfg_dcfr = test_cfg(8);
         cfg_dcfr.dcfr = true;

@@ -21,6 +21,8 @@
 //! blueprint-v4 v3 trainer schedule (artifacts/blueprint_v4_amendment_v3.md; all default-off =>
 //! byte-identical, read by trainer::V3Cfg::from_env inside the lib):
 //!
+//!   POKERBOT_SIGNED_REGRETS=1    arm-2 mode: signed regrets + regret floor + hard pruning, NO
+//!                                LCFR discount, CFR+ w=t averaging kept (excl. with LCFR).
 //!   POKERBOT_LCFR=1              Pluribus Linear-CFR mode: signed regrets + periodic discount +
 //!                                unweighted average accumulation.
 //!   POKERBOT_LCFR_D / _W         discount interval / window in ITERATIONS (defaults 250 / 10000).
@@ -135,10 +137,11 @@ fn main() {
         .unwrap_or(0);
     let regstats = env_flag("POKERBOT_REGSTATS");
     eprintln!(
-        "[ab_train] v3: lcfr={} lcfr_d={} lcfr_w={} prune_c={} prune_start={} prune_explore={} \
-         regret_floor={} snapshot_avg={} snap_start={snap_start} cov_hands={cov_hands} \
-         regstats={regstats}",
+        "[ab_train] v3: lcfr={} signed_regrets={} lcfr_d={} lcfr_w={} prune_c={} prune_start={} \
+         prune_explore={} regret_floor={} snapshot_avg={} snap_start={snap_start} \
+         cov_hands={cov_hands} regstats={regstats}",
         v3.lcfr,
+        v3.signed_regrets,
         v3.lcfr_d,
         v3.lcfr_w,
         v3.prune_c,
