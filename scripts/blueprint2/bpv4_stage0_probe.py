@@ -3,8 +3,18 @@
 
 Runs bp3_forced_response_probe.py `rollout` (8 shards x 5000 deals, seed 13, hands AA and K9s)
 against one arm's checkpoint with the arm's env (key mode / postflop mode / K), then `merge`.
-Shards run as parallel subprocesses (each is single-threaded Python). Adapter fallback rate MUST
-be 0.0000 in every shard (else the serve twin is broken — abort, fix parity, rerun).
+Shards run as parallel subprocesses (each is single-threaded Python).
+
+TWO sanity gates per shard:
+  * ``adapter_fallback_rate == 0`` — catches a BROKEN serve twin (bridge/lookup EXCEPTION or an
+    all-zero row). NOTE: this does NOT detect a fingerprint MISS — a miss returns a valid
+    uniform-legal distribution, so it is silently absorbed and never increments fallback_count.
+  * ``postflop miss-rate`` (flop/turn/river fingerprint misses, POKERBOT_BP_COVERAGE) <=
+    ``--max-postflop-miss`` — the REAL train/probe skew signal. Under the vast fullhist key space the
+    postflop TAIL misses far more than the summary control and is served as uniform-random play, which
+    biases EV(open)-EV(limp) in an arm-dependent way (the exact axis A1/A2 rest on). A shard whose
+    postflop miss-rate exceeds the bar FAILS: the G5 verdict from that arm is NOT trustworthy until the
+    probe is made MRR-aware / the arm is better visited.
 
 Usage:
   python scripts/blueprint2/bpv4_stage0_probe.py --arm H200 \
@@ -38,6 +48,11 @@ def main() -> int:
     ap.add_argument("--parallel", type=int, default=6)
     ap.add_argument("--seed", type=int, default=13)
     ap.add_argument("--hands", default="AA,K9s")
+    ap.add_argument("--max-postflop-miss", type=float, default=0.02,
+                    help="fail a shard whose flop/turn/river fingerprint miss-rate exceeds this (the "
+                         "fullhist train/probe skew signal adapter_fallback_rate cannot see). Default "
+                         "0.02 (2%%). Raise deliberately only if the differential vs the summary control "
+                         "is understood.")
     args = ap.parse_args()
 
     hands = [h.strip() for h in args.hands.split(",") if h.strip()]
@@ -84,10 +99,23 @@ def main() -> int:
             else:
                 d = json.load(open(out, encoding="utf-8"))
                 fb = d["adapter_fallback_rate"]
+                cov = d.get("bp_coverage", {}) or {}
+                pf_h = sum(cov.get(st, {}).get("hits", 0) for st in ("flop", "turn", "river"))
+                pf_m = sum(cov.get(st, {}).get("misses", 0) for st in ("flop", "turn", "river"))
+                pf_miss = pf_m / max(1, pf_h + pf_m)
                 print(f"[{args.arm}] done {hand} shard {s}: {d['deals']} deals "
-                      f"fallback={fb:.4f} wall={d['wall_s']:.0f}s", flush=True)
+                      f"fallback={fb:.4f} postflop_miss={pf_miss:.4f} [{pf_m}/{pf_h + pf_m}] "
+                      f"wall={d['wall_s']:.0f}s", flush=True)
                 if fb > 0.0:
                     fails.append((hand, s, f"fallback {fb}"))
+                # The fingerprint-miss gate adapter_fallback_rate cannot provide: a high postflop
+                # miss-rate means much of this arm's downstream play was uniform-random (train/probe
+                # abstraction skew), so its EV(open)-EV(limp) is not trustworthy.
+                if not cov:
+                    fails.append((hand, s, "no bp_coverage recorded (POKERBOT_BP_COVERAGE off?)"))
+                elif pf_miss > args.max_postflop_miss:
+                    fails.append((hand, s, f"postflop miss-rate {pf_miss:.4f} > "
+                                           f"{args.max_postflop_miss:.4f}"))
         running = still
     if fails:
         print(f"[{args.arm}] PROBE FAILED shards: {fails} — twin broken? fix parity, rerun",
@@ -102,6 +130,8 @@ def main() -> int:
     d = json.load(open(merged, encoding="utf-8"))
     print(f"\n[{args.arm}] G5 verdict inputs (paired vs limp, bb/100):")
     for hand, h in d["hands"].items():
+        pf = h.get("postflop_miss_rate", 0.0)
+        print(f"  {hand} postflop_miss_rate={pf:.4f} (bp_coverage={h.get('bp_coverage', {})})")
         for k, v in h["paired_vs_limp"].items():
             print(f"  {hand} {k}: {v['delta_bb100']:+.1f} ± {v['se_bb100']:.1f}")
         for a, s in h["arms"].items():

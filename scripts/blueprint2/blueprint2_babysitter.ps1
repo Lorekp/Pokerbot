@@ -28,6 +28,12 @@ param(
   [switch]$PreflopHistKey,            # blueprint-v3: pass --preflop-hist-key (POKERBOT_PREFLOP_HIST_KEY=1
                                       #   on the box; the aliasing fix). Serve MUST then use the same env
                                       #   (ship_blueprint --preflop-hist-key). Use via bp3_prefhist_babysitter.ps1.
+  [switch]$FullHistKey,               # blueprint-v4 Stage-0: pass --fullhist-key (POKERBOT_FULLHIST_KEY=1 on
+                                      #   the box; full action-history key on EVERY street). Pair with -Mrr.
+                                      #   Serve/eval MUST use the same env. Use via bpv4_stage0_babysitter.ps1.
+  [switch]$Mrr,                       # blueprint-v4 Stage-0: pass --mrr (POKERBOT_MRR=1; M-RR action-thinning
+                                      #   that makes fullhist convergent, ~10^31 -> ~413M rows). Probe/eval
+                                      #   MUST also set POKERBOT_MRR=1 (train/probe abstraction-skew guard).
   [switch]$WorkSteal,                 # pass --work-steal (+33% deals/s @64c measured; pass it)
   [switch]$Dcfr,                      # NOT recommended (CFR+ > DCFR at iter16000 for 6-max)
   [double]$DcfrPruneThreshold = -300000.0,
@@ -167,6 +173,8 @@ function Invoke-Launch {
   if ($RiverOchs)  { $argsList += @("--river-ochs", $RiverOchs) }
   if ($DepthEdges) { $argsList += @("--depth-edges", $DepthEdges) }
   if ($PreflopHistKey) { $argsList += "--preflop-hist-key" }
+  if ($FullHistKey) { $argsList += "--fullhist-key" }
+  if ($Mrr)        { $argsList += "--mrr" }
   if ($WorkSteal)  { $argsList += "--work-steal" }
   if ($Dcfr)       { $argsList += @("--dcfr", "--dcfr-prune-threshold", $DcfrPruneThreshold,
                                     "--dcfr-explore-frac", $DcfrExploreFrac) }
@@ -183,7 +191,7 @@ function Invoke-Launch {
 }
 
 $capH = [int]($MAXSEC / 3600)
-$leverTxt = (@(if ($PreflopHistKey) { "preflop_hist_key" }; if ($WorkSteal) { "work_steal" }; if ($Dcfr) { "dcfr" }) -join "+"); if (-not $leverTxt) { $leverTxt = "NONE (baseline)" }
+$leverTxt = (@(if ($PreflopHistKey) { "preflop_hist_key" }; if ($FullHistKey) { "fullhist_key" }; if ($Mrr) { "mrr" }; if ($WorkSteal) { "work_steal" }; if ($Dcfr) { "dcfr" }) -join "+"); if (-not $leverTxt) { $leverTxt = "NONE (baseline)" }
 Write-Host "=== blueprint-v2 babysitter: $Run ===" -ForegroundColor Cyan
 Write-Host "    target=$Iters it  n_deals=$NDeals  flop/turn=EMD K$NumBuckets  river=OCHS ($([System.IO.Path]::GetFileName($RiverOchs)))"
 Write-Host "    LEVERS=$leverTxt" -ForegroundColor Green
@@ -279,6 +287,8 @@ if ($convergedStop) {
   if ($EmdFrozen) { $resume += " --emd-frozen $EmdFrozen" }
   if ($RiverOchs) { $resume += " --river-ochs $RiverOchs" }
   if ($PreflopHistKey) { $resume += " --preflop-hist-key" }
+  if ($FullHistKey) { $resume += " --fullhist-key" }
+  if ($Mrr) { $resume += " --mrr" }
   if ($WorkSteal) { $resume += " --work-steal" }
   Write-Host "  $resume"
 }

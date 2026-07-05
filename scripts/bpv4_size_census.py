@@ -124,11 +124,25 @@ def action_amount(a, action):
         return to_call + max(target - committed, 0)
     return 0
 
-def allowed_actions(state, a, pre_mask, post_mask, dedupe):
-    """legal AND menu, with equal-final-commit aggressive actions deduped (lowest idx kept)."""
+def allowed_actions(state, a, pre_mask, post_mask, dedupe, mrr=False):
+    """legal AND menu, with equal-final-commit aggressive actions deduped (lowest idx kept).
+
+    mrr=True applies Pluribus's deep-node rule (design M-RR, §4.2.2 / P-supp p.12-13): POSTFLOP,
+    a RE-raise (raising while FACING a live bet) is thinned to {1x pot, all-in}; the FIRST bet of
+    a street keeps the full postflop menu. This is action-abstraction thinning (perfect recall of
+    the *thinned* actions preserved), NOT history/key truncation — the design's "structural relief
+    valve, ahead of key truncation" that collapses the ~10^30 history space toward Pluribus's
+    finite 664.8M-class scale."""
     legal = bn.legal_action_mask(state, -1)
-    menu = pre_mask if int(a[O_STREET]) == 0 else post_mask
+    street = int(a[O_STREET])
+    menu = pre_mask if street == 0 else post_mask
     acts = [i for i in range(11) if legal[i] and menu[i]]
+    if mrr and street >= 1:
+        seat = int(a[O_ACTION_SEAT])
+        facing_bet = int(a[O_CURRENT_BET]) > int(a[O_COMMITTED_STREET + seat])
+        if facing_bet:  # RE-raise decision -> thin raise sizes to {1x pot, all-in}
+            keep = {FOLD, CHECK, CALL, ALL_IN, BET0 + 4}  # BET0+4 = 1.0x pot bucket
+            acts = [i for i in acts if i in keep]
     if not any(acts):
         acts = [i for i in range(11) if legal[i]][:1]  # engine guarantees CHECK fallback
     if not dedupe:
@@ -214,7 +228,8 @@ ZERO = (0, 0, 0, 0, 0, 0, 0, 0)  # d0..d3, e1..e3, terminal-paths
 def add(u, v):
     return tuple(x + y for x, y in zip(u, v))
 
-def enumerate_menu(menu_name, dedupe, max_states, log_every, progress, preflop_only=False):
+def enumerate_menu(menu_name, dedupe, max_states, log_every, progress, preflop_only=False,
+                   mrr=False):
     pre_mask, post_mask = menu_masks(MENUS[menu_name])
     deck = list(range(52))
     root = bn.init_hand(0, [10000] * 6, [1] * 6, 0, deck, [1, 2])
@@ -291,7 +306,7 @@ def enumerate_menu(menu_name, dedupe, max_states, log_every, progress, preflop_o
                     b6 = betting6(a, seat)
                     key_groups.add((pos, b6))
                     key_groups_h3.add((pos, b6, hist3(a)))
-                acts = allowed_actions(state, a, pre_mask, post_mask, dedupe)
+                acts = allowed_actions(state, a, pre_mask, post_mask, dedupe, mrr)
                 frame[1] = [bn.apply_action(state, act) for act in acts]
                 frame[2] = 0
                 frame[3] = tuple(d)
@@ -313,6 +328,7 @@ def enumerate_menu(menu_name, dedupe, max_states, log_every, progress, preflop_o
     res = solve(root)
     return {
         "menu": menu_name,
+        "mrr": mrr,
         "dedupe_equal_amount": dedupe,
         "aborted_at_max_states": aborted[0],
         "distinct_betting_states": len(memo),
@@ -325,7 +341,7 @@ def enumerate_menu(menu_name, dedupe, max_states, log_every, progress, preflop_o
         "elapsed_s": round(time.time() - t0, 1),
     }
 
-def walk_census(menu_name, dedupe, n_deals, seed, progress, snap_every=1000):
+def walk_census(menu_name, dedupe, n_deals, seed, progress, snap_every=1000, mrr=False):
     """Trainer-visitation census: for each deal, run 6 hero traversals (hero branches ALL
     allowed actions; opponents sample ONE uniform-over-allowed). Count distinct FULL-HISTORY
     rows per street: key = (street, actor-derived pos [pre] , card-class/bucket, action hist).
@@ -358,7 +374,7 @@ def walk_census(menu_name, dedupe, n_deals, seed, progress, snap_every=1000):
         rows_summary[street].add(digest)
         rows[street].add((digest[:5], hist))  # digest[:5] carries card-bucket byte-space;
         # (bucket,hist) distinctness == (digest_cardpart,hist): betting6 is hist-redundant
-        acts = allowed_actions(state, a, pre_mask, post_mask, dedupe)
+        acts = allowed_actions(state, a, pre_mask, post_mask, dedupe, mrr)
         if seat == hero:
             for act in acts:
                 traverse(bn.apply_action(state, act), hero)
@@ -388,7 +404,7 @@ def walk_census(menu_name, dedupe, n_deals, seed, progress, snap_every=1000):
             curve.append(snap)
             progress(json.dumps(snap))
     return {
-        "menu": menu_name, "dedupe_equal_amount": dedupe, "deals": done_deals,
+        "menu": menu_name, "mrr": mrr, "dedupe_equal_amount": dedupe, "deals": done_deals,
         "seed": seed,
         "rows_fullhist_final": {"preflop": len(rows[0]), "flop": len(rows[1]),
                                  "turn": len(rows[2]), "river": len(rows[3])},
@@ -409,17 +425,22 @@ def main():
     ap.add_argument("--log-every", type=int, default=200_000)
     ap.add_argument("--out", default="")
     ap.add_argument("--preflop-only", action="store_true")
+    ap.add_argument("--mrr", action="store_true",
+                    help="apply Pluribus deep-node rule: postflop re-raises thinned to {1x pot, all-in}")
     args = ap.parse_args()
 
     def progress(msg):
-        print(f"[census {args.mode} {args.menu}] {msg}", flush=True)
+        tag = "+mrr" if args.mrr else ""
+        print(f"[census {args.mode} {args.menu}{tag}] {msg}", flush=True)
 
     if args.mode == "enumerate":
         res = enumerate_menu(args.menu, not args.no_dedupe, args.max_states,
-                             args.log_every, progress, preflop_only=args.preflop_only)
+                             args.log_every, progress, preflop_only=args.preflop_only,
+                             mrr=args.mrr)
         res["preflop_only"] = args.preflop_only
     else:
-        res = walk_census(args.menu, not args.no_dedupe, args.deals, args.seed, progress)
+        res = walk_census(args.menu, not args.no_dedupe, args.deals, args.seed, progress,
+                          mrr=args.mrr)
     js = json.dumps(res, indent=2)
     print(js)
     if args.out:

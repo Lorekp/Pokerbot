@@ -281,3 +281,155 @@ mirroring 4e above.
   does not carry the river-OCHS keying yet); evals/serve use the Python path — same regime the
   deployed EMD blueprint already runs. Follow-up: port river-OCHS into
   `fingerprint.rs::fingerprint_fast_depth_emd` + `probe_native_emd_parity.py`.
+
+# Blueprint-v4 Stage-0 — cloud FULLHIST arms
+
+Trains the DECISIVE full-action-history-key + M-RR arms to the 45k backstop on a 256 GB spot box,
+runs mid-run kill-gates at 20k/30k, and produces the A1/A2 causal verdict. Design of record:
+`artifacts/blueprint_pluribus_grade_design_v2.md` §5–7. Why cloud: M-RR made fullhist CONVERGENT but
+still Pluribus-scale (~413M rows ≈ 55 GB blob / ~90–110 GB RAM); the local 31 GB box ROW_CAPs at
+~iter 2,200, far below the 40k gates. The SUMMARY controls (S200/S1000) are DONE + validated locally
+(S200@20k reproduces BTN 8.77% open / AA-limp 90.7% — the limp-trap the controls must show), so only
+the FULLHIST arms need the box.
+
+**Arm order (run the box for these in this sequence):**
+1. **H200** — fullhist + M-RR, made-hand K200. The decisive **A1** arm vs the DONE S200 summary
+   control (same K, only the key space differs → isolates the history axis). Launch this first.
+2. **HD200** — H200 with DCFR (`-Dcfr`, a follow-up; the launcher/babysitter DCFR passthrough is the
+   deliverable-1 follow-up — do NOT block H200 on it).
+3. **H1000** — fullhist + M-RR, made-hand K1000. The **A2** card-axis arm (K1000-vs-K200 within
+   fullhist decides whether an EMD re-fit enters Stage 1).
+4. **HE** — fullhist + M-RR + EMD-K160/river-OCHS (the EMD stretch; a SEPARATE launch that re-adds
+   `-EmdFrozen`/`-RiverOchs` and the sha sidecars).
+
+## V0. Pre-flight (BEFORE launching the box)
+
+```powershell
+# 1) fullhist key cross-language parity — Rust fingerprint.rs == Python twin on >=512 all-street
+#    states, ON and OFF (a miss here means every lookup on a fullhist blueprint falls to uniform):
+python -m pytest tests/test_fullhist_key_parity.py::test_fullhist_key_parity -q
+#    (skips cleanly if battery_native is not built; build it first so the gate actually runs.)
+
+# 2) default-off byte-identity (bp2/bp3 launches must be unchanged): the new --fullhist-key/--mrr
+#    launcher flags OFF must generate a byte-identical bootstrap — dead-knob screen per the design.
+
+# 3) EMD/OCHS sha sidecars — ONLY for the HE arm (H200/HD200/H1000 are made-hand K200/K1000, no
+#    EMD/OCHS). For HE, ship the frozen bucketer + river-OCHS sha sidecars the same way bp2/bp3 do.
+```
+
+## V1. Launch (H200 first) — the USER runs the spot box
+
+```powershell
+# Leave this terminal open; the babysitter owns spotpick + resume-from-S3 + on-box dead-man cost
+# caps + storm/quota/spot guards, inherited UNCHANGED from blueprint2_babysitter.ps1.
+powershell -ExecutionPolicy Bypass -File scripts\blueprint2\bpv4_stage0_babysitter.ps1
+```
+
+`bpv4_stage0_babysitter.ps1` bakes the H200 config: `-FullHistKey -Mrr -WorkSteal -Iters 45000
+-NumBuckets 200 -EmdFrozen "" -RiverOchs "" -CheckpointEvery 10000 -InstanceType c6i.32xlarge
+-NoConvergeStop`. Checkpoint cadence 10000 => ladder 10k/20k/30k/40k (covers both kill-gate points;
+fullhist blobs are 30–55 GB so 500-iter cadence would be an S3 upload storm). For **H1000** append
+`-NumBuckets 1000`; for **HE** append `-EmdFrozen data\abstraction\emd_frozen_flop_turn_160_r400.emdfrzn
+-RiverOchs data\abstraction\river_ochs_160.rochs -NumBuckets 160` (and use its own `-Run bpv4_he200`).
+Any extra `blueprint2_babysitter.ps1` parameter is forwarded verbatim.
+
+## V2. Watch (second terminal, read-only, never terminates a box)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\blueprint2\watch_blueprint2.ps1 `
+    -Run bpv4_h200 -Iters 45000
+```
+
+## V3. Mid-run KILL GATE at ~20k AND ~30k (third terminal)
+
+Design §6.3 (bp3 lesson: the 30k check would have saved that run). Cost at risk ~$5 (20k) / ~$12
+(30k). Streams the latest S3 ladder checkpoint memory-safely (never loads the 30–55 GB blob whole),
+extracts the fullhist preflop nodes, and prints G1–G4/G6 + the trend forms of G2/G3:
+
+```powershell
+python scripts\blueprint2\bpv4_kill_gate.py --run-subdir bpv4_h200            # latest ladder point
+python scripts\blueprint2\bpv4_kill_gate.py --run-subdir bpv4_h200 --iter 20000   # pin 20k
+python scripts\blueprint2\bpv4_kill_gate.py --run-subdir bpv4_h200 --iter 30000   # pin 30k
+```
+
+Gates (calibrated at the mid-run point; hard caps at every check, trend HARD from `--trend-hard-iters`
+= 30k): **G1** UTG≤HJ≤CO≤BTN open (−0.5pt tol, BTN>UTG); **G2** BTN open ≥ 20% (+ decline ≥ −3pt hard
+at 30k); **G3** AA-BTN-limp ≤ 30% (+ non-rising hard at 30k); **G4** BB-vs-BTN-open fold ≤ 70%
+(open-size-weighted); **G6** BTN jam share of open ≤ 10%. A nonzero **negative-control** count (summary
+rows read from a fullhist blob) ABORTS with rc 2 — the key space is wrong, do not trust the numbers.
+The babysitter also runs these from the S3 ladder automatically and terminates on KILL; on a manual
+**KILL** verdict:
+
+```powershell
+aws ec2 terminate-instances --instance-ids <iid> --region eu-central-1   # + stop the babysitter
+```
+
+## V4. Download the final checkpoint (after the 45k backstop, or the last good ladder point)
+
+```powershell
+aws s3 cp `
+  s3://video-processing-6789/pokerbot/prod6000/native_cfr/bpv4_h200/checkpoints/iter_045000.nlcfr `
+  runs\native_cfr\bpv4_stage0\H200\iter_045000.nlcfr --region eu-central-1
+# (grab the whole ladder dir if you want the final gate's 30k/40k trajectory clauses)
+```
+
+## V5. Final Stage-0 gates + G5 probe -> A1/A2 verdict
+
+```powershell
+# G1-G4/G6 + ladder + M1 row scan at 30k/40k on the AVERAGE strategy (streaming, wrong-key-space
+# negative control asserted per checkpoint):
+python scripts\blueprint2\bpv4_stage0_gates.py --arm H200 `
+    --dir runs\native_cfr\bpv4_stage0\H200 --key-mode fullhist `
+    --out artifacts\bpv4_stage0_gates_H200.json
+
+# Direct-key extraction sanity (does NOT use abstracted_legal — direct dict lookup, MRR-independent):
+python scripts\blueprint2\preflop_root_diag.py --full-hist --deltas `
+    runs\native_cfr\bpv4_stage0\H200\iter_030000.nlcfr `
+    runs\native_cfr\bpv4_stage0\H200\iter_040000.nlcfr `
+    --out artifacts\bpv4_extract_H200.json
+
+# G5 forced-response probe (8-shard, fallback-0 gate). SET POKERBOT_MRR=1 (see the MRR-FIDELITY note):
+$env:POKERBOT_MRR = "1"
+python scripts\blueprint2\bpv4_stage0_probe.py --arm H200 `
+    --ckpt runs\native_cfr\bpv4_stage0\H200\iter_040000.nlcfr `
+    --key-mode fullhist --postflop-mode fast --num-buckets 200
+```
+
+**Verdict** — write `artifacts/bpv4_stage0_verdict.md` by hand from the two JSONs:
+* **A1 (history axis) PASS** iff H200 passes G1–G5 while the DONE S200 summary control fails ≥ 2 of
+  them ⇒ history keying is causal ⇒ fund Stage 1. G5a: EV(best sized open) − EV(limp) ≥ −25 bb/100;
+  G5b: EV(open) > 0. If the fullhist arm ALSO fails broadly ⇒ **STOP, do not fund Stage 1** (the
+  residual driver is cards/deeper; the `bp3_forced_response_probe.md` §5 closure terms stand).
+* **A2 (card axis)**: run the same on **H1000** (K1000). If the K1000-vs-K200 main effect on G2/G5 >
+  half the history main effect ⇒ an EMD re-fit enters Stage 1.
+
+## !! CRITICAL — G5 probe M-RR fidelity (must read before trusting the verdict)
+
+The G5 probe rollout is a **pure-Python path** (`bpv4_stage0_probe.py` → `bp3_forced_response_probe.py`
+`rollout` → `TabularBlueprintAgent` → `TabularBlueprintAdapter` → `lbr.make_blueprint_policy`). It does
+**NOT** call the Rust `trainer::abstracted_legal` (the MRR-thinning path) **nor** `subgame::abstracted_
+legal` (subgame.rs:240). It is the **Python analog of the SERVE path**: it legal-masks the stored strat
+row with the un-thinned serve menu `allowed_post = (0,1,3,4,5)` and reads **no** `POKERBOT_MRR` env var.
+
+* **Setting `POKERBOT_MRR=1` for the probe is a NO-OP on this path** (only the Rust trainer OnceLock
+  reads it). We set it anyway — defensively/for provenance, and so any future native probe honors it.
+* **Fidelity is preserved IMPLICITLY, and only conditionally.** On a fingerprint **hit** the frozen
+  average-strategy row carries **zero** mass on MRR-removed actions (the trainer masked them out), so
+  masking the row by the wider serve menu + renormalizing keeps them zero → downstream play stays
+  within the trained (thinned) menu. **BUT on a fingerprint MISS**, `make_blueprint_policy` silently
+  returns **uniform over the full un-thinned legal menu** (MRR-removed sizes included) — train/probe
+  abstraction skew — **and this miss is NOT counted by the probe's `adapter_fallback_rate` gate**
+  (`TabularBlueprintAgent.fallback_count` only trips on an exception / all-zero row; the miss is
+  absorbed inside `make_blueprint_policy`, which always returns a valid distribution). So the driver's
+  "fallback == 0.0000" abort does **not** actually detect fingerprint misses.
+* **What to do:** treat the G5 verdict as trustworthy only if the checkpoint is well-converged in the
+  fullhist key space so misses are near-zero. **SCHEDULED FIX** (before the probe is load-bearing for a
+  promotion decision): make the probe MRR-aware — either (a) enable `lbr._BP_COVERAGE` in the rollout
+  and assert per-street miss-rate ≈ 0, or (b) apply the M-RR keep-lists to the serve menu / uniform
+  fallback when `POKERBOT_MRR=1` (mirror `mrr_reraise_keep`/`mrr_tr_first_keep` in
+  `lbr.make_blueprint_policy`). The forced arms themselves (open325/open400/jam) are **preflop**, which
+  M-RR never thins, so the forcing is unaffected — only the postflop rollout tail carries this risk.
+* The direct-key extractor (`preflop_root_diag.py --full-hist`, and the streaming
+  `bpv4_stage0_gates.py`/`bpv4_kill_gate.py`) does **NOT** use `abstracted_legal` — it looks keys up
+  directly in the checkpoint dict and all its gate nodes are **preflop** (untouched by M-RR), so
+  extraction and every G1–G4/G6 number are **MRR-independent** and unaffected.

@@ -209,6 +209,18 @@ thread_local! {
         RefCell::new(FpMemo::with_capacity_and_hasher(1 << 17, Default::default()));
 }
 
+/// Hard per-thread capacity cap for FP_MEMO — a MODE-AGNOSTIC memory bound (NOT env-gated). FP_MEMO is a
+/// PURE message->blake2b-digest cache (see `fingerprint::digest_msg_memoed`: a hit returns exactly the
+/// digest a miss recomputes via `blake2b16(b"", &msg)`), so CLEARING it can only cost recompute — it can
+/// NEVER change any emitted digest or any regret/strat value. Under summary / made-hand keys the distinct-
+/// message count equals the trained row count: the LARGEST such run, S1000 (made-hand K1000), asymptotes
+/// ~296K rows, S200 = 99,390, and the deployed EMD-K160 blueprint fewer still — all >7x under this cap, so
+/// summary / production runs NEVER trip it and stay BYTE-IDENTICAL. Under POKERBOT_FULLHIST_KEY the
+/// distinct-message count tracks the billions-scale infoset table and would otherwise duplicate the whole
+/// message table PER rayon worker (the H200 OOM at 83.3M rows / 18.4 GiB). 2^21 = 2,097,152 entries
+/// * ~150 B ~= 315 MB per thread instead of ~8-12 GB.
+const FP_MEMO_CAP: usize = 1 << 21; // 2,097,152
+
 /// Per-deal starting stack (in chips) and ante — fixed-depth 100bb, ante 0 (the deployed blueprint's
 /// regime; depth randomization is a future env-gated knob, not in this floor trainer). 100 BB at
 /// `core::CHIP_UNIT` (100) chips/BB = 10_000 chips.
@@ -610,15 +622,93 @@ fn accumulate_local_into(acc: &mut NlheTables, local: LocalDelta) {
 // legal set, uniform fallback)
 // --------------------------------------------------------------------------------------------------
 
+/// M-RR (menu re-raise thinning) + turn/river first-raise thinning — the blueprint-v4 action-
+/// abstraction discipline (design `blueprint_pluribus_grade_design_v2.md` §4.2.2; Pluribus P-supp
+/// pp.12-13 rounds-3-4 rule). ENV-GATED `POKERBOT_MRR=1`, read ONCE per process via OnceLock (same
+/// convention as `POKERBOT_FULLHIST_KEY` / `POKERBOT_WORKSTEAL` / `POKERBOT_DCFR`). Default OFF =>
+/// `abstracted_legal` returns the legacy pre/post-split mask, BYTE-IDENTICAL to before (because
+/// `abstracted_legal_mrr(.., false)` is the exact old body) — so all trainer goldens are unchanged with
+/// the env unset.
+///
+/// TRAIN/SERVE SCOPE (verified, WF2 cold-review): this `abstracted_legal` (`cfg: &TrainerCfg`) is the
+/// TRAINER's, used ONLY on the training path. The serve/search path uses a SEPARATE function,
+/// `subgame::abstracted_legal` (`pcfg: &PlayoutConfig`, subgame.rs:240), which this env does NOT touch.
+/// So `POKERBOT_MRR` thins ONLY training, and serve stays byte-identical whether the env is set or not
+/// (that is exactly what Stage 0 needs — it only runs `ab_train`). CONSEQUENCE FOR STAGE 2: the design's
+/// serve keep-lists MUST separately mirror this rule in `subgame::abstracted_legal` (promoted to an
+/// explicit `InfosetCfg` field in Stage 1). Do NOT assume serve inherits the thinning from this knob —
+/// a v4 blueprint trained under thinned menus but served on the full menu is the train/serve action-
+/// abstraction skew §4.2.2 exists to prevent.
+fn mrr_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENV: OnceLock<bool> = OnceLock::new();
+    *ENV.get_or_init(|| {
+        std::env::var("POKERBOT_MRR")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// M-RR re-raise keep-list (POSTFLOP, when FACING a live bet): {FOLD, CHECK, CALL, ALL_IN, 1x-pot} =
+/// Pluribus rounds-3-4 re-raise menu {1x pot, all-in} (<=2 sizes). `BET_BUCKET_START + 4` is the 1.0x-
+/// pot bucket (cf. `lbr::POT_BET_INDEX`). Mirrors `scripts/bpv4_size_census.py::allowed_actions(mrr=True)`.
+fn mrr_reraise_keep() -> &'static [bool; NUM_ACTIONS] {
+    use std::sync::OnceLock;
+    static M: OnceLock<[bool; NUM_ACTIONS]> = OnceLock::new();
+    M.get_or_init(|| allowed_mask(&[4]))
+}
+
+/// Turn/river FIRST-raise keep-list: {FOLD, CHECK, CALL, ALL_IN, 1/2-pot, 1x-pot} = Pluribus rounds-3-4
+/// first-raise menu {1/2, 1x pot, all-in} (<=3 sizes) = keep-list [1,4] + jam (design §4.2.2 v2 reversal
+/// of "keep richer"). The FLOP's first raise keeps the full `cfg.allowed_post` menu (Pluribus's flop is
+/// "more coarse" than round 1 but NOT as thin as turn/river). `BET_BUCKET_START + 1` = 1/2-pot
+/// (`lbr::HALF_POT_INDEX`).
+fn mrr_tr_first_keep() -> &'static [bool; NUM_ACTIONS] {
+    use std::sync::OnceLock;
+    static M: OnceLock<[bool; NUM_ACTIONS]> = OnceLock::new();
+    M.get_or_init(|| allowed_mask(&[1, 4]))
+}
+
 #[inline]
 fn abstracted_legal<const N: usize>(
     s: &EnvStateN<N>,
     seat: usize,
     cfg: &TrainerCfg,
 ) -> [bool; NUM_ACTIONS] {
+    abstracted_legal_mrr(s, seat, cfg, mrr_enabled())
+}
+
+/// The `abstracted_legal` body with M-RR as an explicit parameter (so unit tests can exercise both
+/// arms without touching the process-global env OnceLock). `mrr == false` is the EXACT legacy body
+/// (pre/post split), preserving byte-identity when the env is unset.
+#[inline]
+fn abstracted_legal_mrr<const N: usize>(
+    s: &EnvStateN<N>,
+    seat: usize,
+    cfg: &TrainerCfg,
+    mrr: bool,
+) -> [bool; NUM_ACTIONS] {
     let full = core::legal_action_mask(s, seat as i32);
-    let allowed = if s.street == 0 {
+    // Preflop: legacy menu, UNTOUCHED (served direct, its fineness is load-bearing — design §4.2.2).
+    // Postflop under M-RR: choose the thinned menu for this node. F/X/C/AI are in EVERY keep-list, so
+    // the masked set is never empty (the same CHECK-fallback invariant the census relies on). `seat` is
+    // the acting seat (== `s.action_seat` at every call site — `legal_action_mask` above is computed for
+    // it), so `facing_bet` == "a live bet exists this street" == "any raise here is a RE-raise".
+    // NOTE (WF2 census-parity): the keep-lists are applied DIRECTLY (not intersected with
+    // `cfg.allowed_post`). Identical to the census `legal AND post AND keep` for the deployed post-list
+    // [0,1,3,4,5] since both kept bet buckets (id4=½, id7=1x) ARE in it. If a future menu config drops
+    // bucket 1 or 4 from `allowed_post`, intersect the keep-lists with it here (Stage-1 `InfosetCfg`).
+    let allowed: &[bool; NUM_ACTIONS] = if s.street == 0 {
         &cfg.allowed_pre
+    } else if mrr {
+        let facing_bet = s.current_bet > s.committed_street[seat];
+        if facing_bet {
+            mrr_reraise_keep()
+        } else if s.street >= 2 {
+            mrr_tr_first_keep()
+        } else {
+            &cfg.allowed_post
+        }
     } else {
         &cfg.allowed_post
     };
@@ -2442,6 +2532,18 @@ impl NlheTables {
             let mut acc = NlheTables::default();
             FP_MEMO.with(|cell| {
                 let memo = &mut *cell.borrow_mut();
+                // MEMORY BOUND (byte-identity neutral, mode-agnostic): FP_MEMO is a pure
+                // message->blake2b-digest cache, so clearing it only forces recompute of the SAME
+                // digest — it can never change a regret/strat value or an emitted digest. Summary /
+                // production runs stay far below FP_MEMO_CAP and NEVER clear (byte-identical); only
+                // POKERBOT_FULLHIST_KEY runs, whose distinct-message count tracks the billions-scale
+                // infoset table, ever trip it — bounding this worker's memo to ~FP_MEMO_CAP entries
+                // (~315 MB) instead of duplicating the whole message table per rayon worker (the
+                // H200 83.3M-row OOM). Checked once per worker per iteration (a `broadcast` task);
+                // per-iteration regrowth is only a few thousand entries, so the memo stays ~cap.
+                if memo.len() > FP_MEMO_CAP {
+                    memo.clear();
+                }
                 loop {
                     // Claim the next deal index atomically. Relaxed is sufficient: the only invariant is
                     // that each index is handed out exactly once (fetch_add guarantees that); there is no
@@ -3170,6 +3272,178 @@ mod tests {
             dcfr_explore_frac: 0.05,
             river_ochs: None,
         }
+    }
+
+    /// M-RR (menu re-raise thinning) + turn/river first-raise thinning — exercises `abstracted_legal_mrr`
+    /// directly with `mrr=true`/`mrr=false` (NOT the process-global env OnceLock), on engine-built nodes.
+    /// Node construction mirrors the `scripted_3bet_root()` idiom (src/tests.rs): identity-deck 100bb
+    /// 6-max hand, button=0 => SB=1, BB=2, UTG=3; UTG opens 1x-pot, folds to BB who 3-bets, UTG calls,
+    /// BB checks the option; flop deals with seats 2 & 3 live (BB=seat 2 first to act). `abstracted_legal`
+    /// = `full_legal AND allowed`, allowed per design v2 §4.2.2 (spec §3 table). "aggressive bet-size" =
+    /// the bet-fraction buckets `BET_BUCKET_START..ALL_IN` (ids 3..=9); ALL_IN (id 10) is in EVERY
+    /// keep-list, so it is checked separately (never a thinning target).
+    #[test]
+    fn test_mrr_menu_thinning() {
+        let f = core::FOLD;
+        let x = core::CHECK;
+        let c = core::CALL;
+        let ai = core::ALL_IN;
+        let bbs = core::BET_BUCKET_START;
+        let cfg = test_cfg(64);
+
+        // (1) Keep-mask helpers exactly.
+        let rr = mrr_reraise_keep();
+        let trf = mrr_tr_first_keep();
+        for a in 0..NUM_ACTIONS {
+            let want_rr = a == f || a == x || a == c || a == ai || a == bbs + 4;
+            assert_eq!(rr[a], want_rr, "mrr_reraise_keep bit {a}");
+            let want_trf =
+                a == f || a == x || a == c || a == ai || a == bbs + 1 || a == bbs + 4;
+            assert_eq!(trf[a], want_trf, "mrr_tr_first_keep bit {a}");
+        }
+
+        // Legacy postflop menu recomputed directly (spec §5 assertion 5 oracle).
+        let legacy = |s: &EnvStateN<6>, seat: usize, allowed: &[bool; NUM_ACTIONS]| {
+            let full = core::legal_action_mask(s, seat as i32);
+            let mut m = [false; NUM_ACTIONS];
+            for a in 0..NUM_ACTIONS {
+                m[a] = full[a] && allowed[a];
+            }
+            m
+        };
+
+        // Build the flop root (identity-deck 3-bet-then-call), seats 2 & 3 live, BB=seat 2 to act.
+        let stacks = [100 * core::BB_CHIPS; 6];
+        let occ = [true; 6];
+        let mut deck = [0i32; 52];
+        for (i, d) in deck.iter_mut().enumerate() {
+            *d = i as i32;
+        }
+        let pre_root = core::init_hand_n::<6>(0, &stacks, &occ, 0, &deck, [0u32, 0u32]);
+
+        // (preflop, extra) both arms == legacy allowed_pre; MRR leaves preflop untouched (ON == OFF).
+        assert_eq!(pre_root.street, 0, "pre_root is preflop");
+        let pre_off = abstracted_legal_mrr(&pre_root, pre_root.action_seat as usize, &cfg, false);
+        let pre_on = abstracted_legal_mrr(&pre_root, pre_root.action_seat as usize, &cfg, true);
+        assert_eq!(
+            pre_off,
+            legacy(&pre_root, pre_root.action_seat as usize, &cfg.allowed_pre),
+            "preflop OFF == legacy allowed_pre"
+        );
+        assert_eq!(pre_on, pre_off, "preflop untouched by MRR");
+
+        let script: [(i32, usize); 8] = [
+            (3, bbs + 4), // UTG opens 1x-pot
+            (4, f),
+            (5, f),
+            (0, f),
+            (1, f),
+            (2, bbs + 5), // BB 3-bets 1.5x-pot
+            (3, c),       // UTG calls
+            (2, x),       // BB checks the option; preflop closes
+        ];
+        let mut env = pre_root;
+        for (seat, action) in script {
+            assert!(!core::is_chance_node(&env), "unexpected chance node mid-script");
+            assert_eq!(env.action_seat, seat, "script actor mismatch");
+            env = core::apply_action(&env, action);
+        }
+        while core::is_chance_node(&env) {
+            env = core::sample_chance(&env);
+        }
+        assert_eq!(env.street, core::STREET_FLOP, "flop root");
+        assert_eq!(env.action_seat, 2, "BB (seat 2) first to act on the flop");
+        let flop_first = env;
+
+        // (2) Flop FIRST raise (seat 2, not facing a bet): MRR ON == MRR OFF (flop first-raise unthinned).
+        let s2 = flop_first.action_seat as usize;
+        assert!(
+            flop_first.current_bet <= flop_first.committed_street[s2],
+            "flop first-to-act is not facing a live bet"
+        );
+        let ff_on = abstracted_legal_mrr(&flop_first, s2, &cfg, true);
+        let ff_off = abstracted_legal_mrr(&flop_first, s2, &cfg, false);
+        assert_eq!(ff_on, ff_off, "flop first raise unchanged by MRR");
+        // (5) OFF == legacy allowed_post at the flop first-raise node.
+        assert_eq!(
+            ff_off,
+            legacy(&flop_first, s2, &cfg.allowed_post),
+            "flop first-raise OFF == legacy allowed_post"
+        );
+
+        // (3) Flop RE-raise: seat 2 bets 1x-pot, seat 3 acts facing the live bet.
+        let facing = core::apply_action(&flop_first, bbs + 4);
+        let s3 = facing.action_seat as usize;
+        assert_eq!(s3, 3, "seat 3 acts facing the flop bet");
+        assert!(
+            facing.current_bet > facing.committed_street[s3],
+            "seat 3 is facing a live bet (a raise here is a re-raise)"
+        );
+        let rr_on = abstracted_legal_mrr(&facing, s3, &cfg, true);
+        let rr_off = abstracted_legal_mrr(&facing, s3, &cfg, false);
+        // MRR-ON aggressive bet-size ids ⊆ {bbs+4}.
+        for a in bbs..ai {
+            if rr_on[a] {
+                assert_eq!(a, bbs + 4, "MRR-ON re-raise aggressive bet id must be 1x-pot only");
+            }
+        }
+        // Behavior change: at least one aggressive bet-size id present OFF is absent ON.
+        let mut changed = false;
+        for a in bbs..ai {
+            if rr_off[a] && !rr_on[a] {
+                changed = true;
+            }
+        }
+        assert!(changed, "MRR must remove at least one aggressive re-raise size on the flop");
+        assert!(rr_on[f] && rr_off[f], "FOLD present in both arms at re-raise");
+        assert!(rr_on[c] && rr_off[c], "CALL present in both arms at re-raise");
+        // (5) OFF == legacy allowed_post at the flop re-raise node.
+        assert_eq!(
+            rr_off,
+            legacy(&facing, s3, &cfg.allowed_post),
+            "flop re-raise OFF == legacy allowed_post"
+        );
+
+        // (4) Turn FIRST raise: flop check/check, sample the turn card, seat 2 first to act.
+        let mut turn = core::apply_action(&flop_first, x); // seat 2 checks
+        turn = core::apply_action(&turn, x); // seat 3 checks — flop closes
+        while core::is_chance_node(&turn) {
+            turn = core::sample_chance(&turn);
+        }
+        assert_eq!(turn.street, 2, "turn street == 2");
+        let ts = turn.action_seat as usize;
+        assert!(
+            turn.current_bet <= turn.committed_street[ts],
+            "turn first-to-act is not facing a live bet"
+        );
+        let tr_on = abstracted_legal_mrr(&turn, ts, &cfg, true);
+        let tr_off = abstracted_legal_mrr(&turn, ts, &cfg, false);
+        // MRR-ON aggressive bet-size ids ⊆ {bbs+1, bbs+4}.
+        for a in bbs..ai {
+            if tr_on[a] {
+                assert!(
+                    a == bbs + 1 || a == bbs + 4,
+                    "MRR-ON turn first-raise aggressive bet id must be 1/2- or 1x-pot only, got {a}"
+                );
+            }
+        }
+        // ⅓ (bbs+0), ¾ (bbs+3), 1½ (bbs+5) present OFF must be absent ON (design v2 turn/river thinning).
+        for a in [bbs, bbs + 3, bbs + 5] {
+            if tr_off[a] {
+                assert!(!tr_on[a], "MRR turn first-raise must drop bet id {a}");
+            }
+        }
+        // At least one of them was actually legal OFF (so the check above bit on real behavior change).
+        assert!(
+            tr_off[bbs] || tr_off[bbs + 3] || tr_off[bbs + 5],
+            "premise: some thinned turn bet size must be engine-legal OFF"
+        );
+        // (5) OFF == legacy allowed_post at the turn first-raise node.
+        assert_eq!(
+            tr_off,
+            legacy(&turn, ts, &cfg.allowed_post),
+            "turn first-raise OFF == legacy allowed_post"
+        );
     }
 
     #[test]

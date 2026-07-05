@@ -90,6 +90,14 @@ def _configure_env(args) -> None:
     os.environ["POKERBOT_POSTFLOP_BUCKETS"] = "1"
     os.environ["POKERBOT_PREFLOP_LOSSLESS"] = "1"
     os.environ["POKERBOT_POSTFLOP_NUM_BUCKETS"] = str(args.num_buckets)
+    # Measure per-street fingerprint COVERAGE on the rollout serve path (lbr.make_blueprint_policy reads
+    # this env AT IMPORT, so it must be set before any pokerbot import). CRITICAL for the G5 verdict:
+    # ``adapter_fallback_rate`` does NOT detect a fingerprint MISS — a miss returns a *valid* uniform-legal
+    # distribution, so it is silently absorbed and never increments fallback_count. Under the vast fullhist
+    # key space the postflop TAIL misses far more than the summary control, biasing EV(open)-EV(limp) in an
+    # arm-dependent way. Enabling coverage records hits/misses per street so the driver can gate on the real
+    # skew signal. Recording only (a bool check per lookup) — does NOT change EV/CRN.
+    os.environ["POKERBOT_BP_COVERAGE"] = "1"
     if args.postflop_mode == "emd":
         os.environ["POKERBOT_POSTFLOP_MODE"] = "emd"
         os.environ["POKERBOT_POSTFLOP_EMD_FROZEN"] = os.path.abspath(args.emd_frozen)
@@ -272,18 +280,29 @@ def _rollout_main(args) -> int:
 
     fb = sum(a.fallback_count for a in agents.values())
     dc = sum(a.decision_count for a in agents.values())
+    # Per-street fingerprint coverage on the serve path (POKERBOT_BP_COVERAGE, set in _configure_env).
+    # This is the ONLY signal that catches the fullhist postflop-tail MISS that adapter_fallback_rate
+    # cannot (a miss returns a valid uniform-legal distribution -> no fallback increment). The driver
+    # gates the G5 verdict on the postflop (flop/turn/river) miss-rate.
+    from pokerbot.eval import lbr as _lbr
+    bp_cov = _lbr.bp_coverage_report()
     res = {
         "mode": "rollout", "hand": hand, "blueprint": args.blueprint, "seed": args.seed,
         "start": args.start, "deals": reached, "tried": tried,
         "reach_rate": reached / max(1, tried), "runouts": args.runouts,
         "adapter_fallback_rate": fb / max(1, dc),
+        "bp_coverage": bp_cov,
         "deltas_bb": out, "meta": meta,
         "wall_s": round(time.time() - t0, 1),
     }
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(res, f)
+    _pf_h = sum(bp_cov.get(s, {}).get("hits", 0) for s in ("flop", "turn", "river"))
+    _pf_m = sum(bp_cov.get(s, {}).get("misses", 0) for s in ("flop", "turn", "river"))
+    _pf_miss = _pf_m / max(1, _pf_h + _pf_m)
     _plog(f"{tag} DONE {reached} deals in {res['wall_s']:.0f}s -> {args.out} "
-          f"(fallback {res['adapter_fallback_rate']:.4f})")
+          f"(fallback {res['adapter_fallback_rate']:.4f}; postflop miss-rate {_pf_miss:.4f} "
+          f"[{_pf_m}/{_pf_h + _pf_m}]; per-street {bp_cov})")
     return 0
 
 
@@ -433,10 +452,26 @@ def _merge_main(args) -> int:
                         meta["resp"][a][side][k] = meta["resp"][a][side].get(k, 0) + v
                 for k, v in m["end_street"][a].items():
                     meta["end_street"][a][k] = meta["end_street"][a].get(k, 0) + v
+        # Aggregate per-street fingerprint coverage across this hand's shards so the A1/A2 verdict step
+        # can compare postflop miss-rate between the fullhist arm and the summary control (a large
+        # DIFFERENTIAL is the biased-verdict signal). ``adapter_fallback_rate`` cannot see this.
+        cov_agg: dict[str, list[int]] = {}
+        for x in ss:
+            for st, c in (x.get("bp_coverage") or {}).items():
+                a = cov_agg.setdefault(st, [0, 0])
+                a[0] += int(c.get("hits", 0))
+                a[1] += int(c.get("misses", 0))
+        bp_coverage = {st: {"hits": h, "misses": m,
+                            "hit_rate": (h / (h + m) if (h + m) else 0.0)}
+                       for st, (h, m) in cov_agg.items()}
+        pf_h = sum(cov_agg.get(st, [0, 0])[0] for st in ("flop", "turn", "river"))
+        pf_m = sum(cov_agg.get(st, [0, 0])[1] for st in ("flop", "turn", "river"))
         out["hands"][hand] = {"n_deals": int(n), "tried": tried,
                               "reach_rate": n / max(1, tried),
                               "arms": stats, "paired_vs_limp": paired, "meta": meta,
-                              "fallback_rates": [x["adapter_fallback_rate"] for x in ss]}
+                              "fallback_rates": [x["adapter_fallback_rate"] for x in ss],
+                              "bp_coverage": bp_coverage,
+                              "postflop_miss_rate": pf_m / max(1, pf_h + pf_m)}
         _plog(f"merge {hand}: n={n}  " + "  ".join(
             f"{a}={stats[a]['ev_bb100']:+.1f}±{stats[a]['se_bb100']:.1f}" for a in ARMS))
     with open(args.out, "w", encoding="utf-8") as f:

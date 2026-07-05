@@ -14,11 +14,20 @@ there — partial evidence beats OOM. Stall guard: no trainer output for >30 min
 
 Arms (all: n_deals=200, seed 0xC0FFEE baked in ab_train, 45k iters):
   S200   summary keying, made-hand K200,  CFR+   (E5 arm-A validity anchor @20k: BTN ~8.5%)
-  H200   FULLHIST,       made-hand K200,  CFR+
+  H200   FULLHIST+M-RR,  made-hand K200,  CFR+
   S1000  summary,        made-hand K1000, CFR+
-  H1000  FULLHIST,       made-hand K1000, CFR+
-  HD200  FULLHIST,       made-hand K200,  DCFR(1.5,0,2)+RBP (-300k bb, explore 0.05)
-  HE160  FULLHIST,       EMD-K160 + river-OCHS, CFR+  (stretch, overnight)
+  H1000  FULLHIST+M-RR,  made-hand K1000, CFR+
+  HD200  FULLHIST+M-RR,  made-hand K200,  DCFR(1.5,0,2)+RBP (-300k bb, explore 0.05)
+  HE160  FULLHIST+M-RR,  EMD-K160 + river-OCHS, CFR+  (stretch, overnight)
+
+design v2 (blueprint_pluribus_grade_design_v2.md §4.2.2/§7.1): every FULLHIST arm trains WITH M-RR
+(POKERBOT_MRR=1) — postflop re-raises -> {1x pot, all-in}, turn/river first raise -> {1/2, 1x, jam},
+flop first raise full. Measured MANDATORY: un-thinned fullhist is non-convergent (~10^31 history
+space; H200 grew ~42k rows/iter, OOM'd). SUMMARY arms (S200/S1000) get NO M-RR (their key space is
+already bounded). Every FULLHIST arm also carries POKERBOT_AB_ROW_CAP: a graceful checkpoint-and-exit
+at ROW_CAP strat rows instead of an OS commit-limit kill (which had also killed this parent runner).
+NOTE: HE160 uses the K160 EMD/OCHS blobs that exist today; the design-faithful HE200 (EMD-K200 per
+§4.3) needs a bucketer re-fit first (separate task) and is not wired here.
 
 Usage:
   python scripts/blueprint2/bpv4_stage0_run.py [--arms S200,H200,...] [--iters 45000]
@@ -47,13 +56,15 @@ CHECKPOINTS = "1000,2500,5000,10000,15000,20000,25000,30000,35000,40000,45000"
 EMD_FROZEN = os.path.join(_ROOT, "data", "abstraction", "emd_frozen_flop_turn_160_r400.emdfrzn")
 RIVER_OCHS = os.path.join(_ROOT, "data", "abstraction", "river_ochs_160.rochs")
 
+# FULLHIST arms train WITH M-RR (design v2 §4.2.2 — measured mandatory). SUMMARY arms omit it.
 ARMS: dict[str, dict[str, str]] = {
     "S200": {},
-    "H200": {"POKERBOT_FULLHIST_KEY": "1"},
+    "H200": {"POKERBOT_FULLHIST_KEY": "1", "POKERBOT_MRR": "1"},
     "S1000": {"POKERBOT_AB_NUM_BUCKETS": "1000"},
-    "H1000": {"POKERBOT_FULLHIST_KEY": "1", "POKERBOT_AB_NUM_BUCKETS": "1000"},
-    "HD200": {"POKERBOT_FULLHIST_KEY": "1", "POKERBOT_AB_DCFR": "1"},
-    "HE160": {"POKERBOT_FULLHIST_KEY": "1", "POKERBOT_AB_NUM_BUCKETS": "160",
+    "H1000": {"POKERBOT_FULLHIST_KEY": "1", "POKERBOT_MRR": "1",
+              "POKERBOT_AB_NUM_BUCKETS": "1000"},
+    "HD200": {"POKERBOT_FULLHIST_KEY": "1", "POKERBOT_MRR": "1", "POKERBOT_AB_DCFR": "1"},
+    "HE160": {"POKERBOT_FULLHIST_KEY": "1", "POKERBOT_MRR": "1", "POKERBOT_AB_NUM_BUCKETS": "160",
               "POKERBOT_AB_EMD_FROZEN": EMD_FROZEN, "POKERBOT_AB_RIVER_OCHS": RIVER_OCHS},
 }
 DEFAULT_ORDER = ["S200", "H200", "S1000", "H1000", "HD200", "HE160"]
@@ -61,6 +72,12 @@ DEFAULT_ORDER = ["S200", "H200", "S1000", "H1000", "HD200", "HE160"]
 RSS_FRAC_LIMIT = 0.60          # of total box RAM (design §7.1.2 RSS guard)
 STALL_S = 30 * 60              # kill-and-report on no trainer output for 30 min
 HEARTBEAT_S = 60.0             # progress-log cadence
+# Graceful in-process row cap for FULLHIST arms (POKERBOT_AB_ROW_CAP): checkpoint-and-exit(0) at this
+# many strat rows so a sudden alloc spike cannot outrun the 2s RSS poll and trigger an OS commit-limit
+# kill (0xC0000409) — which previously killed both the arm AND this runner. Validated clean-stop value
+# on the 31 GB box: ~55M rows ~= 12 GiB, safely under the 18.6 GB (60%) RSS guard. SUMMARY arms never
+# reach it (S1000 asymptotes ~296k rows). Applied only when POKERBOT_FULLHIST_KEY is set for the arm.
+FULLHIST_ROW_CAP = 55_000_000
 
 
 def plog(msg: str) -> None:
@@ -100,6 +117,10 @@ def run_arm(arm: str, iters: int, state: dict) -> str:
     env.pop("POKERBOT_FULLHIST_KEY", None)
     env.pop("POKERBOT_PREFLOP_HIST_KEY", None)
     env.update(ARMS[arm])
+    # FULLHIST arms: graceful row-cap guard (see FULLHIST_ROW_CAP). SUMMARY arms never reach it and
+    # are left uncapped (byte-identical to prior summary runs).
+    if ARMS[arm].get("POKERBOT_FULLHIST_KEY") == "1":
+        env["POKERBOT_AB_ROW_CAP"] = str(FULLHIST_ROW_CAP)
     env["POKERBOT_AB_CHECKPOINTS"] = CHECKPOINTS
     env["POKERBOT_AB_RESUME"] = "1"
     env["POKERBOT_WORKSTEAL"] = "1"

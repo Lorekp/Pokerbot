@@ -149,6 +149,18 @@ fn main() {
     let already = tab.iters_done;
     let t0 = std::time::Instant::now();
     let mut last = t0;
+    // In-process memory guard (OPT-IN, OFF the byte-identity path). Under POKERBOT_FULLHIST_KEY the
+    // dynamic Shard table grows ~42k rows/iter with no plateau; on a ~31 GB box its committed
+    // footprint crosses the OS commit limit and the OS issues an external ExitProcess(1)/rc1 kill
+    // BEFORE the runner's 2s RSS poll can react (Windows working-set trimming hides the climb). Row
+    // count is a deterministic, allocation-free proxy for committed memory. When POKERBOT_AB_ROW_CAP>0
+    // and the table reaches it, write a checkpoint at the CURRENT iter and exit(0) so the arm records
+    // furthest-reached partial evidence (design §7.1.2). Default 0 = disabled => byte-identical to the
+    // old harness (S200/S1000/production never set it).
+    let row_cap: u64 = std::env::var("POKERBOT_AB_ROW_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     for i in (already + 1)..=iters {
         tab.train_iteration(&cfg);
         if checkpoints.binary_search(&i).is_ok() {
@@ -164,6 +176,28 @@ fn main() {
                 blob.len(),
                 p.display()
             );
+        }
+        // Graceful memory-cap stop (only decides WHEN to stop; never any value — see row_cap above).
+        // Writes an already-correct checkpoint at the current iter via the SAME serialize() path,
+        // then exit(0) so the run records status at this checkpoint instead of an external rc1 kill.
+        // Placed AFTER the fixed-checkpoint block so a stop can land at ANY iter (the crash at iter
+        // 2040 fell BETWEEN fixed checkpoints 1000 and 2500).
+        if row_cap > 0 && (tab.n_strat_infosets() as u64) >= row_cap {
+            let blob = serialize(&tab);
+            let p = ckpt_path(i);
+            let tmp = p.with_extension("nlcfr.tmp");
+            std::fs::write(&tmp, &blob).expect("write row-cap checkpoint tmp");
+            std::fs::rename(&tmp, &p).expect("rename row-cap checkpoint");
+            eprintln!(
+                "[ab_train] ROW_CAP {} reached at iter={} strat_rows={} bytes={} -> {}; wrote \
+                 checkpoint and stopping cleanly (partial evidence, design §7.1.2)",
+                row_cap,
+                i,
+                tab.n_strat_infosets(),
+                blob.len(),
+                p.display()
+            );
+            std::process::exit(0);
         }
         // Heartbeat ~every 15s so a long run is visibly progressing (the user's logging rule).
         if last.elapsed().as_secs_f64() >= 15.0 {

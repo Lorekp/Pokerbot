@@ -205,6 +205,7 @@ bash /tmp/bootstrap.sh
 def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_deals, num_buckets,
                    depth_edges, checkpoint_every, keep_alive=False, emd_frozen_rel="", emd_sha="",
                    river_ochs_rel="", river_ochs_sha="", preflop_hist_key=False,
+                   fullhist_key=False, mrr=False,
                    work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
                    wall_guard_secs=21600, awscli_zip="awscli-exe-linux-x86_64.zip") -> str:
     """The full on-box bootstrap (was inline user-data until it exceeded EC2's 16KB cap).
@@ -216,6 +217,167 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
     final = "echo BOOTSTRAP_DONE_KEEP_ALIVE" if keep_alive else "shutdown -h now"
     depth_csv = ",".join(str(float(x)) for x in (depth_edges or []))
     hist_flag = "1" if preflop_hist_key else "0"
+    # Blueprint-v4 Stage-0 keys (FULLHIST full-action-history key + M-RR action-thinning). ADDITIVE +
+    # default-off BYTE-IDENTICAL: when BOTH flags are off ``fullhist_block`` is the empty string, so the
+    # rendered bootstrap is byte-for-byte the bp2/bp3 script (the export/echo lines simply do not exist).
+    # When either is on, it mirrors the PREFLOP_HIST_KEY plumbing above: export the env the trainer reads
+    # (fingerprint.rs fullhist A-segment on every street + trainer::abstracted_legal M-RR action-thinning)
+    # plus an echo milestone. The checkpoint MUST then be served/evaluated with the SAME env
+    # (design: artifacts/blueprint_pluribus_grade_design_v2.md §5-7).
+    fullhist_flag = "1" if fullhist_key else "0"
+    mrr_flag = "1" if mrr else "0"
+    if fullhist_key or mrr:
+        fullhist_block = (
+            f"export POKERBOT_FULLHIST_KEY={fullhist_flag}\n"
+            f'echo "FULLHIST_KEY=$POKERBOT_FULLHIST_KEY"\n'
+            f"export POKERBOT_MRR={mrr_flag}\n"
+            f'echo "MRR=$POKERBOT_MRR"'
+        )
+    else:
+        fullhist_block = ""
+    # Checkpoint uploader. The fullhist+M-RR arm's ``save_bytes()`` blob is ~30-55 GB, which EXCEEDS
+    # S3's 5 GiB single-PutObject HARD LIMIT — a bare ``put_object(Body=blob)`` 400s EntityTooLarge and
+    # crashes the run at the FIRST checkpoint (no durable checkpoint => spot auto-resume permanently
+    # broken => real money burned for zero output). So when EITHER fullhist/M-RR flag is on we emit a
+    # MULTIPART uploader (upload_fileobj + server-side copy for the `latest` pointer) that also retries
+    # transient S3 errors instead of crash-exiting. This is ADDITIVE + default-off BYTE-IDENTICAL: with
+    # both flags off ``ckpt_upload_imports`` is "" and ``ckpt_upload_fn`` is the ORIGINAL two-put_object
+    # function verbatim, so the bp2/bp3 bootstrap is byte-for-byte unchanged (their small (<64 MB)
+    # checkpoints never needed multipart). Only the >5 GiB fullhist arms (which always set the flags)
+    # take the new path.
+    if fullhist_key or mrr:
+        ckpt_upload_imports = "\nimport io\nfrom boto3.s3.transfer import TransferConfig"
+        ckpt_upload_fn = (
+            "_XFER = TransferConfig(multipart_threshold=64 * 1024 * 1024,\n"
+            "                       multipart_chunksize=256 * 1024 * 1024,\n"
+            "                       max_concurrency=1, use_threads=False)\n"
+            "\n"
+            "\n"
+            "class _BlobReader(io.RawIOBase):\n"
+            "    # Non-copying seekable file-like over the save_bytes() blob. upload_fileobj streams it in\n"
+            "    # 256 MB multipart parts WITHOUT io.BytesIO(blob)'s full second copy (that copy would add\n"
+            "    # ~55 GB at the checkpoint RAM peak on the 256 GB box and risk OOM). use_threads=False keeps\n"
+            "    # reads serial so the single shared position is race-free.\n"
+            "    def __init__(self, buf):\n"
+            "        self._mv = memoryview(buf)\n"
+            "        self._pos = 0\n"
+            "    def readable(self):\n"
+            "        return True\n"
+            "    def seekable(self):\n"
+            "        return True\n"
+            "    def readinto(self, b):\n"
+            "        n = min(len(b), len(self._mv) - self._pos)\n"
+            "        b[:n] = self._mv[self._pos:self._pos + n]\n"
+            "        self._pos += n\n"
+            "        return n\n"
+            "    def seek(self, off, whence=0):\n"
+            "        if whence == 0:\n"
+            "            self._pos = off\n"
+            "        elif whence == 1:\n"
+            "            self._pos += off\n"
+            "        else:\n"
+            "            self._pos = len(self._mv) + off\n"
+            "        return self._pos\n"
+            "    def tell(self):\n"
+            "        return self._pos\n"
+            "\n"
+            "\n"
+            "def _upload(blob, iters_done):\n"
+            "    # versioned per-iter checkpoint + a `latest` pointer. The fullhist+M-RR blob is ~30-55 GB,\n"
+            "    # which EXCEEDS S3's 5 GiB single-PutObject hard limit; a bare put_object(Body=blob) would\n"
+            "    # 400 EntityTooLarge and crash the run at the FIRST checkpoint. Use the multipart managed\n"
+            "    # transfer, and point `latest` at the just-uploaded object via a server-side multipart COPY\n"
+            "    # (no second 55 GB network upload). Retry transient S3 errors; NEVER crash the whole run on\n"
+            "    # an upload blip (the on-box dead-man caps still bound cost; the next checkpoint may succeed).\n"
+            "    key = RUN_PREFIX + f\"/checkpoints/iter_{iters_done:06d}.nlcfr\"\n"
+            "    last = None\n"
+            "    for attempt in range(1, 6):\n"
+            "        try:\n"
+            "            s3.upload_fileobj(_BlobReader(blob), BUCKET, key, Config=_XFER)\n"
+            "            s3.copy({\"Bucket\": BUCKET, \"Key\": key}, BUCKET, LATEST_KEY, Config=_XFER)\n"
+            "            print(f\"CKPT iters_done={iters_done} -> s3://{BUCKET}/{key} ({len(blob)} bytes, multipart)\", flush=True)\n"
+            "            return\n"
+            "        except Exception as e:\n"
+            "            last = e\n"
+            "            print(f\"CKPT UPLOAD FAIL attempt={attempt}/5 iters_done={iters_done}: {e!r}\", flush=True)\n"
+            "            time.sleep(min(30, 5 * attempt))\n"
+            "    print(f\"CKPT UPLOAD GAVE UP after 5 attempts iters_done={iters_done}: {last!r} -- continuing\", flush=True)"
+        )
+    else:
+        ckpt_upload_imports = ""
+        ckpt_upload_fn = (
+            "def _upload(blob, iters_done):\n"
+            "    # versioned per-iter checkpoint + a `latest` pointer (atomic on S3: a single PutObject).\n"
+            "    key = RUN_PREFIX + f\"/checkpoints/iter_{iters_done:06d}.nlcfr\"\n"
+            "    s3.put_object(Bucket=BUCKET, Key=key, Body=blob)\n"
+            "    s3.put_object(Bucket=BUCKET, Key=LATEST_KEY, Body=blob)\n"
+            "    print(f\"CKPT iters_done={iters_done} -> s3://{BUCKET}/{key} ({len(blob)} bytes)\", flush=True)"
+        )
+    # Blueprint-v4 Stage-0 G8 ROW-BUDGET RAM backstop. ADDITIVE + default-off BYTE-IDENTICAL: gated the
+    # SAME way as the multipart uploader above (emitted ONLY when fullhist_key or mrr), so with both flags
+    # off ``row_budget_const`` and ``row_budget_block`` are "" and the rendered driver is byte-for-byte the
+    # bp2/bp3 script. Both are attached as SUFFIXES to existing driver lines (not their own placeholder
+    # line) so the off-path emits zero extra bytes (no stray blank line). ``row_budget_const`` reads the
+    # env budget once at module scope (default 400_000_000 = design G8; 0 disables). ``row_budget_block``
+    # runs after each training chunk: when the strat-row count (t.n_infosets(), the SAME accessor the
+    # PROGRESS/CKPT prints use, backed by n_strat_infosets()) reaches the budget it writes a FINAL
+    # checkpoint via the SAME multipart _upload (versioned + `latest`) and breaks, letting the driver fall
+    # through to its normal end-of-run log upload + the bootstrap dead-man shutdown (NO hard crash). This
+    # mirrors ab_train.rs POKERBOT_AB_ROW_CAP (checkpoint-then-exit-0, partial evidence per design 7.1.2):
+    # the fullhist+M-RR table grows ~42k rows/iter with no plateau, and on a fixed-RAM box its committed
+    # footprint eventually crosses the box's memory and the OS OOM-kills the run BEFORE a checkpoint lands
+    # (which would permanently break spot auto-resume). Row count is a deterministic, allocation-free proxy
+    # for committed memory.
+    if fullhist_key or mrr:
+        row_budget_const = (
+            "\n"
+            "ROW_BUDGET = int(os.environ.get(\"POKERBOT_ROW_BUDGET\", \"400000000\"))  # G8 RAM backstop (rows); 0=off"
+        )
+        # G8 PRE-TRAIN guard (requirement d): a spot-resumed box that LOADED an already-at/past-budget
+        # checkpoint must stop BEFORE allocating another CKPT_EVERY chunk — otherwise t.train(step) runs a
+        # whole native chunk (growing the table hundreds of millions of rows further) before the post-chunk
+        # check can fire, re-creating the exact OOM the backstop exists to prevent (and, if the OOM lands
+        # before the post-chunk _upload, an OOM-crash-resume livelock: every resume reloads the same
+        # at-budget checkpoint and dies again). Emitted as a SUFFIX on the `while` header (its own line), so
+        # with both flags off it is "" and the loop is byte-for-byte the bp2/bp3 driver. Same accessor
+        # (t.n_infosets() -> n_strat_infosets, the PROGRESS/CKPT print accessor) and same `>=` threshold as
+        # the post-chunk check. NO re-upload here: the loaded checkpoint IS the durable at-budget one (the
+        # previous box wrote it via the post-chunk _upload), and calling save_bytes() would allocate the very
+        # ~55-90 GB serialize blob we are trying to avoid — print + break lets the driver fall through to its
+        # end-of-run log upload + the on-box dead-man shutdown (NO hard crash). Mirrors ab_train.rs
+        # POKERBOT_AB_ROW_CAP "stop before growing further" semantics (design 7.1.2).
+        row_budget_pre = (
+            "\n"
+            "        # G8 ROW-BUDGET pre-train guard: a spot-resumed box that loaded an at/past-budget\n"
+            "        # checkpoint stops BEFORE allocating another chunk (requirement d). Same accessor +\n"
+            "        # threshold as the post-chunk check; the loaded checkpoint is already durable so we do\n"
+            "        # NOT re-serialize (avoids the ~55-90GB blob) -- print + break, fall through to the\n"
+            "        # end-of-run log upload + on-box dead-man shutdown (NO hard crash).\n"
+            "        if ROW_BUDGET > 0 and t.n_infosets() >= ROW_BUDGET:\n"
+            "            print(f\"ROW_BUDGET_STOP (resume/pre-train) budget={ROW_BUDGET} \"\n"
+            "                  f\"rows={t.n_infosets()} iters_done={t.iters_done()} -- already at/past \"\n"
+            "                  f\"budget on entry, stopping cleanly (no new chunk; last checkpoint already \"\n"
+            "                  f\"durable) (G8 partial evidence, design 7.1.2)\", flush=True)\n"
+            "            break"
+        )
+        row_budget_block = (
+            "\n"
+            "        # G8 ROW-BUDGET RAM backstop: checkpoint-then-stop cleanly when the table hits the budget\n"
+            "        # (mirrors ab_train.rs POKERBOT_AB_ROW_CAP; partial evidence, design 7.1.2). n_infosets()\n"
+            "        # is the same strat-row accessor the PROGRESS/CKPT prints use. NEVER hard-crash: write a\n"
+            "        # FINAL checkpoint via the SAME multipart _upload (versioned + latest) and break so the\n"
+            "        # driver falls through to its end-of-run log upload + the on-box dead-man shutdown.\n"
+            "        if ROW_BUDGET > 0 and t.n_infosets() >= ROW_BUDGET:\n"
+            "            _upload(t.save_bytes(), t.iters_done())\n"
+            "            print(f\"ROW_BUDGET_STOP budget={ROW_BUDGET} rows={t.n_infosets()} \"\n"
+            "                  f\"iters_done={t.iters_done()} -- wrote FINAL checkpoint (versioned + latest), \"\n"
+            "                  f\"stopping cleanly (G8 partial evidence, design 7.1.2)\", flush=True)\n"
+            "            break"
+        )
+    else:
+        row_budget_const = ""
+        row_budget_pre = ""
+        row_budget_block = ""
     # No output redirect (cloud-init captures stdout to /var/log/cloud-init-output.log, visible via
     # get-console-output) — same lesson the SD-CFR launcher documents.
     return f"""#!/bin/bash
@@ -280,7 +442,7 @@ export PYTHONPATH=/opt/pokerbot RUST_BACKTRACE=1
 # stamps + guards it). "0" is byte-identical to the shipped key space.
 export POKERBOT_PREFLOP_HIST_KEY={hist_flag}
 echo "PREFLOP_HIST_KEY=$POKERBOT_PREFLOP_HIST_KEY"
-
+{fullhist_block}
 # S2: verify the shipped EMD frozen blob matches its known sha256 BEFORE training. A same-K CORRUPTED blob
 # (truncated S3 round-trip) -> wrong potential-aware buckets -> a broken blueprint that the convergence-stop
 # (abstraction-agnostic) cannot catch and only the final ranking gate would; the ctor's num_buckets==K check
@@ -309,7 +471,7 @@ fi
 
 cat > /opt/pokerbot/drive_native_cfr.py <<'PYEOF'
 import os, sys, time, traceback
-import boto3
+import boto3{ckpt_upload_imports}
 import battery_native as bn
 
 BUCKET = "{bucket}"
@@ -318,7 +480,7 @@ REGION = "{region}"
 ITERS = {iters}
 N_DEALS = {n_deals}
 NUM_BUCKETS = {num_buckets}
-CKPT_EVERY = {checkpoint_every}
+CKPT_EVERY = {checkpoint_every}{row_budget_const}
 DEPTH_EDGES = [float(x) for x in "{depth_csv}".split(",") if x]
 # Optional shared frozen EMD (hole,board)->bucket lookup (relative to /opt/pokerbot). When set, the
 # trainer keys postflop flop/turn buckets from this table (river/preflop stay made-hand) — the SAME blob
@@ -349,12 +511,7 @@ def _download_latest():
     except Exception:
         return None
 
-def _upload(blob, iters_done):
-    # versioned per-iter checkpoint + a `latest` pointer (atomic on S3: a single PutObject).
-    key = RUN_PREFIX + f"/checkpoints/iter_{{iters_done:06d}}.nlcfr"
-    s3.put_object(Bucket=BUCKET, Key=key, Body=blob)
-    s3.put_object(Bucket=BUCKET, Key=LATEST_KEY, Body=blob)
-    print(f"CKPT iters_done={{iters_done}} -> s3://{{BUCKET}}/{{key}} ({{len(blob)}} bytes)", flush=True)
+{ckpt_upload_fn}
 
 def main():
     # full ctor: (num_buckets, depth_edges, n_deals, n_seats, prune_threshold, fast_merge, emd_frozen_path,
@@ -381,10 +538,10 @@ def main():
     print(f"TRAIN target={{ITERS}} from={{start}} n_deals={{N_DEALS}} num_buckets={{NUM_BUCKETS}} "
           f"depth_edges={{DEPTH_EDGES}}", flush=True)
     t0 = time.time()
-    while t.iters_done() < ITERS:
+    while t.iters_done() < ITERS:{row_budget_pre}
         nxt = min(t.iters_done() + CKPT_EVERY, ITERS)
         step = nxt - t.iters_done()
-        t.train(step)
+        t.train(step){row_budget_block}
         _upload(t.save_bytes(), t.iters_done())
         el = time.time() - t0
         done = t.iters_done() - start
@@ -494,6 +651,19 @@ def main() -> None:
                         "betting-state ALIASING root cause (artifacts/preflop_mispricing_diagnosis.md). "
                         "The checkpoint MUST then be served with the same env: ship it via "
                         "ship_blueprint.py --preflop-hist-key (stamp + two-sided serve guard).")
+    p.add_argument("--fullhist-key", action="store_true",
+                   help="blueprint-v4 Stage-0 (bpv4_h200): export POKERBOT_FULLHIST_KEY=1 on the box so the "
+                        "trainer keys EVERY street's infosets with the full action-history A-segment "
+                        "(fingerprint.rs, env-gated) — the Pluribus-grade exact-history key "
+                        "(artifacts/blueprint_pluribus_grade_design_v2.md). Pair with --mrr (the M-RR "
+                        "action-thinning that makes fullhist convergent). Default off => byte-identical "
+                        "bootstrap (bp2/bp3 unaffected). Serve/eval MUST use the same env.")
+    p.add_argument("--mrr", action="store_true",
+                   help="blueprint-v4 Stage-0: export POKERBOT_MRR=1 on the box so trainer::abstracted_legal "
+                        "applies M-RR (multiplicative regret / action-thinning), collapsing the fullhist tree "
+                        "from ~10^31 to a Pluribus-class ~413M rows (bpv4-mrr-relief-valve). Default off => "
+                        "byte-identical bootstrap. Any in-model probe/eval MUST also set POKERBOT_MRR=1 "
+                        "(train/probe abstraction skew otherwise biases the verdict).")
     p.add_argument("--work-steal", action="store_true",
                    help="atomic deal-counter + rayon::broadcast scheduler (closes the deep-deal load "
                         "imbalance; +33%% deals/s @64c measured). Statistically-equivalent, default OFF.")
@@ -565,6 +735,7 @@ def main() -> None:
         emd_frozen_rel=args.emd_frozen, emd_sha=emd_sha,
         river_ochs_rel=args.river_ochs, river_ochs_sha=river_ochs_sha,
         preflop_hist_key=args.preflop_hist_key,
+        fullhist_key=args.fullhist_key, mrr=args.mrr,
         work_steal=args.work_steal, dcfr=args.dcfr,
         dcfr_prune_threshold=args.dcfr_prune_threshold, dcfr_explore_frac=args.dcfr_explore_frac,
         wall_guard_secs=wall_guard_secs, awscli_zip=awscli_zip,
