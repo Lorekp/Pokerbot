@@ -1,11 +1,18 @@
 """Population prior over per-context action-bin distributions — the Dirichlet PSEUDOCOUNTS that give
-new/unknown players a realistic loose-passive cold-start AND shrink small-n individual data toward
-the population (the anti-overfit regularizer).
+new/unknown players a cold-start read AND shrink small-n individual data toward the population
+(the anti-overfit regularizer).
 
-Real-population analysis (IRC, 5.2M hands / 4719 players) found median VPIP ~48%, PFR ~10%,
-aggression factor ~0.65 — i.e. LOOSE-PASSIVE: they enter many pots, raise little, call/check a lot,
-and under-fold to bets. The dominant exploit is therefore THIN VALUE-BETTING (and rarely bluffing).
-The prior below encodes that character per context so cold-start play already leans the right way.
+PROVENANCE WARNING (exploitation overhaul design 2026-07-05, artifacts/exploitation_overhaul_design.md):
+the numbers below (VPIP ~48%, PFR ~10%, AF ~0.65) come from the IRC corpus — 1995-2001,
+predominantly FIXED-LIMIT, full-ring, pre-Moneymaker. They are NOT a measured fact about modern
+online NLHE: the IRC nolimit folder (25,787 hands) has zero calibration signal (skill-estimator
+reliability 0.00), and the modern micro/low-stakes 6-max field is BIMODAL (tight-aggressive reg
+majority-by-seats + a loose-passive fish minority; field-mean VPIP ~22-32 per the coaching/HUD
+literature cited in the design §8). The "field is loose-passive => the edge is thin value-betting"
+doctrine holds for the FISH ARCHETYPE, not the field mean. The modern replacement is
+``pokerbot.opponent.archetype_prior`` (a K=5 archetype mixture), gated behind
+POKERBOT_ARCHETYPE_PRIOR until its pre-registered validation gate (G-P2) passes on real captured
+NLHE data — until then THIS module remains the deployed default (byte-identical behavior).
 
 Loads ``data/player_profiles/irc_population_prior.json`` if present; otherwise falls back to an
 in-code generator so the engine never hard-depends on the file (mirrors mixer._load_calibrated_threshold).
