@@ -198,6 +198,20 @@ fn shard_of(key: &[u8; 16]) -> usize {
     (h.finish() as usize) & (N_SHARDS - 1)
 }
 
+/// BENCH/TEST-ONLY: insert a `(cum_regret, strat_sum)` row pair into the shard `shard_of` routes the
+/// key to — the same placement the trainer uses. Lets an out-of-crate bench synthesize a realistically
+/// sharded `NlheTables` without depending on private `shard_of`. Not on any hot path.
+pub fn bench_insert_row(
+    tab: &mut NlheTables,
+    key: [u8; 16],
+    cum: [f64; NUM_ACTIONS],
+    strat: [f64; NUM_ACTIONS],
+) {
+    let s = shard_of(&key);
+    tab.shards[s].cum_regret.insert(key, narrow_r(&cum));
+    tab.shards[s].strat_sum.insert(key, strat);
+}
+
 thread_local! {
     /// Per-rayon-thread, process-persistent blake2b-digest memo for the CFR+ hot loop. A pure-function
     /// cache (fingerprint message -> blake2b digest); see the comment at its use site in
@@ -492,6 +506,21 @@ impl NlheTables {
     /// Number of distinct infosets with a strategy-sum row (== the served blueprint size).
     pub fn n_strat_infosets(&self) -> usize {
         self.total_strat_len()
+    }
+
+    /// BENCH/TEST-ONLY: iters_done accessor/setter and owned row dumps (widened to f64) so an
+    /// out-of-crate bench can build a serial-reference encoder without private access. Not hot-path.
+    pub fn iters_done(&self) -> u64 {
+        self.iters_done
+    }
+    pub fn set_iters_done(&mut self, n: u64) {
+        self.iters_done = n;
+    }
+    pub fn dump_cum_rows(&self) -> Vec<([u8; 16], [f64; NUM_ACTIONS])> {
+        self.iter_all_cum().map(|(k, r)| (*k, widen_r(r))).collect()
+    }
+    pub fn dump_strat_rows(&self) -> Vec<([u8; 16], [f64; NUM_ACTIONS])> {
+        self.iter_all_strat().map(|(k, r)| (*k, *r)).collect()
     }
 
     /// Number of distinct infosets with a cum_regret row. Under v3 `snapshot_avg` (no postflop
@@ -3413,6 +3442,32 @@ pub fn snapshot(tab: &NlheTables) -> HashMap<[u8; 16], [f64; NUM_ACTIONS]> {
 // modelled on leduc::serialize (leduc.rs:607-696), adapted to fixed-width [u8;16] keys.
 // --------------------------------------------------------------------------------------------------
 
+/// Serialize DIRECTLY to a file path, returning the number of bytes written. Byte-identical to
+/// `std::fs::write(path, serialize(tab))` — it produces the SAME NLCFR001 blob (same global sort, same
+/// fixed-width rows) and writes it through a large `BufWriter`.
+///
+/// WHY (checkpoint-speed ops, 2026-07-06): the cloud driver's pause was `blob = t.save_bytes()` (Rust
+/// builds the ~58 GB `Vec<u8>`, then `PyBytes::new` COPIES it into a Python bytes object — a second full
+/// ~58 GB memcpy on the pause path and a ~58 GB RAM-peak bump, risking OOM at the §10 132 GB RSS peak)
+/// followed by Python `f.write(blob)` (a third pass). This path lets the PyO3 wrapper build the blob and
+/// write it to the local ckpt volume ENTIRELY in Rust under `py.detach()` (GIL released), skipping the
+/// PyBytes copy. The returned byte count is all Python needs to log + hand to the detached uploader.
+/// The `.tmp` + rename atomicity stays in Python (unchanged marker semantics); this only replaces the
+/// serialize+PyBytes+write triple with a single serialize+write.
+pub fn serialize_to_file(tab: &NlheTables, path: &str) -> std::io::Result<usize> {
+    use std::io::Write;
+    // Build the blob (identical to `serialize`) then stream it out. We still materialize the blob in RAM
+    // because the global key sort requires the full pair vector; the win is eliminating the PyBytes copy,
+    // not the blob itself. A 16 MiB BufWriter amortizes syscall overhead on the sequential write.
+    let blob = serialize(tab);
+    let f = std::fs::File::create(path)?;
+    let mut w = std::io::BufWriter::with_capacity(16 * 1024 * 1024, f);
+    w.write_all(&blob)?;
+    w.flush()?;
+    w.into_inner()?.sync_all()?;
+    Ok(blob.len())
+}
+
 pub fn serialize(tab: &NlheTables) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"NLCFR001");
@@ -3456,12 +3511,59 @@ fn write_map_sharded<'a>(
     // rows, ~58 GB blob) the serial sort dominated the per-checkpoint training pause (~140 MB/s
     // measured => ~7-10 min); with the S3 upload now detached, serialize IS the pause.
     pairs.par_sort_unstable_by(|a, b| a.0.cmp(b.0));
-    for (key, row) in pairs {
-        out.extend_from_slice(&key[..]); // fixed 16-byte key (no length prefix needed)
-        for &v in &row {
-            out.extend_from_slice(&v.to_le_bytes());
+    encode_sorted_pairs(out, &pairs);
+}
+
+/// Fixed on-disk row width for an `NLCFR001`/serialize map row: 16-byte key + `NUM_ACTIONS` f64 LE.
+const SER_ROW_BYTES: usize = 16 + 8 * NUM_ACTIONS;
+
+/// Encode an ALREADY-GLOBALLY-SORTED `(key, row)` slice into `out` as the fixed-width row stream
+/// (16-byte key then 11 f64 LE per row), appended after the `total_len` prefix the caller wrote.
+///
+/// PERF (checkpoint-speed ops, 2026-07-06): the previous serial `extend_from_slice` loop was the
+/// dominant serialize cost at the bpv4 fullhist scale (~655M rows => single-thread ~104 B/row memcpy
+/// of a ~58 GB blob). Because every row is EXACTLY `SER_ROW_BYTES` wide, row `i` occupies the disjoint
+/// output range `[i*W, (i+1)*W)` — so we preallocate the exact output tail ONCE and let rayon fill
+/// disjoint row-chunks in parallel. This is a pure data-parallel scatter with no cross-thread aliasing
+/// (each chunk owns a non-overlapping `&mut [u8]`), so the emitted bytes are BIT-IDENTICAL to the serial
+/// loop for the same sorted input (the golden-SHA gate and the `serialize`/`deserialize` round-trip tests
+/// verify this). Serial fallback for tiny inputs avoids rayon overhead where it cannot pay for itself.
+fn encode_sorted_pairs(out: &mut Vec<u8>, pairs: &[(&[u8; 16], [f64; NUM_ACTIONS])]) {
+    let n = pairs.len();
+    let base = out.len();
+    out.resize(base + n * SER_ROW_BYTES, 0u8);
+    let dst = &mut out[base..];
+
+    #[inline]
+    fn encode_one(slot: &mut [u8], key: &[u8; 16], row: &[f64; NUM_ACTIONS]) {
+        slot[..16].copy_from_slice(&key[..]);
+        let mut o = 16;
+        for &v in row {
+            slot[o..o + 8].copy_from_slice(&v.to_le_bytes());
+            o += 8;
         }
     }
+
+    // Rayon fixed-cost is ~1M rows; below that the serial loop wins.
+    const PAR_MIN_ROWS: usize = 1 << 20;
+    if n < PAR_MIN_ROWS {
+        for (i, (key, row)) in pairs.iter().enumerate() {
+            let off = i * SER_ROW_BYTES;
+            encode_one(&mut dst[off..off + SER_ROW_BYTES], key, row);
+        }
+        return;
+    }
+    // Chunk the output by whole rows so each rayon task owns a disjoint, row-aligned slice. Zip the
+    // matching row-chunk of `pairs` (same fixed row count per chunk => 1:1 alignment).
+    let rows_per_chunk = n.div_ceil(rayon::current_num_threads().max(1) * 4).max(1);
+    dst.par_chunks_mut(rows_per_chunk * SER_ROW_BYTES)
+        .zip(pairs.par_chunks(rows_per_chunk))
+        .for_each(|(byte_chunk, pair_chunk)| {
+            for (i, (key, row)) in pair_chunk.iter().enumerate() {
+                let off = i * SER_ROW_BYTES;
+                encode_one(&mut byte_chunk[off..off + SER_ROW_BYTES], key, row);
+            }
+        });
 }
 
 fn read_u64(b: &[u8], p: &mut usize) -> Option<u64> {
@@ -3584,12 +3686,44 @@ pub fn serialize_current_strategy(tab: &NlheTables) -> Vec<u8> {
             (k, row)
         })
         .collect();
-    pairs.sort_by(|a, b| a.0.cmp(b.0));
-    for (k, row) in pairs {
-        out.extend_from_slice(&k[..]);
-        for &v in &row {
-            out.extend_from_slice(&v.to_le_bytes());
+    // PERF (checkpoint-speed ops, 2026-07-06): parallel sort + parallel fixed-width encode, matching
+    // the `write_map_sharded` treatment. Keys are UNIQUE (HashMap keys), so unstable-vs-stable cannot
+    // reorder equal elements and the NLSNAP01 byte stream is IDENTICAL to the prior serial `sort_by` +
+    // serial encode loop (the snap round-trip / averager tests gate this). Rows are fixed `SNAP_ROW_BYTES`
+    // wide, so row `i` owns the disjoint output range `[i*W, (i+1)*W)` — preallocate once, fill in
+    // parallel with no cross-thread aliasing.
+    pairs.par_sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let n_rows = pairs.len();
+    let base = out.len();
+    out.resize(base + n_rows * SNAP_ROW_BYTES, 0u8);
+    let dst = &mut out[base..];
+
+    #[inline]
+    fn encode_snap_one(slot: &mut [u8], key: &[u8; 16], row: &[f32; NUM_ACTIONS]) {
+        slot[..16].copy_from_slice(&key[..]);
+        let mut o = 16;
+        for &v in row {
+            slot[o..o + 4].copy_from_slice(&v.to_le_bytes());
+            o += 4;
         }
+    }
+
+    const PAR_MIN_ROWS: usize = 1 << 20;
+    if n_rows < PAR_MIN_ROWS {
+        for (i, (k, row)) in pairs.iter().enumerate() {
+            let off = i * SNAP_ROW_BYTES;
+            encode_snap_one(&mut dst[off..off + SNAP_ROW_BYTES], k, row);
+        }
+    } else {
+        let rows_per_chunk = n_rows.div_ceil(rayon::current_num_threads().max(1) * 4).max(1);
+        dst.par_chunks_mut(rows_per_chunk * SNAP_ROW_BYTES)
+            .zip(pairs.par_chunks(rows_per_chunk))
+            .for_each(|(byte_chunk, pair_chunk)| {
+                for (i, (k, row)) in pair_chunk.iter().enumerate() {
+                    let off = i * SNAP_ROW_BYTES;
+                    encode_snap_one(&mut byte_chunk[off..off + SNAP_ROW_BYTES], k, row);
+                }
+            });
     }
     out
 }
@@ -5220,6 +5354,29 @@ mod tests {
                 assert_eq!(shard_of(k), s, "strat key in wrong shard after deserialize");
             }
         }
+    }
+
+    /// `serialize_to_file` writes the EXACT same NLCFR001 blob as `serialize` (the checkpoint-speed
+    /// direct-to-file path must not change one byte — same magic, header, global sort, fixed-width rows).
+    #[test]
+    fn serialize_to_file_is_byte_identical_to_serialize() {
+        let cfg = test_cfg(64);
+        let mut a = NlheTables::new();
+        for _ in 0..3 {
+            a.train_iteration(&cfg);
+        }
+        let want = serialize(&a);
+        let mut path = std::env::temp_dir();
+        path.push(format!("nlcfr_ser2file_{}.nlcfr", std::process::id()));
+        let p = path.to_str().unwrap();
+        let n = serialize_to_file(&a, p).expect("serialize_to_file");
+        assert_eq!(n, want.len(), "returned byte count mismatch");
+        let got = std::fs::read(p).expect("read back");
+        let _ = std::fs::remove_file(p);
+        assert_eq!(got, want, "serialize_to_file blob differs from serialize blob");
+        // And it deserializes back to a re-serialize-identical table (resume bit-identity).
+        let b = deserialize(&got).expect("deserialize file blob");
+        assert_eq!(serialize(&b), want, "file blob not resume-identical");
     }
 
     /// On-disk NLCFR001 row width is f64 (8 bytes/elem) for BOTH maps regardless of the in-memory
