@@ -80,7 +80,7 @@
     -NumBuckets 200 `
     -EmdFrozen "" `
     -RiverOchs "" `
-    -CheckpointEvery 500 `
+    -CheckpointEvery 250 `
     -GateEvery 2500 `
     -CkptVolumeGb 400 `
     -InstanceType "c6i.32xlarge" `
