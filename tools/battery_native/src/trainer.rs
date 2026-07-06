@@ -628,15 +628,23 @@ fn lcfr_discount_event(v3: &V3Cfg, t: u64) -> bool {
 /// nd=200 (verified by an old-vs-new iters=1 A/B) / ~0 at nd=64 — all far inside the
 /// `compare_trainer_states` atol=1e-9 production gate. (An earlier comment claimed "bit-identical at
 /// 8/12 threads"; that was a coincidence of the nd=64 smoke shape, corrected after the throughput A/B.)
+/// R2 (perf, byte-identical): takes `&mut LocalDelta` and `drain()`s it instead of consuming a fresh
+/// per-deal allocation, so callers REUSE one `LocalDelta` per worker/task across all their deals
+/// (capacity survives; the two per-deal map allocations + their ~8 growth-rehash doublings each —
+/// ~0.4-0.5 GB/iter of realloc traffic at nd=8192 — disappear). Value-equivalence: every drained
+/// (key,row) is folded into ITS OWN `acc` entry by `+=`/`radd`, and a key occurs at most once per
+/// LocalDelta map, so the fold is key-independent — the accumulated values (and the merged table)
+/// are byte-identical regardless of the drain order or the map's capacity history (golden SHA gate
+/// re-verified post-change on the static scheduler).
 #[inline]
-fn accumulate_local_into(acc: &mut NlheTables, local: LocalDelta) {
-    for (k, row) in local.cum_regret {
+fn accumulate_local_into(acc: &mut NlheTables, local: &mut LocalDelta) {
+    for (k, row) in local.cum_regret.drain() {
         let e = acc.shards[shard_of(&k)].cum_regret.entry(k).or_insert(ZEROS_R);
         for a in 0..NUM_ACTIONS {
             e[a] = radd(e[a], row[a]);
         }
     }
-    for (k, row) in local.strat_sum {
+    for (k, row) in local.strat_sum.drain() {
         let e = acc.shards[shard_of(&k)].strat_sum.entry(k).or_insert(ZEROS);
         for a in 0..NUM_ACTIONS {
             e[a] += row[a];
@@ -2364,8 +2372,8 @@ fn run_batch<const N: usize>(
     }
     // Fold each deal's LocalDelta into the task accumulator in ASCENDING deal-index order (travs is in
     // deal order) — IDENTICAL fold order to the sequential `accumulate_local_into` per deal.
-    for trav in travs.into_iter() {
-        accumulate_local_into(acc, trav.local);
+    for mut trav in travs.into_iter() {
+        accumulate_local_into(acc, &mut trav.local);
     }
 }
 
@@ -2765,18 +2773,21 @@ impl NlheTables {
             .fold(
                 || {
                     fp_memo_cap_check();
-                    NlheTables::default()
+                    // R2: one REUSED LocalDelta per task (drained into `acc` after each deal, so it is
+                    // always empty at deal start — identical content to the old fresh-per-deal map,
+                    // minus the per-deal alloc + growth rehashes; see `accumulate_local_into`).
+                    (NlheTables::default(), LocalDelta::default())
                 },
-                |mut acc, d| {
+                |(mut acc, mut local), d| {
                 let deal_seed = iter_seed
                     .wrapping_add((d as u64).wrapping_mul(0x100000001b3))
                     .rotate_left(17);
                 let mut rng = Rng::seed_from_u64(deal_seed);
                 let root = deal_root::<N>(&mut rng, d as u64);
-                // Per-deal DELTA accumulator: starts EMPTY, so `local` IS this deal's delta —
-                // `one_traversal` reads strategy from the shared `read` snapshot and `+=`-writes only the
-                // touched regret/strat-sum rows here. Folded into the per-task `acc` immediately after.
-                let mut local = LocalDelta::default();
+                // Per-deal DELTA accumulator: EMPTY at this point (drained after the previous deal), so
+                // `local` IS this deal's delta — `one_traversal` reads strategy from the shared `read`
+                // snapshot and `+=`-writes only the touched regret/strat-sum rows here. Drained into the
+                // per-task `acc` immediately after.
                 FP_MEMO.with(|cell| {
                     let memo = &mut *cell.borrow_mut();
                     for hero in 0..N {
@@ -2785,9 +2796,10 @@ impl NlheTables {
                         );
                     }
                 });
-                accumulate_local_into(&mut acc, local);
-                acc
+                accumulate_local_into(&mut acc, &mut local);
+                (acc, local)
             })
+            .map(|(acc, _local)| acc)
             .collect()
     }
 
@@ -2835,6 +2847,10 @@ impl NlheTables {
         // closure on every thread in the current pool and collects the results in thread-index order.
         rayon::broadcast(|_ctx| {
             let mut acc = NlheTables::default();
+            // R2: one REUSED LocalDelta per worker (drained into `acc` after each deal — empty at every
+            // deal start, so per-deal content is identical to the old fresh-per-deal map without the
+            // alloc + growth-rehash churn; see `accumulate_local_into`).
+            let mut local = LocalDelta::default();
             FP_MEMO.with(|cell| {
                 let memo = &mut *cell.borrow_mut();
                 // MEMORY BOUND (byte-identity neutral, mode-agnostic): FP_MEMO is a pure
@@ -2862,13 +2878,12 @@ impl NlheTables {
                         .rotate_left(17);
                     let mut rng = Rng::seed_from_u64(deal_seed);
                     let root = deal_root::<N>(&mut rng, d as u64);
-                    let mut local = LocalDelta::default();
                     for hero in 0..N {
                         one_traversal::<N>(
                             &root, hero, cfg, read, &mut local, &mut rng, t, memo, eff_prune, v3i,
                         );
                     }
-                    accumulate_local_into(&mut acc, local);
+                    accumulate_local_into(&mut acc, &mut local);
                 }
             });
             acc
@@ -2939,7 +2954,7 @@ impl NlheTables {
         // The profile twin keeps the STATIC scheduler regardless of `work_steal` (the dynamic scheduler is
         // a pure-throughput change, not a measurement change; the profile counters must reflect a stable,
         // comparable per-node traversal). DCFR's `eff_prune` IS honored so the profile reflects RBP firing.
-        let pairs: Vec<(NlheTables, TraverseStats)> = (0..cfg.n_deals_per_iter)
+        let pairs: Vec<(NlheTables, TraverseStats, LocalDelta)> = (0..cfg.n_deals_per_iter)
             .into_par_iter()
             .with_min_len(deal_chunk_min_len(
                 cfg.n_deals_per_iter,
@@ -2950,15 +2965,15 @@ impl NlheTables {
             .fold(
                 || {
                     fp_memo_cap_check();
-                    (NlheTables::default(), TraverseStats::default())
+                    // R2: reused per-task LocalDelta (see `collect_partials_n` / `accumulate_local_into`).
+                    (NlheTables::default(), TraverseStats::default(), LocalDelta::default())
                 },
-                |(mut acc, mut acc_stats), d| {
+                |(mut acc, mut acc_stats, mut local), d| {
                     let deal_seed = iter_seed
                         .wrapping_add((d as u64).wrapping_mul(0x100000001b3))
                         .rotate_left(17);
                     let mut rng = Rng::seed_from_u64(deal_seed);
                     let root = deal_root::<N>(&mut rng, d as u64);
-                    let mut local = LocalDelta::default();
                     FP_MEMO.with(|cell| {
                         let memo = &mut *cell.borrow_mut();
                         let before = memo.len();
@@ -2970,15 +2985,15 @@ impl NlheTables {
                         }
                         acc_stats.fp_memo_new_entries += memo.len().saturating_sub(before) as u64;
                     });
-                    accumulate_local_into(&mut acc, local);
-                    (acc, acc_stats)
+                    accumulate_local_into(&mut acc, &mut local);
+                    (acc, acc_stats, local)
                 },
             )
             .collect();
 
         let mut partials = Vec::with_capacity(pairs.len());
         let mut total = TraverseStats::default();
-        for (partial, stats) in pairs {
+        for (partial, stats, _local) in pairs {
             total.merge(&stats);
             partials.push(partial);
         }
