@@ -16,7 +16,10 @@ use std::env;
 use std::time::Instant;
 
 use battery_native::core::NUM_ACTIONS;
-use battery_native::trainer::{bench_insert_row, deserialize, serialize, NlheTables};
+use battery_native::trainer::{
+    apply_delta_checked, bench_insert_row, bench_mark_dirty_fraction, deserialize, serialize,
+    serialize_delta, NlheTables,
+};
 
 const SER_ROW_BYTES: usize = 16 + 8 * NUM_ACTIONS;
 
@@ -268,4 +271,87 @@ fn main() {
         let secs = gb * 1e9 / (mbps_ser * 1e6);
         println!("  {:>4.0} GB blob : pause ~{:.1}s", gb, secs);
     }
+
+    // -- DELTA CHECKPOINTS (checkpoint-speed R2, 2026-07-06) ------------------------------------------
+    // Measure delta-serialize rate + pause at several touched fractions, and PROVE base+delta resume is
+    // byte-identical to a full re-serialize of the same state. The dirty set is 1-in-`every` rows.
+    //
+    // Production touched fraction: the fullhist table grows ~42k rows/iter (memory note); at a 250-iter
+    // cadence a window touches on the order of (250 * touched_per_iter) rows. We sweep a range of
+    // fractions and report the per-fraction delta pause + projected S3 upload volume so the report can
+    // pick the operating point.
+    println!("\n\n== DELTA CHECKPOINT PROFILE ==");
+    // Full-base serialize timing (reuse `best` from above as the base pause at this local size).
+    let full_pause = best;
+    let full_gb = blob_len as f64 / 1e9;
+    for &every in &[100usize, 50, 20, 10, 5] {
+        // Fresh table so the dirty fraction is clean (arm + mark).
+        let mut dt = NlheTables::new();
+        for i in 0..n {
+            let mut key = [0u8; 16];
+            let a = (i as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ 0xDEADBEEFCAFEBABE;
+            let b = (i as u64).wrapping_mul(0x123456789ABCDEF0) ^ 0x1357911131517191;
+            key[..8].copy_from_slice(&a.to_le_bytes());
+            key[8..].copy_from_slice(&b.to_le_bytes());
+            let mut cum = [0.0f64; NUM_ACTIONS];
+            let mut strat = [0.0f64; NUM_ACTIONS];
+            for k in 0..NUM_ACTIONS {
+                cum[k] = (i as f64) * 1e-6 + (k as f64);
+                strat[k] = 0.1 + (k as f64) * 0.01;
+            }
+            bench_insert_row(&mut dt, key, cum, strat);
+        }
+        dt.set_iters_done(62_250);
+        let (dc, ds) = bench_mark_dirty_fraction(&mut dt, every);
+        let frac = (dc + ds) as f64 / (2 * n) as f64;
+
+        // Delta serialize timing (best-of reps).
+        let mut best_d = f64::INFINITY;
+        let mut dblob = Vec::new();
+        for _ in 0..reps {
+            let t0 = Instant::now();
+            let out = serialize_delta(&dt, 62_000, 1).expect("armed");
+            best_d = best_d.min(t0.elapsed().as_secs_f64());
+            dblob = out;
+        }
+        let dgb = dblob.len() as f64 / 1e9;
+        let dmbps = dblob.len() as f64 / 1e6 / best_d;
+
+        // BYTE-IDENTITY GATE: a fresh "base" table (dirty rows perturbed away, then delta re-applied)
+        // must re-serialize identically to `dt`. Simplest faithful check: base = dt serialized as
+        // NLCFR001 at base_iter; deserialize; apply the delta; compare to serialize(dt).
+        // (Here base == full dt, so base+delta trivially == dt; the crate unit test covers the
+        // divergent-base case. We still assert to catch a format regression.)
+        let want_dt = serialize(&dt);
+        let mut base_tab = deserialize(&want_dt).unwrap();
+        base_tab.set_iters_done(62_000);
+        let applied = apply_delta_checked(&mut base_tab, &dblob, 62_000, 0);
+        assert!(applied.is_some(), "delta chain-verify failed at every={every}");
+        assert_eq!(
+            serialize(&base_tab),
+            want_dt,
+            "[GATE] base+delta != full re-serialize at every={every}"
+        );
+
+        let speedup_vs_full = full_pause / best_d;
+        let vol_ratio = dgb / full_gb;
+        println!(
+            "  every={:>3} (touched {:>5.2}%): dirty=({},{}) delta_blob={:.4} GB  \
+             pause={:.4}s ({:.0} MB/s)  vs full: {:.1}x faster, {:.1}% of upload volume  [GATE ok]",
+            every,
+            frac * 100.0,
+            dc,
+            ds,
+            dgb,
+            best_d,
+            dmbps,
+            speedup_vs_full,
+            vol_ratio * 100.0
+        );
+    }
+    println!(
+        "\n  (full base at this size: {:.4} GB, pause {:.4}s. Delta pause/volume scale ~linearly with\n   \
+         the touched fraction; the report projects 41/80/100 GB base sizes with these ratios.)",
+        full_gb, full_pause
+    );
 }
