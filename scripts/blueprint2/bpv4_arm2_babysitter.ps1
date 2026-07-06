@@ -85,7 +85,10 @@
 # 609M M-RR census is refuted and the 900M budget would fire ~iter 3000. Budget 1.4B (reaches
 # the iter-5000 pruning onset with margin; ~532GB at 0.38GB/M rows) requires 1TB boxes: all
 # 512GB m-families excluded; chain = r6a head + r6i/r6id/r6in/r7a alternates.
-$env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n,c6i,c6in,c6id,c7a,m6i,m6id,m6in,m6idn,m6a,m7a"
+# CHURN CURATION (2026-07-06 ~21:40, spot-advisor probe): r6i is in the >20% interruption band
+# for eu-central-1 (worst) -- excluded. x2idn.32xlarge (2TB, <5% band, $2.86-2.91 = cheaper than
+# r6a in 1a/1b) stays IN the chain as a preferred alternate.
+$env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n,c6i,c6in,c6id,c7a,m6i,m6id,m6in,m6idn,m6a,m7a,r6i"
 & (Join-Path $PSScriptRoot "blueprint2_babysitter.ps1") `
     -Run "bpv4_emd160_arm2b" `
     -FullHistKey `
