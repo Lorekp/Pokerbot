@@ -1443,6 +1443,25 @@ mod py {
             PyBytes::new(py, &nlhe_trainer::serialize(&self.tab))
         }
 
+        /// Serialize the checkpoint DIRECTLY to `path` (Rust file write under `py.detach()`), returning
+        /// the number of bytes written. Byte-identical to writing `save_bytes()` to disk, but WITHOUT the
+        /// intermediate ~58 GB PyBytes copy — the driver's per-checkpoint pause and RAM peak both drop by
+        /// one full blob (checkpoint-speed ops, 2026-07-06). The caller keeps `.tmp`+rename atomicity and
+        /// the marker/upload handoff; this only replaces `blob = save_bytes(); f.write(blob)` with a single
+        /// in-Rust serialize+write. Hogwild materializes to the fork-merge shape first (same as save_bytes).
+        fn save_bytes_to_file(&self, py: Python<'_>, path: &str) -> PyResult<usize> {
+            #[cfg(feature = "hogwild")]
+            if let Some(h) = &self.hog {
+                let tab = h.table.snapshot_tables(h.iters_done);
+                return py
+                    .detach(|| nlhe_trainer::serialize_to_file(&tab, path))
+                    .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()));
+            }
+            let tab = &self.tab;
+            py.detach(|| nlhe_trainer::serialize_to_file(tab, path))
+                .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
+        }
+
         /// blueprint-v4 v3 (snapshot averaging): serialize the CURRENT strategy (positive-part-
         /// normalized cum_regret) as an NLSNAP01 blob — the rounds-2-4 snapshot the offline
         /// `snap_avg` averager consumes (`trainer::serialize_current_strategy`; Pluribus P-supp
