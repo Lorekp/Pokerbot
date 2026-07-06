@@ -176,6 +176,13 @@ class NlheCFRTrainer:
             return False
         self._iters = struct.unpack("<Q", blob[8:16])[0]
         self._set = self._members(blob, 16)
+        # MODEL install_loaded_tables (lib.rs ~1670): `self.tab = tab` replaces the WHOLE table,
+        # and a deserialized NlheTables has dirty: None -- so an arm_delta_tracking() done BEFORE
+        # the load is silently WIPED (the 2026-07-06 profile-run bug, i-0f9aa667065ac1388: every
+        # save_delta_to_file returned None and each rolling checkpoint silently fell through to a
+        # 60 GB full base, rate 0.194 it/s). Both load_bytes AND load_bytes_from_file (which
+        # funnels here, like the real pymethods) must wipe.
+        self._dirty = None
         return True
     def load_bytes_from_file(self, path):
         # Round-3 resume entrypoint (real trainer: mmap + parallel deserialize). Fake: read + load.
@@ -390,7 +397,7 @@ def main():
     print(f"[smoke] sandbox {tmp}", flush=True)
     try:
         # ---------- run 1: uninterrupted reference ----------
-        print("[smoke] 1/8 uninterrupted reference run...", flush=True)
+        print("[smoke] 1/9 uninterrupted reference run...", flush=True)
         box1, env1 = setup_env(tmp, "ref")
         rc, out = run_driver(box1, env1)
         assert rc == 0, f"reference run rc={rc}\n{out}"
@@ -417,7 +424,7 @@ def main():
               f"kept={marker_iters(box1)} snaps={snap_iters}", flush=True)
 
         # ---------- run 2: kill mid-run after the iter-6 marker ----------
-        print("[smoke] 2/8 kill-mid-run (simulated spot reclaim after iter-6 marker)...", flush=True)
+        print("[smoke] 2/9 kill-mid-run (simulated spot reclaim after iter-6 marker)...", flush=True)
         box2, env2 = setup_env(tmp, "killed")
         rc, out = run_driver(box2, env2, sleep="0.5", kill_after_marker=6)
         assert rc != 0
@@ -435,7 +442,7 @@ def main():
               flush=True)
 
         # ---------- run 3: resume ----------
-        print("[smoke] 3/8 resume run (must reject corrupt@9, ignore partial@7, resume@6)...",
+        print("[smoke] 3/9 resume run (must reject corrupt@9, ignore partial@7, resume@6)...",
               flush=True)
         rc, out = run_driver(box2, env2)
         assert rc == 0, f"resume run rc={rc}\n{out}"
@@ -450,7 +457,7 @@ def main():
         # ---------- run 4: DELTA-mode uninterrupted (POKERBOT_DELTA_CKPT=1) ----------
         # A gate (iter 5,10) and the first checkpoint write a full base; the rolling checkpoints in between
         # write NLDLT001-shaped deltas. Final state must equal run-1's, and delta blobs must exist on S3.
-        print("[smoke] 4/8 delta-mode run (base at gates, deltas between; final == uninterrupted)...",
+        print("[smoke] 4/9 delta-mode run (base at gates, deltas between; final == uninterrupted)...",
               flush=True)
         box4, env4 = setup_env(tmp, "delta")
         # CHUNK=1 (< CKPT_EVERY) so the chunked train loop has mid-window boundaries; pre-touch the
@@ -462,7 +469,8 @@ def main():
         if os.environ.get("DELTA_DEBUG"):
             print(out, flush=True)
         assert rc == 0, f"delta run rc={rc}\n{out}"
-        assert "DELTA_CKPT enabled" in out, "delta arm banner missing"
+        # post-wipe-fix banner: fresh start arms AFTER the (absent) load, in the else branch
+        assert "DELTA_CKPT armed (fresh start)" in out, f"delta arm banner missing:\n{out}"
         wait_uploads(box4, {ITERS})
         assert final_blob(box4, ITERS) == ref_final, "delta-mode final base != uninterrupted final state"
         # Deltas were WRITTEN at the non-gate rolling checkpoints (from the driver log) — and bases only
@@ -488,7 +496,7 @@ def main():
               f"rebalance@{rebal_iter}, final IDENTICAL", flush=True)
 
         # ---------- run 5: DELTA-mode kill + resume (base + delta chain) ----------
-        print("[smoke] 5/8 delta-mode kill + resume (base@5 + delta chain -> identical final)...",
+        print("[smoke] 5/9 delta-mode kill + resume (base@5 + delta chain -> identical final)...",
               flush=True)
         box5, env5 = setup_env(tmp, "delta_resume")
         env5 = dict(env5, POKERBOT_DELTA_CKPT="1")
@@ -515,7 +523,7 @@ def main():
         # spot_watch touches the reclaim flag; the CHUNKED train loop notices it mid-window, banks
         # the un-checkpointed iters as ONE synchronous delta at a NON-cadence iter (+ .ok marker),
         # and exits 0. A fresh resume must land on base + emergency delta.
-        print("[smoke] 6/8 emergency flush (reclaim flag mid-window -> banked delta @ "
+        print("[smoke] 6/9 emergency flush (reclaim flag mid-window -> banked delta @ "
               "non-cadence iter)...", flush=True)
         box6, env6 = setup_env(tmp, "emergency")
         env6 = dict(env6, POKERBOT_DELTA_CKPT="1", POKERBOT_CKPT_CHUNK="1")
@@ -545,7 +553,7 @@ def main():
               f"IDENTICAL final", flush=True)
 
         # ---------- run 7: PRESTAGE valid (bootstrap-prestaged base+chain; NO blob download) ----------
-        print("[smoke] 7/8 prestage-valid resume (S3 blobs deleted -> prestaged copies used)...",
+        print("[smoke] 7/9 prestage-valid resume (S3 blobs deleted -> prestaged copies used)...",
               flush=True)
         box7, env7 = setup_env(tmp, "prestage")
         env7 = dict(env7, POKERBOT_DELTA_CKPT="1")
@@ -592,7 +600,7 @@ def main():
               "final", flush=True)
 
         # ---------- run 8: PRESTAGE stale (newer marker appeared) -> clean fallback download ----------
-        print("[smoke] 8/8 prestage-stale resume (manifest points at an old marker -> fresh "
+        print("[smoke] 8/9 prestage-stale resume (manifest points at an old marker -> fresh "
               "download)...", flush=True)
         stale_path = ckdir / "prestage_base.nlcfr"
         shutil.copyfile(ck7 / "iter_000010.nlcfr", stale_path)
@@ -610,6 +618,51 @@ def main():
         assert "RESUMED from latest checkpoint at iters_done=12" in out, out
         print("[smoke]   OK stale prestage ignored -> fresh download of the newest base (iter 12)",
               flush=True)
+
+        # ---------- run 9: POST-RESUME CHAIN CONTINUATION (the load-wipes-arming bug) ----------
+        # The real trainer's load_bytes(_from_file) replaces the whole table (dirty -> None), so a
+        # pre-load arm_delta_tracking() was silently wiped and EVERY post-resume rolling checkpoint
+        # fell through to a full base (60 GB / ~250 s each on the real box). The fixed driver arms
+        # AFTER load + delta apply, reset_dirty, and roots _BASE at the resumed marker -- so the
+        # FIRST post-resume cadence checkpoint must be a cheap DELTA continuing the chain (seq N+1
+        # on the same base), and a subsequent kill+resume must apply base + N+1 deltas.
+        print("[smoke] 9/9 post-resume chain continuation (first ckpt after resume is a DELTA, "
+              "seq N+1)...", flush=True)
+        box9, env9 = setup_env(tmp, "chain_cont")
+        env9 = dict(env9, POKERBOT_DELTA_CKPT="1")
+        # Kill after the iter-6 delta marker: durable state = base@5 + delta seq1@6 (N=1); the
+        # next boundary (8) is NOT a gate, so a correctly re-armed driver must write a DELTA there.
+        rc, out = run_driver(box9, env9, sleep="0.5", kill_after_marker=6,
+                             marker_fn=all_marker_iters)
+        assert rc != 0
+        # resume run, killed right after the first post-resume cadence checkpoint's marker (8)
+        rc, out = run_driver(box9, env9, sleep="0.5", kill_after_marker=8,
+                             marker_fn=all_marker_iters)
+        assert rc != 0
+        assert "DELTA_CKPT armed post-load; chain rooted at base=5 seq=1" in out, \
+            f"post-load arm banner missing/wrong:\n{out}"
+        assert "RESUMED from latest checkpoint at iters_done=6 (base_iter=5, +1 deltas)" in out, out
+        first_ckpt = re.search(r"CKPT_(SERIALIZE|DELTA) iters_done=(\d+)(?: base=(\d+) seq=(\d+))?",
+                               out)
+        assert first_ckpt, f"no checkpoint line in resume run:\n{out}"
+        assert first_ckpt.group(1) == "DELTA", \
+            f"FIRST post-resume checkpoint must be a DELTA, got {first_ckpt.group(0)}\n{out}"
+        assert (int(first_ckpt.group(2)), int(first_ckpt.group(3)), int(first_ckpt.group(4))) \
+            == (8, 5, 2), f"delta must continue the chain (iter 8, base 5, seq 2): {first_ckpt.group(0)}"
+        ck9 = (box9 / "s3" / "fakebucket" / "pokerbot" / "prod6000" / "native_cfr" / "smoke_arm2"
+               / "checkpoints")
+        mk8 = json.loads((ck9 / "iter_000008.nldlt.ok").read_text(encoding="utf-8"))
+        assert mk8["base_iter"] == 5 and mk8["seq"] == 2 and mk8["iters_done"] == 8, mk8
+        # final resume: must apply base@5 + BOTH deltas (6, 8) and finish identical to run 1
+        rc, out = run_driver(box9, env9)
+        assert rc == 0, f"chain-continuation final resume rc={rc}\n{out}"
+        assert "DELTA_CKPT armed post-load; chain rooted at base=5 seq=2" in out, out
+        assert "RESUMED from latest checkpoint at iters_done=8 (base_iter=5, +2 deltas)" in out, out
+        wait_uploads(box9, {ITERS})
+        assert final_blob(box9, ITERS) == ref_final, \
+            "chain-continuation resumed final state != uninterrupted final state"
+        print("[smoke]   OK resume re-armed post-load: first ckpt = DELTA@8 (base 5, seq 2); "
+              "kill+resume applied base+2 deltas -> IDENTICAL final", flush=True)
 
         print(f"[smoke] ALL PASS in {time.time() - t_start:.1f}s", flush=True)
     finally:

@@ -981,15 +981,19 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "            _emergency_flush(t)\n"
             "            return"
         )
-        # Resume (fullhist): arm delta tracking BEFORE loading (so the first post-resume window
-        # tracks), download the newest verified BASE to disk (tuned parallel GETs), mmap-load it via
-        # load_bytes_from_file (parallel deserialize, no full-blob Python read), then apply its
-        # contiguous verified delta chain. When DELTA_CKPT is off, arm is skipped and
-        # _resume_apply_deltas is a no-op => same as base-only resume.
+        # Resume (fullhist): download the newest verified BASE to disk (tuned parallel GETs),
+        # mmap-load it via load_bytes_from_file (parallel deserialize, no full-blob Python read),
+        # apply its contiguous verified delta chain, then arm delta tracking AFTER the load --
+        # install_loaded_tables replaces the whole NlheTables (dirty resets to None), so an arm
+        # BEFORE the load is silently WIPED and every save_delta_to_file declines to a full base
+        # (profile run i-0f9aa667065ac1388, 2026-07-06: 60 GB base + ~250 s pause every 100 iters,
+        # rate 0.194 it/s). Arm-after-load + reset_dirty gives the first window a clean start, and
+        # _BASE roots at the RESUMED marker so the first post-restart checkpoint is a cheap DELTA
+        # (the old first-ckpt-is-a-base rule predates resume-aware chains; gates still force bases,
+        # so chain length stays bounded by GATE_EVERY/CKPT_EVERY + the few signal deltas).
+        # When DELTA_CKPT is off, arm is skipped and _resume_apply_deltas is a no-op => same as
+        # base-only resume.
         resume_block = (
-            "    if DELTA_CKPT:\n"
-            "        t.arm_delta_tracking()\n"
-            "        print(\"DELTA_CKPT enabled: delta-chain checkpoints armed\", flush=True)\n"
             "    resume_path, base_iter = _download_latest()\n"
             "    if resume_path is not None and t.load_bytes_from_file(resume_path):\n"
             "        try:\n"
@@ -997,11 +1001,23 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "        except OSError:\n"
             "            pass\n"
             "        nd = _resume_apply_deltas(t, base_iter)\n"
+            "        if DELTA_CKPT:\n"
+            "            t.arm_delta_tracking()  # AFTER load: load replaces the tables (unarms)\n"
+            "            t.reset_dirty()\n"
+            "            if base_iter is not None:\n"
+            "                _BASE[\"iter\"] = base_iter\n"
+            "                _BASE[\"seq\"] = nd\n"
+            "                print(f\"DELTA_CKPT armed post-load; chain rooted at base={base_iter} seq={nd}\", flush=True)\n"
+            "            else:\n"
+            "                print(\"DELTA_CKPT armed post-load; legacy resume -> first ckpt is a full base\", flush=True)\n"
             "        # Keep the 'RESUMED from latest checkpoint at iters_done=N' prefix VERBATIM (parsed by\n"
             "        # watch_bpv4_stage0.ps1); append the delta-chain detail after it.\n"
             "        print(f\"RESUMED from latest checkpoint at iters_done={t.iters_done()} \"\n"
             "              f\"(base_iter={base_iter}, +{nd} deltas)\", flush=True)\n"
             "    else:\n"
+            "        if DELTA_CKPT:\n"
+            "            t.arm_delta_tracking()  # fresh start: no load will wipe it\n"
+            "            print(\"DELTA_CKPT armed (fresh start); first ckpt is the chain-root base\", flush=True)\n"
             "        print(\"FRESH start (no resumable checkpoint)\", flush=True)\n"
             "    # drop any UNCONSUMED prestaged blobs (stale prestage / fresh start) -- keeps the ckpt\n"
             "    # staging volume clear for the ~58-69 GB base serializes.\n"

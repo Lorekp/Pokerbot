@@ -67,7 +67,11 @@
 # cycles); c6i measured 27-51 min this morning. m6i stays head (capacity-failed once, retried each
 # launch); c6a/c5-family excluded from the ALTS so a capacity fallback lands on c6i/c6in/m6a
 # instead of re-rolling the churniest pool.
-$env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n"
+# RAM FLOOR (2026-07-06 ~16:30, profile run i-0f9aa667065ac1388): the run's RSS is 191 GB at iter
+# 1000 AND GROWS; a 256 GB box (c7a landed via fallback) page-thrashed to 0.194 it/s under the
+# 60 GB checkpoint serialize+upload churn. ALL 256 GB 128-vCPU families excluded (c6i/c6in/c6id/
+# c7a) -- the chain now lands on 512 GB+ types only (m6i head; m6a/m6id/m6in/m7a/r6i alternates).
+$env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n,c6i,c6in,c6id,c7a"
 & (Join-Path $PSScriptRoot "blueprint2_babysitter.ps1") `
     -Run "bpv4_emd160_arm2b" `
     -FullHistKey `
