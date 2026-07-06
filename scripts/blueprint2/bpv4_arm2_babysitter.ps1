@@ -19,12 +19,14 @@
 #       artifacts/_arm2b_fullhist_parity_k160.json (3630 states, 0 mismatches).
 #   * -V3SignedRegrets                 : POKERBOT_SIGNED_REGRETS=1 -- signed regrets + deep floor +
 #       pruning, NO discount events, w=t averaging kept (sec 2.1).
-#   * -V3PruneC -50000 -V3PruneStart 5000 (sec 12.2): C = -64 x stationary neg_p999 (794.3 bb,
-#       fresh SIGNED-REGRETS calibration, sec 2) -- sec 11's -30000 was a mis-derivation from v3's
-#       LCFR regime and is RETIRED. Floor = C*31/30 = -51,667 (trainer default).
-#       K0 REGSTATS sanity (BINDING): at the iter-5000 checkpoint neg_p999 must be in
-#       **[390, 3910] bb** (= [C/64/2, C/64*5]); outside => STOP, rescale C to -64 x measured
-#       p999 (1 s.f.), relaunch from the 5000 checkpoint.
+#   * -V3PruneC -1000000 -V3PruneStart 5000: K0 FIRED 2026-07-06 20:15 (sec 19). Registered
+#       procedure executed verbatim: measured neg_p999 = 19,950 bb at the iter-5000 REGSTATS
+#       (band [390, 3910] from the C=-50000 calibration; the sec-2 794.3 bb stationary estimate
+#       was ~25x low at production scale) => C = -64 x 19,950 = -1,276,800 -> 1 s.f. =
+#       **-1,000,000**; floor = C*31/30 (trainer default); relaunched FROM the iter-5000 base
+#       (post-5000 old-C deltas purged from S3). History: sec 11's -30000 (LCFR regime) RETIRED;
+#       sec 12.2's -50000 (small-scale signed-regrets calibration) SUPERSEDED by this on-scale
+#       measurement.
 #   * -Iters 40000 -NDeals 8192 -CheckpointEvery 250 -GateEvery 2500 : sec 11 traversal-identical
 #       spec point (327.7M traversals); 250-iter rolling checkpoints (SPOT, sec 13 relaunch: the
 #       2026-07-06 perf merge makes the storm math work -- training ~2.9x faster verified locally
@@ -95,7 +97,7 @@ $env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n,c6i,c6in,c6id,c7a,m6i,
     -Mrr `
     -WorkSteal `
     -V3SignedRegrets `
-    -V3PruneC "-50000" `
+    -V3PruneC "-1000000" `
     -V3PruneStart "5000" `
     -V3SnapshotAvg `
     -V3SnapStart "3200" `
