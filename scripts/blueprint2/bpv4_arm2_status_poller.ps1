@@ -107,7 +107,7 @@ function Get-CkptInfo {
   $markers = @()   # @{ iter=; epoch= } for each .ok marker
   $bigBlobGB = 0.0
   foreach ($o in $items) {
-    if ($o.K -match "iter_(\d+)\.nlcfr\.ok$") {
+    if ($o.K -match "iter_(\d+)\.(nlcfr|nldlt)\.ok$") {
       $markers += @{ iter=[int64]$Matches[1]; epoch=(Iso-Epoch $o.M) }
     } elseif ($o.K -match "iter_(\d+)\.nlcfr$") {
       $gb = [double]$o.S / 1GB

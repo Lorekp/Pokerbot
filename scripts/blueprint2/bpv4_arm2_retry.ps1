@@ -12,7 +12,7 @@ $cycle = 0
 function Get-Iters {
   $keys = (aws s3api list-objects-v2 --bucket video-processing-6789 --prefix "pokerbot/prod6000/native_cfr/bpv4_emd160_arm2b/checkpoints/" --query "Contents[].Key" --output text --region eu-central-1 2>$null)
   $best = [int64]-1
-  if ($keys) { foreach ($k in ($keys -split "\s+")) { if ($k -match "iter_(\d+)\.nlcfr\.ok$") { $v=[int64]$Matches[1]; if ($v -gt $best) { $best=$v } } } }
+  if ($keys) { foreach ($k in ($keys -split "\s+")) { if ($k -match "iter_(\d+)\.(nlcfr|nldlt)\.ok$") { $v=[int64]$Matches[1]; if ($v -gt $best) { $best=$v } } } }
   return $best
 }
 while ((Get-Date) -lt $deadline) {

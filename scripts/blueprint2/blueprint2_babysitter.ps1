@@ -176,7 +176,7 @@ function Get-LatestItersDone {
   if ($keys) {
     $best = [int64]-1
     foreach ($k in ($keys -split "\s+")) {
-      if ($k -match "iter_(\d+)\.nlcfr\.ok$") {
+      if ($k -match "iter_(\d+)\.(nlcfr|nldlt)\.ok$") {
         $v = [int64]$Matches[1]
         if ($v -gt $best) { $best = $v }
       }
