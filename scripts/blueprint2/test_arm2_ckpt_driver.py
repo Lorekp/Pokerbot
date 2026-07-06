@@ -89,7 +89,7 @@ class _Client:
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "wb") as f:
             shutil.copyfileobj(fobj, f)
-    def download_file(self, Bucket, Key, path):
+    def download_file(self, Bucket, Key, path, Config=None):
         shutil.copyfile(self._p(Bucket, Key), path)
     def delete_object(self, Bucket, Key):
         try:
@@ -168,6 +168,13 @@ class NlheCFRTrainer:
         self._iters = struct.unpack("<Q", blob[8:16])[0]
         self._set = self._members(blob, 16)
         return True
+    def load_bytes_from_file(self, path):
+        # Round-3 resume entrypoint (real trainer: mmap + parallel deserialize). Fake: read + load.
+        try:
+            with open(path, "rb") as f:
+                return self.load_bytes(f.read())
+        except OSError:
+            return False
     # -- delta --
     def arm_delta_tracking(self):
         if self._dirty is None:

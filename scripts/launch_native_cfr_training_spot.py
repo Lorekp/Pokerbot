@@ -650,23 +650,50 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
     if fullhist_key or mrr:
         # Resume = newest checkpoint WITH a verified .ok marker (size+sha256) -- NEVER a partial
         # upload. Legacy `latest` pointer stays as a last-resort fallback (pre-marker runs).
+        #
+        # RESUME-SPEED path (2026-07-06, round-3 prologue optimization): the resume prologue was
+        # "download 55-100 GB from S3, then serial-deserialize" -- ~10-15 min, and every spot respawn
+        # burns most of an 18-27 min lifetime on it. Two fixes here:
+        #   (1) DOWNLOAD THROUGHPUT: `s3.download_file`'s DEFAULT TransferConfig is 10 concurrent 8 MB
+        #       ranged GETs -- on a c6a.32xlarge (50 Gbps, 128 vCPU) that leaves the pipe mostly idle. A
+        #       tuned TransferConfig (64 MB parts x 64 concurrent ranged GETs, use_threads=True) saturates
+        #       many more streams and sustains multiple GB/s off a single S3 object.
+        #   (2) NO PYTHON BYTES COPY: `_download_latest` now returns the on-disk PATH (not a ~55-100 GB
+        #       Python `bytes`). The driver resumes via `t.load_bytes_from_file(path)` (mmap + PARALLEL
+        #       deserialize, GIL released) -- removing both the full-blob Python read AND the serial
+        #       single-thread rehash-storm deserialize (measured 9.6x faster load at scale).
+        # sha256 is still verified (integrity of a resumed checkpoint is non-negotiable), streamed once
+        # before the mmap load.
         download_latest_fn = (
+            "_DL_XFER = TransferConfig(multipart_threshold=64 * 1024 * 1024,\n"
+            "                          multipart_chunksize=64 * 1024 * 1024,\n"
+            "                          max_concurrency=64, use_threads=True)\n"
+            "\n"
+            "\n"
             "def _dl_verified(mk, dst):\n"
-            "    # Download the blob for marker `mk` to `dst`, verifying size+sha256; return its meta dict\n"
-            "    # or raise. Shared by base + delta resume so verification is identical.\n"
+            "    # Download the blob for marker `mk` to `dst` (tuned parallel ranged GETs), verifying\n"
+            "    # size+sha256; return its meta dict or raise. Shared by base + delta resume so\n"
+            "    # verification is identical.\n"
             "    meta = json.loads(s3.get_object(Bucket=BUCKET, Key=mk)[\"Body\"].read())\n"
             "    key = mk[:-3]\n"
-            "    s3.download_file(BUCKET, key, dst)\n"
-            "    if os.path.getsize(dst) != int(meta[\"bytes\"]):\n"
-            "        raise ValueError(f\"size {os.path.getsize(dst)} != {meta['bytes']}\")\n"
+            "    t0 = time.time()\n"
+            "    s3.download_file(BUCKET, key, dst, Config=_DL_XFER)\n"
+            "    dl = time.time() - t0\n"
+            "    sz = os.path.getsize(dst)\n"
+            "    if sz != int(meta[\"bytes\"]):\n"
+            "        raise ValueError(f\"size {sz} != {meta['bytes']}\")\n"
             "    sha = _sha256_file(dst)\n"
             "    if sha != meta[\"sha256\"]:\n"
             "        raise ValueError(f\"sha {sha} != {meta['sha256']}\")\n"
+            "    gbps = (sz / 1e9) / dl if dl > 0 else 0.0\n"
+            "    print(f\"RESUME dl s3://{BUCKET}/{key} bytes={sz} dl={dl:.1f}s ({gbps:.2f} GB/s)\",\n"
+            "          flush=True)\n"
             "    return meta\n"
             "\n"
             "\n"
             "def _download_latest():\n"
-            "    # Returns (base_blob, base_iter) for the newest VERIFIED full base, or (None, None).\n"
+            "    # Returns (base_path, base_iter) for the newest VERIFIED full base (tuned download;\n"
+            "    # the driver mmap-loads the path via load_bytes_from_file), or (None, None).\n"
             "    try:\n"
             "        pg = s3.get_paginator(\"list_objects_v2\").paginate(\n"
             "            Bucket=BUCKET, Prefix=RUN_PREFIX + \"/checkpoints/\")\n"
@@ -680,16 +707,16 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "            os.makedirs(CKPT_DIR, exist_ok=True)\n"
             "            path = os.path.join(CKPT_DIR, \"resume.nlcfr\")\n"
             "            meta = _dl_verified(mk, path)\n"
-            "            with open(path, \"rb\") as f:\n"
-            "                blob = f.read()\n"
-            "            os.remove(path)\n"
             "            print(f\"RESUME verified base s3 iter={meta['iters_done']} bytes={meta['bytes']} \"\n"
             "                  f\"sha256={meta['sha256'][:12]}..\", flush=True)\n"
-            "            return blob, int(meta[\"iters_done\"])\n"
+            "            return path, int(meta[\"iters_done\"])\n"
             "        except Exception as e:\n"
             "            print(f\"RESUME candidate {mk} rejected: {e!r} -- trying next\", flush=True)\n"
-            "    try:  # legacy pointer fallback (pre-marker runs only)\n"
-            "        return s3.get_object(Bucket=BUCKET, Key=LATEST_KEY)[\"Body\"].read(), None\n"
+            "    try:  # legacy pointer fallback (pre-marker runs only): stage to disk, return path\n"
+            "        os.makedirs(CKPT_DIR, exist_ok=True)\n"
+            "        path = os.path.join(CKPT_DIR, \"resume.nlcfr\")\n"
+            "        s3.download_file(BUCKET, LATEST_KEY, path, Config=_DL_XFER)\n"
+            "        return path, None\n"
             "    except Exception:\n"
             "        return None, None\n"
             "\n"
@@ -747,15 +774,21 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
         )
         next_stop_expr = "_next_stop(t.iters_done())"
         ckpt_stmt = "_ckpt(t)"
-        # Resume (fullhist): arm delta tracking BEFORE loading (so the first post-resume window tracks),
-        # download the newest verified BASE, load it, then apply its contiguous verified delta chain. When
-        # DELTA_CKPT is off, arm is skipped and _resume_apply_deltas is a no-op => same as base-only resume.
+        # Resume (fullhist): arm delta tracking BEFORE loading (so the first post-resume window
+        # tracks), download the newest verified BASE to disk (tuned parallel GETs), mmap-load it via
+        # load_bytes_from_file (parallel deserialize, no full-blob Python read), then apply its
+        # contiguous verified delta chain. When DELTA_CKPT is off, arm is skipped and
+        # _resume_apply_deltas is a no-op => same as base-only resume.
         resume_block = (
             "    if DELTA_CKPT:\n"
             "        t.arm_delta_tracking()\n"
             "        print(\"DELTA_CKPT enabled: delta-chain checkpoints armed\", flush=True)\n"
-            "    blob, base_iter = _download_latest()\n"
-            "    if blob is not None and t.load_bytes(blob):\n"
+            "    resume_path, base_iter = _download_latest()\n"
+            "    if resume_path is not None and t.load_bytes_from_file(resume_path):\n"
+            "        try:\n"
+            "            os.remove(resume_path)\n"
+            "        except OSError:\n"
+            "            pass\n"
             "        nd = _resume_apply_deltas(t, base_iter)\n"
             "        # Keep the 'RESUMED from latest checkpoint at iters_done=N' prefix VERBATIM (parsed by\n"
             "        # watch_bpv4_stage0.ps1); append the delta-chain detail after it.\n"
@@ -784,8 +817,8 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
         next_stop_expr = "min(t.iters_done() + CKPT_EVERY, ITERS)"
         ckpt_stmt = "_upload(t.save_bytes(), t.iters_done())"
         ckpt_wait_block = ""
-        # Legacy resume: single-blob _download_latest (no delta chain on the bp2/bp3 path). Byte-identical
-        # to the pre-R2 inline resume block.
+        # Legacy resume (both flags off): single-blob _download_latest returning a BLOB (no delta
+        # chain, no path staging on the bp2/bp3 path). Byte-identical to the pre-R2/R3 inline block.
         resume_block = (
             "    blob = _download_latest()\n"
             "    if blob is not None and t.load_bytes(blob):\n"

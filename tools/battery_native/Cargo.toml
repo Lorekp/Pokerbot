@@ -20,6 +20,10 @@ rayon = "1"
 # FxHashMap (compiler-internal hash function exposed as a crate). The AoSoA `cfr_table` uses it
 # for its scalar-u64 infoset index (5-8 cycle probes vs 20-40 cycles for std HashMap on i64 keys).
 rustc-hash = "2"
+# Memory-map the local checkpoint file on resume so the parallel deserialize reads the ~55-100 GB blob
+# directly from the page cache — no Python `bytes` copy of the whole file (the resume-speed path). Tiny,
+# zero transitive deps.
+memmap2 = "0.9"
 
 [dev-dependencies]
 # Off-the-shelf RNG reference point for the `bench_rng` example's three-way speed comparison
