@@ -1462,6 +1462,94 @@ mod py {
                 .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
         }
 
+        // ---- DELTA CHECKPOINTS (checkpoint-speed R2, 2026-07-06) --------------------------------------
+        // Fork-merge-only (same posture as the v3 snapshot modes): the delta dirty-set is populated in the
+        // fork-merge `merge_partials{,_clamped}` path. Arm ONCE at startup; then per checkpoint the driver
+        // calls `save_delta_to_file` (or `save_bytes_to_file` for a full base) and `reset_dirty`.
+
+        /// Arm delta-checkpoint dirty tracking (idempotent). Errors on the hogwild path (delta mode is
+        /// fork-merge only). A straight run that never arms pays nothing and is byte-identical.
+        fn arm_delta_tracking(&mut self) -> PyResult<()> {
+            #[cfg(feature = "hogwild")]
+            if self.hog.is_some() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "arm_delta_tracking: unsupported on the hogwild path",
+                ));
+            }
+            self.tab.arm_delta_tracking();
+            Ok(())
+        }
+
+        /// Serialize the DIRTY rows since the last checkpoint as an `NLDLT001` delta straight to `path`
+        /// (Rust write under `py.detach()`), rooted at `base_iter` with sequence `seq`. Returns the byte
+        /// count, or None if delta tracking is unarmed OR the window touched the whole table
+        /// (`dirty_is_full` after a discount pass) — in either case the caller must write a full base
+        /// instead. The delta does NOT reset the dirty set (the driver calls `reset_dirty` only after the
+        /// upload handoff, so a failed/partial upload leaves the window intact for the next attempt).
+        fn save_delta_to_file(
+            &self,
+            py: Python<'_>,
+            path: &str,
+            base_iter: u64,
+            seq: u64,
+        ) -> PyResult<Option<usize>> {
+            #[cfg(feature = "hogwild")]
+            if self.hog.is_some() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "save_delta_to_file: unsupported on the hogwild path",
+                ));
+            }
+            if !self.tab.delta_armed() || self.tab.dirty_is_full() {
+                return Ok(None);
+            }
+            let tab = &self.tab;
+            py.detach(|| nlhe_trainer::serialize_delta_to_file(tab, path, base_iter, seq))
+                .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
+        }
+
+        /// Apply an `NLDLT001` delta blob onto the in-memory table (resume path). Chain-verified: the
+        /// delta's base_iter must equal `base_iter` and its seq must be `prev_seq + 1` and its iters_done
+        /// must advance. Returns `(iters_done, seq)` on success, None on any mismatch (fail-closed).
+        fn apply_delta(
+            &mut self,
+            blob: &[u8],
+            base_iter: u64,
+            prev_seq: u64,
+        ) -> PyResult<Option<(u64, u64)>> {
+            #[cfg(feature = "hogwild")]
+            if self.hog.is_some() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "apply_delta: unsupported on the hogwild path",
+                ));
+            }
+            Ok(nlhe_trainer::apply_delta_checked(
+                &mut self.tab,
+                blob,
+                base_iter,
+                prev_seq,
+            ))
+        }
+
+        /// Read the `(base_iter, iters_done, seq)` header of a delta blob without applying it (cheap;
+        /// 32-byte parse). None on bad magic / truncation. Lets the driver validate chain contiguity
+        /// before downloading a full delta.
+        #[staticmethod]
+        fn delta_header(blob: &[u8]) -> Option<(u64, u64, u64)> {
+            nlhe_trainer::delta_header(blob)
+        }
+
+        /// Clear the dirty set at a checkpoint boundary (retains capacity). No-op when unarmed. Called
+        /// AFTER a delta/base checkpoint's rows are captured AND handed to the uploader.
+        fn reset_dirty(&mut self) {
+            self.tab.reset_dirty();
+        }
+
+        /// `(dirty_cum_rows, dirty_strat_rows)` accumulated since the last `reset_dirty` — telemetry so
+        /// the driver can log delta sparsity and decide base-vs-delta. (0,0) when unarmed.
+        fn dirty_counts(&self) -> (usize, usize) {
+            self.tab.dirty_counts()
+        }
+
         /// blueprint-v4 v3 (snapshot averaging): serialize the CURRENT strategy (positive-part-
         /// normalized cum_regret) as an NLSNAP01 blob — the rounds-2-4 snapshot the offline
         /// `snap_avg` averager consumes (`trainer::serialize_current_strategy`; Pluribus P-supp

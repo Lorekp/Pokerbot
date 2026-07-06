@@ -39,6 +39,7 @@ use rayon::prelude::*;
 // sorts keys). It carries zero transitive deps. `FxHashMap<K,V>` is a `HashMap<K,V,FxBuildHasher>`; we
 // alias it locally so the rest of the module reads exactly as before.
 use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet as HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -210,6 +211,27 @@ pub fn bench_insert_row(
     let s = shard_of(&key);
     tab.shards[s].cum_regret.insert(key, narrow_r(&cum));
     tab.shards[s].strat_sum.insert(key, strat);
+}
+
+/// BENCH-ONLY: arm delta tracking and mark a deterministic 1-in-`every` fraction of the table's existing
+/// rows dirty (both cum and strat), so `bench_serialize` can measure delta-serialize rate at a realistic
+/// touched fraction. Returns the (dirty_cum, dirty_strat) counts. Not on any hot path.
+pub fn bench_mark_dirty_fraction(tab: &mut NlheTables, every: usize) -> (usize, usize) {
+    tab.arm_delta_tracking();
+    let dirty = tab.dirty.as_deref_mut().unwrap();
+    for (sh, dd) in tab.shards.iter().zip(dirty.iter_mut()) {
+        for (i, k) in sh.cum_regret.keys().enumerate() {
+            if every <= 1 || i % every == 0 {
+                dd.cum.insert(*k);
+            }
+        }
+        for (i, k) in sh.strat_sum.keys().enumerate() {
+            if every <= 1 || i % every == 0 {
+                dd.strat.insert(*k);
+            }
+        }
+    }
+    tab.dirty_counts()
 }
 
 thread_local! {
@@ -404,6 +426,26 @@ pub struct NlheTables {
     pub shards: Box<[Shard; N_SHARDS]>,
     /// Iterations completed (for resume). The next `train_iteration` continues at `iters_done+1`.
     pub iters_done: u64,
+    /// DELTA-CHECKPOINT dirty tracking (checkpoint-speed R2, 2026-07-06). Per-shard set of keys whose
+    /// cum_regret / strat_sum row was touched (merged into) SINCE the last delta/base checkpoint. Populated
+    /// for free inside `merge_partials{,_clamped}` — those already visit every touched key per iteration —
+    /// so accumulating the window union costs one HashSet insert per touched key/iter (touched << table).
+    /// A delta checkpoint serializes exactly these rows (their CURRENT absolute values) as an `NLDLT001`
+    /// sidecar; `reset_dirty` clears it at the checkpoint boundary. This is AUXILIARY state: it never
+    /// affects the `serialize`/`NLCFR001` bytes (deserialize leaves it empty; `dump_*`/`iter_all_*`
+    /// ignore it), so every full-base checkpoint and every existing reader is byte-unchanged. `Option`
+    /// so the default/deserialized table carries NO tracking overhead until delta mode is armed
+    /// (`arm_delta_tracking`) — a straight non-delta run allocates nothing here and is byte-identical.
+    pub dirty: Option<Box<[DirtyShard; N_SHARDS]>>,
+}
+
+/// Per-shard dirty-key sets for delta checkpoints (see `NlheTables::dirty`). Two independent sets because
+/// a hero node touches only cum_regret while an opponent node touches only strat_sum — tracking them
+/// separately keeps each delta map exactly the rows that actually changed.
+#[derive(Default, Clone)]
+pub struct DirtyShard {
+    pub cum: HashSet<[u8; 16]>,
+    pub strat: HashSet<[u8; 16]>,
 }
 
 impl Default for NlheTables {
@@ -412,6 +454,7 @@ impl Default for NlheTables {
         NlheTables {
             shards: Box::new(std::array::from_fn(|_| Shard::default())),
             iters_done: 0,
+            dirty: None,
         }
     }
 }
@@ -421,6 +464,7 @@ impl Clone for NlheTables {
         NlheTables {
             shards: Box::new((*self.shards).clone()),
             iters_done: self.iters_done,
+            dirty: self.dirty.clone(),
         }
     }
 }
@@ -551,6 +595,93 @@ impl NlheTables {
     fn iter_all_strat(&self) -> impl Iterator<Item = (&[u8; 16], &[f64; NUM_ACTIONS])> {
         self.shards.iter().flat_map(|s| s.strat_sum.iter())
     }
+
+    // ---- DELTA CHECKPOINT dirty tracking (checkpoint-speed R2, 2026-07-06) --------------------------
+
+    /// Arm delta-checkpoint dirty tracking: allocate the per-shard dirty sets (empty). Idempotent — a
+    /// second call is a no-op so re-arming after a resume never clears a partial window. Called ONCE by
+    /// the driver at startup when delta checkpoints are enabled. When NOT armed, the merge's dirty-record
+    /// branch is skipped entirely (`self.dirty.is_none()`), so a straight run pays nothing and stays
+    /// byte-identical.
+    pub fn arm_delta_tracking(&mut self) {
+        if self.dirty.is_none() {
+            self.dirty = Some(Box::new(std::array::from_fn(|_| DirtyShard::default())));
+        }
+    }
+
+    /// True when delta tracking is armed.
+    pub fn delta_armed(&self) -> bool {
+        self.dirty.is_some()
+    }
+
+    /// Total dirty (cum + strat) row counts across all shards — for telemetry / bench (0 when unarmed).
+    pub fn dirty_counts(&self) -> (usize, usize) {
+        match &self.dirty {
+            Some(d) => (
+                d.iter().map(|s| s.cum.len()).sum(),
+                d.iter().map(|s| s.strat.len()).sum(),
+            ),
+            None => (0, 0),
+        }
+    }
+
+    /// Clear the dirty sets at a checkpoint boundary WITHOUT deallocating (retains HashSet capacity so
+    /// the next window doesn't re-grow from zero). Called AFTER a delta (or full base) checkpoint's rows
+    /// have been captured. No-op when unarmed.
+    pub fn reset_dirty(&mut self) {
+        if let Some(d) = &mut self.dirty {
+            for s in d.iter_mut() {
+                s.cum.clear();
+                s.strat.clear();
+            }
+        }
+    }
+
+    /// Mark EVERY row dirty (whole table). Called after a full-table mutation pass that the per-row dirty
+    /// tracking cannot represent as a sparse delta — a DCFR discount (`apply_dcfr_discount`) or an LCFR
+    /// discount EVENT (`apply_lcfr` when the event fires) rescales every stored regret/strat row, so the
+    /// next delta after such an iteration would legitimately have to carry the entire table. Rather than
+    /// emit a table-sized "delta", the driver checks `dirty_is_full()` and forces a FULL BASE checkpoint
+    /// at that boundary (see `save_delta_or_base_to_file`). arm-2b (`signed_regrets`, no LCFR discount,
+    /// dcfr off) NEVER reaches these passes, so this is a correctness safeguard for the discount arms.
+    /// No-op when unarmed.
+    pub fn mark_all_dirty(&mut self) {
+        if self.dirty.is_none() {
+            return;
+        }
+        // Reuse the shard partition: every existing key in each shard is dirty. Split-borrow shards +
+        // dirty so each worker owns its pair; cum and strat tracked independently (a discount touches
+        // both maps).
+        use rayon::prelude::*;
+        let (shards, dirty) = (&self.shards, self.dirty.as_deref_mut().unwrap());
+        shards
+            .par_iter()
+            .zip(dirty.par_iter_mut())
+            .for_each(|(sh, dd)| {
+                dd.cum.clear();
+                dd.strat.clear();
+                dd.cum.reserve(sh.cum_regret.len());
+                dd.strat.reserve(sh.strat_sum.len());
+                for k in sh.cum_regret.keys() {
+                    dd.cum.insert(*k);
+                }
+                for k in sh.strat_sum.keys() {
+                    dd.strat.insert(*k);
+                }
+            });
+    }
+
+    /// True when the dirty set already covers the whole table (every cum + strat row is dirty) — set by
+    /// `mark_all_dirty` after a full-table discount pass. The driver forces a full base here instead of a
+    /// table-sized delta. Cheap: compares per-shard dirty counts to map lengths.
+    pub fn dirty_is_full(&self) -> bool {
+        match &self.dirty {
+            Some(d) => d.iter().zip(self.shards.iter()).all(|(dd, sh)| {
+                dd.cum.len() >= sh.cum_regret.len() && dd.strat.len() >= sh.strat_sum.len()
+            }),
+            None => false,
+        }
+    }
 }
 
 /// Insert a (cum_regret, strat_sum) pair for `key` into the correct shard of `shards`. Used by the hogwild
@@ -618,6 +749,51 @@ fn merge_shard(dst: &mut Shard, src: &Shard) {
         let e = dst.strat_sum.entry(*k).or_insert(ZEROS);
         for a in 0..NUM_ACTIONS {
             e[a] += ds[a];
+        }
+    }
+}
+
+/// DELTA-CHECKPOINT (R2, 2026-07-06): parallel iterator over `(shard_index, &mut Shard, Option<&mut
+/// DirtyShard>)` that split-borrows the shards array and the optional dirty array so a rayon worker owns
+/// BOTH its shard and its dirty-shard exclusively. When `dirty` is `None` (delta tracking unarmed — every
+/// straight/golden run) each item's third element is `None`, `record_dirty` is a no-op, and the whole
+/// path is byte-identical to the pre-R2 `shards.par_iter_mut().enumerate()`.
+fn with_dirty<'a>(
+    shards: &'a mut [Shard; N_SHARDS],
+    dirty: Option<&'a mut [DirtyShard; N_SHARDS]>,
+) -> impl rayon::iter::IndexedParallelIterator<Item = (usize, &'a mut Shard, Option<&'a mut DirtyShard>)>
+{
+    // Materialize the dirty side as N_SHARDS Options so the zip is always a full-length IndexedParallel
+    // iterator whether or not tracking is armed. `par_iter_mut().map(Some)` for the armed case; a
+    // repeat-None equivalent for the unarmed case, both length N_SHARDS.
+    use rayon::prelude::*;
+    let dirty_opts: Vec<Option<&'a mut DirtyShard>> = match dirty {
+        Some(d) => d.par_iter_mut().map(Some).collect(),
+        None => (0..N_SHARDS).into_par_iter().map(|_| None).collect(),
+    };
+    shards
+        .par_iter_mut()
+        .zip(dirty_opts)
+        .enumerate()
+        .map(|(s, (dst, dd))| (s, dst, dd))
+}
+
+/// Record the keys touched by this iteration's `partials` for shard `s` into the dirty set `dd` (if
+/// armed). The partials' shard-`s` sub-maps ARE exactly the touched rows (the merge just folded them in),
+/// so this is one HashSet insert per touched key — O(touched), never O(table). No-op (early return) when
+/// `dd` is `None` (delta tracking unarmed) => zero cost on a straight run.
+#[inline]
+fn record_dirty(dd: Option<&mut DirtyShard>, partials: &[NlheTables], s: usize) {
+    let dd = match dd {
+        Some(d) => d,
+        None => return,
+    };
+    for p in partials {
+        for k in p.shards[s].cum_regret.keys() {
+            dd.cum.insert(*k);
+        }
+        for k in p.shards[s].strat_sum.keys() {
+            dd.strat.insert(*k);
         }
     }
 }
@@ -2753,11 +2929,15 @@ impl NlheTables {
             // table pass stays (replaces `floor_cum_regret` for this iteration).
             self.merge_partials(cfg, partials);
             self.apply_dcfr_discount(t);
+            // Delta: a DCFR discount rescales EVERY row -> the next checkpoint cannot be a sparse delta.
+            self.mark_all_dirty();
         } else if lcfr_discount_event(v3, t) {
             // v3 LCFR (Pluribus) DISCOUNT-EVENT iteration: the (t/D)/((t/D)+1) discount touches ALL
             // regrets and average-strategy rows, so the full `apply_lcfr` pass stays.
             self.merge_partials(cfg, partials);
             self.apply_lcfr(t, v3);
+            // Delta: an LCFR discount event rescales EVERY row -> force a full base at this boundary.
+            self.mark_all_dirty();
         } else if v3.lcfr || v3.signed_regrets {
             // v3 floor-ONLY iteration (every arm-2 `signed_regrets` iteration, and every LCFR
             // iteration off the discount schedule): the legacy `apply_lcfr` pass only clamps rows
@@ -3112,10 +3292,15 @@ impl NlheTables {
         partials: Vec<NlheTables>,
         clamp: MergeClamp,
     ) {
-        self.shards.par_iter_mut().enumerate().for_each(|(s, dst)| {
+        // Split-borrow shards + dirty so each rayon worker owns shard `s` AND its dirty-shard `s`
+        // exclusively (disjoint &mut, no locking). `dirty` is None on a straight (non-delta) run =>
+        // the record branch compiles to a null pointer check that is never taken => byte-identical.
+        let (shards, dirty) = (&mut self.shards, self.dirty.as_deref_mut());
+        with_dirty(shards, dirty).for_each(|(s, dst, dd)| {
             for p in &partials {
                 merge_shard(dst, &p.shards[s]);
             }
+            record_dirty(dd, &partials, s);
             match clamp {
                 MergeClamp::Positive => {
                     // Byte-exact twin of `floor_cum_regret`'s per-row op (`if r < 0.0 { r = 0.0 }`
@@ -3173,10 +3358,12 @@ impl NlheTables {
         // `compare_trainer_states` atol=1e-9 production gate; full multi-iter runs then diverge into
         // distinct-but-equally-valid CFR sample paths via normal chaotic regret amplification.
         // `cfg.fast_merge` is ignored (the sharded merge IS the parallel path; tree-reduce is retired).
-        self.shards.par_iter_mut().enumerate().for_each(|(s, dst)| {
+        let (shards, dirty) = (&mut self.shards, self.dirty.as_deref_mut());
+        with_dirty(shards, dirty).for_each(|(s, dst, dd)| {
             for p in &partials {
                 merge_shard(dst, &p.shards[s]);
             }
+            record_dirty(dd, &partials, s);
         });
         // R4: hand the merged-out partials back to the work-steal accumulator pool (drop as before on
         // the static/golden path — `work_steal_enabled` false).
@@ -3345,11 +3532,13 @@ impl NlheTables {
             let floor_start = Instant::now();
             self.apply_dcfr_discount(t);
             floor_ms = floor_start.elapsed().as_secs_f64() * 1000.0;
+            self.mark_all_dirty();
         } else if lcfr_discount_event(v3, t) {
             self.merge_partials(cfg, partials);
             let floor_start = Instant::now();
             self.apply_lcfr(t, v3);
             floor_ms = floor_start.elapsed().as_secs_f64() * 1000.0;
+            self.mark_all_dirty();
         } else if v3.lcfr || v3.signed_regrets {
             if v3.regret_floor == f64::NEG_INFINITY {
                 self.merge_partials(cfg, partials);
@@ -3548,6 +3737,30 @@ pub fn serialize_to_file(tab: &NlheTables, path: &str) -> std::io::Result<usize>
     Ok(blob.len())
 }
 
+/// Serialize a DELTA blob (`serialize_delta`) straight to `path` under a BufWriter, returning bytes
+/// written. Returns Ok(None) when delta tracking is unarmed (the caller must fall back to a full base).
+/// Byte-identical to writing `serialize_delta()` to disk; the delta blob is still materialized in RAM
+/// (its global key sort needs the full dirty-pair vector), but the dirty set is a small fraction of the
+/// table so the blob is small.
+pub fn serialize_delta_to_file(
+    tab: &NlheTables,
+    path: &str,
+    base_iter: u64,
+    seq: u64,
+) -> std::io::Result<Option<usize>> {
+    use std::io::Write;
+    let blob = match serialize_delta(tab, base_iter, seq) {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let f = std::fs::File::create(path)?;
+    let mut w = std::io::BufWriter::with_capacity(16 * 1024 * 1024, f);
+    w.write_all(&blob)?;
+    w.flush()?;
+    w.into_inner()?.sync_all()?;
+    Ok(Some(blob.len()))
+}
+
 pub fn serialize(tab: &NlheTables) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"NLCFR001");
@@ -3718,6 +3931,150 @@ pub fn deserialize(b: &[u8]) -> Option<NlheTables> {
     read_map_into_shards(b, &mut p, &mut t.shards, MapKind::Strat)?;
     t.iters_done = iters_done;
     Some(t)
+}
+
+// --------------------------------------------------------------------------------------------------
+// DELTA CHECKPOINTS (checkpoint-speed R2, 2026-07-06) — `NLDLT001` sidecar
+// --------------------------------------------------------------------------------------------------
+//
+// A delta serializes only the rows touched since the last (base or delta) checkpoint — the CURRENT
+// absolute value of each dirty row, NOT an increment. Applying a chain base -> d1 -> d2 -> ... reproduces
+// the straight-run table EXACTLY because (a) each row's on-disk value is its post-floor absolute value at
+// that checkpoint, and (b) the dirty set is the exact union of rows the merges touched in the window, so
+// every row that CHANGED is present and every ABSENT row is bit-unchanged from the base (last-writer-wins
+// on apply). This is a NEW format read ONLY by the trainer's resume path: the full-base `.nlcfr`
+// (`NLCFR001`) files stay byte-identical, so `snap_avg`, the babysitters' header parse, and every eval
+// `.nlcfr` reader are UNTOUCHED.
+//
+// Layout (all little-endian):
+//   magic        b"NLDLT001"                       (8 bytes)
+//   base_iter    u64   iters_done of the FULL BASE this delta chain roots at
+//   iters_done   u64   iters_done at this delta (resume continues at iters_done+1)
+//   seq          u64   monotone delta sequence within the chain (base=0, first delta=1, ...)
+//   cum   map    write_map_sharded over the DIRTY cum_regret rows (global-sorted, f64-widened)
+//   strat map    write_map_sharded over the DIRTY strat_sum  rows (global-sorted, f64)
+//
+// The two maps use the SAME fixed-width, globally-sorted `write_map_sharded` encoding as `NLCFR001`, so a
+// delta blob is deterministic (a given state + dirty set always serialize identically) and its rows
+// deserialize through the same `read_map_into_shards` path.
+pub const DELTA_MAGIC: &[u8; 8] = b"NLDLT001";
+
+/// Emit ONE map as `write_map_sharded` does, but restricted to the keys present in `dirty` (the
+/// per-shard dirty set for this map). Gathers only dirty (key, row) pairs across all shards, then the
+/// identical global-sort + parallel fixed-width encode. `total` is the exact dirty-row count (so the u64
+/// length prefix is correct); `pick` reads the CURRENT row for a dirty key from its shard.
+fn write_map_dirty<'a, R, F>(
+    out: &mut Vec<u8>,
+    shards: &'a [Shard; N_SHARDS],
+    dirty: &'a [DirtyShard; N_SHARDS],
+    which_dirty: fn(&'a DirtyShard) -> &'a HashSet<[u8; 16]>,
+    which_map: fn(&'a Shard) -> &'a HashMap<[u8; 16], R>,
+    to_f64: F,
+) where
+    R: 'a,
+    F: Fn(&R) -> [f64; NUM_ACTIONS] + Sync,
+{
+    // Gather dirty (key, row) pairs. A key can be dirty but ABSENT from the map only if a discount pass
+    // dropped it — not possible here (dirty keys always came from a merge that inserted the row, and
+    // rows are never removed), but we defensively skip a missing key rather than panic.
+    let to_f64 = &to_f64;
+    let pairs: Vec<(&[u8; 16], [f64; NUM_ACTIONS])> = shards
+        .iter()
+        .enumerate()
+        .flat_map(|(s, sh)| {
+            let map = which_map(sh);
+            which_dirty(&dirty[s])
+                .iter()
+                .filter_map(move |k| map.get(k).map(|r| (k, to_f64(r))))
+        })
+        .collect();
+    out.extend_from_slice(&(pairs.len() as u64).to_le_bytes());
+    // Same discipline as write_map_sharded: ONE global ascending key sort, then parallel fixed-width
+    // encode. Keys are unique (HashSet -> unique keys, each in exactly one shard) so unstable sort is
+    // deterministic.
+    let mut pairs = pairs;
+    pairs.par_sort_unstable_by(|a, b| a.0.cmp(b.0));
+    encode_sorted_pairs(out, &pairs);
+}
+
+/// Serialize the DIRTY rows of `tab` as an `NLDLT001` delta blob rooted at `base_iter`, sequence `seq`.
+/// Requires delta tracking to be armed (`tab.dirty.is_some()`); returns None if unarmed (the driver
+/// must fall back to a full base).
+pub fn serialize_delta(tab: &NlheTables, base_iter: u64, seq: u64) -> Option<Vec<u8>> {
+    let dirty = tab.dirty.as_deref()?;
+    let mut out = Vec::new();
+    out.extend_from_slice(DELTA_MAGIC);
+    out.extend_from_slice(&base_iter.to_le_bytes());
+    out.extend_from_slice(&tab.iters_done.to_le_bytes());
+    out.extend_from_slice(&seq.to_le_bytes());
+    write_map_dirty(
+        &mut out,
+        &tab.shards,
+        dirty,
+        |d| &d.cum,
+        |sh| &sh.cum_regret,
+        widen_r,
+    );
+    write_map_dirty(
+        &mut out,
+        &tab.shards,
+        dirty,
+        |d| &d.strat,
+        |sh| &sh.strat_sum,
+        |r| *r,
+    );
+    Some(out)
+}
+
+/// Header of a delta blob: `(base_iter, iters_done, seq)`. Cheap — reads only the 32-byte header, does
+/// NOT parse the row maps. Used by the driver to validate chain contiguity before downloading/applying a
+/// full delta. Returns None on bad magic / truncation.
+pub fn delta_header(b: &[u8]) -> Option<(u64, u64, u64)> {
+    if b.len() < 32 || &b[0..8] != DELTA_MAGIC {
+        return None;
+    }
+    let mut p = 8usize;
+    let base_iter = read_u64(b, &mut p)?;
+    let iters_done = read_u64(b, &mut p)?;
+    let seq = read_u64(b, &mut p)?;
+    Some((base_iter, iters_done, seq))
+}
+
+/// Apply an `NLDLT001` delta blob onto `tab` IN PLACE: every row in the delta OVERWRITES (last-writer-
+/// wins) the co-keyed row in `tab` (or inserts it), and `tab.iters_done` advances to the delta's
+/// iters_done. Delta rows are absolute post-floor values, so overwrite (not add) is correct. The caller
+/// is responsible for chain contiguity (this fn trusts the blob); `apply_delta_checked` enforces it.
+/// Returns None on a malformed blob (fail-closed). Does NOT touch `tab.dirty` (resume re-arms fresh).
+pub fn apply_delta(tab: &mut NlheTables, b: &[u8]) -> Option<(u64, u64, u64)> {
+    let (base_iter, iters_done, seq) = delta_header(b)?;
+    let mut p = 32usize;
+    // Reuse read_map_into_shards' row stream reader, but OVERWRITE semantics: insert() on a HashMap
+    // replaces, which is exactly last-writer-wins. read_map_into_shards already uses insert(), so a
+    // delta row replaces the base row for the same key.
+    read_map_into_shards(b, &mut p, &mut tab.shards, MapKind::Regret)?;
+    read_map_into_shards(b, &mut p, &mut tab.shards, MapKind::Strat)?;
+    tab.iters_done = iters_done;
+    Some((base_iter, iters_done, seq))
+}
+
+/// Apply a delta only if it is the expected next link in the chain: its `base_iter` matches `base_iter`,
+/// its `seq` is exactly `prev_seq + 1`, and its `iters_done` is strictly greater than the current
+/// `tab.iters_done`. Returns the new `(iters_done, seq)` on success, None (leaving `tab` UNCHANGED-ish —
+/// see note) on any mismatch. NOTE: because `apply_delta` streams rows in place, a REJECT must be decided
+/// BEFORE calling it — so this checks the header first and only then applies. Fail-closed: a gap, a
+/// duplicate/out-of-order seq, a wrong base, or a stale iters_done all reject.
+pub fn apply_delta_checked(
+    tab: &mut NlheTables,
+    b: &[u8],
+    base_iter: u64,
+    prev_seq: u64,
+) -> Option<(u64, u64)> {
+    let (h_base, h_iters, h_seq) = delta_header(b)?;
+    if h_base != base_iter || h_seq != prev_seq + 1 || h_iters <= tab.iters_done {
+        return None;
+    }
+    let (_b, iters_done, seq) = apply_delta(tab, b)?;
+    Some((iters_done, seq))
 }
 
 // --------------------------------------------------------------------------------------------------
@@ -5457,6 +5814,190 @@ mod tests {
         // And it deserializes back to a re-serialize-identical table (resume bit-identity).
         let b = deserialize(&got).expect("deserialize file blob");
         assert_eq!(serialize(&b), want, "file blob not resume-identical");
+    }
+
+    /// DELTA-CHECKPOINT resume bit-identity (checkpoint-speed R2). A full base at iter N followed by a
+    /// chain of per-checkpoint deltas, applied onto a fresh table, must produce a `serialize()` blob
+    /// BYTE-IDENTICAL to the straight uninterrupted run at the same iter — for CFR+ AND the arm-2b
+    /// signed-regrets config (which is what the LIVE run uses). This is the round-2 extension of
+    /// checkpoint_resume_reproduces_straight_run to the delta chain.
+    #[test]
+    fn delta_chain_resume_reproduces_straight_run_byte_identical() {
+        let configs: [(&str, V3Cfg); 3] = [
+            ("cfr_plus_default", V3Cfg::default()),
+            (
+                "arm2b_signed_finite_floor",
+                V3Cfg {
+                    signed_regrets: true,
+                    regret_floor: -50.0,
+                    ..V3Cfg::default()
+                },
+            ),
+            (
+                "arm2_signed_no_floor",
+                V3Cfg {
+                    signed_regrets: true,
+                    ..V3Cfg::default()
+                },
+            ),
+        ];
+        // Checkpoint boundaries: base at 2, deltas at 3,4,5,6 (like a 250-iter cadence in miniature).
+        for (name, v3) in configs {
+            let cfg = test_cfg(48);
+
+            // STRAIGHT run to iter 6.
+            let mut straight = NlheTables::new();
+            for _ in 0..6 {
+                straight.train_iteration_v3(&cfg, &v3);
+            }
+            let want = serialize(&straight);
+
+            // DELTA-CHAIN run: arm tracking, train to base boundary (2), capture full base, then per
+            // boundary capture a delta of exactly the window's dirty rows and reset.
+            let mut src = NlheTables::new();
+            src.arm_delta_tracking();
+            for _ in 0..2 {
+                src.train_iteration_v3(&cfg, &v3);
+            }
+            let base_iter = src.iters_done;
+            let base_blob = serialize(&src); // full NLCFR001 base — byte-identical format
+            src.reset_dirty();
+
+            let mut deltas: Vec<Vec<u8>> = Vec::new();
+            let mut seq = 0u64;
+            for _ in 0..4 {
+                src.train_iteration_v3(&cfg, &v3);
+                seq += 1;
+                let d = serialize_delta(&src, base_iter, seq).expect("armed => Some");
+                deltas.push(d);
+                src.reset_dirty();
+            }
+
+            // RESUME: fresh table loads the base, then applies the delta chain in seq order.
+            let mut resumed = deserialize(&base_blob).expect("base deserialize");
+            assert_eq!(resumed.iters_done, base_iter);
+            let mut prev_seq = 0u64;
+            for d in &deltas {
+                let (it, s) = apply_delta_checked(&mut resumed, d, base_iter, prev_seq)
+                    .expect("in-order delta must apply");
+                prev_seq = s;
+                assert!(it > base_iter);
+            }
+            assert_eq!(resumed.iters_done, straight.iters_done, "config={name}");
+            assert_eq!(
+                serialize(&resumed),
+                want,
+                "delta-chain resume diverged from straight run: config={name}"
+            );
+        }
+    }
+
+    /// A delta carries ONLY the rows touched in its window (dirty set), and re-serializing the same state
+    /// with the same dirty set is deterministic (byte-stable). Also: applying a delta is last-writer-wins
+    /// (overwrite), so a re-applied delta is idempotent.
+    #[test]
+    fn delta_is_sparse_deterministic_and_idempotent() {
+        let cfg = test_cfg(48);
+        let v3 = V3Cfg::default();
+        let mut src = NlheTables::new();
+        src.arm_delta_tracking();
+        for _ in 0..3 {
+            src.train_iteration_v3(&cfg, &v3);
+        }
+        let base_iter = src.iters_done;
+        let base = serialize(&src);
+        src.reset_dirty();
+        // One more window.
+        src.train_iteration_v3(&cfg, &v3);
+        let (dc, ds) = src.dirty_counts();
+        let d1 = serialize_delta(&src, base_iter, 1).unwrap();
+        let d2 = serialize_delta(&src, base_iter, 1).unwrap();
+        assert_eq!(d1, d2, "delta serialize must be deterministic");
+        // Delta row count == dirty count (sparse), and < full table.
+        let (bi, it, seq) = delta_header(&d1).unwrap();
+        assert_eq!((bi, seq), (base_iter, 1));
+        assert_eq!(it, src.iters_done);
+        // Parse the two map lengths from the delta header region.
+        let mut p = 32usize;
+        let n_cum = read_u64(&d1, &mut p).unwrap() as usize;
+        // skip cum rows
+        p += n_cum * SER_ROW_BYTES;
+        let n_strat = read_u64(&d1, &mut p).unwrap() as usize;
+        assert_eq!(n_cum, dc, "delta cum rows == dirty cum count");
+        assert_eq!(n_strat, ds, "delta strat rows == dirty strat count");
+        assert!(
+            n_cum < src.total_cum_len(),
+            "delta must be sparse (fewer rows than the full table)"
+        );
+
+        // Idempotent apply: base + delta, then delta AGAIN => same blob.
+        let mut a = deserialize(&base).unwrap();
+        apply_delta(&mut a, &d1).unwrap();
+        let once = serialize(&a);
+        apply_delta(&mut a, &d1).unwrap();
+        assert_eq!(serialize(&a), once, "re-applying a delta must be idempotent");
+    }
+
+    /// apply_delta_checked FAILURE MODES: a gap (seq skip), a wrong base_iter, a stale iters_done, and a
+    /// malformed blob all REJECT (fail-closed) so a broken chain never applies an inconsistent state.
+    #[test]
+    fn delta_chain_verification_rejects_bad_links() {
+        let cfg = test_cfg(48);
+        let v3 = V3Cfg::default();
+        let mut src = NlheTables::new();
+        src.arm_delta_tracking();
+        for _ in 0..2 {
+            src.train_iteration_v3(&cfg, &v3);
+        }
+        let base_iter = src.iters_done;
+        let base = serialize(&src);
+        src.reset_dirty();
+        src.train_iteration_v3(&cfg, &v3);
+        let d1 = serialize_delta(&src, base_iter, 1).unwrap();
+
+        // Gap: prev_seq=1 means we expect seq=2, but d1 is seq=1 -> reject.
+        let mut a = deserialize(&base).unwrap();
+        assert!(apply_delta_checked(&mut a, &d1, base_iter, 1).is_none(), "gap must reject");
+        // Wrong base: chain rooted at a different base_iter -> reject.
+        assert!(
+            apply_delta_checked(&mut a, &d1, base_iter + 1, 0).is_none(),
+            "wrong base must reject"
+        );
+        // Correct link applies.
+        assert!(apply_delta_checked(&mut a, &d1, base_iter, 0).is_some(), "in-order must apply");
+        // Stale iters_done: re-applying d1 now (a.iters_done == d1.iters_done) -> reject (not > cur).
+        assert!(
+            apply_delta_checked(&mut a, &d1, base_iter, 0).is_none(),
+            "stale iters_done must reject"
+        );
+        // Malformed blob (truncated header) -> None.
+        assert!(delta_header(&d1[..16]).is_none(), "truncated header must be None");
+        assert!(apply_delta(&mut a, &d1[..16]).is_none(), "malformed apply must be None");
+    }
+
+    /// Delta tracking is AUXILIARY: arming it and running iterations must NOT change the `serialize()`
+    /// bytes vs an identical un-armed run. Proves full-base checkpoints stay byte-identical whether or
+    /// not delta mode is on (the golden-SHA gates are unaffected by delta tracking).
+    #[test]
+    fn arming_delta_tracking_does_not_change_serialize_bytes() {
+        let cfg = test_cfg(48);
+        let v3 = V3Cfg {
+            signed_regrets: true,
+            regret_floor: -50.0,
+            ..V3Cfg::default()
+        };
+        let mut plain = NlheTables::new();
+        let mut armed = NlheTables::new();
+        armed.arm_delta_tracking();
+        for _ in 0..5 {
+            plain.train_iteration_v3(&cfg, &v3);
+            armed.train_iteration_v3(&cfg, &v3);
+        }
+        assert_eq!(
+            serialize(&plain),
+            serialize(&armed),
+            "arming delta tracking must not change the NLCFR001 base bytes"
+        );
     }
 
     /// On-disk NLCFR001 row width is f64 (8 bytes/elem) for BOTH maps regardless of the in-memory
