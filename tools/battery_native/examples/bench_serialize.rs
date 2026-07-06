@@ -16,7 +16,9 @@ use std::env;
 use std::time::Instant;
 
 use battery_native::core::NUM_ACTIONS;
-use battery_native::trainer::{bench_insert_row, deserialize, serialize, NlheTables};
+use battery_native::trainer::{
+    bench_insert_row, deserialize, deserialize_parallel, serialize, NlheTables,
+};
 
 const SER_ROW_BYTES: usize = 16 + 8 * NUM_ACTIONS;
 
@@ -157,6 +159,7 @@ fn main() {
     println!("[GATE] parallel blob sha256   = {}", sha256_hex(&blob));
     println!("[GATE] serial   blob sha256   = {}", sha256_hex(&ref_blob));
     assert!(ident, "BYTE-IDENTITY GATE FAILED: parallel encode diverged from serial reference");
+    drop(ref_blob); // free the 2nd full blob before the memory-heavier phases (large-n RAM headroom)
 
     // -- round-trip GATE: serialize -> deserialize -> serialize --------------------------------------
     let tab2 = deserialize(&blob).expect("deserialize");
@@ -164,6 +167,8 @@ fn main() {
     let rt = blob == blob2;
     println!("[GATE] serialize->deserialize->serialize identical : {}", rt);
     assert!(rt, "ROUND-TRIP GATE FAILED");
+    drop(tab2);
+    drop(blob2);
 
     let blob_len = blob.len();
     println!(
@@ -267,5 +272,69 @@ fn main() {
     for gb in [41.0f64, 58.0, 80.0] {
         let secs = gb * 1e9 / (mbps_ser * 1e6);
         println!("  {:>4.0} GB blob : pause ~{:.1}s", gb, secs);
+    }
+
+    // ================================================================================================
+    // LOAD (deserialize) phase — the RESUME PROLOGUE cost. This is the round-3 target: the serial
+    // `deserialize` routes+inserts one row at a time into rehashing shard maps; `deserialize_parallel`
+    // hash-partitions in parallel and pre-sizes each shard map. Same blob => both must round-trip to a
+    // re-serialize-identical table (byte-equivalence gate), and we report GB/s + rows/s for each.
+    // ================================================================================================
+    println!("\n\n== DESERIALIZE (RESUME LOAD) PHASE ==");
+    let n_rows_total = blob_len / SER_ROW_BYTES; // cum + strat rows
+    let gb = blob_len as f64 / 1e9;
+    drop(tab); // free the source table — the load phase only needs `blob` (large-n RAM headroom)
+
+    // Byte-equivalence GATE: serial-load and parallel-load re-serialize to the SAME blob. Done ONE table
+    // at a time (serialize each, drop it) to keep peak RAM at ~2 blobs, not 2 tables + 2 blobs.
+    let ser_blob = {
+        let t_ld = deserialize(&blob).expect("serial deserialize");
+        serialize(&t_ld)
+    };
+    let par_blob = {
+        let t_lp = deserialize_parallel(&blob).expect("parallel deserialize");
+        serialize(&t_lp)
+    };
+    let load_ident = ser_blob == par_blob && ser_blob == blob;
+    println!("[GATE] serial-load re-serialize == original          : {}", ser_blob == blob);
+    println!("[GATE] parallel-load re-serialize == serial-load     : {}", ser_blob == par_blob);
+    println!("[GATE] parallel-load re-serialize == original        : {}", par_blob == blob);
+    assert!(load_ident, "LOAD BYTE-EQUIVALENCE GATE FAILED");
+    drop(ser_blob);
+    drop(par_blob);
+
+    // -- timing: serial deserialize (best-of reps) --
+    let mut best_ld = f64::INFINITY;
+    for _ in 0..reps {
+        let t0 = Instant::now();
+        let tt = deserialize(&blob).expect("serial deserialize");
+        let dt = t0.elapsed().as_secs_f64();
+        std::hint::black_box(&tt);
+        best_ld = best_ld.min(dt);
+    }
+    // -- timing: parallel deserialize (best-of reps) --
+    let mut best_lp = f64::INFINITY;
+    for _ in 0..reps {
+        let t0 = Instant::now();
+        let tt = deserialize_parallel(&blob).expect("parallel deserialize");
+        let dt = t0.elapsed().as_secs_f64();
+        std::hint::black_box(&tt);
+        best_lp = best_lp.min(dt);
+    }
+    let gbps_ld = gb / best_ld;
+    let gbps_lp = gb / best_lp;
+    let rps_ld = n_rows_total as f64 / best_ld;
+    let rps_lp = n_rows_total as f64 / best_lp;
+    println!("\nload rows (cum+strat) = {}", n_rows_total);
+    println!("-- deserialize SERIAL   : {:.4}s  {:.3} GB/s  {:.2}e6 rows/s", best_ld, gbps_ld, rps_ld / 1e6);
+    println!("-- deserialize PARALLEL : {:.4}s  {:.3} GB/s  {:.2}e6 rows/s", best_lp, gbps_lp, rps_lp / 1e6);
+    println!("LOAD SPEEDUP (serial -> parallel) = {:.2}x", best_ld / best_lp);
+
+    println!("\n== LOAD PROJECTION (serial {:.3} GB/s | parallel {:.3} GB/s) ==", gbps_ld, gbps_lp);
+    for pgb in [41.0f64, 55.0, 58.0, 80.0, 100.0] {
+        let s_ld = pgb / gbps_ld;
+        let s_lp = pgb / gbps_lp;
+        println!("  {:>4.0} GB blob : serial ~{:.1}s ({:.1} min)  parallel ~{:.1}s ({:.1} min)",
+                 pgb, s_ld, s_ld / 60.0, s_lp, s_lp / 60.0);
     }
 }

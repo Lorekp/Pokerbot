@@ -3720,6 +3720,141 @@ pub fn deserialize(b: &[u8]) -> Option<NlheTables> {
     Some(t)
 }
 
+/// One fixed-width map section (a `u64` length prefix followed by `n` rows of `SER_ROW_BYTES`) located
+/// in the blob. Returns `(n, rows_start_offset, next_offset)` or None on truncation. Because every row is
+/// EXACTLY `SER_ROW_BYTES` wide, the section's byte span is fully determined by `n` — this is the fixed-
+/// width property the parallel loader exploits to split a section into disjoint row ranges without a
+/// serial pre-scan.
+fn locate_map_section(b: &[u8], p: usize) -> Option<(usize, usize, usize)> {
+    if p + 8 > b.len() {
+        return None;
+    }
+    let n = u64::from_le_bytes(b[p..p + 8].try_into().ok()?) as usize;
+    let start = p + 8;
+    let end = start.checked_add(n.checked_mul(SER_ROW_BYTES)?)?;
+    if end > b.len() {
+        return None;
+    }
+    Some((n, start, end))
+}
+
+/// Parse ONE fixed-width row at byte offset `off` (16-byte key then `NUM_ACTIONS` f64 LE). The caller
+/// guarantees `off + SER_ROW_BYTES <= b.len()` (via `locate_map_section`), so this does no bounds check.
+#[inline]
+fn parse_row_at(b: &[u8], off: usize) -> ([u8; 16], [f64; NUM_ACTIONS]) {
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&b[off..off + 16]);
+    let mut row = [0.0f64; NUM_ACTIONS];
+    let mut o = off + 16;
+    for a in row.iter_mut() {
+        *a = f64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        o += 8;
+    }
+    (key, row)
+}
+
+/// PARALLEL load of one fixed-width map section into the shards' `which` sub-map.
+///
+/// The section's rows are a globally-sorted stream (any key routes to exactly one shard via `shard_of`),
+/// so loading is: (1) split the row range into contiguous chunks, one per rayon task; (2) each task
+/// routes its chunk's rows into `N_SHARDS` thread-local buckets of `(key,row)` — this is the parallel
+/// hash-and-partition; (3) `par_iter_mut` over shards, PRE-SIZING each destination map to its exact row
+/// count (from the collected buckets) before inserting, which eliminates the rehash/alloc storm the serial
+/// path suffers (the round-1 profiler measured rehash/alloc churn as the top load stall). The inserted
+/// (key -> row) set is IDENTICAL to the serial `read_map_into_shards` (same rows, same shard routing,
+/// unique keys => insertion order within a shard is irrelevant), so a parallel-loaded table re-serializes
+/// byte-for-byte identically to a serial-loaded one.
+fn load_map_parallel(
+    b: &[u8],
+    n: usize,
+    rows_start: usize,
+    shards: &mut [Shard; N_SHARDS],
+    which: &MapKind,
+) {
+    if n == 0 {
+        return;
+    }
+    // Row-index chunking: split [0, n) into ~4 chunks per thread for load balance.
+    let nthreads = rayon::current_num_threads().max(1);
+    let rows_per_chunk = n.div_ceil(nthreads * 4).max(1);
+    let n_chunks = n.div_ceil(rows_per_chunk);
+
+    // Phase 1 (parallel): each chunk routes its rows into N_SHARDS local buckets. A bucket holds only the
+    // row's BYTE OFFSET into the blob (u64), NOT an owned (key,row) copy — this keeps the transient
+    // partition memory at 8 B/row instead of 104 B/row (~13x smaller), which matters at the 55-100 GB
+    // production scale where an owned-copy partition would nearly double peak RAM. Phase 2 re-parses each
+    // row from its offset (a cheap fixed-width read) as it inserts.
+    let mut per_chunk: Vec<Vec<Vec<u64>>> = (0..n_chunks)
+        .into_par_iter()
+        .map(|c| {
+            let r0 = c * rows_per_chunk;
+            let r1 = (r0 + rows_per_chunk).min(n);
+            // Rough even split hint so bucket vecs rarely reallocate.
+            let hint = ((r1 - r0) / N_SHARDS) + 1;
+            let mut buckets: Vec<Vec<u64>> =
+                (0..N_SHARDS).map(|_| Vec::with_capacity(hint)).collect();
+            for r in r0..r1 {
+                let off = rows_start + r * SER_ROW_BYTES;
+                let mut key = [0u8; 16];
+                key.copy_from_slice(&b[off..off + 16]);
+                buckets[shard_of(&key)].push(off as u64);
+            }
+            buckets
+        })
+        .collect();
+
+    // Phase 2 (parallel over shards): each shard owns its destination map exclusively. Pre-size to the
+    // exact incoming row count (sum across chunks) to avoid incremental rehashing, then parse+insert each
+    // row from its offset. Re-parsing is a fixed-width read from the (page-cached) blob — cheaper than the
+    // rehash storm it replaces.
+    shards.par_iter_mut().enumerate().for_each(|(s, shard)| {
+        let total: usize = per_chunk.iter().map(|c| c[s].len()).sum();
+        match which {
+            MapKind::Regret => {
+                shard.cum_regret.reserve(total);
+                for chunk in per_chunk.iter() {
+                    for &off in chunk[s].iter() {
+                        let (key, row) = parse_row_at(b, off as usize);
+                        shard.cum_regret.insert(key, narrow_r(&row));
+                    }
+                }
+            }
+            MapKind::Strat => {
+                shard.strat_sum.reserve(total);
+                for chunk in per_chunk.iter() {
+                    for &off in chunk[s].iter() {
+                        let (key, row) = parse_row_at(b, off as usize);
+                        shard.strat_sum.insert(key, row);
+                    }
+                }
+            }
+        }
+    });
+    // Drop the transient offset buckets explicitly (8 B/row).
+    per_chunk.clear();
+}
+
+/// PARALLEL `deserialize`: semantically identical to `deserialize` (same shards, same rows, same
+/// `iters_done`) but the two map sections are hash-partitioned + inserted in parallel with pre-sized
+/// destination maps. Returns None on the SAME fail-closed conditions (bad magic / truncation) as the
+/// serial path. A table loaded here re-serializes byte-for-byte identically to a serially-loaded one
+/// (verified: `parallel_load_is_byte_equivalent_to_serial`).
+pub fn deserialize_parallel(b: &[u8]) -> Option<NlheTables> {
+    if b.len() < 16 || &b[0..8] != b"NLCFR001" {
+        return None;
+    }
+    let iters_done = u64::from_le_bytes(b[8..16].try_into().ok()?);
+    // Locate BOTH sections serially (two 8-byte reads + arithmetic) — cheap and keeps the parse
+    // fail-closed on truncation before any parallel work starts.
+    let (n_cum, cum_start, cum_end) = locate_map_section(b, 16)?;
+    let (n_strat, strat_start, _strat_end) = locate_map_section(b, cum_end)?;
+    let mut t = NlheTables::default();
+    load_map_parallel(b, n_cum, cum_start, &mut t.shards, &MapKind::Regret);
+    load_map_parallel(b, n_strat, strat_start, &mut t.shards, &MapKind::Strat);
+    t.iters_done = iters_done;
+    Some(t)
+}
+
 // --------------------------------------------------------------------------------------------------
 // blueprint-v4 v3 — CURRENT-STRATEGY SNAPSHOTS (Pluribus rounds-2-4 snapshot averaging) + the
 // streaming offline averager, and the ON-POLICY COVERAGE probe (first-class metric per the Stage-0
@@ -5434,6 +5569,68 @@ mod tests {
                 assert_eq!(shard_of(k), s, "strat key in wrong shard after deserialize");
             }
         }
+    }
+
+    /// RESUME-SPEED gate (2026-07-06): `deserialize_parallel` produces a table SEMANTICALLY IDENTICAL to
+    /// the serial `deserialize` — same iters_done, same shard routing, and (the load-side byte-equivalence
+    /// gate the round prompt requires) a table that re-serializes byte-for-byte identically whether it was
+    /// loaded serially or in parallel. Trains a few iters so both maps are non-trivially populated across
+    /// many shards, then checks parallel-load == serial-load at the blob, shard-count, and per-shard key-set
+    /// level.
+    #[test]
+    fn parallel_load_is_byte_equivalent_to_serial() {
+        let cfg = test_cfg(64);
+        let mut a = NlheTables::new();
+        for _ in 0..5 {
+            a.train_iteration(&cfg);
+        }
+        let blob = serialize(&a);
+        let ser = deserialize(&blob).expect("serial deserialize");
+        let par = deserialize_parallel(&blob).expect("parallel deserialize");
+        // iters_done preserved on both paths.
+        assert_eq!(ser.iters_done, par.iters_done, "iters_done mismatch");
+        // save(load_serial) == save(load_parallel) == original blob (the load-path byte-equivalence gate).
+        assert_eq!(serialize(&par), blob, "parallel-load re-serialize != original blob");
+        assert_eq!(serialize(&ser), serialize(&par), "serial vs parallel re-serialize differ");
+        // Same row counts per map.
+        assert_eq!(ser.total_cum_len(), par.total_cum_len(), "cum row count differs");
+        assert_eq!(ser.total_strat_len(), par.total_strat_len(), "strat row count differs");
+        // Per-shard key sets identical AND every key correctly routed (no cross-shard leakage).
+        for (s, (ssh, psh)) in ser.shards.iter().zip(par.shards.iter()).enumerate() {
+            assert_eq!(
+                ssh.cum_regret.len(),
+                psh.cum_regret.len(),
+                "shard {s} cum len differs"
+            );
+            assert_eq!(
+                ssh.strat_sum.len(),
+                psh.strat_sum.len(),
+                "shard {s} strat len differs"
+            );
+            for (k, v) in psh.cum_regret.iter() {
+                assert_eq!(shard_of(k), s, "parallel cum key in wrong shard");
+                assert_eq!(ssh.cum_regret.get(k), Some(v), "parallel cum row differs from serial");
+            }
+            for (k, v) in psh.strat_sum.iter() {
+                assert_eq!(shard_of(k), s, "parallel strat key in wrong shard");
+                assert_eq!(ssh.strat_sum.get(k), Some(v), "parallel strat row differs from serial");
+            }
+        }
+    }
+
+    /// `deserialize_parallel` fail-closes on the SAME bad inputs as the serial path (bad magic, truncated
+    /// header, truncated section) — a partial/corrupt resume blob must be rejected, not half-loaded.
+    #[test]
+    fn deserialize_parallel_rejects_garbage() {
+        assert!(deserialize_parallel(b"").is_none());
+        assert!(deserialize_parallel(b"NOTMAGIC").is_none());
+        assert!(deserialize_parallel(b"NLCFR001").is_none()); // magic but no iters_done
+        // Valid header + cum length claiming rows that aren't there => truncation reject.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(b"NLCFR001");
+        bad.extend_from_slice(&7u64.to_le_bytes()); // iters_done
+        bad.extend_from_slice(&5u64.to_le_bytes()); // cum: claims 5 rows, provides none
+        assert!(deserialize_parallel(&bad).is_none(), "truncated section must reject");
     }
 
     /// `serialize_to_file` writes the EXACT same NLCFR001 blob as `serialize` (the checkpoint-speed

@@ -612,8 +612,29 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
     if fullhist_key or mrr:
         # Resume = newest checkpoint WITH a verified .ok marker (size+sha256) -- NEVER a partial
         # upload. Legacy `latest` pointer stays as a last-resort fallback (pre-marker runs).
+        #
+        # RESUME-SPEED path (2026-07-06, round-3 prologue optimization): the resume prologue was
+        # "download 55-100 GB from S3, then serial-deserialize" -- ~10-15 min, and every spot respawn
+        # burns most of an 18-27 min lifetime on it. Two fixes here:
+        #   (1) DOWNLOAD THROUGHPUT: `s3.download_file`'s DEFAULT TransferConfig is 10 concurrent 8 MB
+        #       ranged GETs -- on a c6a.32xlarge (50 Gbps, 128 vCPU) that leaves the pipe mostly idle. A
+        #       tuned TransferConfig (64 MB parts x 64 concurrent ranged GETs, use_threads=True) saturates
+        #       many more streams and sustains multiple GB/s off a single S3 object.
+        #   (2) NO PYTHON BYTES COPY: `_download_latest` now returns the on-disk PATH (not a ~55-100 GB
+        #       Python `bytes`). The driver resumes via `t.load_bytes_from_file(path)` (mmap + PARALLEL
+        #       deserialize, GIL released) -- removing both the full-blob Python read AND the serial
+        #       single-thread rehash-storm deserialize (measured 9.6x faster load at scale).
+        # sha256 is still verified (integrity of a resumed checkpoint is non-negotiable), streamed once
+        # before the mmap load.
         download_latest_fn = (
+            "_DL_XFER = TransferConfig(multipart_threshold=64 * 1024 * 1024,\n"
+            "                          multipart_chunksize=64 * 1024 * 1024,\n"
+            "                          max_concurrency=64, use_threads=True)\n"
+            "\n"
+            "\n"
             "def _download_latest():\n"
+            "    # Returns the local PATH of a verified resume checkpoint (mmap-loaded by the driver via\n"
+            "    # load_bytes_from_file), or None if nothing is resumable. Fast tuned-concurrency download.\n"
             "    try:\n"
             "        pg = s3.get_paginator(\"list_objects_v2\").paginate(\n"
             "            Bucket=BUCKET, Prefix=RUN_PREFIX + \"/checkpoints/\")\n"
@@ -628,27 +649,44 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "            key = mk[:-3]\n"
             "            os.makedirs(CKPT_DIR, exist_ok=True)\n"
             "            path = os.path.join(CKPT_DIR, \"resume.nlcfr\")\n"
-            "            s3.download_file(BUCKET, key, path)\n"
-            "            if os.path.getsize(path) != int(meta[\"bytes\"]):\n"
-            "                raise ValueError(f\"size {os.path.getsize(path)} != {meta['bytes']}\")\n"
+            "            t0 = time.time()\n"
+            "            s3.download_file(BUCKET, key, path, Config=_DL_XFER)\n"
+            "            dl = time.time() - t0\n"
+            "            sz = os.path.getsize(path)\n"
+            "            if sz != int(meta[\"bytes\"]):\n"
+            "                raise ValueError(f\"size {sz} != {meta['bytes']}\")\n"
             "            sha = _sha256_file(path)\n"
             "            if sha != meta[\"sha256\"]:\n"
             "                raise ValueError(f\"sha {sha} != {meta['sha256']}\")\n"
-            "            with open(path, \"rb\") as f:\n"
-            "                blob = f.read()\n"
-            "            os.remove(path)\n"
-            "            print(f\"RESUME verified s3://{BUCKET}/{key} bytes={meta['bytes']} \"\n"
-            "                  f\"sha256={sha[:12]}..\", flush=True)\n"
-            "            return blob\n"
+            "            gbps = (sz / 1e9) / dl if dl > 0 else 0.0\n"
+            "            print(f\"RESUME downloaded s3://{BUCKET}/{key} bytes={sz} \"\n"
+            "                  f\"sha256={sha[:12]}.. dl={dl:.1f}s ({gbps:.2f} GB/s)\", flush=True)\n"
+            "            return path\n"
             "        except Exception as e:\n"
             "            print(f\"RESUME candidate {mk} rejected: {e!r} -- trying next\", flush=True)\n"
-            "    try:  # legacy pointer fallback (pre-marker runs only)\n"
-            "        return s3.get_object(Bucket=BUCKET, Key=LATEST_KEY)[\"Body\"].read()\n"
+            "    try:  # legacy pointer fallback (pre-marker runs only): stage to disk, return path\n"
+            "        os.makedirs(CKPT_DIR, exist_ok=True)\n"
+            "        path = os.path.join(CKPT_DIR, \"resume.nlcfr\")\n"
+            "        s3.download_file(BUCKET, LATEST_KEY, path, Config=_DL_XFER)\n"
+            "        return path\n"
             "    except Exception:\n"
             "        return None"
         )
         next_stop_expr = "_next_stop(t.iters_done())"
         ckpt_stmt = "_ckpt(t)"
+        # RESUME (fullhist path): _download_latest returns a PATH; resume via load_bytes_from_file
+        # (mmap + parallel deserialize, no full-blob Python read). The staged file is removed after load.
+        resume_block = (
+            "    resume_path = _download_latest()\n"
+            "    if resume_path is not None and t.load_bytes_from_file(resume_path):\n"
+            "        print(f\"RESUMED from checkpoint at iters_done={t.iters_done()}\", flush=True)\n"
+            "        try:\n"
+            "            os.remove(resume_path)\n"
+            "        except OSError:\n"
+            "            pass\n"
+            "    else:\n"
+            "        print(\"FRESH start (no resumable checkpoint)\", flush=True)"
+        )
         # end-of-run: block on in-flight detached uploads BEFORE the driver exits -- the bootstrap
         # shuts the box down right after the driver, which would otherwise kill the final upload.
         ckpt_wait_block = (
@@ -669,6 +707,14 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
         next_stop_expr = "min(t.iters_done() + CKPT_EVERY, ITERS)"
         ckpt_stmt = "_upload(t.save_bytes(), t.iters_done())"
         ckpt_wait_block = ""
+        # LEGACY resume (both flags off): _download_latest returns a BLOB; byte-identical to pre-round-3.
+        resume_block = (
+            "    blob = _download_latest()\n"
+            "    if blob is not None and t.load_bytes(blob):\n"
+            "        print(f\"RESUMED from latest checkpoint at iters_done={t.iters_done()}\", flush=True)\n"
+            "    else:\n"
+            "        print(\"FRESH start (no resumable checkpoint)\", flush=True)"
+        )
     # v3 arms: print the EFFECTIVE prune config right after the LEVERS line. The LEVERS line's
     # `prune=` value is the INERT dcfr-mode knob (cfg.dcfr_prune_threshold, IGNORED when dcfr=False
     # -- trainer.rs effective_prune_threshold), which confused the arm-2 monitor (`prune=-300000.0`
@@ -948,11 +994,7 @@ def main():
         print(f"river-OCHS ACTIVE: {{RIVER_OCHS_PATH}} stamp={{t.river_ochs_stamp()}}", flush=True)
     print(f"LEVERS work_steal={{WORK_STEAL}} dcfr={{DCFR}} "
           f"(prune={{DCFR_PRUNE_THRESHOLD}} explore={{DCFR_EXPLORE_FRAC}}) hogwild={{t.is_hogwild()}}", flush=True){v3_banner}
-    blob = _download_latest()
-    if blob is not None and t.load_bytes(blob):
-        print(f"RESUMED from latest checkpoint at iters_done={{t.iters_done()}}", flush=True)
-    else:
-        print("FRESH start (no resumable checkpoint)", flush=True)
+{resume_block}
     start = t.iters_done()
     print(f"TRAIN target={{ITERS}} from={{start}} n_deals={{N_DEALS}} num_buckets={{NUM_BUCKETS}} "
           f"depth_edges={{DEPTH_EDGES}}", flush=True)

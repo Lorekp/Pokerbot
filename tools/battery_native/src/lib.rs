@@ -1527,8 +1527,63 @@ mod py {
             ))
         }
 
-        fn load_bytes(&mut self, blob: &[u8]) -> PyResult<bool> {
-            match nlhe_trainer::deserialize(blob) {
+        fn load_bytes(&mut self, py: Python<'_>, blob: &[u8]) -> PyResult<bool> {
+            // RESUME-SPEED path (2026-07-06): parallel hash-partition + pre-sized sharded insert under
+            // `py.detach()` (GIL released) — semantically identical to the serial `deserialize` (same
+            // shards/rows/iters_done; re-serializes byte-for-byte identically) but the deserialize is no
+            // longer a single-threaded rehash-storm. The blob is already fully in RAM here (Python owns
+            // the `bytes`); `load_bytes_from_file` avoids even that copy.
+            let parsed = py.detach(|| nlhe_trainer::deserialize_parallel(blob));
+            self.install_loaded_tables(parsed)
+        }
+
+        /// Resume DIRECTLY from a local checkpoint file: memory-map the `.nlcfr` file and parallel-
+        /// deserialize it without materializing a Python `bytes` copy of the whole blob first. Pairs with
+        /// the download path that already stages the checkpoint on the local ckpt volume — the driver can
+        /// hand this the on-disk path instead of `download -> read() -> load_bytes(blob)` (which builds a
+        /// full ~55-100 GB Python bytes object and holds the GIL). Returns True on a successful load, False
+        /// on a bad-magic/truncated blob (same fail-closed contract as `load_bytes`).
+        fn load_bytes_from_file(&mut self, py: Python<'_>, path: &str) -> PyResult<bool> {
+            let parsed = py
+                .detach(|| -> std::io::Result<Option<nlhe_trainer::NlheTables>> {
+                    let f = std::fs::File::open(path)?;
+                    // SAFETY: the checkpoint file is written once + renamed atomically and is not mutated
+                    // while we hold it open for read; the mapping is read-only and dropped before return.
+                    let mmap = unsafe { memmap2::Mmap::map(&f)? };
+                    Ok(nlhe_trainer::deserialize_parallel(&mmap))
+                })
+                .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
+            self.install_loaded_tables(parsed)
+        }
+
+        fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+            let out = PyDict::new(py);
+            #[cfg(feature = "hogwild")]
+            if let Some(h) = &self.hog {
+                let tab = h.table.snapshot_tables(h.iters_done);
+                for (key, row) in nlhe_trainer::snapshot(&tab) {
+                    out.set_item(PyBytes::new(py, &key), row.to_vec())?;
+                }
+                return Ok(out);
+            }
+            for (key, row) in nlhe_trainer::snapshot(&self.tab) {
+                out.set_item(PyBytes::new(py, &key), row.to_vec())?;
+            }
+            Ok(out)
+        }
+    }
+
+    // Non-Python helpers on the trainer (a plain `impl`, kept OUT of `#[pymethods]` because it takes the
+    // internal `NlheTables` type). Shared by `load_bytes` and `load_bytes_from_file`.
+    impl NlheCFRTrainer {
+        /// Install a freshly-deserialized table (or None on a bad/truncated blob) into the trainer,
+        /// preserving the hogwild-vs-fork-merge branch that both load entrypoints previously duplicated.
+        /// Returns Ok(false) when `parsed` is None (fail-closed: the caller reports "not resumable").
+        fn install_loaded_tables(
+            &mut self,
+            parsed: Option<nlhe_trainer::NlheTables>,
+        ) -> PyResult<bool> {
+            match parsed {
                 Some(tab) => {
                     #[cfg(feature = "hogwild")]
                     if let Some(h) = &mut self.hog {
@@ -1548,22 +1603,6 @@ mod py {
                 }
                 None => Ok(false),
             }
-        }
-
-        fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-            let out = PyDict::new(py);
-            #[cfg(feature = "hogwild")]
-            if let Some(h) = &self.hog {
-                let tab = h.table.snapshot_tables(h.iters_done);
-                for (key, row) in nlhe_trainer::snapshot(&tab) {
-                    out.set_item(PyBytes::new(py, &key), row.to_vec())?;
-                }
-                return Ok(out);
-            }
-            for (key, row) in nlhe_trainer::snapshot(&self.tab) {
-                out.set_item(PyBytes::new(py, &key), row.to_vec())?;
-            }
-            Ok(out)
         }
     }
 
