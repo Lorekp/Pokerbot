@@ -37,8 +37,13 @@
 #       profiler (3.2x, byte-identical, golden sha 77bc2aa8 verbatim) + checkpoint (2.2x pause,
 #       format-compatible, resume-identity test) merges -- both independently re-verified.
 #   * -V3SnapshotAvg -V3SnapStart 3200 : 8% of 40k (v3 rule verbatim, sec 11).
-#   * -RowBudget 550000000             : G8 RAM backstop on max(strat,cum); K160 shrinks the space
-#       vs the K200 census, so this is looser than registered -- kept verbatim.
+#   * -RowBudget 900000000             : G8 RAM backstop on max(strat,cum). RE-DERIVED 2026-07-06
+#       from the profile run (i-073e03466cb6fce7d): cum_regret alone hit 550M rows by iter 1400
+#       (~90% of the ~609M M-RR keyspace -- coverage fills fast at nd=8192), so the registered
+#       550M value stops the run at ~3.5% of target; it was sized as a RAM guard, not a kill gate.
+#       Measured RAM: 191 GB RSS at ~500M rows = 0.38 GB/M rows -> 900M rows = ~342 GB, safe on
+#       the 512 GB chain (256 GB families are excluded above) while still backstopping runaway
+#       growth past the keyspace estimate. See blueprint_v4_arm2_amendment.md sec 16.
 #   * -V3CovHands 2048 -V3Regstats     : COVERAGE + REGSTATS at every checkpoint; train.log uploads
 #       at every checkpoint (v3 lesson).
 #
@@ -84,7 +89,7 @@ $env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n,c6i,c6in,c6id,c7a"
     -V3SnapStart "3200" `
     -V3CovHands 2048 `
     -V3Regstats `
-    -RowBudget 550000000 `
+    -RowBudget 900000000 `
     -Iters 40000 `
     -NDeals 8192 `
     -NumBuckets 160 `
