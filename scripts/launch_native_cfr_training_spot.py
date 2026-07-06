@@ -244,7 +244,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
                    river_ochs_rel="", river_ochs_sha="", preflop_hist_key=False,
                    fullhist_key=False, mrr=False,
                    work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
-                   v3=None, row_budget=None, no_cache_fetch=False, delta_ckpt=False,
+                   v3=None, row_budget=None, no_cache_fetch=False, delta_ckpt=False, profile_run=False,
                    wall_guard_secs=21600, awscli_zip="awscli-exe-linux-x86_64.zip") -> str:
     """The full on-box bootstrap (was inline user-data until it exceeded EC2's 16KB cap).
     Uploaded to S3 by main() and exec'd by user_data_stub(). Content is otherwise the proven
@@ -1351,6 +1351,48 @@ while true; do
 done
 SWEOF
 nohup bash /tmp/spot_watch.sh >/var/log/spot_watch.log 2>&1 &"""
+    # COMPUTE PROFILER (--profile-run, 2026-07-06): mpstat per-core utilization + pidstat on the
+    # driver + ONE steady-state `perf record` sample (~8 min in, past resume + first checkpoint),
+    # pushed to s3 {run_prefix}/logs/profile/ every 300 s so a mid-run reclaim keeps the evidence.
+    # Rendered EMPTY when off -> every existing render stays byte-identical (appended, no newline).
+    # Everything is non-fatal: a missing linux-tools for the AWS kernel just skips the perf sample.
+    if profile_run:
+        profile_block = f"""
+
+# COMPUTE PROFILER (--profile-run): mpstat/pidstat sampling + one steady-state perf capture.
+apt-get install -y -qq sysstat linux-tools-common "linux-tools-$(uname -r)" || echo "PROFILE: linux-tools install partial (non-fatal)"
+cat > /tmp/profile_watch.sh <<'PWEOF'
+PDIR=/var/log/profile; mkdir -p $PDIR
+PID=""
+for i in $(seq 1 120); do PID=$(pgrep -f drive_native_cfr.py | head -1); [ -n "$PID" ] && break; sleep 5; done
+if [ -z "$PID" ]; then echo "PROFILE: driver never appeared"; exit 0; fi
+echo "PROFILE: driver pid=$PID"
+nohup mpstat -P ALL 30 > $PDIR/mpstat.log 2>&1 &
+nohup pidstat -u -r 30 -p $PID > $PDIR/pidstat.log 2>&1 &
+( sleep 480
+  if command -v perf >/dev/null 2>&1 && kill -0 $PID 2>/dev/null; then
+    perf record -F 99 -g -p $PID -o $PDIR/perf.data -- sleep 75 2> $PDIR/perf.log || true
+    perf report --stdio -i $PDIR/perf.data --no-children 2>/dev/null | head -400 > $PDIR/perf_flat.txt || true
+    perf report --stdio -i $PDIR/perf.data 2>/dev/null | head -400 > $PDIR/perf_children.txt || true
+    rm -f $PDIR/perf.data
+  else
+    echo "perf unavailable or driver gone" > $PDIR/perf_flat.txt
+  fi ) &
+while true; do
+  for f in mpstat.log pidstat.log perf_flat.txt perf_children.txt perf.log; do
+    if [ -s "$PDIR/$f" ]; then timeout 60 aws s3 cp "$PDIR/$f" "s3://{bucket}/{run_prefix}/logs/profile/$f" --region {region} >/dev/null 2>&1 || true; fi
+  done
+  kill -0 $PID 2>/dev/null || break
+  sleep 300
+done
+for f in mpstat.log pidstat.log perf_flat.txt perf_children.txt perf.log; do
+  if [ -s "$PDIR/$f" ]; then timeout 60 aws s3 cp "$PDIR/$f" "s3://{bucket}/{run_prefix}/logs/profile/$f" --region {region} >/dev/null 2>&1 || true; fi
+done
+echo "PROFILE: done"
+PWEOF
+nohup bash /tmp/profile_watch.sh >/var/log/profile_watch.log 2>&1 &"""
+    else:
+        profile_block = ""
     # No output redirect (cloud-init captures stdout to /var/log/cloud-init-output.log, visible via
     # get-console-output) — same lesson the SD-CFR launcher documents.
     return f"""#!/bin/bash
@@ -1565,7 +1607,7 @@ if __name__ == "__main__":
         sys.exit(1)
 PYEOF
 
-{spot_watch_block}
+{spot_watch_block}{profile_block}
 
 python3 /opt/pokerbot/drive_native_cfr.py 2>&1 | tee /var/log/native-cfr-train.log
 echo "train exit ${{PIPESTATUS[0]}}"
@@ -1734,6 +1776,12 @@ def main() -> None:
                         "Resume = base + verified contiguous delta chain (driver-sim: final state "
                         "byte-identical to uninterrupted). Cuts the per-checkpoint pause + upload from "
                         "full-blob-sized to dirty-set-sized -- the spot-storm lever at short cadence.")
+    p.add_argument("--profile-run", action="store_true", default=False,
+                   help="COMPUTE PROFILER sidecar on the box: mpstat -P ALL 30 (per-core utilization) "
+                        "+ pidstat -u -r 30 on the driver (CPU%%/RSS churn) + ONE steady-state "
+                        "`perf record -F 99 -g` sample ~8 min in, all pushed to "
+                        "<run_prefix>/logs/profile/ every 300 s (reclaim-durable). Non-fatal "
+                        "everywhere; OFF renders a byte-identical bootstrap.")
     p.add_argument("--row-budget", type=int, default=None,
                    help="G8 RAM backstop: export POKERBOT_ROW_BUDGET on the box (rows in the guarded "
                         "map — max(strat,cum) under v3 snapshot_avg, strat otherwise). Omit = the "
@@ -1836,7 +1884,7 @@ def main() -> None:
         work_steal=args.work_steal, dcfr=args.dcfr,
         dcfr_prune_threshold=args.dcfr_prune_threshold, dcfr_explore_frac=args.dcfr_explore_frac,
         v3=v3_cfg, row_budget=args.row_budget, no_cache_fetch=args.no_cache_fetch,
-        delta_ckpt=args.delta_ckpt,
+        delta_ckpt=args.delta_ckpt, profile_run=args.profile_run,
         wall_guard_secs=wall_guard_secs, awscli_zip=awscli_zip,
     )
     bootstrap_key = f"{args.prefix}/{run_subdir}/code/bootstrap.sh"
