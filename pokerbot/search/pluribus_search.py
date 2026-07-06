@@ -230,6 +230,33 @@ class PluribusReBeLConfig:
     # on BOTH paths (tests/test_river_overbet_knob.py), engine_ab_h2h zero-gate, golden byte-identity
     # at default. Default False => the static keep-list everywhere, byte-identical.
     river_overbet: bool = False
+    # R3 MINI-PROOF (2026-07-05, artifacts/search_gap_audit.md §3.1) — HAND-CONDITIONAL SUBGAME
+    # INFOSETS (measurement knob, GTO path only). When True, the subgame infoset key of every
+    # NON-HERO seat is extended with that seat's EXACT private hole cards from the CURRENT sampled
+    # world (env.holes carries the iteration's sampled opponent holes), so a two-sided opponent
+    # learns a PER-HAND strategy inside the subgame (it can fold-bad / call-good) instead of one
+    # hand-blind range-average contaminated by the hero's fixed actual holding — the documented
+    # BUG-2/R3 limitation. The hero's own key stays PUBLIC-ONLY: his hand is a fixed point mass per
+    # solve (Pluribus reads his strategy off at his actual hand). PYTHON SCALAR LOOP ONLY — the
+    # native subgame path does not implement it (any arm setting this must keep
+    # POKERBOT_NATIVE_SUBGAME off; the native gate is unchanged and would silently ignore the knob).
+    # Default False => every key byte-identical to today. Env default POKERBOT_HAND_COND_INFOSETS.
+    hand_conditional_infosets: bool = field(
+        default_factory=lambda: os.environ.get("POKERBOT_HAND_COND_INFOSETS", "0")
+        not in ("0", "", "false", "False"))
+    # R3 MINI-PROOF arm D — HERO-LEAK FIX (measurement knob, GTO path only). When True, on
+    # iterations whose TRAVERSER IS NOT the hero (the opponent-regret-building iterations of a
+    # two-sided solve; the hero's own averaging iterations are untouched), the hero's hole in the
+    # sampled world is REDRAWN from ``pbs.beliefs[hero_seat]`` — the caller seeds that row with the
+    # hero's reach range; the default hero point mass makes the redraw a provable no-op — so
+    # opponent regrets stop learning a response to the hero's ACTUAL holding (the BUG-2 clairvoyance
+    # half). The served strategy is still read off at the hero's actual hand (his averaging
+    # iterations keep his real hole). Python scalar loop only, like hand_conditional_infosets.
+    # Default False => sampled worlds byte-identical to today (no extra RNG draws either).
+    # Env default POKERBOT_SAMPLE_HERO_RANGE.
+    sample_hero_range: bool = field(
+        default_factory=lambda: os.environ.get("POKERBOT_SAMPLE_HERO_RANGE", "0")
+        not in ("0", "", "false", "False"))
     client_bet_sizing: bool = True    # use the SAME action abstraction as training (blueprint keys hit)
     search_preflop: bool = False      # Pluribus: serve preflop from blueprint, search postflop only
     # A1 stack-agnostic preflop: the preflop blueprint is keyed on (hole, position) only and trained at
@@ -587,6 +614,11 @@ class PluribusReBeLSolver:
         self._native_over_budget_warned = False
         self._two_sided_active = False  # set per-solve; True => cycle traverser (config.two_sided, GTO path)
         self._traversers = []
+        # R3 mini-proof knobs (set per-solve; False/-1 defaults => _infoset_key and the world sampler
+        # are byte-identical to the pre-knob code on every path).
+        self._hand_cond_active = False   # config.hand_conditional_infosets ∧ GTO path
+        self._hero_range_active = False  # config.sample_hero_range ∧ GTO path
+        self._solve_hero = -1            # hero seat of the current solve (consumed by _infoset_key)
         # R2 biased continuation leaves: set per-solve (config.leaf_biased_continuations, GTO path only —
         # mirrors the two_sided gating). False (default) => the legacy leaf path, byte-identical.
         self._leaf_biased_active = False
@@ -705,7 +737,17 @@ class PluribusReBeLSolver:
         folded = np.asarray(env.seat_status == SEAT_FOLDED, dtype=bool)
         active_mean = float(stacks[~folded].mean()) if (~folded).any() else float(stacks.mean())
         spr_bucket = int(pot / max(active_mean, 1.0) * 4)
-        return f"{seat}|{int(np.asarray(env.street))}|{board}|{seats}|{actions}|spr{spr_bucket}"
+        key = f"{seat}|{int(np.asarray(env.street))}|{board}|{seats}|{actions}|spr{spr_bucket}"
+        # R3 mini-proof (config.hand_conditional_infosets, GTO path): NON-HERO infosets carry the
+        # seat's exact private hand from the current sampled world, canonicalized (lo,hi). The hero
+        # key stays public-only (fixed point mass per solve). Default OFF => key unchanged, byte-
+        # identical to the pre-knob code.
+        if self._hand_cond_active and seat != self._solve_hero:
+            h = np.asarray(env.holes)[seat]
+            c0, c1 = int(h[0]), int(h[1])
+            if c0 >= 0 and c1 >= 0:
+                key += f"|h{min(c0, c1)},{max(c0, c1)}"
+        return key
 
     def _public_seed(self, env, hero: int) -> int:
         """Stable 64-bit seed from the PUBLIC state at a solve root (board, history, street, stacks,
@@ -850,6 +892,19 @@ class PluribusReBeLSolver:
         key = self._leaf_key(env)
         if self._two_sided_active:
             key = (key, int(hero))  # two-sided: the leaf value is per-traverser, so key the cache on the seat
+        # R3 mini-proof (config.hand_conditional_infosets): the leaf cache must be WORLD-conditional
+        # too, or the hand-extended infosets would keep receiving the PUBLIC-keyed frozen 4-world
+        # mean — a hand-blind value signal that makes per-hand keys a no-op by construction (on the
+        # river the "leaf" is the settle/showdown, whose value is exactly the sampled holes'
+        # showdown). Key the cache additionally on every non-folded seat's hole from THIS world's
+        # env, so each (leaf, world) evaluates under its own holes. Default OFF => key unchanged.
+        if self._hand_cond_active:
+            _st = np.asarray(env.seat_status)
+            _hs = np.asarray(env.holes)
+            key = (key, tuple(
+                (s, min(int(_hs[s, 0]), int(_hs[s, 1])), max(int(_hs[s, 0]), int(_hs[s, 1])))
+                for s in range(_st.shape[0]) if int(_st[s]) != int(SEAT_FOLDED)
+            ))
         # R2 — Pluribus biased continuation leaves (gated, default OFF => the legacy path below runs
         # byte-identically).
         if self._leaf_biased_active:
@@ -1157,6 +1212,34 @@ class PluribusReBeLSolver:
             state = _reshuffle_undealt(state, np.random.default_rng(seed))
         return state
 
+    def _sample_hero_hole(self, pbs: PBSTracker, hero: int, sampled_holes: dict) -> tuple[int, int] | None:
+        """R3 mini-proof arm D helper: draw the hero's hole from ``pbs.beliefs[hero]`` (1326-combo
+        row; the caller seeds it with the hero's REACH range — the default hero point mass makes
+        this return his actual hand), excluding combos that collide with this iteration's sampled
+        opponent holes or the dead cards the tracker already knows (board). NOTE the tracker's
+        ``dead_cards`` includes the hero's ACTUAL hole; that must NOT exclude his own combos here,
+        so only board/opponent-card collisions are masked (board exclusion is already baked into a
+        properly seeded row: off-board combos carry zero mass). Draws come from ``self._hole_rng``
+        (the decoupled sampler stream when config.decouple_sampler). Returns None (=> keep the
+        actual hand) when the row is unseeded/empty or fully blocked."""
+        from pokerbot.search.pbs_tracker import _COMBO_CARD_INDICES
+        probs = np.asarray(pbs.beliefs[hero], dtype=np.float64).copy()
+        if probs.sum() <= 1e-12:
+            return None
+        used = set()
+        for (c0, c1) in sampled_holes.values():
+            used.add(int(c0))
+            used.add(int(c1))
+        for i, (c0, c1) in enumerate(_COMBO_CARD_INDICES):
+            if probs[i] > 0.0 and (c0 in used or c1 in used):
+                probs[i] = 0.0
+        tot = probs.sum()
+        if tot <= 1e-12:
+            return None
+        idx = int(self._hole_rng.choice(probs.shape[0], p=probs / tot))
+        c0, c1 = _COMBO_CARD_INDICES[idx]
+        return (int(c0), int(c1))
+
     def _pushfold_prior(self, base_state, hero: int, legal: np.ndarray) -> np.ndarray | None:
         """Certified ICM push/fold ROOT prior for a shallow preflop spot (tournament N>6 lever), or None.
 
@@ -1228,6 +1311,15 @@ class PluribusReBeLSolver:
         self._root_av_sum = None      # reset the AIVAT root-CFV accumulator (per-decision; no carryover)
         self._root_av_wsum = 0.0
         base_state = to_numpy_state(root.env)
+        # R3 mini-proof knobs (GTO path only — opponent_model must be None, mirroring the two_sided
+        # gating; the exploit path's modeled opponents are frozen reads, not learners, so hand-
+        # conditioning them is meaningless there). Defaults are False => both flags stay False and
+        # _infoset_key / the world sampler below are byte-identical to the pre-knob code.
+        self._solve_hero = hero
+        self._hand_cond_active = bool(
+            getattr(cfg, "hand_conditional_infosets", False) and self.opponent_model is None)
+        self._hero_range_active = bool(
+            getattr(cfg, "sample_hero_range", False) and self.opponent_model is None)
         if cfg.per_decision_seed:
             # Fresh stream per decision, seeded from the public state: the solve is a pure function of
             # (public state, opponent model, config) — see PluribusReBeLConfig.per_decision_seed.
@@ -1602,6 +1694,17 @@ class PluribusReBeLSolver:
                     )
 
         root_key = self._infoset_key(base_state, hero)
+        # SERVE-KEY GUARANTEE (regression: 2026-07-05 dev.fun playground KeyError). The served root
+        # policy below is read from the regret / strategy-sum tables by root_key. Register the ROOT
+        # infoset here — BEFORE the traversal loop — so that read can never face a missing key, even
+        # when the solve is budget-bound to zero iterations, cancelled before the first traversal, or
+        # (under two-sided cycling) the hero seat never happens to traverse this node. _get_regrets
+        # inserts zeros into BOTH _regrets and _strategy_sum; this is byte-identical to the prior
+        # behaviour (the first in-loop _cfv visit reuses this same zero array, and a zero strategy_sum
+        # falls through to the uniform-over-legal regret-match at serve), so the served policy is
+        # unchanged — it only removes the missing-key KeyError class that the arena caught as a
+        # decider-error fallback (silently degrading the live decision to a crude fallback action).
+        self._get_regrets(root_key)
         iterations = 0
         budget_bound = False
         while iterations < eff_max_iters:
@@ -1621,11 +1724,21 @@ class PluribusReBeLSolver:
                           f"(per-solver count tracked in SolveResult.metadata)", flush=True)
                 break
             sampled_holes = pbs.sample_opponent_holes(self._hole_rng)
-            world = self._set_world(base_state, sampled_holes)
             # Traverser cycles across live seats when two-sided (== hero when one-sided/exploit). The hero's
             # served average (strategy_sum[root_key]) builds only on hero-traverser iterations, so two-sided
             # needs proportionally more iterations for the same hero convergence (native makes that cheap).
             traverser = self._traversers[iterations % len(self._traversers)]
+            # R3 mini-proof arm D (config.sample_hero_range): on NON-hero-traverser iterations redraw
+            # the hero's hole from pbs.beliefs[hero] (caller-seeded reach range; the default point
+            # mass redraws his actual hand) so opponent regrets stop conditioning on the hero's
+            # actual holding. Hero-traverser (averaging) iterations keep his real hole. Default OFF
+            # => this branch never runs and no extra RNG draw is consumed (byte-identical).
+            if self._hero_range_active and traverser != hero:
+                hh = self._sample_hero_hole(pbs, hero, sampled_holes)
+                if hh is not None:
+                    sampled_holes = dict(sampled_holes)
+                    sampled_holes[hero] = hh
+            world = self._set_world(base_state, sampled_holes)
             self._cfv(world, traverser, 0, iterations)
             iterations += 1
 
@@ -1635,6 +1748,10 @@ class PluribusReBeLSolver:
         # last iteration — the CFR's current strategy at iteration K, exactly the expression the
         # no-average fallback below computes. Default False => the averaged serve, byte-identical.
         _serve_final = bool(cfg.serve_final_iterate and self.opponent_model is None)
+        # Serve-side reads use .get(...) with an explicit default (never a raw ``dict[root_key]``): a
+        # root infoset the traversal never populated must degrade to the uniform-over-legal
+        # regret-match, NOT raise KeyError (the SERVE-KEY GUARANTEE above already registers root_key;
+        # the defaults are belt-and-suspenders so a future refactor cannot reintroduce the crash).
         ss = self._strategy_sum.get(root_key)
         if not _serve_final and ss is not None and ss.sum() > 1e-12:
             avg = ss * legal

@@ -283,6 +283,37 @@ def test_preflop_served_from_blueprint():
     assert abs(float(res.action_probs.sum()) - 1.0) < 1e-5
 
 
+def test_serve_survives_untraversed_root_infoset():
+    """Regression (2026-07-05 dev.fun playground KeyError): a solve whose CFR traversal never
+    populates the ROOT infoset — budget-bound to zero iterations, cancelled before the first
+    traversal, or (under two-sided cycling) the hero seat never traversing it — must still serve a
+    valid uniform-over-legal distribution and MUST NOT raise KeyError from the serve-side strategy
+    read. The playground surfaced exactly this: an action-infoset node reached during serving
+    (key ``seat|street|board|seats|actions|sprN``, no ``cont!`` prefix) that the traversal never
+    populated; the arena's decider-error fallback caught it, but on the engine path it silently
+    degrades a decision to a crude fallback. Mirrors the arena config (two_sided)."""
+    env = _postflop_env()
+    hero = int(env.action_seat)
+    root = SubgameRoot(env=env, hero_seat=hero, pbs_vector=None,
+                       legal_mask=legal_action_mask_np(env, hero).astype(bool))
+    # max_iterations=0 => the traversal loop never runs => _cfv never accumulates the root infoset.
+    cfg = PluribusReBeLConfig(max_iterations=0, time_budget_ms=20000, native=False, two_sided=True,
+                              leaf=ContinuationLeafConfig(select="uniform", rollout_samples=1))
+    sv = PluribusReBeLSolver({}, cfg)
+    res = sv.solve(root, _StubPBS(env, hero))            # must NOT raise KeyError
+    probs = np.asarray(res.action_probs, dtype=float)
+    assert abs(probs.sum() - 1.0) < 1e-6
+    # A zero-traversal serve is uniform over the abstracted-legal actions (regret-match of zeros).
+    alegal = sv._legal(to_numpy_state(env), hero)
+    assert np.all(probs[~alegal] == 0.0)
+    expect = alegal.astype(np.float64) / max(alegal.sum(), 1)
+    assert np.allclose(probs, expect, atol=1e-6)
+    # SERVE-KEY GUARANTEE: the root infoset is registered in BOTH tables even with zero traversals,
+    # so the serve-side read can never face a missing key.
+    root_key = sv._infoset_key(to_numpy_state(env), hero)
+    assert root_key in sv._regrets and root_key in sv._strategy_sum
+
+
 # --------------------------------------------------------------------------- FIREWALL
 def test_firewall_invariants_unchanged():
     from pokerbot.opponent.context import context_spec_hash, action_bin, NUM_BINS
