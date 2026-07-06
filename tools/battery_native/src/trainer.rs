@@ -188,9 +188,9 @@ fn radd(acc: RegretT, x: f64) -> RegretT {
 /// `N_SHARDS` (a power of two). Only within-process consistency is required (the serialized blob is
 /// global-sorted and shard-count-free), so this never affects checkpoint portability.
 //
-// FORBIDDEN: per-shard sort then concat in `write_map_sharded`. The blob's key order MUST be ONE global
-// ascending sort over all keys across all shards (matching the pre-refactor `keys.sort()`), else the
-// NLCFR001 blob diverges from recorded goldens and S3 resume breaks.
+// FORBIDDEN: per-shard sort then concat in the serialize gather (`concat_and_sort`). The blob's key
+// order MUST be ONE global ascending sort over all keys across all shards (matching the pre-refactor
+// `keys.sort()`), else the NLCFR001 blob diverges from recorded goldens and S3 resume breaks.
 #[inline]
 fn shard_of(key: &[u8; 16]) -> usize {
     use std::hash::Hasher;
@@ -3711,152 +3711,358 @@ pub fn snapshot(tab: &NlheTables) -> HashMap<[u8; 16], [f64; NUM_ACTIONS]> {
 // modelled on leduc::serialize (leduc.rs:607-696), adapted to fixed-width [u8;16] keys.
 // --------------------------------------------------------------------------------------------------
 
-/// Serialize DIRECTLY to a file path, returning the number of bytes written. Byte-identical to
-/// `std::fs::write(path, serialize(tab))` — it produces the SAME NLCFR001 blob (same global sort, same
-/// fixed-width rows) and writes it through a large `BufWriter`.
-///
-/// WHY (checkpoint-speed ops, 2026-07-06): the cloud driver's pause was `blob = t.save_bytes()` (Rust
-/// builds the ~58 GB `Vec<u8>`, then `PyBytes::new` COPIES it into a Python bytes object — a second full
-/// ~58 GB memcpy on the pause path and a ~58 GB RAM-peak bump, risking OOM at the §10 132 GB RSS peak)
-/// followed by Python `f.write(blob)` (a third pass). This path lets the PyO3 wrapper build the blob and
-/// write it to the local ckpt volume ENTIRELY in Rust under `py.detach()` (GIL released), skipping the
-/// PyBytes copy. The returned byte count is all Python needs to log + hand to the detached uploader.
-/// The `.tmp` + rename atomicity stays in Python (unchanged marker semantics); this only replaces the
-/// serialize+PyBytes+write triple with a single serialize+write.
-pub fn serialize_to_file(tab: &NlheTables, path: &str) -> std::io::Result<usize> {
-    use std::io::Write;
-    // Build the blob (identical to `serialize`) then stream it out. We still materialize the blob in RAM
-    // because the global key sort requires the full pair vector; the win is eliminating the PyBytes copy,
-    // not the blob itself. A 16 MiB BufWriter amortizes syscall overhead on the sequential write.
-    let blob = serialize(tab);
-    let f = std::fs::File::create(path)?;
-    let mut w = std::io::BufWriter::with_capacity(16 * 1024 * 1024, f);
-    w.write_all(&blob)?;
-    w.flush()?;
-    w.into_inner()?.sync_all()?;
-    Ok(blob.len())
+// --------------------------------------------------------------------------------------------------
+// gather / sort / encode / write core (checkpoint-speed R3, 2026-07-06)
+//
+// The per-checkpoint training pause is serialize+write, and the R3 on-box profile (m6id.32xlarge,
+// RAYON=64) measured BOTH `save_delta_to_file` and `save_bytes_to_file` at ~250 MB/s. Root cause was
+// three serial/oversized stages stacked on the pause path:
+//   1. SERIAL GATHER: the old `write_map_sharded`/`write_map_dirty` collected (key, OWNED [f64;11])
+//      pairs (96 B each) one key at a time on one thread (per-key HashMap random probes + Vec doubling
+//      growth that re-memcpys the whole pair vector ~log n times).
+//   2. HEAVY SORT: `par_sort_unstable` moved those 96 B elements; the perf -F99 sample showed
+//      rayon::slice::sort::recurse at 34% of active samples.
+//   3. BLOCKING WRITE + UNCONDITIONAL fsync: the full blob was materialized in RAM, written through one
+//      BufWriter stream, then `sync_all()` waited for the ENTIRE device writeback (~size / 700 MiB/s on
+//      the gp3 root — ~17 s alone for a 12.7 GB delta) inside the pause.
+// The rewrite below keeps the BYTES IDENTICAL (same header, same u64 length prefixes, same ONE global
+// ascending key order, same fixed-width 16-byte-key + 11xf64-LE rows) while fixing all three:
+//   1. gather is parallel-over-shards into per-shard vectors of 24 B (key, &row) REFS (the f64 widening
+//      moves to encode time), concatenated then
+//   2. par_sort_unstable_by_key over the u128 big-endian key value — u128 BE order == lexicographic
+//      [u8;16] order, keys are UNIQUE (HashMap keys), so the sorted order (and thus the bytes) is
+//      deterministic regardless of rayon thread count or gather order; and
+//   3. the file writers encode fixed-size row chunks into small per-task buffers and write them with
+//      PARALLEL POSITIONED writes at their (fixed, layout-determined) offsets — no full-blob
+//      materialization, no serial stream — and fsync is OPT-IN (`POKERBOT_CKPT_FSYNC=1`): on the spot
+//      boxes durability comes from the detached S3 upload (the uploader reads the just-written file
+//      through the coherent page cache), the `.tmp`+rename atomicity stays in Python, and every reader
+//      of these files is fail-closed on truncation/garbage — so waiting for device writeback inside the
+//      training pause bought nothing. Set POKERBOT_CKPT_FSYNC=1 to restore the old sync_all behavior.
+// --------------------------------------------------------------------------------------------------
+
+/// Fixed on-disk row width for an `NLCFR001`/serialize map row: 16-byte key + `NUM_ACTIONS` f64 LE.
+const SER_ROW_BYTES: usize = 16 + 8 * NUM_ACTIONS;
+
+/// One gathered map entry: (16-byte key, borrowed row). 24 bytes — vs the 96 B owned pair the old
+/// gather built — so the global sort moves 4x less memory and the f64 widening happens exactly once,
+/// at encode time.
+type KeyRow<'a, R> = ([u8; 16], &'a R);
+
+/// Concatenate per-shard pair vectors and globally sort ascending by key. u128::from_be_bytes preserves
+/// the lexicographic [u8;16] order exactly (big-endian), so this is the SAME order as the old
+/// `sort_by(|a,b| a.0.cmp(b.0))` — and because keys are UNIQUE, the unstable parallel sort yields ONE
+/// deterministic permutation regardless of thread count or input order.
+fn concat_and_sort<'a, R: Sync>(mut parts: Vec<Vec<KeyRow<'a, R>>>) -> Vec<KeyRow<'a, R>> {
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+    let mut all: Vec<KeyRow<'a, R>> = Vec::with_capacity(total);
+    for p in parts.iter_mut() {
+        all.append(p);
+    }
+    all.par_sort_unstable_by_key(|p| u128::from_be_bytes(p.0));
+    all
 }
 
-/// Serialize a DELTA blob (`serialize_delta`) straight to `path` under a BufWriter, returning bytes
-/// written. Returns Ok(None) when delta tracking is unarmed (the caller must fall back to a full base).
-/// Byte-identical to writing `serialize_delta()` to disk; the delta blob is still materialized in RAM
-/// (its global key sort needs the full dirty-pair vector), but the dirty set is a small fraction of the
-/// table so the blob is small.
+/// Parallel-over-shards gather of EVERY (key, row) in one sub-map, globally sorted. Replaces the old
+/// serial `iter_all_*().collect()` on the full-base path.
+fn gather_sorted_all<'a, R, F>(shards: &'a [Shard; N_SHARDS], map_of: F) -> Vec<KeyRow<'a, R>>
+where
+    R: Sync,
+    F: Fn(&'a Shard) -> &'a HashMap<[u8; 16], R> + Sync,
+{
+    let parts: Vec<Vec<KeyRow<'a, R>>> = shards
+        .par_iter()
+        .map(|sh| {
+            let m = map_of(sh);
+            let mut v = Vec::with_capacity(m.len());
+            for (k, r) in m.iter() {
+                v.push((*k, r));
+            }
+            v
+        })
+        .collect();
+    concat_and_sort(parts)
+}
+
+/// Parallel-over-shards gather of the DIRTY (key, row) pairs in one sub-map, globally sorted. Replaces
+/// the old serial per-key `flat_map` gather on the delta path. A dirty key absent from the map is
+/// defensively skipped (same posture as before: dirty keys always came from a merge that inserted the
+/// row and rows are never removed, but we skip rather than panic).
+fn gather_sorted_dirty<'a, R, FD, FM>(
+    shards: &'a [Shard; N_SHARDS],
+    dirty: &'a [DirtyShard; N_SHARDS],
+    set_of: FD,
+    map_of: FM,
+) -> Vec<KeyRow<'a, R>>
+where
+    R: Sync,
+    FD: Fn(&'a DirtyShard) -> &'a HashSet<[u8; 16]> + Sync,
+    FM: Fn(&'a Shard) -> &'a HashMap<[u8; 16], R> + Sync,
+{
+    let parts: Vec<Vec<KeyRow<'a, R>>> = shards
+        .par_iter()
+        .zip(dirty.par_iter())
+        .map(|(sh, dd)| {
+            let m = map_of(sh);
+            let ds = set_of(dd);
+            let mut v = Vec::with_capacity(ds.len());
+            for k in ds.iter() {
+                if let Some(r) = m.get(k) {
+                    v.push((*k, r));
+                }
+            }
+            v
+        })
+        .collect();
+    concat_and_sort(parts)
+}
+
+/// A globally-sorted map section ready to encode: the cum_regret rows (RegretT, widened to f64 at
+/// encode) or the strat_sum rows (already f64). Holding REFS keeps the section at 24 B/row; the two
+/// variants exist because the two sub-maps have different in-memory precision under `f32_regret`.
+enum SortedSection<'a> {
+    Cum(Vec<KeyRow<'a, [RegretT; NUM_ACTIONS]>>),
+    Strat(Vec<KeyRow<'a, [f64; NUM_ACTIONS]>>),
+}
+
+impl<'a> SortedSection<'a> {
+    fn len(&self) -> usize {
+        match self {
+            SortedSection::Cum(v) => v.len(),
+            SortedSection::Strat(v) => v.len(),
+        }
+    }
+
+    /// Encode rows `[lo, hi)` into `dst` (which must be exactly `(hi-lo) * SER_ROW_BYTES` long) as the
+    /// fixed-width on-disk form: 16-byte key then `NUM_ACTIONS` f64 LE. cum rows WIDEN to f64 here so
+    /// the on-disk blob is f64-width regardless of the `f32_regret` feature (an f32-trained checkpoint
+    /// is byte-format-compatible with the f64 build; `widen_r` is an exact identity under f64 and an
+    /// exact f32->f64 conversion otherwise — bit-identical to the old widen-at-gather bytes).
+    fn encode_range(&self, lo: usize, hi: usize, dst: &mut [u8]) {
+        match self {
+            SortedSection::Cum(v) => encode_rows(&v[lo..hi], dst, widen_r),
+            SortedSection::Strat(v) => encode_rows(&v[lo..hi], dst, |r| *r),
+        }
+    }
+}
+
+/// Serial fixed-width encode of a pair slice into an exactly-sized destination. Byte layout is the same
+/// as it has always been: 16-byte key, then each f64 little-endian. Parallelism happens ACROSS calls
+/// (disjoint chunks), never inside one.
+fn encode_rows<R>(
+    pairs: &[KeyRow<'_, R>],
+    dst: &mut [u8],
+    conv: impl Fn(&R) -> [f64; NUM_ACTIONS],
+) {
+    debug_assert_eq!(dst.len(), pairs.len() * SER_ROW_BYTES);
+    for (i, (key, r)) in pairs.iter().enumerate() {
+        let slot = &mut dst[i * SER_ROW_BYTES..(i + 1) * SER_ROW_BYTES];
+        slot[..16].copy_from_slice(&key[..]);
+        let row = conv(r);
+        let mut o = 16;
+        for &v in row.iter() {
+            slot[o..o + 8].copy_from_slice(&v.to_le_bytes());
+            o += 8;
+        }
+    }
+}
+
+/// Append one section to an in-RAM blob: u64 length prefix, then the rows — parallel scatter into the
+/// exact preallocated tail (each rayon task owns a disjoint row-aligned `&mut [u8]`, so the bytes are
+/// bit-identical to the serial loop). Serial fallback below ~1M rows where rayon can't pay for itself.
+fn append_section_to_vec(out: &mut Vec<u8>, sec: &SortedSection<'_>) {
+    let n = sec.len();
+    out.extend_from_slice(&(n as u64).to_le_bytes());
+    let base = out.len();
+    out.resize(base + n * SER_ROW_BYTES, 0u8);
+    let dst = &mut out[base..];
+    const PAR_MIN_ROWS: usize = 1 << 20;
+    if n < PAR_MIN_ROWS {
+        sec.encode_range(0, n, dst);
+        return;
+    }
+    let rows_per_chunk = n.div_ceil(rayon::current_num_threads().max(1) * 4).max(1);
+    dst.par_chunks_mut(rows_per_chunk * SER_ROW_BYTES)
+        .enumerate()
+        .for_each(|(ci, byte_chunk)| {
+            let lo = ci * rows_per_chunk;
+            let hi = (lo + rows_per_chunk).min(n);
+            sec.encode_range(lo, hi, byte_chunk);
+        });
+}
+
+/// Rows per positioned-write job on the file path (~8 MiB of output each): big enough to amortize the
+/// syscall + fill the page-cache copy, small enough that a ~12.7 GB delta yields ~1600 jobs so 64+
+/// threads stay busy. PURE PERF: job size never affects the bytes (each job writes its rows at their
+/// layout-determined absolute offsets).
+const FILE_JOB_ROWS: usize = (8 * 1024 * 1024) / SER_ROW_BYTES;
+
+/// Opt-in fsync for the checkpoint file writers. Default OFF: the write lands in the page cache and the
+/// kernel writes it back while training resumes — the old unconditional `sync_all()` stalled the
+/// training pause for the full device writeback (~size / disk-rate; ~17 s per 12.7 GB delta on the gp3
+/// root) and bought no real durability on a spot box (the S3 upload is the durable copy; the uploader
+/// and every local reader see the page-cache bytes coherently; all blob readers are fail-closed on a
+/// crash-truncated file). Set POKERBOT_CKPT_FSYNC=1 to restore the old wait-for-writeback behavior.
+fn ckpt_fsync_enabled() -> bool {
+    matches!(std::env::var("POKERBOT_CKPT_FSYNC").as_deref(), Ok("1"))
+}
+
+/// Positioned write of a whole buffer at an absolute file offset (thread-safe on a shared `&File`:
+/// every call carries its own offset, nothing relies on the shared cursor).
+#[cfg(unix)]
+fn write_all_at(f: &std::fs::File, buf: &[u8], off: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(f, buf, off)
+}
+#[cfg(windows)]
+fn write_all_at(f: &std::fs::File, mut buf: &[u8], mut off: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match f.seek_write(buf, off) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "seek_write returned 0",
+                ))
+            }
+            Ok(n) => {
+                buf = &buf[n..];
+                off += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Stream `header ++ [len ++ rows]*` to `path` WITHOUT materializing the blob: the total size and every
+/// byte's offset are fixed by the layout (fixed-width rows), so the file is `set_len` up front and
+/// row chunks are encoded into small per-task buffers and written with PARALLEL positioned writes.
+/// The resulting file is byte-for-byte the concatenation the in-RAM path produces, for ANY `job_rows`
+/// and ANY rayon thread count. Returns total bytes written. fsync is opt-in (`ckpt_fsync_enabled`).
+fn write_sections_to_file(
+    path: &str,
+    header: &[u8],
+    sections: &[SortedSection<'_>],
+    job_rows: usize,
+) -> std::io::Result<usize> {
+    let f = std::fs::File::create(path)?;
+    // Fixed layout: header, then per section a u64 length prefix followed by n * SER_ROW_BYTES rows.
+    let mut rows_off: Vec<u64> = Vec::with_capacity(sections.len());
+    let mut off = header.len() as u64;
+    for sec in sections {
+        rows_off.push(off + 8);
+        off += 8 + (sec.len() * SER_ROW_BYTES) as u64;
+    }
+    let total = off;
+    f.set_len(total)?;
+    write_all_at(&f, header, 0)?;
+    for (i, sec) in sections.iter().enumerate() {
+        write_all_at(&f, &(sec.len() as u64).to_le_bytes(), rows_off[i] - 8)?;
+    }
+    let jr = job_rows.max(1);
+    for (i, sec) in sections.iter().enumerate() {
+        let n = sec.len();
+        let base = rows_off[i];
+        (0..n.div_ceil(jr)).into_par_iter().try_for_each_init(
+            Vec::<u8>::new,
+            |buf, j| -> std::io::Result<()> {
+                let lo = j * jr;
+                let hi = (lo + jr).min(n);
+                buf.clear();
+                buf.resize((hi - lo) * SER_ROW_BYTES, 0u8);
+                sec.encode_range(lo, hi, &mut buf[..]);
+                write_all_at(&f, &buf[..], base + (lo * SER_ROW_BYTES) as u64)
+            },
+        )?;
+    }
+    if ckpt_fsync_enabled() {
+        f.sync_all()?;
+    }
+    Ok(total as usize)
+}
+
+/// The two full-table sections (cum + strat), gathered in parallel and globally sorted.
+fn gather_table_sections(tab: &NlheTables) -> [SortedSection<'_>; 2] {
+    [
+        SortedSection::Cum(gather_sorted_all(&tab.shards, |sh| &sh.cum_regret)),
+        SortedSection::Strat(gather_sorted_all(&tab.shards, |sh| &sh.strat_sum)),
+    ]
+}
+
+/// The two DIRTY-row sections (cum + strat) for a delta, gathered in parallel and globally sorted.
+fn gather_dirty_sections<'a>(
+    tab: &'a NlheTables,
+    dirty: &'a [DirtyShard; N_SHARDS],
+) -> [SortedSection<'a>; 2] {
+    [
+        SortedSection::Cum(gather_sorted_dirty(
+            &tab.shards,
+            dirty,
+            |d| &d.cum,
+            |sh| &sh.cum_regret,
+        )),
+        SortedSection::Strat(gather_sorted_dirty(
+            &tab.shards,
+            dirty,
+            |d| &d.strat,
+            |sh| &sh.strat_sum,
+        )),
+    ]
+}
+
+/// The 16-byte NLCFR001 header (magic + iters_done).
+fn nlcfr_header(tab: &NlheTables) -> [u8; 16] {
+    let mut h = [0u8; 16];
+    h[..8].copy_from_slice(b"NLCFR001");
+    h[8..].copy_from_slice(&tab.iters_done.to_le_bytes());
+    h
+}
+
+/// Serialize DIRECTLY to a file path, returning the number of bytes written. Byte-identical to
+/// `std::fs::write(path, serialize(tab))` — same global sort, same fixed-width rows — but the blob is
+/// NEVER materialized: rows stream to the file through parallel positioned writes (see the R3 header
+/// comment above). Transient RAM drops from pairs+full-blob (~1.5x blob size) to the 24 B/row sorted
+/// ref vectors (~23% of blob size) plus ~8 MiB per rayon task. Runs entirely under `py.detach()` on the
+/// PyO3 path; the `.tmp` + rename atomicity stays in Python (unchanged marker semantics).
+pub fn serialize_to_file(tab: &NlheTables, path: &str) -> std::io::Result<usize> {
+    let sections = gather_table_sections(tab);
+    write_sections_to_file(path, &nlcfr_header(tab), &sections, FILE_JOB_ROWS)
+}
+
+/// Serialize a DELTA (`NLDLT001`, dirty rows only) straight to `path`, returning bytes written.
+/// Returns Ok(None) when delta tracking is unarmed (the caller must fall back to a full base).
+/// Byte-identical to writing `serialize_delta()` to disk; same streaming writer as
+/// `serialize_to_file` (no blob materialization, parallel gather/sort/encode/write, opt-in fsync).
 pub fn serialize_delta_to_file(
     tab: &NlheTables,
     path: &str,
     base_iter: u64,
     seq: u64,
 ) -> std::io::Result<Option<usize>> {
-    use std::io::Write;
-    let blob = match serialize_delta(tab, base_iter, seq) {
-        Some(b) => b,
+    let dirty = match tab.dirty.as_deref() {
+        Some(d) => d,
         None => return Ok(None),
     };
-    let f = std::fs::File::create(path)?;
-    let mut w = std::io::BufWriter::with_capacity(16 * 1024 * 1024, f);
-    w.write_all(&blob)?;
-    w.flush()?;
-    w.into_inner()?.sync_all()?;
-    Ok(Some(blob.len()))
+    let sections = gather_dirty_sections(tab, dirty);
+    let header = delta_blob_header(tab, base_iter, seq);
+    write_sections_to_file(path, &header, &sections, FILE_JOB_ROWS).map(Some)
 }
 
 pub fn serialize(tab: &NlheTables) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(b"NLCFR001");
-    out.extend_from_slice(&tab.iters_done.to_le_bytes());
-    // cum_regret rows WIDEN to f64 on the wire so the NLCFR001 blob is f64-width regardless of the
-    // `f32_regret` feature: an f32-trained checkpoint is byte-format-compatible with the f64 build, and
-    // the served strategy comes from strat_sum (f64) — the on-disk cum is only used to RESUME training,
-    // where the f32->f64->f32 round-trip is exact. iter_all_strat is already f64.
-    write_map_sharded(
-        &mut out,
-        tab.total_cum_len(),
-        tab.iter_all_cum().map(|(k, r)| (k, widen_r(r))),
-    );
-    write_map_sharded(
-        &mut out,
-        tab.total_strat_len(),
-        tab.iter_all_strat().map(|(k, r)| (k, *r)),
-    );
+    // In-RAM blob (save_bytes / hogwild snapshot / tests). Same parallel gather+sort+encode core as the
+    // file path; cum rows WIDEN to f64 at encode so the NLCFR001 blob is f64-width regardless of the
+    // `f32_regret` feature (an f32-trained checkpoint is byte-format-compatible with the f64 build, and
+    // the f32->f64->f32 resume round-trip is exact). NEVER per-shard-sort-then-concat (would scramble
+    // the ONE global ascending key order the format requires).
+    let sections = gather_table_sections(tab);
+    let n_rows: usize = sections.iter().map(|s| s.len()).sum();
+    let mut out = Vec::with_capacity(16 + 16 + n_rows * SER_ROW_BYTES);
+    out.extend_from_slice(&nlcfr_header(tab));
+    for sec in &sections {
+        append_section_to_vec(&mut out, sec);
+    }
     out
-}
-
-/// Emit a sharded map as the IDENTICAL on-disk form the old un-sharded `write_map` produced: a u64
-/// length prefix, then every (16-byte key, 11 f64 LE) row in ONE GLOBAL ascending key order. We gather
-/// the (key, row) pairs across ALL shards and do a single `sort_by(key)` — the same lexicographic order
-/// as the old `keys.sort()` on the flat map — so the NLCFR001 blob is byte-identical regardless of
-/// `N_SHARDS` (and thus checkpoint-portable). NEVER per-shard-sort-then-concat (would scramble the order).
-fn write_map_sharded<'a>(
-    out: &mut Vec<u8>,
-    total_len: usize,
-    all: impl Iterator<Item = (&'a [u8; 16], [f64; NUM_ACTIONS])>,
-) {
-    out.extend_from_slice(&(total_len as u64).to_le_bytes());
-    // Owned f64 rows (cum_regret is widened by the caller; strat_sum copied) so the on-disk form is
-    // f64-width for BOTH maps regardless of the in-memory cum precision.
-    let mut pairs: Vec<(&[u8; 16], [f64; NUM_ACTIONS])> = all.collect();
-    debug_assert_eq!(pairs.len(), total_len);
-    // PERF-ONLY (arm-2 spot-resilience ops, 2026-07-05): parallel unstable sort. Keys are UNIQUE
-    // (HashMap keys; `shard_of` routes each key to exactly one shard), so unstable-vs-stable cannot
-    // reorder equal elements and the blob stays BYTE-IDENTICAL to the serial `sort_by` (verified:
-    // ab_train smoke blob sha unchanged pre/post). Rationale: at the bpv4 fullhist scale (~655M
-    // rows, ~58 GB blob) the serial sort dominated the per-checkpoint training pause (~140 MB/s
-    // measured => ~7-10 min); with the S3 upload now detached, serialize IS the pause.
-    pairs.par_sort_unstable_by(|a, b| a.0.cmp(b.0));
-    encode_sorted_pairs(out, &pairs);
-}
-
-/// Fixed on-disk row width for an `NLCFR001`/serialize map row: 16-byte key + `NUM_ACTIONS` f64 LE.
-const SER_ROW_BYTES: usize = 16 + 8 * NUM_ACTIONS;
-
-/// Encode an ALREADY-GLOBALLY-SORTED `(key, row)` slice into `out` as the fixed-width row stream
-/// (16-byte key then 11 f64 LE per row), appended after the `total_len` prefix the caller wrote.
-///
-/// PERF (checkpoint-speed ops, 2026-07-06): the previous serial `extend_from_slice` loop was the
-/// dominant serialize cost at the bpv4 fullhist scale (~655M rows => single-thread ~104 B/row memcpy
-/// of a ~58 GB blob). Because every row is EXACTLY `SER_ROW_BYTES` wide, row `i` occupies the disjoint
-/// output range `[i*W, (i+1)*W)` — so we preallocate the exact output tail ONCE and let rayon fill
-/// disjoint row-chunks in parallel. This is a pure data-parallel scatter with no cross-thread aliasing
-/// (each chunk owns a non-overlapping `&mut [u8]`), so the emitted bytes are BIT-IDENTICAL to the serial
-/// loop for the same sorted input (the golden-SHA gate and the `serialize`/`deserialize` round-trip tests
-/// verify this). Serial fallback for tiny inputs avoids rayon overhead where it cannot pay for itself.
-fn encode_sorted_pairs(out: &mut Vec<u8>, pairs: &[(&[u8; 16], [f64; NUM_ACTIONS])]) {
-    let n = pairs.len();
-    let base = out.len();
-    out.resize(base + n * SER_ROW_BYTES, 0u8);
-    let dst = &mut out[base..];
-
-    #[inline]
-    fn encode_one(slot: &mut [u8], key: &[u8; 16], row: &[f64; NUM_ACTIONS]) {
-        slot[..16].copy_from_slice(&key[..]);
-        let mut o = 16;
-        for &v in row {
-            slot[o..o + 8].copy_from_slice(&v.to_le_bytes());
-            o += 8;
-        }
-    }
-
-    // Rayon fixed-cost is ~1M rows; below that the serial loop wins.
-    const PAR_MIN_ROWS: usize = 1 << 20;
-    if n < PAR_MIN_ROWS {
-        for (i, (key, row)) in pairs.iter().enumerate() {
-            let off = i * SER_ROW_BYTES;
-            encode_one(&mut dst[off..off + SER_ROW_BYTES], key, row);
-        }
-        return;
-    }
-    // Chunk the output by whole rows so each rayon task owns a disjoint, row-aligned slice. Zip the
-    // matching row-chunk of `pairs` (same fixed row count per chunk => 1:1 alignment).
-    let rows_per_chunk = n.div_ceil(rayon::current_num_threads().max(1) * 4).max(1);
-    dst.par_chunks_mut(rows_per_chunk * SER_ROW_BYTES)
-        .zip(pairs.par_chunks(rows_per_chunk))
-        .for_each(|(byte_chunk, pair_chunk)| {
-            for (i, (key, row)) in pair_chunk.iter().enumerate() {
-                let off = i * SER_ROW_BYTES;
-                encode_one(&mut byte_chunk[off..off + SER_ROW_BYTES], key, row);
-            }
-        });
 }
 
 fn read_u64(b: &[u8], p: &mut usize) -> Option<u64> {
@@ -4086,78 +4292,38 @@ pub fn deserialize_parallel(b: &[u8]) -> Option<NlheTables> {
 //   base_iter    u64   iters_done of the FULL BASE this delta chain roots at
 //   iters_done   u64   iters_done at this delta (resume continues at iters_done+1)
 //   seq          u64   monotone delta sequence within the chain (base=0, first delta=1, ...)
-//   cum   map    write_map_sharded over the DIRTY cum_regret rows (global-sorted, f64-widened)
-//   strat map    write_map_sharded over the DIRTY strat_sum  rows (global-sorted, f64)
+//   cum   map    u64 len + the DIRTY cum_regret rows (global-sorted, f64-widened)
+//   strat map    u64 len + the DIRTY strat_sum  rows (global-sorted, f64)
 //
-// The two maps use the SAME fixed-width, globally-sorted `write_map_sharded` encoding as `NLCFR001`, so a
+// The two maps use the SAME fixed-width, globally-sorted section encoding as `NLCFR001`, so a
 // delta blob is deterministic (a given state + dirty set always serialize identically) and its rows
 // deserialize through the same `read_map_into_shards` path.
 pub const DELTA_MAGIC: &[u8; 8] = b"NLDLT001";
 
-/// Emit ONE map as `write_map_sharded` does, but restricted to the keys present in `dirty` (the
-/// per-shard dirty set for this map). Gathers only dirty (key, row) pairs across all shards, then the
-/// identical global-sort + parallel fixed-width encode. `total` is the exact dirty-row count (so the u64
-/// length prefix is correct); `pick` reads the CURRENT row for a dirty key from its shard.
-fn write_map_dirty<'a, R, F>(
-    out: &mut Vec<u8>,
-    shards: &'a [Shard; N_SHARDS],
-    dirty: &'a [DirtyShard; N_SHARDS],
-    which_dirty: fn(&'a DirtyShard) -> &'a HashSet<[u8; 16]>,
-    which_map: fn(&'a Shard) -> &'a HashMap<[u8; 16], R>,
-    to_f64: F,
-) where
-    R: 'a,
-    F: Fn(&R) -> [f64; NUM_ACTIONS] + Sync,
-{
-    // Gather dirty (key, row) pairs. A key can be dirty but ABSENT from the map only if a discount pass
-    // dropped it — not possible here (dirty keys always came from a merge that inserted the row, and
-    // rows are never removed), but we defensively skip a missing key rather than panic.
-    let to_f64 = &to_f64;
-    let pairs: Vec<(&[u8; 16], [f64; NUM_ACTIONS])> = shards
-        .iter()
-        .enumerate()
-        .flat_map(|(s, sh)| {
-            let map = which_map(sh);
-            which_dirty(&dirty[s])
-                .iter()
-                .filter_map(move |k| map.get(k).map(|r| (k, to_f64(r))))
-        })
-        .collect();
-    out.extend_from_slice(&(pairs.len() as u64).to_le_bytes());
-    // Same discipline as write_map_sharded: ONE global ascending key sort, then parallel fixed-width
-    // encode. Keys are unique (HashSet -> unique keys, each in exactly one shard) so unstable sort is
-    // deterministic.
-    let mut pairs = pairs;
-    pairs.par_sort_unstable_by(|a, b| a.0.cmp(b.0));
-    encode_sorted_pairs(out, &pairs);
+/// The 32-byte NLDLT001 header (magic + base_iter + iters_done + seq).
+fn delta_blob_header(tab: &NlheTables, base_iter: u64, seq: u64) -> [u8; 32] {
+    let mut h = [0u8; 32];
+    h[..8].copy_from_slice(DELTA_MAGIC);
+    h[8..16].copy_from_slice(&base_iter.to_le_bytes());
+    h[16..24].copy_from_slice(&tab.iters_done.to_le_bytes());
+    h[24..32].copy_from_slice(&seq.to_le_bytes());
+    h
 }
 
 /// Serialize the DIRTY rows of `tab` as an `NLDLT001` delta blob rooted at `base_iter`, sequence `seq`.
 /// Requires delta tracking to be armed (`tab.dirty.is_some()`); returns None if unarmed (the driver
-/// must fall back to a full base).
+/// must fall back to a full base). Same parallel gather/sort/encode core as `serialize` (R3): ONE
+/// global ascending key sort per map (keys unique => deterministic), fixed-width rows, byte-identical
+/// to the pre-R3 serial-gather encoder.
 pub fn serialize_delta(tab: &NlheTables, base_iter: u64, seq: u64) -> Option<Vec<u8>> {
     let dirty = tab.dirty.as_deref()?;
-    let mut out = Vec::new();
-    out.extend_from_slice(DELTA_MAGIC);
-    out.extend_from_slice(&base_iter.to_le_bytes());
-    out.extend_from_slice(&tab.iters_done.to_le_bytes());
-    out.extend_from_slice(&seq.to_le_bytes());
-    write_map_dirty(
-        &mut out,
-        &tab.shards,
-        dirty,
-        |d| &d.cum,
-        |sh| &sh.cum_regret,
-        widen_r,
-    );
-    write_map_dirty(
-        &mut out,
-        &tab.shards,
-        dirty,
-        |d| &d.strat,
-        |sh| &sh.strat_sum,
-        |r| *r,
-    );
+    let sections = gather_dirty_sections(tab, dirty);
+    let n_rows: usize = sections.iter().map(|s| s.len()).sum();
+    let mut out = Vec::with_capacity(32 + 16 + n_rows * SER_ROW_BYTES);
+    out.extend_from_slice(&delta_blob_header(tab, base_iter, seq));
+    for sec in &sections {
+        append_section_to_vec(&mut out, sec);
+    }
     Some(out)
 }
 
@@ -6011,6 +6177,213 @@ mod tests {
         // And it deserializes back to a re-serialize-identical table (resume bit-identity).
         let b = deserialize(&got).expect("deserialize file blob");
         assert_eq!(serialize(&b), want, "file blob not resume-identical");
+    }
+
+    /// PRE-R3 reference encoders: independent serial reimplementations of the OLD (pre checkpoint-speed
+    /// R3) `write_map_sharded` / `write_map_dirty` shape — serial gather of OWNED widened rows, serial
+    /// stable `sort_by` on the 16-byte key, serial byte-by-byte encode. These are what wrote the banked
+    /// S3 artifacts (base iter_001100.nlcfr + deltas 1200/1300/1400); the R3 gates below prove the new
+    /// parallel gather/sort/encode/write paths emit EXACTLY these bytes.
+    fn pre_r3_reference_full(tab: &NlheTables) -> Vec<u8> {
+        fn write_map(out: &mut Vec<u8>, mut pairs: Vec<([u8; 16], [f64; NUM_ACTIONS])>) {
+            out.extend_from_slice(&(pairs.len() as u64).to_le_bytes());
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            for (k, row) in pairs {
+                out.extend_from_slice(&k[..]);
+                for &v in &row {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"NLCFR001");
+        out.extend_from_slice(&tab.iters_done.to_le_bytes());
+        write_map(&mut out, tab.dump_cum_rows());
+        write_map(&mut out, tab.dump_strat_rows());
+        out
+    }
+
+    fn pre_r3_reference_delta(tab: &NlheTables, base_iter: u64, seq: u64) -> Option<Vec<u8>> {
+        fn write_map(out: &mut Vec<u8>, mut pairs: Vec<([u8; 16], [f64; NUM_ACTIONS])>) {
+            out.extend_from_slice(&(pairs.len() as u64).to_le_bytes());
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            for (k, row) in pairs {
+                out.extend_from_slice(&k[..]);
+                for &v in &row {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        let dirty = tab.dirty.as_deref()?;
+        let mut out = Vec::new();
+        out.extend_from_slice(DELTA_MAGIC);
+        out.extend_from_slice(&base_iter.to_le_bytes());
+        out.extend_from_slice(&tab.iters_done.to_le_bytes());
+        out.extend_from_slice(&seq.to_le_bytes());
+        let mut cum: Vec<([u8; 16], [f64; NUM_ACTIONS])> = Vec::new();
+        let mut strat: Vec<([u8; 16], [f64; NUM_ACTIONS])> = Vec::new();
+        for (s, sh) in tab.shards.iter().enumerate() {
+            for k in dirty[s].cum.iter() {
+                if let Some(r) = sh.cum_regret.get(k) {
+                    cum.push((*k, widen_r(r)));
+                }
+            }
+            for k in dirty[s].strat.iter() {
+                if let Some(r) = sh.strat_sum.get(k) {
+                    strat.push((*k, *r));
+                }
+            }
+        }
+        write_map(&mut out, cum);
+        write_map(&mut out, strat);
+        Some(out)
+    }
+
+    /// R3 REGRESSION GATE — the parallel gather/sort/encode serializers (`serialize`, `serialize_delta`)
+    /// must be byte-for-byte identical to the PRE-R3 serial encoders for BOTH the NLCFR001 base and the
+    /// NLDLT001 delta, on a real trained table (not synthetic keys). Byte-identity is the project's
+    /// correctness currency: the banked S3 chain must keep loading and reproducing.
+    #[test]
+    fn r3_serializers_byte_identical_to_pre_r3_reference() {
+        let cfg = test_cfg(48);
+        let v3 = V3Cfg {
+            signed_regrets: true,
+            regret_floor: -50.0,
+            ..V3Cfg::default()
+        };
+        let mut tab = NlheTables::new();
+        tab.arm_delta_tracking();
+        for _ in 0..3 {
+            tab.train_iteration_v3(&cfg, &v3);
+        }
+        let base_iter = tab.iters_done;
+        assert_eq!(
+            serialize(&tab),
+            pre_r3_reference_full(&tab),
+            "NLCFR001 base bytes diverged from the pre-R3 encoder"
+        );
+        tab.reset_dirty();
+        tab.train_iteration_v3(&cfg, &v3); // one dirty window (sparse dirty set)
+        let (dc, ds) = tab.dirty_counts();
+        assert!(dc > 0 && ds > 0, "window must dirty some rows");
+        assert_eq!(
+            serialize_delta(&tab, base_iter, 1),
+            pre_r3_reference_delta(&tab, base_iter, 1),
+            "NLDLT001 delta bytes diverged from the pre-R3 encoder"
+        );
+        // And the post-window full base too (fresh rows inserted this window).
+        assert_eq!(
+            serialize(&tab),
+            pre_r3_reference_full(&tab),
+            "post-window NLCFR001 base bytes diverged from the pre-R3 encoder"
+        );
+    }
+
+    /// R3 FILE-WRITER GATE — the streaming positioned-write path must emit the same bytes as the in-RAM
+    /// serializers for ANY job size (chunk-boundary sweep incl. job_rows=1 and a non-divisor) and ANY
+    /// rayon thread count (1/2/7). On-box thread counts vary by instance type, so cross-thread-count
+    /// byte determinism is REQUIRED, not nice-to-have. Also covers the empty-table and empty-dirty-set
+    /// edges and the unarmed delta fallback (Ok(None)).
+    #[test]
+    fn r3_file_writers_byte_identical_across_job_sizes_and_thread_counts() {
+        let cfg = test_cfg(48);
+        let v3 = V3Cfg::default();
+        let mut tab = NlheTables::new();
+        tab.arm_delta_tracking();
+        for _ in 0..2 {
+            tab.train_iteration_v3(&cfg, &v3);
+        }
+        let base_iter = tab.iters_done;
+        tab.reset_dirty();
+        tab.train_iteration_v3(&cfg, &v3);
+        let want_base = serialize(&tab);
+        let want_delta = serialize_delta(&tab, base_iter, 1).unwrap();
+
+        let tmp = |tag: &str| {
+            let mut p = std::env::temp_dir();
+            p.push(format!("nlcfr_r3_{}_{}.bin", tag, std::process::id()));
+            p.to_str().unwrap().to_string()
+        };
+
+        // Job-size sweep through the private writer (job size is PURE PERF, never bytes).
+        for &jr in &[1usize, 3, 57, FILE_JOB_ROWS] {
+            let p = tmp(&format!("jr{jr}"));
+            let dirty = tab.dirty.as_deref().unwrap();
+            let n = write_sections_to_file(
+                &p,
+                &nlcfr_header(&tab),
+                &gather_table_sections(&tab),
+                jr,
+            )
+            .unwrap();
+            let got = std::fs::read(&p).unwrap();
+            assert_eq!(n, want_base.len(), "base byte count at job_rows={jr}");
+            assert_eq!(got, want_base, "base file bytes differ at job_rows={jr}");
+            let nd = write_sections_to_file(
+                &p,
+                &delta_blob_header(&tab, base_iter, 1),
+                &gather_dirty_sections(&tab, dirty),
+                jr,
+            )
+            .unwrap();
+            let gotd = std::fs::read(&p).unwrap();
+            let _ = std::fs::remove_file(&p);
+            assert_eq!(nd, want_delta.len(), "delta byte count at job_rows={jr}");
+            assert_eq!(gotd, want_delta, "delta file bytes differ at job_rows={jr}");
+        }
+
+        // Thread-count sweep through the PUBLIC entry points (serialize + both file writers).
+        for &tc in &[1usize, 2, 7] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(tc)
+                .build()
+                .expect("build local rayon pool");
+            pool.install(|| {
+                assert_eq!(serialize(&tab), want_base, "serialize bytes differ at {tc} threads");
+                assert_eq!(
+                    serialize_delta(&tab, base_iter, 1).unwrap(),
+                    want_delta,
+                    "serialize_delta bytes differ at {tc} threads"
+                );
+                let p = tmp(&format!("tc{tc}"));
+                serialize_to_file(&tab, &p).unwrap();
+                assert_eq!(
+                    std::fs::read(&p).unwrap(),
+                    want_base,
+                    "serialize_to_file bytes differ at {tc} threads"
+                );
+                serialize_delta_to_file(&tab, &p, base_iter, 1).unwrap().unwrap();
+                assert_eq!(
+                    std::fs::read(&p).unwrap(),
+                    want_delta,
+                    "serialize_delta_to_file bytes differ at {tc} threads"
+                );
+                let _ = std::fs::remove_file(&p);
+            });
+        }
+
+        // Edges: empty table; armed-but-clean dirty set; unarmed delta => Ok(None).
+        let empty = NlheTables::new();
+        let p = tmp("empty");
+        let n = serialize_to_file(&empty, &p).unwrap();
+        let got = std::fs::read(&p).unwrap();
+        assert_eq!(n, got.len());
+        assert_eq!(got, serialize(&empty), "empty-table file bytes differ");
+        assert!(
+            serialize_delta_to_file(&empty, &p, 0, 1).unwrap().is_none(),
+            "unarmed delta-to-file must be Ok(None)"
+        );
+        let mut clean = NlheTables::new();
+        clean.arm_delta_tracking();
+        let nd = serialize_delta_to_file(&clean, &p, 0, 1).unwrap().unwrap();
+        let gotd = std::fs::read(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(nd, gotd.len());
+        assert_eq!(
+            gotd,
+            serialize_delta(&clean, 0, 1).unwrap(),
+            "empty-dirty delta file bytes differ"
+        );
     }
 
     /// DELTA-CHECKPOINT resume bit-identity (checkpoint-speed R2). A full base at iter N followed by a

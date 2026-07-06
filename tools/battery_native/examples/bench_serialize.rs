@@ -18,10 +18,110 @@ use std::time::Instant;
 use battery_native::core::NUM_ACTIONS;
 use battery_native::trainer::{
     apply_delta_checked, bench_insert_row, bench_mark_dirty_fraction, deserialize,
-    deserialize_parallel, serialize, serialize_delta, NlheTables,
+    deserialize_parallel, serialize, serialize_delta, serialize_delta_to_file, serialize_to_file,
+    NlheTables,
 };
 
 const SER_ROW_BYTES: usize = 16 + 8 * NUM_ACTIONS;
+
+// ------------------------------------------------------------------------------------------------
+// OLD-IMPL (pre checkpoint-speed R3) emulation — byte- and perf-faithful replica of the retired
+// pipeline so one binary measures BEFORE and AFTER on the same box and PROVES sha equality:
+//   gather   SERIAL per-key collect of OWNED (key, [f64;11]) pairs (~104 B/elem, Vec doubling growth)
+//   sort     par_sort_unstable over those heavy elements
+//   encode   parallel fixed-width scatter into ONE full in-RAM blob
+//   write    16 MiB BufWriter stream + flush + UNCONDITIONAL sync_all (wait for device writeback)
+// ------------------------------------------------------------------------------------------------
+
+fn old_encode_map(out: &mut Vec<u8>, mut pairs: Vec<([u8; 16], [f64; NUM_ACTIONS])>) {
+    use rayon::prelude::*;
+    out.extend_from_slice(&(pairs.len() as u64).to_le_bytes());
+    pairs.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let n = pairs.len();
+    let base = out.len();
+    out.resize(base + n * SER_ROW_BYTES, 0u8);
+    let dst = &mut out[base..];
+    let rows_per_chunk = n.div_ceil(rayon::current_num_threads().max(1) * 4).max(1);
+    dst.par_chunks_mut(rows_per_chunk * SER_ROW_BYTES)
+        .zip(pairs.par_chunks(rows_per_chunk))
+        .for_each(|(byte_chunk, pair_chunk)| {
+            for (i, (key, row)) in pair_chunk.iter().enumerate() {
+                let off = i * SER_ROW_BYTES;
+                byte_chunk[off..off + 16].copy_from_slice(&key[..]);
+                let mut o = off + 16;
+                for &v in row.iter() {
+                    byte_chunk[o..o + 8].copy_from_slice(&v.to_le_bytes());
+                    o += 8;
+                }
+            }
+        });
+}
+
+/// OLD full-base blob: header + serial-gathered owned rows per map (dump_* is the serial
+/// iterate-and-collect the old `write_map_sharded` did), old sort+encode.
+fn old_impl_full_blob(tab: &NlheTables) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"NLCFR001");
+    out.extend_from_slice(&tab.iters_done().to_le_bytes());
+    old_encode_map(&mut out, tab.dump_cum_rows());
+    old_encode_map(&mut out, tab.dump_strat_rows());
+    out
+}
+
+/// OLD delta blob: 32-byte header + SERIAL per-dirty-key gather (HashSet iter + map.get random
+/// probes, one thread) + old sort+encode — the exact shape of the retired `write_map_dirty`.
+fn old_impl_delta_blob(tab: &NlheTables, base_iter: u64, seq: u64) -> Vec<u8> {
+    let dirty = tab.dirty.as_deref().expect("delta tracking armed");
+    let mut out = Vec::new();
+    out.extend_from_slice(b"NLDLT001");
+    out.extend_from_slice(&base_iter.to_le_bytes());
+    out.extend_from_slice(&tab.iters_done().to_le_bytes());
+    out.extend_from_slice(&seq.to_le_bytes());
+    let cum: Vec<([u8; 16], [f64; NUM_ACTIONS])> = tab
+        .shards
+        .iter()
+        .enumerate()
+        .flat_map(|(s, sh)| {
+            dirty[s].cum.iter().filter_map(move |k| {
+                sh.cum_regret.get(k).map(|r| {
+                    let mut row = [0.0f64; NUM_ACTIONS];
+                    for a in 0..NUM_ACTIONS {
+                        row[a] = r[a] as f64;
+                    }
+                    (*k, row)
+                })
+            })
+        })
+        .collect();
+    let strat: Vec<([u8; 16], [f64; NUM_ACTIONS])> = tab
+        .shards
+        .iter()
+        .enumerate()
+        .flat_map(|(s, sh)| {
+            dirty[s]
+                .strat
+                .iter()
+                .filter_map(move |k| sh.strat_sum.get(k).map(|r| (*k, *r)))
+        })
+        .collect();
+    old_encode_map(&mut out, cum);
+    old_encode_map(&mut out, strat);
+    out
+}
+
+/// OLD file write: 16 MiB BufWriter stream + flush + sync_all (the unconditional fsync the old
+/// `serialize_to_file`/`serialize_delta_to_file` did inside the training pause).
+fn old_impl_write(path: &str, blob: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let f = std::fs::File::create(path)?;
+    let mut w = std::io::BufWriter::with_capacity(16 * 1024 * 1024, f);
+    w.write_all(blob)?;
+    w.flush()?;
+    w.into_inner()
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+        .sync_all()?;
+    Ok(())
+}
 
 /// Independent SERIAL reference encoder: gather -> sort -> serial byte-by-byte (the pre-optimization
 /// shape). Produces the reference NLCFR001 blob to prove the parallel `serialize` is byte-identical.
@@ -275,6 +375,68 @@ fn main() {
         println!("  {:>4.0} GB blob : pause ~{:.1}s", gb, secs);
     }
 
+    // ================================================================================================
+    // FULL-BASE TO-FILE (the actual `save_bytes_to_file` training pause) — OLD impl emulation
+    // (serial gather + heavy sort + full blob + BufWriter + sync_all) vs NEW streaming writer
+    // (parallel gather + 24B-ref sort + parallel positioned writes, fsync opt-in). SHA gate: both
+    // must produce byte-identical files (and == serialize()).
+    // ================================================================================================
+    println!("\n\n== FULL-BASE TO-FILE (OLD impl vs NEW streaming writer) ==");
+    let file_dir = env::var("BENCH_FILE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| env::temp_dir());
+    println!("file dir = {}", file_dir.display());
+    let p_old = file_dir.join("bench_ser_old.nlcfr");
+    let p_new = file_dir.join("bench_ser_new.nlcfr");
+
+    // OLD: encode phases timed separately from the write+fsync.
+    let t0 = Instant::now();
+    let old_blob = old_impl_full_blob(&tab);
+    let old_enc_dt = t0.elapsed().as_secs_f64();
+    let t0 = Instant::now();
+    old_impl_write(p_old.to_str().unwrap(), &old_blob).expect("old write");
+    let old_wr_dt = t0.elapsed().as_secs_f64();
+    let old_total = old_enc_dt + old_wr_dt;
+    assert_eq!(old_blob, blob, "[GATE] OLD-impl blob != current serialize() blob");
+    println!(
+        "  OLD  encode {:.3}s + write+fsync {:.3}s = {:.3}s  ({:.1} MB/s end-to-end)",
+        old_enc_dt, old_wr_dt, old_total, blob_len as f64 / 1e6 / old_total
+    );
+    drop(old_blob);
+
+    // NEW (default: no fsync — page-cache write; kernel writes back while training resumes).
+    let mut best_new = f64::INFINITY;
+    for _ in 0..2 {
+        let t0 = Instant::now();
+        let nb = serialize_to_file(&tab, p_new.to_str().unwrap()).expect("serialize_to_file");
+        best_new = best_new.min(t0.elapsed().as_secs_f64());
+        assert_eq!(nb, blob_len, "byte count mismatch");
+    }
+    println!(
+        "  NEW  (no fsync)  {:.3}s  ({:.1} MB/s end-to-end)",
+        best_new, blob_len as f64 / 1e6 / best_new
+    );
+    // NEW with POKERBOT_CKPT_FSYNC=1 (restores the old durability wait).
+    env::set_var("POKERBOT_CKPT_FSYNC", "1");
+    let t0 = Instant::now();
+    serialize_to_file(&tab, p_new.to_str().unwrap()).expect("serialize_to_file fsync");
+    let new_fsync_dt = t0.elapsed().as_secs_f64();
+    env::remove_var("POKERBOT_CKPT_FSYNC");
+    println!(
+        "  NEW  (fsync=1)   {:.3}s  ({:.1} MB/s end-to-end)",
+        new_fsync_dt, blob_len as f64 / 1e6 / new_fsync_dt
+    );
+    let old_bytes = std::fs::read(&p_old).expect("read old file");
+    let new_bytes = std::fs::read(&p_new).expect("read new file");
+    println!("  [GATE] old-impl file sha256 = {}", sha256_hex(&old_bytes));
+    println!("  [GATE] new-impl file sha256 = {}", sha256_hex(&new_bytes));
+    assert_eq!(old_bytes, new_bytes, "[GATE] FULL-BASE FILE BYTES DIVERGED old vs new");
+    assert_eq!(new_bytes, blob, "[GATE] new file != serialize() blob");
+    println!("  [GATE] full-base file bytes identical (old == new == serialize()) : true");
+    println!("  SPEEDUP (old -> new, no-fsync default) = {:.2}x", old_total / best_new);
+    drop(old_bytes);
+    drop(new_bytes);
+    let _ = std::fs::remove_file(&p_old);
+    let _ = std::fs::remove_file(&p_new);
+
     // -- DELTA CHECKPOINTS (checkpoint-speed R2, 2026-07-06) ------------------------------------------
     // Measure delta-serialize rate + pause at several touched fractions, and PROVE base+delta resume is
     // byte-identical to a full re-serialize of the same state. The dirty set is 1-in-`every` rows.
@@ -350,6 +512,45 @@ fn main() {
             dmbps,
             speedup_vs_full,
             vol_ratio * 100.0
+        );
+
+        // -- DELTA TO-FILE (the actual `save_delta_to_file` training pause): OLD impl emulation
+        //    (serial dirty gather + heavy sort + blob + BufWriter + sync_all) vs NEW streaming writer.
+        //    SHA gate: identical file bytes.
+        let dp_old = file_dir.join(format!("bench_delta_old_{every}.nldlt"));
+        let dp_new = file_dir.join(format!("bench_delta_new_{every}.nldlt"));
+        let t0 = Instant::now();
+        let old_dblob = old_impl_delta_blob(&dt, 62_000, 1);
+        let old_enc = t0.elapsed().as_secs_f64();
+        let t0 = Instant::now();
+        old_impl_write(dp_old.to_str().unwrap(), &old_dblob).expect("old delta write");
+        let old_wr = t0.elapsed().as_secs_f64();
+        assert_eq!(old_dblob, dblob, "[GATE] OLD delta blob != current serialize_delta blob");
+        let mut best_nf = f64::INFINITY;
+        for _ in 0..2 {
+            let t0 = Instant::now();
+            let nb = serialize_delta_to_file(&dt, dp_new.to_str().unwrap(), 62_000, 1)
+                .expect("delta_to_file")
+                .expect("armed");
+            best_nf = best_nf.min(t0.elapsed().as_secs_f64());
+            assert_eq!(nb, dblob.len());
+        }
+        let old_file_bytes = std::fs::read(&dp_old).unwrap();
+        let new_file_bytes = std::fs::read(&dp_new).unwrap();
+        assert_eq!(old_file_bytes, new_file_bytes, "[GATE] DELTA FILE BYTES DIVERGED old vs new");
+        assert_eq!(new_file_bytes, dblob, "[GATE] delta file != serialize_delta blob");
+        let _ = std::fs::remove_file(&dp_old);
+        let _ = std::fs::remove_file(&dp_new);
+        println!(
+            "        TO-FILE: OLD encode {:.3}s + write+fsync {:.3}s = {:.3}s ({:.0} MB/s)  \
+             NEW {:.3}s ({:.0} MB/s)  speedup {:.1}x  [file-sha GATE ok]",
+            old_enc,
+            old_wr,
+            old_enc + old_wr,
+            dblob.len() as f64 / 1e6 / (old_enc + old_wr),
+            best_nf,
+            dblob.len() as f64 / 1e6 / best_nf,
+            (old_enc + old_wr) / best_nf
         );
     }
     println!(

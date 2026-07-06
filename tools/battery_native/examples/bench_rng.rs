@@ -136,8 +136,7 @@ fn time_leaf_eval() {
         let t0 = Instant::now();
         for _r in 0..rounds {
             for env in &leaves {
-                acc +=
-                    uniform_leaf_value::<6>(env, hero, &bp, &cfg, 0x12345, n as i32, false, false);
+                acc += uniform_leaf_value::<6>(env, hero, &bp, &cfg, 0x12345, n as i32, false);
             }
         }
         let dt = t0.elapsed();
