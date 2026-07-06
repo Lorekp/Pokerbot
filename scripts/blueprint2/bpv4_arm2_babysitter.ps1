@@ -68,19 +68,19 @@
     -Mrr `
     -WorkSteal `
     -V3SignedRegrets `
-    -V3PruneC "-50000" `
-    -V3PruneStart "2500" `
+    -V3PruneC "-30000" `
+    -V3PruneStart "5000" `
     -V3SnapshotAvg `
-    -V3SnapStart "1600" `
+    -V3SnapStart "3200" `
     -V3CovHands 2048 `
     -V3Regstats `
     -RowBudget 550000000 `
-    -Iters 20000 `
-    -NDeals 16384 `
+    -Iters 40000 `
+    -NDeals 8192 `
     -NumBuckets 200 `
     -EmdFrozen "" `
     -RiverOchs "" `
-    -CheckpointEvery 1000 `
+    -CheckpointEvery 500 `
     -GateEvery 2500 `
     -CkptVolumeGb 400 `
     -InstanceType "c6i.32xlarge" `
