@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gzip
+import hashlib
 import io
 import sys
 import tarfile
@@ -81,8 +83,31 @@ def build_and_upload_code(s3, bucket: str, prefix: str, crate_src: str = "tools/
                 tar.add(p, arcname=arc, filter=_tar_filter)
     buf.seek(0)
     key = f"{prefix}/code/native_cfr_code.tar.gz"
-    s3.put_object(Bucket=bucket, Key=key, Body=buf.read())
-    print(f"Uploaded code tarball -> s3://{bucket}/{key} ({buf.tell()} bytes; crate_src={crate_src})", flush=True)
+    # SKIP-IF-UNCHANGED (2026-07-06): the retry supervisor deliberately never passes --reuse-code
+    # (stale-code incidents), so every relaunch cycle used to pay the 224 MB home-upstream upload.
+    # Compare on the ACTUAL would-be tarball bytes instead: sha256 of the DECOMPRESSED tar content
+    # (same definition as the on-box CODE_SHA: `gzip -dc | sha256sum` — the gzip envelope carries a
+    # fresh mtime on every tarfile.open, so the compressed bytes never match). The sha is stored as
+    # S3 object metadata on upload; a HEAD + metadata match on the next invocation skips the upload
+    # exactly (content-hash, not mtime/git guesswork). --reuse-code still works as-is (never calls
+    # this function).
+    h = hashlib.sha256()
+    with gzip.GzipFile(fileobj=buf, mode="rb") as gz:
+        for chunk in iter(lambda: gz.read(1 << 24), b""):
+            h.update(chunk)
+    code_sha = h.hexdigest()
+    buf.seek(0)
+    try:
+        head = s3.head_object(Bucket=bucket, Key=key)
+        if head.get("Metadata", {}).get("code-sha") == code_sha:
+            print(f"Code tarball unchanged (sha={code_sha}) -- skipping upload", flush=True)
+            return key
+    except ClientError:
+        pass  # no existing object (or no HEAD permission) -> upload
+    s3.put_object(Bucket=bucket, Key=key, Body=buf.read(),
+                  Metadata={"code-sha": code_sha})
+    print(f"Uploaded code tarball -> s3://{bucket}/{key} ({buf.tell()} bytes; crate_src={crate_src}; "
+          f"code-sha={code_sha})", flush=True)
     return key
 
 
@@ -391,7 +416,8 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
     # AFTER the upload fn — semantically identical). The bootstrap SHELL gains the build-cache block on
     # ALL paths (documented operational change; NOT byte-identical to pre-2026-07-05 renders).
     if fullhist_key or mrr:
-        ckpt_upload_imports = "\nimport hashlib\nimport io\nimport json\nimport subprocess\nfrom boto3.s3.transfer import TransferConfig"
+        ckpt_upload_imports = ("\nimport hashlib\nimport io\nimport json\nimport signal\nimport subprocess"
+                               "\nfrom boto3.s3.transfer import TransferConfig")
         ckpt_upload_fn = (
             "_XFER = TransferConfig(multipart_threshold=64 * 1024 * 1024,\n"
             "                       multipart_chunksize=256 * 1024 * 1024,\n"
@@ -568,7 +594,105 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "        _BASE[\"seq\"] = 0\n"
             "        t.reset_dirty()\n"
             "    print(f\"CKPT_SERIALIZE iters_done={it} bytes={nbytes} wall={time.time() - t0:.1f}s (direct-to-file)\", flush=True)\n"
-            "    _handoff_upload(path, it, wait)"
+            "    _handoff_upload(path, it, wait)\n"
+            "\n"
+            "\n"
+            "# ---- GRACEFUL SPOT-RECLAIM FLUSH (2026-07-06). spot_watch.sh touches /tmp/spot_reclaim the\n"
+            "# moment the 2-min IMDS reclaim notice lands (and only pkills 100 s later as a fallback).\n"
+            "# Training runs in CHUNK-iter slices (~5 s reaction latency at 0.77 it/s) -- t.train(a);\n"
+            "# t.train(b) is BYTE-IDENTICAL to t.train(a+b) (verified vs the arm2b golden gate sha) -- so\n"
+            "# the driver notices the flag fast, banks the un-checkpointed window as ONE synchronous delta\n"
+            "# (+ .ok marker + train.log), and exits 0, instead of losing up to CKPT_EVERY iters of compute\n"
+            "# to the old immediate pkill. /tmp/spot_rebalance (the earlier, softer EC2 rebalance\n"
+            "# recommendation) triggers one extra delta through the NORMAL detached path, then training\n"
+            "# continues.\n"
+            "RECLAIM_FLAG = \"/tmp/spot_reclaim\"\n"
+            "REBAL_FLAG = \"/tmp/spot_rebalance\"\n"
+            "CHUNK = int(os.environ.get(\"POKERBOT_CKPT_CHUNK\", \"4\"))  # iters per train slice\n"
+            "_STOP = {\"reclaim\": False, \"rebal_done\": False}\n"
+            "\n"
+            "\n"
+            "def _on_sigterm(_sig, _frm):\n"
+            "    # spot_watch's fallback pkill -TERM (100 s post-notice) lands here: even if the flag file\n"
+            "    # was somehow missed, the next chunk boundary still flushes if any window remains.\n"
+            "    _STOP[\"reclaim\"] = True\n"
+            "\n"
+            "\n"
+            "signal.signal(signal.SIGTERM, _on_sigterm)\n"
+            "\n"
+            "\n"
+            "def _train_to(t, upto):\n"
+            "    # Chunked training between checkpoint boundaries (bit-identical to one t.train(step)):\n"
+            "    # reclaim/rebalance flags are polled every CHUNK iters instead of every CKPT_EVERY.\n"
+            "    while t.iters_done() < upto:\n"
+            "        if _STOP[\"reclaim\"] or os.path.exists(RECLAIM_FLAG):\n"
+            "            _STOP[\"reclaim\"] = True\n"
+            "            return\n"
+            "        t.train(min(CHUNK, upto - t.iters_done()))\n"
+            "        if (DELTA_CKPT and not _STOP[\"rebal_done\"] and _BASE[\"iter\"] is not None\n"
+            "                and t.iters_done() < upto and os.path.exists(REBAL_FLAG)):\n"
+            "            # strictly mid-window (iters_done < upto) so the extra delta's iter can never\n"
+            "            # collide with an already-written boundary checkpoint's S3 key. Once only.\n"
+            "            _STOP[\"rebal_done\"] = True\n"
+            "            print(f\"REBALANCE early-signal ckpt at iters_done={t.iters_done()}\", flush=True)\n"
+            "            _ckpt(t)\n"
+            "\n"
+            "\n"
+            "def _emergency_flush(t):\n"
+            "    # SPOT RECLAIM: bank the un-checkpointed window as one delta, SYNCHRONOUSLY (a detached\n"
+            "    # uploader would die with the box). DELTA MODE ONLY -- a full base cannot fit the 2-min\n"
+            "    # window (280 s serialize alone); non-delta mode keeps today's behavior (exit; the last\n"
+            "    # cadence checkpoint is already durable). Marker JSON shape == the detached uploader's,\n"
+            "    # so resume treats an emergency delta at a non-cadence iter exactly like any chain link.\n"
+            "    it = t.iters_done()\n"
+            "    if not DELTA_CKPT or _BASE[\"iter\"] is None:\n"
+            "        print(f\"RECLAIM at iters_done={it}: no delta chain to flush \"\n"
+            "              f\"(delta_ckpt={DELTA_CKPT}) -- exiting\", flush=True)\n"
+            "        return\n"
+            "    (dc, ds) = t.dirty_counts()\n"
+            "    if dc == 0 and ds == 0:\n"
+            "        print(f\"RECLAIM at iters_done={it}: window already checkpointed -- nothing to flush\",\n"
+            "              flush=True)\n"
+            "        return\n"
+            "    t0 = time.time()\n"
+            "    try:\n"
+            "        os.makedirs(CKPT_DIR, exist_ok=True)\n"
+            "        dpath = os.path.join(CKPT_DIR, f\"iter_{it:06d}.nldlt\")\n"
+            "        nbytes = t.save_delta_to_file(dpath + \".tmp\", _BASE[\"iter\"], _BASE[\"seq\"] + 1)\n"
+            "        if nbytes is None:\n"
+            "            print(f\"RECLAIM flush unavailable (delta unarmed/full-dirty) at iters_done={it} \"\n"
+            "                  f\"-- exiting\", flush=True)\n"
+            "            return\n"
+            "        os.replace(dpath + \".tmp\", dpath)\n"
+            "        _BASE[\"seq\"] += 1\n"
+            "        t.reset_dirty()\n"
+            "        key = RUN_PREFIX + f\"/checkpoints/iter_{it:06d}.nldlt\"\n"
+            "        size = os.path.getsize(dpath)\n"
+            "        sha = _sha256_file(dpath)\n"
+            "        s3.upload_file(dpath, BUCKET, key, Config=_DL_XFER)\n"
+            "        s3.put_object(Bucket=BUCKET, Key=key + \".ok\",\n"
+            "                      Body=json.dumps({\"iters_done\": it, \"bytes\": size, \"sha256\": sha,\n"
+            "                                       \"base_iter\": _BASE[\"iter\"],\n"
+            "                                       \"seq\": _BASE[\"seq\"]}).encode())\n"
+            "    except Exception as e:\n"
+            "        print(f\"RECLAIM flush FAILED at iters_done={it}: {e!r} -- exiting \"\n"
+            "              f\"(last cadence checkpoint stands)\", flush=True)\n"
+            "        return\n"
+            "    # best-effort: give any in-flight detached uploads the remaining window (their markers\n"
+            "    # complete the chain the emergency delta extends). Never blocks past ~95 s total.\n"
+            "    for pr in list(_UPLOADS):\n"
+            "        if pr.poll() is None:\n"
+            "            try:\n"
+            "                pr.wait(timeout=max(1, int(95 - (time.time() - t0))))\n"
+            "            except Exception:\n"
+            "                break\n"
+            "    try:\n"
+            "        s3.upload_file(\"/var/log/native-cfr-train.log\", BUCKET,\n"
+            "                       RUN_PREFIX + \"/logs/train.log\")\n"
+            "    except Exception as e:\n"
+            "        print(f\"RECLAIM train.log upload failed: {e!r}\", flush=True)\n"
+            "    print(f\"EMERGENCY_FLUSH iters_done={it} bytes={size} wall={time.time() - t0:.1f}s banked\",\n"
+            "          flush=True)"
         )
     else:
         ckpt_upload_imports = ""
@@ -674,6 +798,72 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "                          multipart_chunksize=64 * 1024 * 1024,\n"
             "                          max_concurrency=64, use_threads=True)\n"
             "\n"
+            "# ---- PRESTAGED RESUME (2026-07-06): the bootstrap forks a background prestage right after\n"
+            "# the awscli install (before rustup/pip/build-cache), downloading + sha-verifying the newest\n"
+            "# verified base and its contiguous delta chain into CKPT_DIR, then writing an atomic manifest\n"
+            "# + .done flag. That overlaps the ~114 s+ resume download with the ~2-3 min toolchain\n"
+            "# prologue. The driver consumes a prestaged blob ONLY when its manifest sha/bytes still match\n"
+            "# the CURRENT marker (a newer checkpoint may have landed since); any mismatch/failure falls\n"
+            "# back to the normal tuned download.\n"
+            "PRESTAGE_WAIT_S = 300  # bounded wait for an in-flight prestage before falling back\n"
+            "_PRESTAGE = {\"man\": None, \"loaded\": False}\n"
+            "\n"
+            "\n"
+            "def _prestage_manifest():\n"
+            "    done = os.path.join(CKPT_DIR, \"prestage.done\")\n"
+            "    started = os.path.join(CKPT_DIR, \"prestage.started\")\n"
+            "    if not os.path.exists(done) and os.path.exists(started):\n"
+            "        print(f\"RESUME prestage in progress -- waiting up to {PRESTAGE_WAIT_S}s\", flush=True)\n"
+            "        t0 = time.time()\n"
+            "        while time.time() - t0 < PRESTAGE_WAIT_S and not os.path.exists(done):\n"
+            "            time.sleep(2)\n"
+            "    if not os.path.exists(done):\n"
+            "        return None\n"
+            "    try:\n"
+            "        with open(os.path.join(CKPT_DIR, \"prestage_manifest.json\"), \"r\") as f:\n"
+            "            man = json.load(f)\n"
+            "        return man if man.get(\"base\") else None\n"
+            "    except Exception as e:\n"
+            "        print(f\"RESUME prestage manifest unreadable: {e!r} -- ignoring\", flush=True)\n"
+            "        return None\n"
+            "\n"
+            "\n"
+            "def _prestaged_take(mk, dst):\n"
+            "    # If the prestage manifest holds a verified blob for marker `mk` that STILL matches the\n"
+            "    # current marker meta, move it to `dst` and return the meta; else None (caller downloads).\n"
+            "    # Never raises -- every failure is a clean fallback to today's path.\n"
+            "    try:\n"
+            "        if not _PRESTAGE[\"loaded\"]:\n"
+            "            _PRESTAGE[\"man\"] = _prestage_manifest()\n"
+            "            _PRESTAGE[\"loaded\"] = True\n"
+            "        man = _PRESTAGE[\"man\"]\n"
+            "        if not man:\n"
+            "            return None\n"
+            "        ent = man[\"base\"] if man[\"base\"].get(\"marker\") == mk else None\n"
+            "        if ent is None:\n"
+            "            for d in man.get(\"deltas\", []):\n"
+            "                if d.get(\"marker\") == mk:\n"
+            "                    ent = d\n"
+            "                    break\n"
+            "        if ent is None:\n"
+            "            return None\n"
+            "        meta = json.loads(s3.get_object(Bucket=BUCKET, Key=mk)[\"Body\"].read())\n"
+            "        if (ent.get(\"sha256\") != meta[\"sha256\"]\n"
+            "                or int(ent.get(\"bytes\", -1)) != int(meta[\"bytes\"])):\n"
+            "            print(f\"RESUME prestage STALE for {mk} (marker changed) -- downloading fresh\",\n"
+            "                  flush=True)\n"
+            "            return None\n"
+            "        p = ent.get(\"path\")\n"
+            "        if not p or not os.path.exists(p) or os.path.getsize(p) != int(meta[\"bytes\"]):\n"
+            "            return None\n"
+            "        os.replace(p, dst)  # prestage already sha-verified the file at download time\n"
+            "        print(f\"RESUME using prestaged s3://{BUCKET}/{mk[:-3]} bytes={meta['bytes']} \"\n"
+            "              f\"(download overlapped with bootstrap)\", flush=True)\n"
+            "        return meta\n"
+            "    except Exception as e:\n"
+            "        print(f\"RESUME prestage take failed for {mk}: {e!r} -- downloading\", flush=True)\n"
+            "        return None\n"
+            "\n"
             "\n"
             "def _dl_verified(mk, dst):\n"
             "    # Download the blob for marker `mk` to `dst` (tuned parallel ranged GETs), verifying\n"
@@ -711,7 +901,9 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "        try:\n"
             "            os.makedirs(CKPT_DIR, exist_ok=True)\n"
             "            path = os.path.join(CKPT_DIR, \"resume.nlcfr\")\n"
-            "            meta = _dl_verified(mk, path)\n"
+            "            meta = _prestaged_take(mk, path)\n"
+            "            if meta is None:\n"
+            "                meta = _dl_verified(mk, path)\n"
             "            print(f\"RESUME verified base s3 iter={meta['iters_done']} bytes={meta['bytes']} \"\n"
             "                  f\"sha256={meta['sha256'][:12]}..\", flush=True)\n"
             "            return path, int(meta[\"iters_done\"])\n"
@@ -756,7 +948,8 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "        try:\n"
             "            os.makedirs(CKPT_DIR, exist_ok=True)\n"
             "            dpath = os.path.join(CKPT_DIR, \"resume.nldlt\")\n"
-            "            _dl_verified(mk, dpath)\n"
+            "            if _prestaged_take(mk, dpath) is None:\n"
+            "                _dl_verified(mk, dpath)\n"
             "            with open(dpath, \"rb\") as f:\n"
             "                dblob = f.read()\n"
             "            os.remove(dpath)\n"
@@ -779,6 +972,15 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
         )
         next_stop_expr = "_next_stop(t.iters_done())"
         ckpt_stmt = "_ckpt(t)"
+        # Graceful-reclaim loop shape: chunked train + flush-and-exit on the reclaim flag. The
+        # emergency flush runs BEFORE the row-budget check (a full-base row-budget checkpoint can
+        # never fit the reclaim window).
+        train_stmt = "_train_to(t, nxt)"
+        reclaim_break = (
+            "\n        if _STOP[\"reclaim\"]:\n"
+            "            _emergency_flush(t)\n"
+            "            return"
+        )
         # Resume (fullhist): arm delta tracking BEFORE loading (so the first post-resume window
         # tracks), download the newest verified BASE to disk (tuned parallel GETs), mmap-load it via
         # load_bytes_from_file (parallel deserialize, no full-blob Python read), then apply its
@@ -801,6 +1003,14 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "              f\"(base_iter={base_iter}, +{nd} deltas)\", flush=True)\n"
             "    else:\n"
             "        print(\"FRESH start (no resumable checkpoint)\", flush=True)\n"
+            "    # drop any UNCONSUMED prestaged blobs (stale prestage / fresh start) -- keeps the ckpt\n"
+            "    # staging volume clear for the ~58-69 GB base serializes.\n"
+            "    try:\n"
+            "        for fn in (os.listdir(CKPT_DIR) if os.path.isdir(CKPT_DIR) else []):\n"
+            "            if fn.startswith(\"prestage_\") and (fn.endswith(\".nlcfr\") or fn.endswith(\".nldlt\")):\n"
+            "                os.remove(os.path.join(CKPT_DIR, fn))\n"
+            "    except OSError:\n"
+            "        pass\n"
             "    # POST-RESUME TELEMETRY (2026-07-06): upload train.log NOW, not only at checkpoints --\n"
             "    # a storm-reclaimed box that never reaches its first marker otherwise leaves ZERO\n"
             "    # prologue telemetry (RESUME dl GB/s, load wall), exactly when it's needed most.\n"
@@ -831,6 +1041,9 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
         next_stop_expr = "min(t.iters_done() + CKPT_EVERY, ITERS)"
         ckpt_stmt = "_upload(t.save_bytes(), t.iters_done())"
         ckpt_wait_block = ""
+        # Legacy path: ORIGINAL single train call, no reclaim machinery (byte-identical render).
+        train_stmt = "t.train(step)"
+        reclaim_break = ""
         # Legacy resume (both flags off): single-blob _download_latest returning a BLOB (no delta
         # chain, no path staging on the bp2/bp3 path). Byte-identical to the pre-R2/R3 inline block.
         resume_block = (
@@ -960,6 +1173,184 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
         )
     else:
         ckpt_uploader_file = ""
+    # ---- PRESTAGE + graceful SPOT-WATCH (2026-07-06, fullhist path only; legacy renders keep the
+    # ORIGINAL spot_watch verbatim and no prestage => bp2/bp3 bootstraps stay byte-identical). ----
+    if fullhist_key or mrr:
+        # Background resume-checkpoint prestage: launched IMMEDIATELY after the awscli install
+        # (instance-profile creds already work there; boto3/pip is NOT installed yet, so this is
+        # stdlib-python + aws cli only). Overlaps the ~114 s+ base download with the
+        # rustup/pip/build-cache/EMD prologue. Any failure writes an empty manifest => the driver
+        # falls back to its own tuned download.
+        prestage_py = (
+            "import hashlib, json, os, subprocess, time\n"
+            "\n"
+            "BUCKET = \"" + bucket + "\"\n"
+            "RUN_PREFIX = \"" + run_prefix + "\"\n"
+            "REGION = \"" + region + "\"\n"
+            "CKPT_DIR = \"/opt/pokerbot/ckpt\"\n"
+            "MANIFEST = os.path.join(CKPT_DIR, \"prestage_manifest.json\")\n"
+            "DONE = os.path.join(CKPT_DIR, \"prestage.done\")\n"
+            "\n"
+            "\n"
+            "def _aws(*args, timeout=600):\n"
+            "    return subprocess.run([\"aws\"] + list(args) + [\"--region\", REGION],\n"
+            "                          capture_output=True, text=True, timeout=timeout)\n"
+            "\n"
+            "\n"
+            "def _list_keys():\n"
+            "    r = _aws(\"s3api\", \"list-objects-v2\", \"--bucket\", BUCKET,\n"
+            "             \"--prefix\", RUN_PREFIX + \"/checkpoints/\",\n"
+            "             \"--query\", \"Contents[].Key\", \"--output\", \"json\")\n"
+            "    if r.returncode != 0 or not r.stdout.strip():\n"
+            "        return []\n"
+            "    return json.loads(r.stdout) or []\n"
+            "\n"
+            "\n"
+            "def _read_marker(key):\n"
+            "    r = _aws(\"s3\", \"cp\", \"s3://%s/%s\" % (BUCKET, key), \"-\", timeout=120)\n"
+            "    if r.returncode != 0:\n"
+            "        raise RuntimeError(\"marker fetch failed: \" + key)\n"
+            "    return json.loads(r.stdout)\n"
+            "\n"
+            "\n"
+            "def _fetch_verified(key, meta, dst):\n"
+            "    # aws cli multipart download (max_concurrent_requests/chunksize set via aws configure\n"
+            "    # in the bootstrap) + size/sha256 verify against the .ok marker.\n"
+            "    t0 = time.time()\n"
+            "    r = _aws(\"s3\", \"cp\", \"s3://%s/%s\" % (BUCKET, key), dst, timeout=3000)\n"
+            "    if r.returncode != 0:\n"
+            "        raise RuntimeError(\"blob fetch failed: \" + key)\n"
+            "    sz = os.path.getsize(dst)\n"
+            "    if sz != int(meta[\"bytes\"]):\n"
+            "        raise ValueError(\"size %d != %s for %s\" % (sz, meta[\"bytes\"], key))\n"
+            "    h = hashlib.sha256()\n"
+            "    with open(dst, \"rb\") as f:\n"
+            "        for chunk in iter(lambda: f.read(1 << 24), b\"\"):\n"
+            "            h.update(chunk)\n"
+            "    if h.hexdigest() != meta[\"sha256\"]:\n"
+            "        raise ValueError(\"sha mismatch for \" + key)\n"
+            "    print(\"PRESTAGE fetched %s bytes=%d wall=%.1fs\" % (key, sz, time.time() - t0),\n"
+            "          flush=True)\n"
+            "\n"
+            "\n"
+            "def main():\n"
+            "    man = {\"base\": None, \"deltas\": []}\n"
+            "    try:\n"
+            "        keys = _list_keys()\n"
+            "        os.makedirs(CKPT_DIR, exist_ok=True)\n"
+            "        base = None\n"
+            "        for mk in reversed(sorted(k for k in keys if k.endswith(\".nlcfr.ok\"))):\n"
+            "            try:\n"
+            "                meta = _read_marker(mk)\n"
+            "                dst = os.path.join(CKPT_DIR, \"prestage_base.nlcfr\")\n"
+            "                _fetch_verified(mk[:-3], meta, dst)\n"
+            "                base = {\"marker\": mk, \"path\": dst,\n"
+            "                        \"iters_done\": int(meta[\"iters_done\"]),\n"
+            "                        \"bytes\": int(meta[\"bytes\"]), \"sha256\": meta[\"sha256\"]}\n"
+            "                break\n"
+            "            except Exception as e:\n"
+            "                print(\"PRESTAGE base candidate %s rejected: %r\" % (mk, e), flush=True)\n"
+            "        man[\"base\"] = base\n"
+            "        if base is not None:\n"
+            "            by_seq = {}\n"
+            "            for mk in sorted(k for k in keys if k.endswith(\".nldlt.ok\")):\n"
+            "                try:\n"
+            "                    meta = _read_marker(mk)\n"
+            "                    if int(meta.get(\"base_iter\", -1)) == base[\"iters_done\"]:\n"
+            "                        by_seq[int(meta[\"seq\"])] = (mk, meta)\n"
+            "                except Exception:\n"
+            "                    pass\n"
+            "            seq = 1\n"
+            "            while seq in by_seq:  # contiguous verified chain only (mirrors driver resume)\n"
+            "                (mk, meta) = by_seq[seq]\n"
+            "                try:\n"
+            "                    dst = os.path.join(CKPT_DIR, \"prestage_delta_%04d.nldlt\" % seq)\n"
+            "                    _fetch_verified(mk[:-3], meta, dst)\n"
+            "                    man[\"deltas\"].append({\"marker\": mk, \"path\": dst, \"seq\": seq,\n"
+            "                                          \"base_iter\": base[\"iters_done\"],\n"
+            "                                          \"bytes\": int(meta[\"bytes\"]),\n"
+            "                                          \"sha256\": meta[\"sha256\"]})\n"
+            "                except Exception as e:\n"
+            "                    print(\"PRESTAGE delta seq=%d rejected: %r -- chain stops\" % (seq, e),\n"
+            "                          flush=True)\n"
+            "                    break\n"
+            "                seq += 1\n"
+            "    except Exception as e:\n"
+            "        print(\"PRESTAGE failed: %r -- driver will download itself\" % (e,), flush=True)\n"
+            "        man = {\"base\": None, \"deltas\": []}\n"
+            "    with open(MANIFEST + \".tmp\", \"w\") as f:\n"
+            "        json.dump(man, f)\n"
+            "    os.replace(MANIFEST + \".tmp\", MANIFEST)\n"
+            "    with open(DONE, \"w\") as f:\n"
+            "        f.write(\"done\\n\")\n"
+            "    print(\"PRESTAGE done base=%s deltas=%d\"\n"
+            "          % ((man[\"base\"] or {}).get(\"marker\"), len(man[\"deltas\"])), flush=True)\n"
+            "\n"
+            "\n"
+            "main()\n"
+        )
+        prestage_block = (
+            "\n# PRESTAGE the resume checkpoint (2026-07-06): overlap the ~114 s+ base download with the\n"
+            "# rustup/pip/build-cache/EMD prologue below (stdlib python + aws cli; boto3 not installed\n"
+            "# yet). The driver waits bounded on prestage.done and verifies the manifest against the\n"
+            "# CURRENT markers before consuming; any failure falls back to its own download.\n"
+            "mkdir -p /opt/pokerbot/ckpt\n"
+            "aws configure set default.s3.max_concurrent_requests 64\n"
+            "aws configure set default.s3.multipart_chunksize 64MB\n"
+            "cat > /opt/pokerbot/prestage.py <<'PREOF'\n"
+            + prestage_py +
+            "PREOF\n"
+            "touch /opt/pokerbot/ckpt/prestage.started\n"
+            "nohup python3 /opt/pokerbot/prestage.py > /var/log/prestage.log 2>&1 &\n"
+            "echo \"PRESTAGE launched (background resume-checkpoint download)\""
+        )
+        # Graceful spot watch: flag-first (driver flushes within ~5 s via the chunked loop), PC-side
+        # babysitter death signal (reclaim_notice.json under the run prefix -- FIXED key contract
+        # with the babysitter agent, do NOT rename), pkill only as a 100 s fallback; plus the
+        # earlier-warning rebalance recommendation (flag only -- one extra detached delta, no kill).
+        spot_watch_block = f"""# Background SPOT-INTERRUPT handler (graceful-flush rework 2026-07-06): poll IMDSv2 for BOTH the
+# 2-min reclaim notice and the earlier rebalance recommendation. On reclaim: (1) touch
+# /tmp/spot_reclaim -- the chunked train loop notices within ~5 s and banks an EMERGENCY delta;
+# (2) upload reclaim_notice.json (the PC babysitter's instant death signal; FIXED key contract);
+# (3) pkill -TERM only after a 100 s flush grace (the driver's SIGTERM handler also flushes).
+# On rebalance recommendation: touch /tmp/spot_rebalance only (no kill, no notice json).
+cat > /tmp/spot_watch.sh <<'SWEOF'
+TOK=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+REBAL=0
+while true; do
+  C=$(curl -s -o /dev/null -w "%{{http_code}}" -H "X-aws-ec2-metadata-token: $TOK" http://169.254.169.254/latest/meta-data/spot/instance-action)
+  if [ "$C" = "200" ]; then
+    echo "SPOT_RECLAIM_NOTICE"
+    touch /tmp/spot_reclaim
+    IID=$(curl -s -H "X-aws-ec2-metadata-token: $TOK" http://169.254.169.254/latest/meta-data/instance-id)
+    printf '{{"instance_id": "%s", "iso_time": "%s", "action": "reclaim"}}' "$IID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/reclaim_notice.json
+    timeout 25 aws s3 cp /tmp/reclaim_notice.json s3://{bucket}/{run_prefix}/reclaim_notice.json --region {region} || true
+    sleep 100
+    pkill -TERM -f drive_native_cfr.py || true
+    break
+  fi
+  if [ "$REBAL" = "0" ]; then
+    R=$(curl -s -o /dev/null -w "%{{http_code}}" -H "X-aws-ec2-metadata-token: $TOK" http://169.254.169.254/latest/meta-data/events/recommendations/rebalance)
+    if [ "$R" = "200" ]; then echo "SPOT_REBALANCE_RECOMMENDATION"; REBAL=1; touch /tmp/spot_rebalance; fi
+  fi
+  sleep 5
+done
+SWEOF
+nohup bash /tmp/spot_watch.sh >/var/log/spot_watch.log 2>&1 &"""
+    else:
+        prestage_block = ""
+        # ORIGINAL spot watch VERBATIM (bp2/bp3 byte-identity).
+        spot_watch_block = f"""# Background SPOT-INTERRUPT handler: poll IMDSv2 (token required) for the reclaim notice; on notice send
+# SIGTERM so the driver's last checkpoint is already on S3 (it checkpoints every {checkpoint_every} iters).
+cat > /tmp/spot_watch.sh <<'SWEOF'
+TOK=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+while true; do
+  C=$(curl -s -o /dev/null -w "%{{http_code}}" -H "X-aws-ec2-metadata-token: $TOK" http://169.254.169.254/latest/meta-data/spot/instance-action)
+  if [ "$C" = "200" ]; then echo "SPOT_RECLAIM_NOTICE"; pkill -TERM -f drive_native_cfr.py; break; fi
+  sleep 5
+done
+SWEOF
+nohup bash /tmp/spot_watch.sh >/var/log/spot_watch.log 2>&1 &"""
     # No output redirect (cloud-init captures stdout to /var/log/cloud-init-output.log, visible via
     # get-console-output) — same lesson the SD-CFR launcher documents.
     return f"""#!/bin/bash
@@ -977,7 +1368,7 @@ curl -fsSL "https://awscli.amazonaws.com/{awscli_zip}" -o /tmp/awscliv2.zip
 unzip -q /tmp/awscliv2.zip -d /tmp
 /tmp/aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli --update
 hash -r
-aws --version   # MUST be aws-cli/2.x; if this dies, STEP-0 still bounds the box
+aws --version   # MUST be aws-cli/2.x; if this dies, STEP-0 still bounds the box{prestage_block}
 # Rust toolchain (rustup, stable) for the native build.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -1157,7 +1548,7 @@ def main():
     while t.iters_done() < ITERS:{row_budget_pre}
         nxt = {next_stop_expr}
         step = nxt - t.iters_done()
-        t.train(step){row_budget_block}
+        {train_stmt}{reclaim_break}{row_budget_block}
         {ckpt_stmt}{v3_ckpt_call}
         el = time.time() - t0
         done = t.iters_done() - start
@@ -1174,17 +1565,7 @@ if __name__ == "__main__":
         sys.exit(1)
 PYEOF
 
-# Background SPOT-INTERRUPT handler: poll IMDSv2 (token required) for the reclaim notice; on notice send
-# SIGTERM so the driver's last checkpoint is already on S3 (it checkpoints every {checkpoint_every} iters).
-cat > /tmp/spot_watch.sh <<'SWEOF'
-TOK=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-while true; do
-  C=$(curl -s -o /dev/null -w "%{{http_code}}" -H "X-aws-ec2-metadata-token: $TOK" http://169.254.169.254/latest/meta-data/spot/instance-action)
-  if [ "$C" = "200" ]; then echo "SPOT_RECLAIM_NOTICE"; pkill -TERM -f drive_native_cfr.py; break; fi
-  sleep 5
-done
-SWEOF
-nohup bash /tmp/spot_watch.sh >/var/log/spot_watch.log 2>&1 &
+{spot_watch_block}
 
 python3 /opt/pokerbot/drive_native_cfr.py 2>&1 | tee /var/log/native-cfr-train.log
 echo "train exit ${{PIPESTATUS[0]}}"

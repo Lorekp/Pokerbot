@@ -5,9 +5,19 @@
 # blueprint-v2 changes:
 #   * -RiverOchs <table>  : passes --river-ochs to the launcher so the trainer keys the RIVER with the
 #     OCHS nearest-centroid bucket (design: artifacts/blueprint2_design.md, Change A).
-#   * -ConvMinIters 40000 : the convergence stop may NOT fire before this many iters (Change B — the
+#   * -ConvMinIters 40000 : the convergence stop may NOT fire before this many iters (Change B -- the
 #     bp_emd_k160_1 run stopped prematurely at 18k because the aggregate strategy-delta plateaus as soon
 #     as the preflop mass converges, while postflop rows are still undertrained).
+#
+# 2026-07-06 reclaim-latency overhaul (minimise PC-side dead time in the reclaim->restart loop):
+#   1. INSTANT RECLAIM DETECTION: each poll also fetches <run-prefix>/reclaim_notice.json. When its
+#      instance_id matches the currently-tracked box we immediately enter FAST-POLL mode (30s intervals
+#      instead of $PollSec) so the quota-drain guard clears and a relaunch fires with minimal lag.
+#      Staleness guard = instance_id match; the notice object is never deleted by this script.
+#   2. PROGRESS-GATED RELAUNCH GAP: if the box that just died banked at least one NEW marker (iters
+#      advanced since its launch), the gap before relaunch is reduced to 60s. The full $MinRelaunchGapSec
+#      (600s) is kept only for zero-progress deaths -- the same boxes the churn-abort guard targets.
+#   3. DEFAULT $PollSec 180 -> 90: S3 list + describe-instances at 90s cadence is negligible cost.
 #
 # Run (your AWS creds; same boto3 default profile the launcher uses):
 #   powershell -ExecutionPolicy Bypass -File scripts\blueprint2\blueprint2_babysitter.ps1 -WorkSteal
@@ -86,7 +96,7 @@ param(
                                       #   iters). Every further relaunch in a capacity storm is burn.
   [int]$MinRelaunchGapSec = 600,
   [int]$BootWaitSec = 300,
-  [int]$PollSec = 180,
+  [int]$PollSec = 90,                 # 2026-07-06: reduced from 180; S3+describe at 90s is negligible
   [int]$MaxHours = 12,
   [string]$Region = "eu-central-1",
   [string]$Bucket = "video-processing-6789",
@@ -133,6 +143,8 @@ $prevBox    = ""
 $convergedStop = $false
 $ConvStateFile = Join-Path $env:TEMP ("conv_stop_{0}.json" -f ($Run -replace '[^A-Za-z0-9_]', '_'))
 $lastConvIters = -1
+# 2026-07-06: fast-poll mode flag (set when reclaim notice detected for tracked box)
+$fastPollActive = $false
 
 # AUTO-PICK cheapest spot-available type via the shared spotpick lib when -InstanceType was not given.
 if (-not $InstanceType) {
@@ -193,6 +205,27 @@ function Get-LatestItersDone {
     if ([System.Text.Encoding]::ASCII.GetString($buf, 0, 8) -ne "NLCFR001") { return -1 }
     return [int64][System.BitConverter]::ToUInt64($buf, 8)
   } catch { return -1 } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
+}
+# 2026-07-06: check whether S3 holds a reclaim notice for the currently-tracked box.
+# Returns the instance_id from the notice if it matches $trackedId, else "".
+# Uses s3 cp to a temp file (single small JSON object; head-object doesn't give body).
+# Staleness guard: only returns a match when notice instance_id == $trackedId.
+# This script never deletes the notice (a dying box may rewrite it).
+function Get-ReclaimNoticeId([string]$trackedId) {
+  if (-not $trackedId) { return "" }
+  $noticeKey = "$RUN_PREFIX/reclaim_notice.json"
+  $tmp = Join-Path $env:TEMP "bp2_reclaim_notice.json"
+  aws s3 cp "s3://$Bucket/$noticeKey" $tmp --region $Region 2>$null | Out-Null
+  if (-not (Test-Path $tmp)) { return "" }
+  try {
+    $raw = Get-Content $tmp -Raw -ErrorAction Stop
+    if ($raw -match '"instance_id"\s*:\s*"(i-[0-9a-f]+)"') {
+      $noticeId = $Matches[1]
+      if ($noticeId -eq $trackedId) { return $noticeId }
+    }
+  } catch { }
+  finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
+  return ""
 }
 function Stop-Run {
   $id = Get-LiveBoxId
@@ -305,7 +338,7 @@ while ($true) {
   if ($done -ge $Iters) { Write-Host "DONE: latest checkpoint reached $done/$Iters iters (iters BACKSTOP)."; Stop-Run; break }
   # 2) wall cap (BACKSTOP)
   if ($el -ge $MAXSEC) { Write-Host "STOP: wall-clock cap (${capH}h) reached (wall BACKSTOP)."; Stop-Run; break }
-  # 2b) CONVERGENCE STOP with the blueprint-v2 MIN-ITERS FLOOR: the bp_emd_k160_1 lesson — the aggregate
+  # 2b) CONVERGENCE STOP with the blueprint-v2 MIN-ITERS FLOOR: the bp_emd_k160_1 lesson -- the aggregate
   # strategy-delta plateaus once the (dominant) preflop mass converges while postflop rows are still
   # undertrained, so the stop may not fire before $ConvMinIters.
   if (-not $NoConvergeStop -and $done -ge $ConvMinIters -and $done -gt $lastConvIters) {
@@ -320,8 +353,29 @@ while ($true) {
     $lastConvIters = $done
     Write-Host "    conv: below min-iters floor ($done < $ConvMinIters) - not testing convergence yet"
   }
-  # 3) a box is live and not done -> wait
-  if ($live) { Start-Sleep -Seconds $PollSec; continue }
+  # 3) a box is live and not done -> wait (with reclaim fast-poll detection)
+  if ($live) {
+    # 2026-07-06: check for on-box reclaim notice for the currently tracked box.
+    # If found, switch to FAST-POLL (30s) so we clear the quota-drain guard ASAP.
+    $reclaimId = Get-ReclaimNoticeId $live
+    if ($reclaimId) {
+      if (-not $fastPollActive) {
+        Write-Host "  RECLAIM NOTICE detected for $live -> switching to FAST-POLL (30s)" -ForegroundColor Yellow
+        $fastPollActive = $true
+      }
+      Start-Sleep -Seconds 30
+    } else {
+      if ($fastPollActive) {
+        Write-Host "  fast-poll: no reclaim notice for current box; returning to normal poll" -ForegroundColor Gray
+        $fastPollActive = $false
+      }
+      Start-Sleep -Seconds $PollSec
+    }
+    continue
+  }
+
+  # Reset fast-poll flag once box is gone
+  $fastPollActive = $false
 
   # 3b) EXACT-QUOTA GUARD: a previous box still terminating holds the spot vCPU quota; wait before relaunch.
   if ($draining) {
@@ -335,6 +389,8 @@ while ($true) {
   # 4a) CHURN-ABORT: the box that just died saved NO new checkpoint since its own launch -> streak++.
   # A streak of $MaxNoCkptRelaunches means capacity is being reclaimed faster than the checkpoint
   # cadence; every further relaunch is pure burn. Abort loudly instead (S3 state is preserved).
+  # NOTE: emergency-flush delta markers from the reclaim notice handler count as progress (correct --
+  # a box that banked its dying delta DID make progress, so $done > $doneAtLastLaunch and streak resets).
   if ($launches -gt 0) {
     if ($done -le $doneAtLastLaunch) {
       $noCkptRelaunches++
@@ -348,10 +404,19 @@ while ($true) {
       $noCkptRelaunches = 0
     }
   }
+  # 4b) 2026-07-06 PROGRESS-GATED RELAUNCH GAP:
+  # If the box that just died made measurable progress (iters advanced), use a 60s gap (it was a clean
+  # preemption and the box was productive -- the churn-abort streak also reset above). Only apply the
+  # full $MinRelaunchGapSec (600s) for zero-progress deaths, which are the actual churn-abort cases.
+  $effectiveGapSec = $MinRelaunchGapSec
+  if ($launches -gt 0 -and $done -gt $doneAtLastLaunch) {
+    $effectiveGapSec = 60
+  }
   $sinceLast = ((Get-Date) - $lastLaunch).TotalSeconds
-  if ($launches -gt 0 -and $sinceLast -lt $MinRelaunchGapSec) {
-    $wait = [int]($MinRelaunchGapSec - $sinceLast)
-    Write-Host "  relaunch gap guard: only ${sinceLast}s since last launch (< ${MinRelaunchGapSec}s); waiting ${wait}s"
+  if ($launches -gt 0 -and $sinceLast -lt $effectiveGapSec) {
+    $wait = [int]($effectiveGapSec - $sinceLast)
+    $gapNote = if ($effectiveGapSec -eq 60) { "progress-gated 60s gap" } else { "${MinRelaunchGapSec}s gap (no-progress)" }
+    Write-Host "  relaunch gap guard ($gapNote): only ${sinceLast}s since last launch; waiting ${wait}s"
     Start-Sleep -Seconds $wait
     continue
   }
