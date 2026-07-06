@@ -63,6 +63,8 @@ param(
   [switch]$V3Regstats,                # --v3-regstats (REGSTATS percentile lines)
   [long]$RowBudget = 0,               # --row-budget (POKERBOT_ROW_BUDGET G8 RAM backstop; 0 = omit =
                                       #   driver 400M default + byte-identical bootstrap)
+  [switch]$DeltaCkpt,                 # --delta-ckpt (R2 delta checkpoints: dirty-row NLDLT001 sidecars
+                                      #   between full bases at gate iters; resume-identical, spot lever)
   # --- box / market ---
   [string]$InstanceType = "",          # "" = AUTO-PICK cheapest spot-available type via spotpick
   [int]$Vcpus = 128,
@@ -255,6 +257,7 @@ function Invoke-Launch {
     if ($V3Regstats) { $argsList += "--v3-regstats" }
   }
   if ($RowBudget -gt 0) { $argsList += @("--row-budget", $RowBudget) }
+  if ($DeltaCkpt)  { $argsList += "--delta-ckpt" }
   if ($Spotpick)   { $argsList += "--spotpick" }
   if ($OnDemand)   { $argsList += "--on-demand" }
   if ($CrateSrc)   { $argsList += @("--crate-src", $CrateSrc) }

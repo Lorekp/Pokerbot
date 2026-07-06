@@ -86,7 +86,8 @@ $env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n"
     -NumBuckets 160 `
     -EmdFrozen "data/abstraction/emd_frozen_flop_turn_160_r400.emdfrzn" `
     -RiverOchs "" `
-    -CheckpointEvery 250 `
+    -DeltaCkpt `
+    -CheckpointEvery 100 `
     -GateEvery 2500 `
     -CkptVolumeGb 400 `
     -InstanceType "m6i.32xlarge" `

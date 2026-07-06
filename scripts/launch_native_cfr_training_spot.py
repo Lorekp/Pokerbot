@@ -219,7 +219,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
                    river_ochs_rel="", river_ochs_sha="", preflop_hist_key=False,
                    fullhist_key=False, mrr=False,
                    work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
-                   v3=None, row_budget=None, no_cache_fetch=False,
+                   v3=None, row_budget=None, no_cache_fetch=False, delta_ckpt=False,
                    wall_guard_secs=21600, awscli_zip="awscli-exe-linux-x86_64.zip") -> str:
     """The full on-box bootstrap (was inline user-data until it exceeded EC2's 16KB cap).
     Uploaded to S3 by main() and exec'd by user_data_stub(). Content is otherwise the proven
@@ -264,6 +264,11 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
     # COVERAGE/REGSTATS lines the kill-gate + babysitter grep.
     if v3:
         exports = [
+            # DELTA CHECKPOINTS (R2): driver-level knob, exported alongside the v3 envs so the
+            # generated driver's DELTA_CKPT gate reads it. Training semantics unchanged (driver-sim
+            # proves base+delta resume final state == uninterrupted); OFF renders "0" = R2 default.
+            f"export POKERBOT_DELTA_CKPT={'1' if delta_ckpt else '0'}",
+            'echo "DELTA_CKPT=$POKERBOT_DELTA_CKPT"',
             f"export POKERBOT_LCFR={'1' if v3.get('lcfr') else '0'}",
             'echo "LCFR=$POKERBOT_LCFR"',
             f"export POKERBOT_SIGNED_REGRETS={'1' if v3.get('signed_regrets') else '0'}",
@@ -1342,6 +1347,12 @@ def main() -> None:
     p.add_argument("--v3-cov-hands", type=int, default=2048,
                    help="v3: on-policy coverage probe hands at each checkpoint (0 disables); the "
                         "COVERAGE log line feeds the pre-registered coverage gates")
+    p.add_argument("--delta-ckpt", action="store_true", default=False,
+                   help="R2 delta checkpoints: rolling checkpoints serialize only rows touched since "
+                        "the last checkpoint (NLDLT001 sidecar); full NLCFR001 bases at gate iters. "
+                        "Resume = base + verified contiguous delta chain (driver-sim: final state "
+                        "byte-identical to uninterrupted). Cuts the per-checkpoint pause + upload from "
+                        "full-blob-sized to dirty-set-sized -- the spot-storm lever at short cadence.")
     p.add_argument("--row-budget", type=int, default=None,
                    help="G8 RAM backstop: export POKERBOT_ROW_BUDGET on the box (rows in the guarded "
                         "map — max(strat,cum) under v3 snapshot_avg, strat otherwise). Omit = the "
@@ -1444,6 +1455,7 @@ def main() -> None:
         work_steal=args.work_steal, dcfr=args.dcfr,
         dcfr_prune_threshold=args.dcfr_prune_threshold, dcfr_explore_frac=args.dcfr_explore_frac,
         v3=v3_cfg, row_budget=args.row_budget, no_cache_fetch=args.no_cache_fetch,
+        delta_ckpt=args.delta_ckpt,
         wall_guard_secs=wall_guard_secs, awscli_zip=awscli_zip,
     )
     bootstrap_key = f"{args.prefix}/{run_subdir}/code/bootstrap.sh"
