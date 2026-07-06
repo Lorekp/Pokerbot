@@ -593,6 +593,25 @@ fn merge_shard(dst: &mut Shard, src: &Shard) {
     }
 }
 
+/// Per-iteration regret-floor mode for `merge_partials_clamped` — which clamp the merge applies to
+/// the rows it touched, IN PLACE OF the legacy full-table sweep. Full-table passes remain only where
+/// the semantics genuinely touch every row (DCFR discount, LCFR discount events).
+#[derive(Clone, Copy)]
+enum MergeClamp {
+    /// CFR+ positive floor `max(r, 0)` — the touched-rows twin of `floor_cum_regret`.
+    Positive,
+    /// v3 signed floor `max(r, floor)` — the touched-rows twin of floor-only `apply_lcfr`.
+    SignedFloor(f64),
+}
+
+/// The LCFR discount-event predicate for iteration `t` — factored out of `apply_lcfr` so the
+/// merge-time clamp routing in `train_iteration_n_v3` and the in-pass factor computation can never
+/// drift apart. Arm-2 `signed_regrets` mode never fires it (`v3.lcfr` is required).
+#[inline]
+fn lcfr_discount_event(v3: &V3Cfg, t: u64) -> bool {
+    v3.lcfr && v3.lcfr_d > 0 && t <= v3.lcfr_w && t % v3.lcfr_d == 0
+}
+
 /// Fold one deal's unsharded `LocalDelta` into a per-TASK sharded accumulator `acc` (routing each key
 /// to `acc.shards[shard_of(key)]` and `+=`-ing the row). Used by the rayon `fold` in
 /// `collect_partials_n`: each rayon task owns ONE `acc` and folds all the deals in its work-chunk into
@@ -1102,6 +1121,31 @@ fn v3_env() -> &'static V3Cfg {
     use std::sync::OnceLock;
     static V3: OnceLock<V3Cfg> = OnceLock::new();
     V3.get_or_init(V3Cfg::from_env)
+}
+
+/// POKERBOT_PERF_LOG=1: deep perf telemetry on the PROFILE path only (stderr lines; observational,
+/// never changes a trained value). Read once per process.
+fn perf_log_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("POKERBOT_PERF_LOG").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+/// Per-rayon-task FP_MEMO capacity guard — the same MODE-AGNOSTIC memory bound the work-steal
+/// collector applies per worker per iteration (see `FP_MEMO_CAP`): a pure message->digest cache can
+/// only ever cost recompute when cleared, never change a value. Called from the fold-init of the
+/// static / batched / profile collectors, which previously had NO cap — under POKERBOT_FULLHIST_KEY
+/// their per-thread memos tracked the billions-scale infoset table and grew without bound (measured
+/// ~6.3M new entries/iter at nd=16384 => multi-GB memo by iter ~10 and an eventual OOM/paging wall).
+fn fp_memo_cap_check() {
+    FP_MEMO.with(|cell| {
+        let memo = &mut *cell.borrow_mut();
+        if memo.len() > FP_MEMO_CAP {
+            memo.clear();
+        }
+    });
 }
 
 /// Per-iteration v3 traversal context threaded through `one_traversal` (a Copy 2-bool struct so the
@@ -2613,21 +2657,38 @@ impl NlheTables {
         };
         let read: &NlheTables = self;
         let partials = Self::collect_partials_n::<N>(cfg, read, t, iter_seed, eff_prune, v3i);
-        self.merge_partials(cfg, partials);
         if dcfr_enabled(cfg) {
             // DCFR (CHANGE B): keep SIGNED regret and DISCOUNT it (no positive floor) so the prune hook's
-            // negative-regret signal survives. Replaces `floor_cum_regret` for this iteration.
+            // negative-regret signal survives. The discount genuinely touches EVERY row, so the full
+            // table pass stays (replaces `floor_cum_regret` for this iteration).
+            self.merge_partials(cfg, partials);
             self.apply_dcfr_discount(t);
-        } else if v3.lcfr || v3.signed_regrets {
-            // v3 LCFR (Pluribus): keep SIGNED regret, clamp at `regret_floor`, and on schedule apply the
-            // (t/D)/((t/D)+1) discount to ALL regrets and average-strategy rows. Arm-2 signed-regrets
-            // mode reaches the same pass but `apply_lcfr` fires NO discount events (`event` requires
-            // `v3.lcfr`), so it is floor-only: signed regrets survive, pruning stays meaningful, and
-            // the strat accumulation upstream kept CFR+'s w=t.
+        } else if lcfr_discount_event(v3, t) {
+            // v3 LCFR (Pluribus) DISCOUNT-EVENT iteration: the (t/D)/((t/D)+1) discount touches ALL
+            // regrets and average-strategy rows, so the full `apply_lcfr` pass stays.
+            self.merge_partials(cfg, partials);
             self.apply_lcfr(t, v3);
+        } else if v3.lcfr || v3.signed_regrets {
+            // v3 floor-ONLY iteration (every arm-2 `signed_regrets` iteration, and every LCFR
+            // iteration off the discount schedule): the legacy `apply_lcfr` pass only clamps rows
+            // below `regret_floor` — and only rows MODIFIED BY THIS MERGE can be below it (every
+            // other row was clamped when it was last merged into; clamping is idempotent). So clamp
+            // exactly the merged rows inside the sharded merge instead of sweeping (and rewriting)
+            // the whole table, whose O(total rows)/iter cost was the measured un-plateaued
+            // per-iteration growth (artifacts/trainer_nd_growth_rootcause.md). floor = -inf makes
+            // the legacy sweep a pure no-op rewrite — skip the clamp entirely.
+            if v3.regret_floor == f64::NEG_INFINITY {
+                self.merge_partials(cfg, partials);
+            } else {
+                self.merge_partials_clamped(cfg, partials, MergeClamp::SignedFloor(v3.regret_floor));
+            }
         } else {
-            // CFR+ default: positive-regret floor (byte-identical to today).
-            self.floor_cum_regret();
+            // CFR+ default: positive-regret floor, applied to the rows this merge touched — value-
+            // identical to the legacy full-table `floor_cum_regret` sweep because an untouched row
+            // was already floored (>= 0) at the end of the iteration that last touched it, and
+            // `max(r, 0)` is idempotent (see `merge_partials_clamped`; the pinned ab_train goldens
+            // and `clamped_merge_matches_full_sweep_*` gates hold the byte-identity).
+            self.merge_partials_clamped(cfg, partials, MergeClamp::Positive);
         }
         self.iters_done = t;
     }
@@ -2699,7 +2760,14 @@ impl NlheTables {
             // PER TASK (a small multiple of the thread count), not one per deal. The per-deal `local`
             // stays a cheap unsharded map (only the few-per-task `acc` is sharded). Downstream
             // `merge_partials` then folds these FEW sharded accumulators parallel-over-shards.
-            .fold(NlheTables::default, |mut acc, d| {
+            // The fold-init also applies the FP_MEMO capacity guard once per task (the work-steal
+            // collector's bound, previously missing here — see `fp_memo_cap_check`).
+            .fold(
+                || {
+                    fp_memo_cap_check();
+                    NlheTables::default()
+                },
+                |mut acc, d| {
                 let deal_seed = iter_seed
                     .wrapping_add((d as u64).wrapping_mul(0x100000001b3))
                     .rotate_left(17);
@@ -2831,7 +2899,10 @@ impl NlheTables {
             // (ASCENDING within a leaf job, since the fold visits deal indices in order) and flushes a
             // full batch through `run_batch`.
             .fold(
-                || (NlheTables::default(), Vec::<DealTrav<N>>::with_capacity(b)),
+                || {
+                    fp_memo_cap_check();
+                    (NlheTables::default(), Vec::<DealTrav<N>>::with_capacity(b))
+                },
                 |(mut acc, mut buf), d| {
                     buf.push(DealTrav::<N>::new(d as u64, iter_seed));
                     if buf.len() >= b {
@@ -2877,7 +2948,10 @@ impl NlheTables {
             // PER-TASK SHARDED FOLD (profile twin of collect_partials_n): fold each chunk's deals into
             // one (sharded accumulator, accumulated stats) pair.
             .fold(
-                || (NlheTables::default(), TraverseStats::default()),
+                || {
+                    fp_memo_cap_check();
+                    (NlheTables::default(), TraverseStats::default())
+                },
                 |(mut acc, mut acc_stats), d| {
                     let deal_seed = iter_seed
                         .wrapping_add((d as u64).wrapping_mul(0x100000001b3))
@@ -2911,6 +2985,74 @@ impl NlheTables {
         (partials, total)
     }
 
+    /// `merge_partials` + the per-iteration regret floor FUSED, clamping ONLY the rows this merge
+    /// touched instead of sweeping the whole table.
+    ///
+    /// EQUIVALENCE to the legacy full-table sweep (`floor_cum_regret` / floor-only `apply_lcfr`):
+    ///   * INVARIANT: at the end of every iteration, every cum_regret row satisfies the mode's floor
+    ///     (>= 0 for CFR+, >= regret_floor for v3). Base: the table starts empty; a deserialized
+    ///     checkpoint was saved post-floor. Step: the only mutation between floors is this merge;
+    ///     a row NOT touched by any partial is bit-unchanged and already satisfied the floor from
+    ///     the iteration that last touched it (or from the checkpoint).
+    ///   * The clamp runs AFTER all partials are folded into the shard (same one-floor-per-iteration
+    ///     order as the legacy pass — never per-partial, which would be order-dependent), and
+    ///     `max(r, floor)` is idempotent, so a key appearing in several partials clamps to the same
+    ///     value. Untouched rows: the legacy sweep's unconditional write-back was `narrow(widen(x))
+    ///     == x` at either RegretT precision, so skipping them is also byte-identical.
+    ///   * NOT-COVERED (documented skew, same class as any mid-run config change): resuming a
+    ///     checkpoint under a DIFFERENT mode/floor than it was trained with — the legacy sweep would
+    ///     re-clamp every stale row on the first iteration, this path only re-clamps rows as they
+    ///     are touched. Same-mode resume (the only supported flow) is unaffected.
+    ///
+    /// Cost: O(partial rows) extra probes, replacing the O(total table rows) sweep whose read+write
+    /// of every row every iteration grew without bound with the fullhist table (the nd growth
+    /// pathology's only truly unbounded per-iteration term).
+    fn merge_partials_clamped(
+        &mut self,
+        _cfg: &TrainerCfg,
+        partials: Vec<NlheTables>,
+        clamp: MergeClamp,
+    ) {
+        self.shards.par_iter_mut().enumerate().for_each(|(s, dst)| {
+            for p in &partials {
+                merge_shard(dst, &p.shards[s]);
+            }
+            match clamp {
+                MergeClamp::Positive => {
+                    // Byte-exact twin of `floor_cum_regret`'s per-row op (`if r < 0.0 { r = 0.0 }`
+                    // in RegretT domain), restricted to this merge's touched keys.
+                    for p in &partials {
+                        for k in p.shards[s].cum_regret.keys() {
+                            if let Some(row) = dst.cum_regret.get_mut(k) {
+                                for a in 0..NUM_ACTIONS {
+                                    if row[a] < 0.0 {
+                                        row[a] = 0.0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                MergeClamp::SignedFloor(floor) => {
+                    // Byte-exact twin of floor-only `apply_lcfr`'s per-row op (widen, clamp below
+                    // at `floor`, narrow-store), restricted to this merge's touched keys.
+                    for p in &partials {
+                        for k in p.shards[s].cum_regret.keys() {
+                            if let Some(row) = dst.cum_regret.get_mut(k) {
+                                for a in 0..NUM_ACTIONS {
+                                    let r = row[a] as f64;
+                                    if r < floor {
+                                        row[a] = floor as RegretT;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     fn merge_partials(&mut self, _cfg: &TrainerCfg, partials: Vec<NlheTables>) {
         // SHARDED PARALLEL MERGE (write-time partition, WF5 2026-06-28). Each rayon worker owns ONE
         // shard `dst = self.shards[s]` exclusively (par_iter_mut gives disjoint &mut) and folds every
@@ -2934,6 +3076,11 @@ impl NlheTables {
         });
     }
 
+    // Kept as the REFERENCE full-table sweep: the production path now applies this floor to the
+    // merge-touched rows only (`merge_partials_clamped(.., MergeClamp::Positive)`, value-identical
+    // by the floored-at-iteration-end invariant); the byte-gate tests below still call this sweep
+    // directly to pin that equivalence.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn floor_cum_regret(&mut self) {
         // CFR+ positive-regret floor: applied ONCE, after all partials are merged for this iteration
         // (not per-partial in `merge_shard`, not per-visit in `one_traversal`). The `max(x,0)` per
@@ -3017,7 +3164,10 @@ impl NlheTables {
         // Discount events require `v3.lcfr` explicitly: in arm-2 `signed_regrets` mode this pass is
         // FLOOR-ONLY even though `lcfr_d`/`lcfr_w` carry their env defaults (250/10000) — the
         // whole point of arm 2 is pruning WITHOUT the LCFR discount's early-regret decay.
-        let event = v3.lcfr && v3.lcfr_d > 0 && t <= v3.lcfr_w && t % v3.lcfr_d == 0;
+        // (Floor-only iterations no longer reach this fn from `train_iteration_n_v3` — the clamp
+        // is fused into `merge_partials_clamped` there — but the full pass is kept for the direct
+        // unit-test callers and for the discount-event iterations, which DO reach it.)
+        let event = lcfr_discount_event(v3, t);
         let factor = if event {
             let k = (t / v3.lcfr_d) as f64;
             k / (k + 1.0)
@@ -3074,21 +3224,49 @@ impl NlheTables {
         let partial_cum_rows: usize = partials.iter().map(|p| p.total_cum_len()).sum();
         let partial_strat_rows: usize = partials.iter().map(|p| p.total_strat_len()).sum();
 
+        // Mirror `train_iteration_n_v3`'s merge/floor routing EXACTLY (the
+        // `train_profile_matches_plain_serial_byte_for_byte` gate holds the two paths byte-equal):
+        // full-table passes only for DCFR / LCFR discount events; otherwise the floor is fused into
+        // the merge as a touched-rows clamp (`merge_partials_clamped`), timed inside `merge_ms`
+        // (`floor_ms` is then 0 — there is no whole-table pass to time).
         let merge_start = Instant::now();
-        self.merge_partials(cfg, partials);
-        let merge_ms = merge_start.elapsed().as_secs_f64() * 1000.0;
-
-        // The `floor_ms` slot times the per-iteration regret pass: the CFR+ floor by default, OR the DCFR
-        // discount when `dcfr` is ON (CHANGE B), OR the v3 LCFR floor+discount. Same accounting either way.
-        let floor_start = Instant::now();
+        let mut floor_ms = 0.0;
         if dcfr_enabled(cfg) {
+            self.merge_partials(cfg, partials);
+            let floor_start = Instant::now();
             self.apply_dcfr_discount(t);
-        } else if v3.lcfr || v3.signed_regrets {
+            floor_ms = floor_start.elapsed().as_secs_f64() * 1000.0;
+        } else if lcfr_discount_event(v3, t) {
+            self.merge_partials(cfg, partials);
+            let floor_start = Instant::now();
             self.apply_lcfr(t, v3);
+            floor_ms = floor_start.elapsed().as_secs_f64() * 1000.0;
+        } else if v3.lcfr || v3.signed_regrets {
+            if v3.regret_floor == f64::NEG_INFINITY {
+                self.merge_partials(cfg, partials);
+            } else {
+                self.merge_partials_clamped(cfg, partials, MergeClamp::SignedFloor(v3.regret_floor));
+            }
         } else {
-            self.floor_cum_regret();
+            self.merge_partials_clamped(cfg, partials, MergeClamp::Positive);
         }
-        let floor_ms = floor_start.elapsed().as_secs_f64() * 1000.0;
+        let merge_ms = merge_start.elapsed().as_secs_f64() * 1000.0 - floor_ms;
+
+        // Optional deep perf telemetry (env POKERBOT_PERF_LOG=1, profile path ONLY — the plain path
+        // stays instrumentation-free per `default_train_path_avoids_profile_instrumentation`):
+        // persistent-map len/capacity sums expose rehash waves (capacity jumps) across iterations.
+        if perf_log_enabled() {
+            let cum_cap: usize = self.shards.iter().map(|s| s.cum_regret.capacity()).sum();
+            let strat_cap: usize = self.shards.iter().map(|s| s.strat_sum.capacity()).sum();
+            eprintln!(
+                "[perf] t={} cum_len={} cum_cap={} strat_len={} strat_cap={}",
+                t,
+                self.total_cum_len(),
+                cum_cap,
+                self.total_strat_len(),
+                strat_cap
+            );
+        }
 
         self.iters_done = t;
         TrainIterProfile {
@@ -4734,6 +4912,79 @@ mod tests {
         );
     }
 
+    /// Byte-gate for the fused touched-rows floor (`merge_partials_clamped`): drive a candidate
+    /// table through the REAL `train_iteration_v3` path and a reference table through the LEGACY
+    /// merge-then-full-table-sweep ordering, for several iterations (so rows are created,
+    /// re-touched, and left untouched across iterations), and require `serialize()` equality after
+    /// EVERY iteration — in CFR+ default mode, arm-2 signed-regrets mode with a finite (firing)
+    /// floor, signed mode with floor=-inf (the clamp-skip path), and LCFR mode spanning discount
+    /// events (the branch that still takes the legacy full pass) and floor-only iterations.
+    #[test]
+    fn clamped_merge_matches_legacy_full_sweep_byte_for_byte() {
+        let configs: [(&str, V3Cfg); 4] = [
+            ("cfr_plus_default", V3Cfg::default()),
+            (
+                "arm2_signed_finite_floor",
+                V3Cfg {
+                    signed_regrets: true,
+                    regret_floor: -5.0,
+                    ..V3Cfg::default()
+                },
+            ),
+            (
+                "arm2_signed_no_floor",
+                V3Cfg {
+                    signed_regrets: true,
+                    ..V3Cfg::default()
+                },
+            ),
+            (
+                "lcfr_with_events",
+                V3Cfg {
+                    lcfr: true,
+                    lcfr_d: 2,
+                    lcfr_w: 10,
+                    regret_floor: -5.0,
+                    ..V3Cfg::default()
+                },
+            ),
+        ];
+        for (name, v3) in configs {
+            let cfg = test_cfg(32);
+            let mut cand = NlheTables::new();
+            let mut refr = NlheTables::new();
+            for _ in 0..6 {
+                cand.train_iteration_v3(&cfg, &v3);
+
+                // Legacy ordering: merge everything first, then the full-table floor/discount pass.
+                let t = refr.iters_done + 1;
+                let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
+                let eff_prune = effective_prune_threshold(&cfg, iter_seed, t, &v3);
+                let v3i = V3Iter {
+                    unweighted_strat: v3.lcfr,
+                    strat_pre_only: v3.snapshot_avg,
+                };
+                let partials = {
+                    let read: &NlheTables = &refr;
+                    NlheTables::collect_partials_n::<6>(&cfg, read, t, iter_seed, eff_prune, v3i)
+                };
+                refr.merge_partials(&cfg, partials);
+                if v3.lcfr || v3.signed_regrets {
+                    refr.apply_lcfr(t, &v3);
+                } else {
+                    refr.floor_cum_regret();
+                }
+                refr.iters_done = t;
+
+                assert_eq!(
+                    serialize(&cand),
+                    serialize(&refr),
+                    "fused clamp diverged from legacy sweep: config={name} t={t}"
+                );
+            }
+        }
+    }
+
     /// WF5 sharded-merge BIT-IDENTITY gate. The sharded parallel `merge_partials` (parallel-over-shards,
     /// folding partials in deal order within each shard) must produce cum_regret + strat_sum rows that
     /// are BIT-IDENTICAL (f64.to_bits equality, not merely atol) to an INDEPENDENT serial fold of the
@@ -5053,7 +5304,12 @@ mod tests {
         let plain_impl = &src[plain_start..profile_impl_start];
         assert!(plain_impl.contains("collect_partials_n"));
         assert!(plain_impl.contains("merge_partials"));
-        assert!(plain_impl.contains("floor_cum_regret"));
+        // The per-iteration floor is fused into the merge as a touched-rows clamp (value-identical
+        // to the legacy `floor_cum_regret` sweep — see `merge_partials_clamped`); full-table passes
+        // remain only for DCFR / LCFR discount events.
+        assert!(plain_impl.contains("merge_partials_clamped"));
+        assert!(plain_impl.contains("MergeClamp::Positive"));
+        assert!(plain_impl.contains("MergeClamp::SignedFloor"));
         assert!(!plain_impl.contains("Instant::now"));
         assert!(!plain_impl.contains("elapsed()"));
         assert!(!plain_impl.contains("partial_cum_rows"));
