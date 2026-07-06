@@ -81,7 +81,11 @@
 # window on any 2-min reclaim notice -- so cadence no longer bounds graceful-reclaim loss, only
 # hard deaths (<=~42s compute at 250). 100 -> 250 lifts the compute fraction ~55% -> ~75%; the
 # flush delta (~20-25GB at 250) still fits the notice window. Amendment sec 17.
-$env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n,c6i,c6in,c6id,c7a"
+# 1TB FLOOR (2026-07-06 ~20:45, sec 18): cum_rows 756M @2250 (+19-21M/100, decay slow) -- the
+# 609M M-RR census is refuted and the 900M budget would fire ~iter 3000. Budget 1.4B (reaches
+# the iter-5000 pruning onset with margin; ~532GB at 0.38GB/M rows) requires 1TB boxes: all
+# 512GB m-families excluded; chain = r6a head + r6i/r6id/r6in/r7a alternates.
+$env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n,c6i,c6in,c6id,c7a,m6i,m6id,m6in,m6idn,m6a,m7a"
 & (Join-Path $PSScriptRoot "blueprint2_babysitter.ps1") `
     -Run "bpv4_emd160_arm2b" `
     -FullHistKey `
@@ -94,7 +98,7 @@ $env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n,c6i,c6in,c6id,c7a"
     -V3SnapStart "3200" `
     -V3CovHands 2048 `
     -V3Regstats `
-    -RowBudget 900000000 `
+    -RowBudget 1400000000 `
     -Iters 40000 `
     -NDeals 8192 `
     -NumBuckets 160 `
@@ -104,7 +108,7 @@ $env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n,c6i,c6in,c6id,c7a"
     -CheckpointEvery 250 `
     -GateEvery 2500 `
     -CkptVolumeGb 400 `
-    -InstanceType "m6i.32xlarge" `
+    -InstanceType "r6a.32xlarge" `
     -Spotpick `
     -MaxHours 20 `
     -NoConvergeStop `
