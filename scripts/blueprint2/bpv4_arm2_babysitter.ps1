@@ -62,6 +62,15 @@
 # and evaluate per the amendment (G1-G4/G6 + G5'-checkcall N=40,000 + C1-C3). Serve/eval MUST set
 # POKERBOT_FULLHIST_KEY=1 AND POKERBOT_MRR=1 (train/probe abstraction-skew guard).
 # ASCII ONLY (PS 5.1 reads BOM-less .ps1 as cp1252).
+#
+# 64-vCPU SWITCH (user directive 2026-07-06 ~08:20, after 4 boxes / ~25-70min spot lifetimes on
+# 128-vCPU 32xlarge pools): head = m6a.16xlarge (Zen3, 256 GB, spot ~1.09 USD/h -- cheapest MODERN
+# 64-vCPU box with the RAM for this run's ~132 GB peak RSS; m5a is 6 cents cheaper but Zen1).
+# The exclude list keeps every 128 GB c-family + flex/burst + old-gen family OUT of the launcher's
+# capacity-fallback chain -- the spotpick catalog has no RAM column, so an unfiltered 64-vCPU chain
+# would happily fall back onto a c6i.16xlarge that OOMs 30k iters in. ~half the 128-vCPU throughput
+# => ~48 min/1000 iters; 16xlarge pools historically churn far less than 32xlarge.
+$env:SPOTPICK_EXCLUDE_FAMILIES = "c5,c5a,c5ad,c5d,c5n,c6a,c6i,c6id,c6in,c7a,c7i,c7i-flex,m7i-flex,m4,g4dn,g5,g6,i3,i3en,d3,d3en,x1,x1e"
 & (Join-Path $PSScriptRoot "blueprint2_babysitter.ps1") `
     -Run "bpv4_h200_arm2" `
     -FullHistKey `
@@ -83,7 +92,7 @@
     -CheckpointEvery 250 `
     -GateEvery 2500 `
     -CkptVolumeGb 400 `
-    -InstanceType "c6i.32xlarge" `
+    -InstanceType "m6a.16xlarge" `
     -Spotpick `
     -NoConvergeStop `
     @args

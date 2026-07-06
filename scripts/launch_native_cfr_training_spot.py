@@ -134,7 +134,17 @@ def _spotpick_chain(instance_type: str, arch: str, n: int) -> list[str]:
         if vcpus is None:
             print(f"[spotpick] {instance_type} not in catalog — single type only", flush=True)
             return [instance_type]
-        alts = spotpick.chain(vcpus=vcpus, arch=arch, n=max(n, 1))
+        # SPOTPICK_EXCLUDE_FAMILIES (comma list): keep memory-inadequate families OUT of the
+        # capacity-fallback chain. The catalog carries no RAM column, so at 64 vCPU an unfiltered
+        # chain includes 128 GB c-family boxes that OOM late in a ~132 GB-RSS training run — the
+        # caller (babysitter env) owns the RAM floor for its workload.
+        import os
+        excl = [f.strip() for f in os.environ.get("SPOTPICK_EXCLUDE_FAMILIES", "").split(",")
+                if f.strip()]
+        if excl:
+            print(f"[spotpick] excluding families from fallback chain: {','.join(excl)}", flush=True)
+        alts = spotpick.chain(vcpus=vcpus, arch=arch, n=max(n, 1),
+                              exclude_families=excl or None)
     except Exception as e:  # noqa: BLE001
         print(f"[spotpick] chain() failed ({e!r}) — single type {instance_type}", flush=True)
         return [instance_type]

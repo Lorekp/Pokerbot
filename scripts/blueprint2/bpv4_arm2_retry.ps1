@@ -2,7 +2,8 @@
 # Relaunches bpv4_arm2_babysitter.ps1 -ReuseCode whenever it exits without reaching the 40k target,
 # with a cool-down between cycles (each failed cycle costs <= 3 short-lived boxes, ~2-4 USD).
 # Stop: create artifacts\_arm2_retry.stop . Hard wall: 24h. ASCII ONLY.
-param([int]$CooldownSec = 2700, [int]$MaxHours = 24)
+# 72h wall: 64-vCPU boxes run ~48 min/1000 iters, so 40k needs ~32h of TRAINING time before churn.
+param([int]$CooldownSec = 2700, [int]$MaxHours = 72)
 Set-Location (Join-Path $PSScriptRoot "..\..")
 $deadline = (Get-Date).AddHours($MaxHours)
 $cycle = 0
