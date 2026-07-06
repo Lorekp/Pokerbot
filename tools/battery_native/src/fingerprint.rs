@@ -632,6 +632,22 @@ pub fn fingerprint_fast_depth_emd<const N: usize>(
 
 #[inline]
 fn digest_msg_memoed(msg: Vec<u8>, memo: &mut FpMemo) -> [u8; 16] {
+    // FULLHIST BYPASS (perf, byte-identity-neutral): under POKERBOT_FULLHIST_KEY the message space
+    // tracks the billions-scale infoset table, so the memo's measured hit rate collapses (~27% at
+    // nd=8192 iter 16, arm-2b bench 2026-07-06) while every miss pays a DRAM-cold probe + an insert
+    // that grows the per-thread map by ~2.1M entries/iter (~300 MB/iter process-wide — the paging
+    // driver the FP_MEMO_CAP clears only bound, not remove). blake2b16 on a <100-byte message is
+    // CHEAPER than the cold probe, so skip the memo entirely: the memo is a PURE message->digest
+    // cache (a hit returns exactly what a miss recomputes), so the emitted digest — and every trained
+    // value — is byte-identical either way (golden gate: `fullhist_memo_bypass_digest_identical`).
+    // Summary-key runs (flag off) keep the memo: their distinct-message count is small and the hit
+    // rate ~100%, where the memo is a measured win.
+    if full_hist_key_enabled() {
+        let d = blake2b(16, b"", &msg);
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&d);
+        return out;
+    }
     if let Some(digest) = memo.get(&msg) {
         return *digest;
     }
