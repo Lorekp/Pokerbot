@@ -67,6 +67,10 @@ param(
   [string]$InstanceType = "",          # "" = AUTO-PICK cheapest spot-available type via spotpick
   [int]$Vcpus = 128,
   [string]$Arch = "x86_64",
+  [switch]$ReuseCode,                 # pass --reuse-code on EVERY launch incl. #1 (2026-07-06 incident:
+                                      #   an account-side pipeline reacts to code-tarball uploads and
+                                      #   plants an untrusted .so in the build cache; no upload = no
+                                      #   trigger. Requires the S3 tarball to already match the tree.)
   [string]$CrateSrc = "tools/battery_native",  # the LIVE crate carries river_ochs.rs (the frozen copy at
                                                # runs/bp_crate_frozen does NOT); freeze a new copy first if
                                                # concurrent crate edits are expected during the run
@@ -254,7 +258,7 @@ function Invoke-Launch {
   if ($Spotpick)   { $argsList += "--spotpick" }
   if ($OnDemand)   { $argsList += "--on-demand" }
   if ($CrateSrc)   { $argsList += @("--crate-src", $CrateSrc) }
-  if ($launches -ge 1) { $argsList += "--reuse-code" }
+  if ($ReuseCode -or $launches -ge 1) { $argsList += "--reuse-code" }
   Write-Host "  launching: python $($argsList -join ' ')"
   $out = (& python @argsList 2>&1)
   $out | ForEach-Object { Write-Host "    $_" }

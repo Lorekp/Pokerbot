@@ -209,7 +209,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
                    river_ochs_rel="", river_ochs_sha="", preflop_hist_key=False,
                    fullhist_key=False, mrr=False,
                    work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
-                   v3=None, row_budget=None,
+                   v3=None, row_budget=None, no_cache_fetch=False,
                    wall_guard_secs=21600, awscli_zip="awscli-exe-linux-x86_64.zip") -> str:
     """The full on-box bootstrap (was inline user-data until it exceeded EC2's 16KB cap).
     Uploaded to S3 by main() and exec'd by user_data_stub(). Content is otherwise the proven
@@ -217,6 +217,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
     the stub and is ALREADY ARMED when this runs. The AWS CLI v2 re-install below is idempotent
     (--update) and kept so this script stays self-sufficient if ever run standalone."""
     run_prefix = f"{prefix}/{run_subdir}"
+    no_cache_fetch = "1" if no_cache_fetch else "0"  # rendered into the bootstrap fetch guard
     final = "echo BOOTSTRAP_DONE_KEEP_ALIVE" if keep_alive else "shutdown -h now"
     depth_csv = ",".join(str(float(x)) for x in (depth_edges or []))
     hist_flag = "1" if preflop_hist_key else "0"
@@ -785,7 +786,12 @@ BUILD_KEY=$(printf '%s|%s|%s|%s|%s' "$CODE_SHA" "$BUILD_RUSTFLAGS" "python:lib" 
 CACHE_URI="s3://{bucket}/{prefix}/build_cache/$BUILD_KEY"
 echo "BUILD_CACHE key=$BUILD_KEY (code_sha=$CODE_SHA rustc=$(rustc -V) arch=$(uname -m))"
 CACHE_HIT=0
-if aws s3 cp "$CACHE_URI/battery_native.so" /opt/pokerbot/battery_native.so --region {region} 2>/dev/null \
+# NO_CACHE_FETCH=1 forces the source build (provenance incident 2026-07-06: an unidentified
+# account-side pipeline reacts to code-tarball uploads and plants an untrusted .so under the
+# correct cache key within ~4 min — a fetch can then never be trusted after a tarball upload).
+# The post-build populate still runs, OVERWRITING any planted entry with the trusted artifact.
+if [ "{no_cache_fetch}" != "1" ] \
+   && aws s3 cp "$CACHE_URI/battery_native.so" /opt/pokerbot/battery_native.so --region {region} 2>/dev/null \
    && aws s3 cp "$CACHE_URI/battery_native.so.sha256" /tmp/bn_so.sha --region {region} 2>/dev/null; then
   WANT=$(awk '{{print $1}}' /tmp/bn_so.sha)
   GOT=$(sha256sum /opt/pokerbot/battery_native.so | awk '{{print $1}}')
@@ -1023,6 +1029,11 @@ def main() -> None:
                    help="skip the code upload; REUSE the existing S3 code tarball. The babysitter passes "
                         "this on RELAUNCHES so a locally-changing working tree (e.g. a concurrent crate "
                         "optimization) never re-uploads mid-edit and breaks a resumed box.")
+    p.add_argument("--no-cache-fetch", action="store_true",
+                   help="bootstrap SKIPS the build-cache fetch and always builds from source (still "
+                        "populates/overwrites the cache afterwards). Use when the cache entry cannot be "
+                        "trusted — e.g. the 2026-07-06 incident where an account-side pipeline plants an "
+                        "untrusted .so under the correct key minutes after every code-tarball upload.")
     p.add_argument("--crate-src", default="tools/battery_native",
                    help="path to the crate source to upload (always as tools/battery_native). Point at a "
                         "FROZEN COPY to isolate a running job from concurrent edits to the live crate; "
@@ -1210,7 +1221,7 @@ def main() -> None:
         fullhist_key=args.fullhist_key, mrr=args.mrr,
         work_steal=args.work_steal, dcfr=args.dcfr,
         dcfr_prune_threshold=args.dcfr_prune_threshold, dcfr_explore_frac=args.dcfr_explore_frac,
-        v3=v3_cfg, row_budget=args.row_budget,
+        v3=v3_cfg, row_budget=args.row_budget, no_cache_fetch=args.no_cache_fetch,
         wall_guard_secs=wall_guard_secs, awscli_zip=awscli_zip,
     )
     bootstrap_key = f"{args.prefix}/{run_subdir}/code/bootstrap.sh"
