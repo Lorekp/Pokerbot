@@ -25,13 +25,17 @@
 #       K0 REGSTATS sanity (BINDING): at the iter-5000 checkpoint neg_p999 must be in
 #       **[390, 3910] bb** (= [C/64/2, C/64*5]); outside => STOP, rescale C to -64 x measured
 #       p999 (1 s.f.), relaunch from the 5000 checkpoint.
-#   * -Iters 40000 -NDeals 8192 -CheckpointEvery 1000 -GateEvery 2500 : sec 11 traversal-identical
-#       spec point (327.7M traversals); 1000-iter rolling checkpoints (on-demand -- no reclaims to
-#       bank against, sec 12.3), gate ladder checkpoints kept forever.
+#   * -Iters 40000 -NDeals 8192 -CheckpointEvery 250 -GateEvery 2500 : sec 11 traversal-identical
+#       spec point (327.7M traversals); 250-iter rolling checkpoints (SPOT, sec 13 relaunch: the
+#       2026-07-06 perf merge makes the storm math work -- training ~2.9x faster verified locally
+#       + serialize pause 212s->~96s at 41GB -- fresh-box time-to-first-marker ~8-12 min vs the
+#       measured 20-27 min reclaim windows), gate ladder checkpoints kept forever.
 #   * -CkptVolumeGb 400                : root gp3 (700 MiB/s) staging volume for the detached uploader.
-#   * -InstanceType c6a.32xlarge -OnDemand (sec 12.3): 128 vCPU / 256 GB at $4.896/h, ~10-16h =>
-#       ~$52-81. Spot banked ZERO iterations across 7 boxes / 2 pool sizes on 2026-07-06
-#       (20-71 min lifetimes vs ~25 min to first marker) -- user directive: on-demand.
+#   * -InstanceType c6a.32xlarge -Spotpick (sec 13): 128 vCPU / 256 GB at ~$1.88/h spot; projected
+#       ~$20-35 total at the merged pace incl. churn rework. Capacity fallback chain is all
+#       128-vCPU/>=256GB types. User directive 2026-07-06: spot, reassessed viable after the
+#       profiler (3.2x, byte-identical, golden sha 77bc2aa8 verbatim) + checkpoint (2.2x pause,
+#       format-compatible, resume-identity test) merges -- both independently re-verified.
 #   * -V3SnapshotAvg -V3SnapStart 3200 : 8% of 40k (v3 rule verbatim, sec 11).
 #   * -RowBudget 550000000             : G8 RAM backstop on max(strat,cum); K160 shrinks the space
 #       vs the K200 census, so this is looser than registered -- kept verbatim.
@@ -76,11 +80,11 @@
     -NumBuckets 160 `
     -EmdFrozen "data/abstraction/emd_frozen_flop_turn_160_r400.emdfrzn" `
     -RiverOchs "" `
-    -CheckpointEvery 1000 `
+    -CheckpointEvery 250 `
     -GateEvery 2500 `
     -CkptVolumeGb 400 `
     -InstanceType "c6a.32xlarge" `
-    -OnDemand `
+    -Spotpick `
     -MaxHours 20 `
     -NoConvergeStop `
     @args

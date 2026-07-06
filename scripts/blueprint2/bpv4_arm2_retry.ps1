@@ -21,7 +21,9 @@ while ((Get-Date) -lt $deadline) {
   if ($it -ge 40000) { Write-Output "[retry] target reached ($it) -> exit"; break }
   $cycle++
   Write-Output "[retry] cycle $cycle starting at $(Get-Date -Format HH:mm:ss) (iters=$it)"
-  & powershell -ExecutionPolicy Bypass -File "scripts\blueprint2\bpv4_arm2_babysitter.ps1" -ReuseCode 2>&1 |
+  # No -ReuseCode: each cycle re-uploads the tarball so the 2026-07-06 perf merge (and nothing
+  # stale) is what the box builds; the tree is stable now that the perf worktrees are merged.
+  & powershell -ExecutionPolicy Bypass -File "scripts\blueprint2\bpv4_arm2_babysitter.ps1" 2>&1 |
     Out-File -Append "artifacts\_arm2b_babysitter.log" -Encoding utf8
   $it2 = Get-Iters
   Write-Output "[retry] cycle $cycle babysitter exited at $(Get-Date -Format HH:mm:ss) (iters $it -> $it2)"
