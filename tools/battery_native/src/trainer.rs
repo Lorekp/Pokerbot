@@ -604,6 +604,59 @@ enum MergeClamp {
     SignedFloor(f64),
 }
 
+/// R4 (perf): process-global pool of RECYCLED per-worker accumulator tables for the work-steal
+/// collector. Every iteration previously built each worker's sharded partial from scratch (8 workers
+/// x 256 empty maps grown through ~9 rehash doublings to ~300K rows) and dropped it after the merge —
+/// ~0.5-1 GB/iter of alloc + rehash-copy churn at nd=8192. Workers now POP a table from this pool
+/// (clearing its maps at claim, which retains capacity), and the merge pushes the merged-out partials
+/// back. VALUE-EQUIVALENCE: a cleared map is CONTENT-identical to a fresh one — every per-deal delta,
+/// the per-key `+=` fold, and the merge arithmetic are unchanged; only the maps' capacity history (and
+/// therefore their internal iteration order) differs, which no trained value depends on (per-key
+/// entry-wise merge; `serialize` sorts). The pool is used ONLY on the work-steal path, whose deal->
+/// worker assignment is already scheduler-dependent (statistically reproducible, CI-gated — the
+/// `work_steal` standard): for any FIXED schedule the output is byte-identical to the unpooled build.
+/// The STATIC (golden, byte-gated) path never claims from the pool, so its bytes are untouched
+/// (re-verified by the pinned SHA goldens). Trade-off: up to `WS_POOL_CAP` tables' capacity stays
+/// resident between iterations (~the traversal's own working set for one iteration; bounded).
+fn ws_acc_pool() -> &'static std::sync::Mutex<Vec<NlheTables>> {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<std::sync::Mutex<Vec<NlheTables>>> = OnceLock::new();
+    POOL.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Upper bound on pooled tables (safety valve: a static-scheduler run with work_steal cfg-enabled
+/// routes ~n_tasks partials through the recycler — cap keeps that bounded).
+const WS_POOL_CAP: usize = 64;
+
+/// Return merged-out partials to the pool (work-steal path only; overflow beyond `WS_POOL_CAP` drops).
+fn recycle_ws_partials(partials: Vec<NlheTables>) {
+    let mut pool = ws_acc_pool().lock().unwrap();
+    for p in partials {
+        if pool.len() >= WS_POOL_CAP {
+            break;
+        }
+        pool.push(p);
+    }
+}
+
+/// Claim a recycled accumulator table (or a fresh one) and hand it back EMPTY: `clear()` retains the
+/// allocated capacity — the whole point — while making the table content-identical to
+/// `NlheTables::default()`.
+fn claim_ws_acc() -> NlheTables {
+    let popped = ws_acc_pool().lock().unwrap().pop();
+    match popped {
+        Some(mut acc) => {
+            for sh in acc.shards.iter_mut() {
+                sh.cum_regret.clear();
+                sh.strat_sum.clear();
+            }
+            acc.iters_done = 0;
+            acc
+        }
+        None => NlheTables::default(),
+    }
+}
+
 /// The LCFR discount-event predicate for iteration `t` — factored out of `apply_lcfr` so the
 /// merge-time clamp routing in `train_iteration_n_v3` and the in-pass factor computation can never
 /// drift apart. Arm-2 `signed_regrets` mode never fires it (`v3.lcfr` is required).
@@ -2846,7 +2899,9 @@ impl NlheTables {
         // One task per rayon worker thread; each returns its own per-worker partial. `broadcast` runs the
         // closure on every thread in the current pool and collects the results in thread-index order.
         rayon::broadcast(|_ctx| {
-            let mut acc = NlheTables::default();
+            // R4: claim a RECYCLED accumulator (cleared at claim — content-identical to ::default(),
+            // capacity retained; see `ws_acc_pool`). The clear runs here, in parallel across workers.
+            let mut acc = claim_ws_acc();
             // R2: one REUSED LocalDelta per worker (drained into `acc` after each deal — empty at every
             // deal start, so per-deal content is identical to the old fresh-per-deal map without the
             // alloc + growth-rehash churn; see `accumulate_local_into`).
@@ -3024,7 +3079,7 @@ impl NlheTables {
     /// pathology's only truly unbounded per-iteration term).
     fn merge_partials_clamped(
         &mut self,
-        _cfg: &TrainerCfg,
+        cfg: &TrainerCfg,
         partials: Vec<NlheTables>,
         clamp: MergeClamp,
     ) {
@@ -3066,9 +3121,14 @@ impl NlheTables {
                 }
             }
         });
+        // R4: hand the merged-out partials back to the work-steal accumulator pool (drop as before on
+        // the static/golden path — `work_steal_enabled` false).
+        if work_steal_enabled(cfg) {
+            recycle_ws_partials(partials);
+        }
     }
 
-    fn merge_partials(&mut self, _cfg: &TrainerCfg, partials: Vec<NlheTables>) {
+    fn merge_partials(&mut self, cfg: &TrainerCfg, partials: Vec<NlheTables>) {
         // SHARDED PARALLEL MERGE (write-time partition, WF5 2026-06-28). Each rayon worker owns ONE
         // shard `dst = self.shards[s]` exclusively (par_iter_mut gives disjoint &mut) and folds every
         // partial's PRE-GROUPED shard-s sub-table `p.shards[s]` into it. No per-key contention (disjoint
@@ -3083,12 +3143,17 @@ impl NlheTables {
         // new iters=1 A/B (nd=200): identical keys, max abs diff 5.68e-14 — far inside the
         // `compare_trainer_states` atol=1e-9 production gate; full multi-iter runs then diverge into
         // distinct-but-equally-valid CFR sample paths via normal chaotic regret amplification.
-        // `_cfg.fast_merge` is ignored (the sharded merge IS the parallel path; tree-reduce is retired).
+        // `cfg.fast_merge` is ignored (the sharded merge IS the parallel path; tree-reduce is retired).
         self.shards.par_iter_mut().enumerate().for_each(|(s, dst)| {
             for p in &partials {
                 merge_shard(dst, &p.shards[s]);
             }
         });
+        // R4: hand the merged-out partials back to the work-steal accumulator pool (drop as before on
+        // the static/golden path — `work_steal_enabled` false).
+        if work_steal_enabled(cfg) {
+            recycle_ws_partials(partials);
+        }
     }
 
     // Kept as the REFERENCE full-table sweep: the production path now applies this floor to the
