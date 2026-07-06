@@ -323,6 +323,30 @@ fn compress(h: &mut [u64; 8], block: &[u8; 128], t: u128, last: bool) {
 /// blake2b(digest_size, person) of a single message. Matches hashlib.blake2b for keyless,
 /// no-salt, person<=16 bytes. `out_len` <= 64.
 pub fn blake2b(out_len: usize, person: &[u8], data: &[u8]) -> Vec<u8> {
+    let h = blake2b_state(out_len, person, data);
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        out.push((h[i / 8] >> (8 * (i % 8))) as u8);
+    }
+    out
+}
+
+/// 16-byte fixed-output blake2b (R3, perf): identical state math to `blake2b(16, ..)` (both call
+/// `blake2b_state`) but returns the digest in a stack array — no heap Vec per call. The trainer-hot
+/// fingerprint paths emit ~3M digests/iter at nd=8192; this removes that allocation entirely.
+#[inline]
+pub fn blake2b16(person: &[u8], data: &[u8]) -> [u8; 16] {
+    let h = blake2b_state(16, person, data);
+    let mut out = [0u8; 16];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = (h[i / 8] >> (8 * (i % 8))) as u8;
+    }
+    out
+}
+
+/// The blake2b core shared by `blake2b` / `blake2b16` — byte-for-byte the pre-R3 `blake2b` body up
+/// to (but excluding) the output serialization.
+fn blake2b_state(out_len: usize, person: &[u8], data: &[u8]) -> [u64; 8] {
     let mut h = BLAKE2B_IV;
     // Parameter block: h[0] ^= 0x0101kknn where nn=digest_len, kk=keylen(0), fanout=depth=1.
     h[0] ^= 0x0101_0000 ^ (out_len as u64);
@@ -357,12 +381,7 @@ pub fn blake2b(out_len: usize, person: &[u8], data: &[u8]) -> Vec<u8> {
     block[..rem].copy_from_slice(&data[offset..n]);
     t += rem as u128;
     compress(&mut h, &block, t, true);
-
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        out.push((h[i / 8] >> (8 * (i % 8))) as u8);
-    }
-    out
+    h
 }
 
 // ---------------------------------------------------------------------------
@@ -495,11 +514,64 @@ pub fn full_hist_key_enabled() -> bool {
     })
 }
 
+/// Minimal byte-sink abstraction so the message-assembly helpers emit IDENTICAL bytes into either a
+/// heap `Vec<u8>` (serve paths, unchanged) or the stack `MsgBuf` (R3 trainer-hot paths). Method
+/// names/semantics match `Vec`'s inherent ones, so the `Vec` impl is a pure passthrough.
+trait PushBytes {
+    fn push(&mut self, b: u8);
+    fn extend_from_slice(&mut self, s: &[u8]);
+}
+impl PushBytes for Vec<u8> {
+    #[inline]
+    fn push(&mut self, b: u8) {
+        Vec::push(self, b);
+    }
+    #[inline]
+    fn extend_from_slice(&mut self, s: &[u8]) {
+        Vec::extend_from_slice(self, s);
+    }
+}
+
+/// Stack-allocated fingerprint message buffer (R3, perf, byte-identity-neutral): the trainer's hot
+/// fingerprint paths assembled every message in a fresh heap `Vec<u8>` (~3M alloc+free/iter at
+/// nd=8192, all under the process allocator's thread contention). Message length is statically
+/// bounded: worst case = b"w" branch 1+4 + D 2 + H 4 + fullhist A 2+MAX_HISTORY(64) + S 1+6 = 84
+/// bytes; 128 leaves headroom (an overflow would panic via the slice bound — impossible by the
+/// bound above, and a panic is loud, never a silent truncation). Bytes emitted are IDENTICAL to the
+/// Vec path (same PushBytes calls), so digests — and every trained value — are unchanged.
+const MSG_MAX: usize = 128;
+struct MsgBuf {
+    buf: [u8; MSG_MAX],
+    len: usize,
+}
+impl MsgBuf {
+    #[inline]
+    fn new() -> Self {
+        MsgBuf { buf: [0; MSG_MAX], len: 0 }
+    }
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+impl PushBytes for MsgBuf {
+    #[inline]
+    fn push(&mut self, b: u8) {
+        self.buf[self.len] = b;
+        self.len += 1;
+    }
+    #[inline]
+    fn extend_from_slice(&mut self, s: &[u8]) {
+        self.buf[self.len..self.len + s.len()].copy_from_slice(s);
+        self.len += s.len();
+    }
+}
+
 /// Append the full-history segment: b"A" + current street byte + raw action-id bytes.
 /// Caps at the engine's MAX_HISTORY (the engine itself stops recording past it — documented,
 /// accepted aliasing of astronomically rare saturated tails).
 #[inline]
-fn push_full_hist_bytes<const N: usize>(s: &EnvStateN<N>, msg: &mut Vec<u8>) {
+fn push_full_hist_bytes<const N: usize>(s: &EnvStateN<N>, msg: &mut impl PushBytes) {
     msg.push(b'A');
     msg.push(s.street as u8);
     let len = (s.hist_len.max(0) as usize).min(crate::core::MAX_HISTORY);
@@ -630,15 +702,30 @@ pub fn fingerprint_fast_depth_emd<const N: usize>(
     fingerprint_fast_depth(s, seat, num_buckets, depth_edges)
 }
 
+/// Digest a stack-assembled message with the FP memo (R3: slice-probed — the memo key type
+/// `Vec<u8>` borrows as `[u8]`, so the HIT path allocates NOTHING; only a memo MISS pays one
+/// `to_vec` for the inserted key, exactly the allocation the old Vec-assembly path paid on every
+/// call).
 #[inline]
-fn digest_msg_memoed(msg: Vec<u8>, memo: &mut FpMemo) -> [u8; 16] {
-    if let Some(digest) = memo.get(&msg) {
+fn digest_msg_slice_memoed(msg: &[u8], memo: &mut FpMemo) -> [u8; 16] {
+    // FULLHIST BYPASS (R1, perf, byte-identity-neutral): under POKERBOT_FULLHIST_KEY the message
+    // space tracks the billions-scale infoset table, so the memo's measured hit rate collapses
+    // (~27% at nd=8192 iter 16, arm-2b bench 2026-07-06) while every miss pays a DRAM-cold probe +
+    // an insert that grows the per-thread map by ~2.1M entries/iter (~300 MB/iter process-wide —
+    // the paging driver the FP_MEMO_CAP clears only bound, not remove). blake2b16 on a <100-byte
+    // message is CHEAPER than the cold probe, so skip the memo entirely: the memo is a PURE
+    // message->digest cache (a hit returns exactly what a miss recomputes), so the emitted digest —
+    // and every trained value — is byte-identical either way (measured 2.26x wall, util 0.53->0.89).
+    // Summary-key runs (flag off) keep the memo: their distinct-message count is small and the hit
+    // rate ~100%, where the memo is a measured win.
+    if full_hist_key_enabled() {
+        return blake2b16(b"", msg);
+    }
+    if let Some(digest) = memo.get(msg) {
         return *digest;
     }
-    let d = blake2b(16, b"", &msg);
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&d);
-    memo.insert(msg, out);
+    let out = blake2b16(b"", msg);
+    memo.insert(msg.to_vec(), out);
     out
 }
 
@@ -658,7 +745,8 @@ pub fn fingerprint_fast_depth_memo<const N: usize>(
     let bucket = compute_postflop_bucket(h0, h1, &s.board, num_buckets);
     let betting_state = betting_abstraction_key(s, seat);
 
-    let mut msg: Vec<u8> = Vec::with_capacity(1 + 4 + 2 + 1 + 6);
+    // R3: stack MsgBuf instead of a heap Vec — identical PushBytes sequence, identical bytes.
+    let mut msg = MsgBuf::new();
     if bucket >= 0 {
         msg.push(b'B');
         msg.extend_from_slice(&bucket.to_le_bytes());
@@ -681,7 +769,7 @@ pub fn fingerprint_fast_depth_memo<const N: usize>(
     }
     msg.push(b'S');
     msg.extend_from_slice(&betting_state);
-    digest_msg_memoed(msg, memo)
+    digest_msg_slice_memoed(msg.as_slice(), memo)
 }
 
 pub fn fingerprint_fast_depth_postflop_bucket<const N: usize>(
@@ -712,7 +800,8 @@ pub fn fingerprint_fast_depth_postflop_bucket_memo<const N: usize>(
     memo: &mut FpMemo,
 ) -> [u8; 16] {
     let betting_state = betting_abstraction_key(s, seat);
-    let mut msg: Vec<u8> = Vec::with_capacity(1 + 4 + 1 + 6);
+    // R3: stack MsgBuf instead of a heap Vec — identical PushBytes sequence, identical bytes.
+    let mut msg = MsgBuf::new();
     msg.push(b'B');
     msg.extend_from_slice(&bucket.to_le_bytes());
     // blueprint-v4 Stage 0: full action-history segment (see block comment above).
@@ -721,5 +810,5 @@ pub fn fingerprint_fast_depth_postflop_bucket_memo<const N: usize>(
     }
     msg.push(b'S');
     msg.extend_from_slice(&betting_state);
-    digest_msg_memoed(msg, memo)
+    digest_msg_slice_memoed(msg.as_slice(), memo)
 }
