@@ -76,6 +76,11 @@
 # 1000 AND GROWS; a 256 GB box (c7a landed via fallback) page-thrashed to 0.194 it/s under the
 # 60 GB checkpoint serialize+upload churn. ALL 256 GB 128-vCPU families excluded (c6i/c6in/c6id/
 # c7a) -- the chain now lands on 512 GB+ types only (m6i head; m6a/m6id/m6in/m7a/r6i alternates).
+# CADENCE 250 (2026-07-06 ~20:00, user-approved after profile run #3): the parallel serializer
+# (f60ecf4) cut the delta pause to ~14s, and the graceful-flush path banks the un-checkpointed
+# window on any 2-min reclaim notice -- so cadence no longer bounds graceful-reclaim loss, only
+# hard deaths (<=~42s compute at 250). 100 -> 250 lifts the compute fraction ~55% -> ~75%; the
+# flush delta (~20-25GB at 250) still fits the notice window. Amendment sec 17.
 $env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n,c6i,c6in,c6id,c7a"
 & (Join-Path $PSScriptRoot "blueprint2_babysitter.ps1") `
     -Run "bpv4_emd160_arm2b" `
@@ -96,7 +101,7 @@ $env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n,c6i,c6in,c6id,c7a"
     -EmdFrozen "data/abstraction/emd_frozen_flop_turn_160_r400.emdfrzn" `
     -RiverOchs "" `
     -DeltaCkpt `
-    -CheckpointEvery 100 `
+    -CheckpointEvery 250 `
     -GateEvery 2500 `
     -CkptVolumeGb 400 `
     -InstanceType "m6i.32xlarge" `
