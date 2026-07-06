@@ -62,6 +62,12 @@
 # CI-LB <= -15 bb/100 on either => HARD reject). Serve/eval MUST set POKERBOT_FULLHIST_KEY=1 AND
 # POKERBOT_MRR=1 (train/probe abstraction-skew guard).
 # ASCII ONLY (PS 5.1 reads BOM-less .ps1 as cp1252).
+#
+# POOL WEATHER (2026-07-06 ~14:15): c6a lifetimes collapsed to 9-20 min (5 dry boxes across two
+# cycles); c6i measured 27-51 min this morning. m6i stays head (capacity-failed once, retried each
+# launch); c6a/c5-family excluded from the ALTS so a capacity fallback lands on c6i/c6in/m6a
+# instead of re-rolling the churniest pool.
+$env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n"
 & (Join-Path $PSScriptRoot "blueprint2_babysitter.ps1") `
     -Run "bpv4_emd160_arm2b" `
     -FullHistKey `

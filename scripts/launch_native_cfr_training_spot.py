@@ -795,7 +795,16 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "        print(f\"RESUMED from latest checkpoint at iters_done={t.iters_done()} \"\n"
             "              f\"(base_iter={base_iter}, +{nd} deltas)\", flush=True)\n"
             "    else:\n"
-            "        print(\"FRESH start (no resumable checkpoint)\", flush=True)"
+            "        print(\"FRESH start (no resumable checkpoint)\", flush=True)\n"
+            "    # POST-RESUME TELEMETRY (2026-07-06): upload train.log NOW, not only at checkpoints --\n"
+            "    # a storm-reclaimed box that never reaches its first marker otherwise leaves ZERO\n"
+            "    # prologue telemetry (RESUME dl GB/s, load wall), exactly when it's needed most.\n"
+            "    try:\n"
+            "        s3.upload_file(\"/var/log/native-cfr-train.log\", BUCKET,\n"
+            "                       RUN_PREFIX + \"/logs/train.log\")\n"
+            "        print(\"TRAINLOG uploaded post-resume\", flush=True)\n"
+            "    except Exception as e:\n"
+            "        print(f\"post-resume TRAINLOG upload failed: {e!r}\", flush=True)"
         )
         # end-of-run: block on in-flight detached uploads BEFORE the driver exits -- the bootstrap
         # shuts the box down right after the driver, which would otherwise kill the final upload.
