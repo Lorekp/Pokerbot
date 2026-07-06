@@ -109,9 +109,11 @@ $env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n,c6i,c6in,c6id,c7a,m6i,
     -RiverOchs "" `
     -DeltaCkpt `
     -CheckpointEvery 250 `
+    -CkptSecs 600 `
+    -CkptMaxDirtyGb 24 `
     -GateEvery 2500 `
     -CkptVolumeGb 400 `
-    -InstanceType "r6a.32xlarge" `
+    -InstanceType "x2idn.32xlarge" `
     -Spotpick `
     -MaxHours 20 `
     -NoConvergeStop `

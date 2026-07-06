@@ -75,6 +75,10 @@ param(
                                       #   driver 400M default + byte-identical bootstrap)
   [switch]$DeltaCkpt,                 # --delta-ckpt (R2 delta checkpoints: dirty-row NLDLT001 sidecars
                                       #   between full bases at gate iters; resume-identical, spot lever)
+  [int]$CkptSecs = 0,                 # --ckpt-secs (HYBRID rolling-ckpt TIME trigger on the delta path;
+                                      #   0 = omit = launcher default 600 s)
+  [double]$CkptMaxDirtyGb = 0,        # --ckpt-max-dirty-gb (HYBRID rolling-ckpt SIZE trigger, estimated
+                                      #   dirty GB; 0 = omit = launcher default 24 GB)
   # --- box / market ---
   [string]$InstanceType = "",          # "" = AUTO-PICK cheapest spot-available type via spotpick
   [int]$Vcpus = 128,
@@ -291,6 +295,8 @@ function Invoke-Launch {
   }
   if ($RowBudget -gt 0) { $argsList += @("--row-budget", $RowBudget) }
   if ($DeltaCkpt)  { $argsList += "--delta-ckpt" }
+  if ($CkptSecs -gt 0)       { $argsList += @("--ckpt-secs", $CkptSecs) }
+  if ($CkptMaxDirtyGb -gt 0) { $argsList += @("--ckpt-max-dirty-gb", $CkptMaxDirtyGb) }
   if ($Spotpick)   { $argsList += "--spotpick" }
   if ($OnDemand)   { $argsList += "--on-demand" }
   if ($CrateSrc)   { $argsList += @("--crate-src", $CrateSrc) }

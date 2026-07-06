@@ -177,6 +177,45 @@ def _spotpick_chain(instance_type: str, arch: str, n: int) -> list[str]:
     return chain[:max(n, 1)]
 
 
+def _sps_rank_chain(chain: list[str], region: str) -> list[str]:
+    """Re-rank a spot fallback chain by LIVE capacity depth via GetSpotPlacementScores (IAM grant
+    2026-07-06). One region-level query per type (the same <=8 parameter combinations recur all
+    day, staying clear of the SPS unique-combination quota); stable sort DESC by score preserves
+    the caller's price/preference order within a score tier. FAIL-OPEN: any error (missing IAM,
+    API throttle) returns the chain untouched. Kill-switch: SPOTPICK_NO_SPS=1.
+
+    Rationale (churn probe 2026-07-06): the storm's reclaims are capacity-driven, and per-pool
+    depth diverges hard — r6a scored 1/10 in two AZs (our churniest family that day) while
+    r6id/x2idn scored 3/10 everywhere. Walking the chain in live-depth order puts each launch in
+    the deepest pool the chain knows about."""
+    import os
+    if os.environ.get("SPOTPICK_NO_SPS", "0") == "1" or len(chain) <= 1:
+        return chain
+    try:
+        import boto3
+        ec2 = boto3.client("ec2", region_name=region)
+        scores = {}
+        for t in chain[:8]:
+            try:
+                r = ec2.get_spot_placement_scores(
+                    InstanceTypes=[t], TargetCapacity=128, TargetCapacityUnitType="vcpu",
+                    RegionNames=[region])
+                scores[t] = max((s.get("Score", 0) for s in r.get("SpotPlacementScores", [])),
+                                default=0)
+            except Exception:  # noqa: BLE001 -- per-type throttle/denial: rank what we have
+                scores[t] = -1
+        if all(v < 0 for v in scores.values()):
+            print("[spotpick] SPS unavailable for every type -- keeping static chain order", flush=True)
+            return chain
+        ranked = sorted(chain, key=lambda t: -scores.get(t, -1))
+        print("[spotpick] SPS-ranked chain: "
+              + ", ".join(f"{t}={scores.get(t, '?')}" for t in ranked), flush=True)
+        return ranked
+    except Exception as e:  # noqa: BLE001
+        print(f"[spotpick] SPS ranking failed ({e!r}) -- keeping static chain order", flush=True)
+        return chain
+
+
 def _launch_with_fallback(ec2, run_kwargs: dict, *, instance_types: list[str], spot: bool):
     """Try ``run_instances`` down ``instance_types`` until one succeeds (capacity errors advance to the
     next type; any other error is fatal). Returns (instance_id, instance_type_used). The caller bakes
@@ -244,7 +283,8 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
                    river_ochs_rel="", river_ochs_sha="", preflop_hist_key=False,
                    fullhist_key=False, mrr=False,
                    work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
-                   v3=None, row_budget=None, no_cache_fetch=False, delta_ckpt=False, profile_run=False,
+                   v3=None, row_budget=None, no_cache_fetch=False, delta_ckpt=False,
+                   ckpt_secs=600, ckpt_max_dirty_gb=24.0, profile_run=False,
                    wall_guard_secs=21600, awscli_zip="awscli-exe-linux-x86_64.zip") -> str:
     """The full on-box bootstrap (was inline user-data until it exceeded EC2's 16KB cap).
     Uploaded to S3 by main() and exec'd by user_data_stub(). Content is otherwise the proven
@@ -294,6 +334,12 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             # proves base+delta resume final state == uninterrupted); OFF renders "0" = R2 default.
             f"export POKERBOT_DELTA_CKPT={'1' if delta_ckpt else '0'}",
             'echo "DELTA_CKPT=$POKERBOT_DELTA_CKPT"',
+            # HYBRID rolling-checkpoint cadence (2026-07-06): time/size triggers for the delta
+            # path's ROLLING checkpoints (the driver reads these once at module scope; the
+            # non-delta / legacy paths never read them). Exported like POKERBOT_DELTA_CKPT above.
+            f"export POKERBOT_CKPT_SECS={int(ckpt_secs)}",
+            f"export POKERBOT_CKPT_MAX_DIRTY_GB={float(ckpt_max_dirty_gb)}",
+            'echo "CKPT_SECS=$POKERBOT_CKPT_SECS CKPT_MAX_DIRTY_GB=$POKERBOT_CKPT_MAX_DIRTY_GB"',
             f"export POKERBOT_LCFR={'1' if v3.get('lcfr') else '0'}",
             'echo "LCFR=$POKERBOT_LCFR"',
             f"export POKERBOT_SIGNED_REGRETS={'1' if v3.get('signed_regrets') else '0'}",
@@ -375,8 +421,9 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "            print(f\"TRAINLOG UPLOAD FAIL attempt={attempt}/3: {e!r}\", flush=True)\n"
             "            time.sleep(min(30, 5 * attempt))"
         )
-        # fullhist path: rolling checkpoints run every CKPT_EVERY but the pre-registered v3
-        # measurement extras (snapshot/COVERAGE/REGSTATS) only at gate-cadence iters (_is_gate).
+        # fullhist path: rolling checkpoints run every CKPT_EVERY (non-delta) / on the hybrid
+        # time-size triggers (delta path, 2026-07-06) but the pre-registered v3 measurement
+        # extras (snapshot/COVERAGE/REGSTATS) only at gate-cadence iters (_is_gate).
         if fullhist_key or mrr:
             v3_ckpt_call = "\n        _v3_ckpt_extras(t, _is_gate(t.iters_done()))"
         else:
@@ -434,9 +481,18 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "\n"
             "\n"
             "def _next_stop(cur):\n"
-            "    # next training-loop boundary = earliest of (next CKPT_EVERY multiple, next GATE_EVERY\n"
-            "    # multiple, ITERS) -- rolling resume checkpoints land every CKPT_EVERY AND the\n"
-            "    # pre-registered gate ladder (e.g. 2.5k/5k/.../20k for arm-2) is always hit exactly.\n"
+            "    # next training-loop boundary. DELTA path (hybrid time/size cadence, 2026-07-06): the\n"
+            "    # loop clamps ONLY to the pre-registered gate ladder + ITERS -- gates are ALWAYS hit\n"
+            "    # iter-exact (full base + snapshot/COVERAGE/REGSTATS); the rolling checkpoints between\n"
+            "    # gates fire from _train_to's time/size triggers at ARBITRARY iters (the babysitter/\n"
+            "    # poller already accept arbitrary-iter markers). Non-delta path: earliest of (next\n"
+            "    # CKPT_EVERY multiple, next GATE_EVERY multiple, ITERS) -- the original iter cadence,\n"
+            "    # behavior unchanged.\n"
+            "    if DELTA_CKPT:\n"
+            "        nxt = ITERS\n"
+            "        if GATE_EVERY > 0:\n"
+            "            nxt = min(nxt, ((cur // GATE_EVERY) + 1) * GATE_EVERY)\n"
+            "        return nxt\n"
             "    nxt = ((cur // CKPT_EVERY) + 1) * CKPT_EVERY\n"
             "    if GATE_EVERY > 0:\n"
             "        nxt = min(nxt, ((cur // GATE_EVERY) + 1) * GATE_EVERY)\n"
@@ -543,12 +599,43 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "# DELTA CHECKPOINTS (checkpoint-speed R2, 2026-07-06). Gated by POKERBOT_DELTA_CKPT=1 (default\n"
             "# OFF => every checkpoint is a full base, BYTE-IDENTICAL to the pre-R2 driver). When ON: a GATE\n"
             "# boundary and the first checkpoint after a (re)start write a FULL BASE (kept forever / resumable\n"
-            "# root); the up-to-(GATE_EVERY/CKPT_EVERY - 1) rolling checkpoints between gates write a sparse\n"
-            "# NLDLT001 DELTA of only the rows touched since the base. Resume applies the newest verified base\n"
-            "# + its contiguous verified delta chain. Chain length is bounded by GATE_EVERY/CKPT_EVERY (arm-2b:\n"
-            "# 2500/250 = 10), so a resume replays <= 9 deltas.\n"
+            "# root); the rolling checkpoints between gates write a sparse NLDLT001 DELTA of only the rows\n"
+            "# touched since the base. Resume applies the newest verified base + its contiguous verified delta\n"
+            "# chain. Chain length is bounded by the gate window over the rolling cadence (hybrid triggers\n"
+            "# below; CKPT_MIN_GAP_SECS floors it), so a resume replays a bounded delta chain.\n"
             "DELTA_CKPT = os.environ.get(\"POKERBOT_DELTA_CKPT\", \"0\") == \"1\"\n"
             "_BASE = {\"iter\": None, \"seq\": 0}  # current delta-chain base_iter + last delta seq (None => next ckpt is a base)\n"
+            "\n"
+            "# HYBRID TIME/SIZE ROLLING TRIGGER (2026-07-06, delta path only -- replaces the CKPT_EVERY iter\n"
+            "# cadence there; non-delta keeps CKPT_EVERY). A rolling checkpoint fires between training chunks\n"
+            "# when EITHER (a) estimated dirty bytes >= CKPT_MAX_DIRTY_BYTES -- keeps the graceful-reclaim\n"
+            "# EMERGENCY flush (serialize ~0.85 GB/s + sync upload ~0.5 GB/s ~= 3.2 s/GB) inside the 2-min\n"
+            "# reclaim notice + 100 s grace -- OR (b) wall-clock since the last checkpoint >= CKPT_SECS\n"
+            "# (bounds replay loss when dirty growth is slow, e.g. post-pruning). CKPT_MIN_GAP_SECS floors\n"
+            "# the interval so a burst can't thrash. Dirty bytes are ESTIMATED as dirty_counts() total rows\n"
+            "# x an EMA bytes/row seeded at 60 B/row and updated from every ACTUAL delta save (_ckpt).\n"
+            "# 0 disables a trigger. Gates are untouched: _next_stop still clamps the train loop to the\n"
+            "# gate ladder + ITERS, so gate checkpoints stay iter-exact full bases.\n"
+            "CKPT_SECS = float(os.environ.get(\"POKERBOT_CKPT_SECS\", \"600\"))\n"
+            "CKPT_MAX_DIRTY_BYTES = float(os.environ.get(\"POKERBOT_CKPT_MAX_DIRTY_GB\", \"24\")) * 1e9\n"
+            "CKPT_MIN_GAP_SECS = float(os.environ.get(\"POKERBOT_CKPT_MIN_GAP_SECS\", \"60\"))\n"
+            "_ROLL = {\"last_ts\": time.time(), \"bpr\": 60.0}  # last-ckpt wall time + EMA delta bytes/dirty-row\n"
+            "\n"
+            "\n"
+            "def _roll_due(t):\n"
+            "    # Returns a reason string when a hybrid rolling checkpoint is due, else None. Called\n"
+            "    # between training chunks strictly mid-window (never at a gate/ITERS boundary).\n"
+            "    now = time.time()\n"
+            "    if now - _ROLL[\"last_ts\"] < CKPT_MIN_GAP_SECS:\n"
+            "        return None\n"
+            "    (dc, ds) = t.dirty_counts()\n"
+            "    est = (dc + ds) * _ROLL[\"bpr\"]\n"
+            "    if CKPT_MAX_DIRTY_BYTES > 0 and est >= CKPT_MAX_DIRTY_BYTES:\n"
+            "        return (f\"size est_dirty={est / 1e9:.2f}GB >= cap={CKPT_MAX_DIRTY_BYTES / 1e9:.2f}GB \"\n"
+            "                f\"(rows={dc + ds} bpr={_ROLL['bpr']:.1f})\")\n"
+            "    if CKPT_SECS > 0 and now - _ROLL[\"last_ts\"] >= CKPT_SECS:\n"
+            "        return f\"time {now - _ROLL['last_ts']:.0f}s >= {CKPT_SECS:.0f}s\"\n"
+            "    return None\n"
             "\n"
             "\n"
             "def _ckpt(t, wait=False):\n"
@@ -562,6 +649,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "    # DELTA decision: base at a gate / first-after-restart / full-dirty; delta otherwise.\n"
             "    want_delta = (DELTA_CKPT and _BASE[\"iter\"] is not None and not _is_gate(it))\n"
             "    if want_delta:\n"
+            "        (pre_dc, pre_ds) = t.dirty_counts()  # BEFORE save/reset: the EMA bytes/row input\n"
             "        try:\n"
             "            os.makedirs(CKPT_DIR, exist_ok=True)\n"
             "            dpath = os.path.join(CKPT_DIR, f\"iter_{it:06d}.nldlt\")\n"
@@ -573,9 +661,14 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "            os.replace(dpath + \".tmp\", dpath)\n"
             "            _BASE[\"seq\"] += 1\n"
             "            t.reset_dirty()  # window captured & durable-locally; next window starts clean\n"
-            "            (dc, ds) = t.dirty_counts()  # 0,0 right after reset -- log the pre-reset was done in _handoff\n"
+            "            rows = pre_dc + pre_ds\n"
+            "            if rows > 0:\n"
+            "                # EMA bytes/dirty-row from the ACTUAL delta -- feeds _roll_due's size estimate\n"
+            "                _ROLL[\"bpr\"] += 0.5 * (nbytes / rows - _ROLL[\"bpr\"])\n"
+            "            _ROLL[\"last_ts\"] = time.time()\n"
             "            print(f\"CKPT_DELTA iters_done={it} base={_BASE['iter']} seq={_BASE['seq']} \"\n"
             "                  f\"bytes={nbytes} wall={time.time() - t0:.1f}s \"\n"
+            "                  f\"dirty_rows={rows} bpr={_ROLL['bpr']:.1f} \"\n"
             "                  f\"cum_rows={t.n_cum_infosets()}\", flush=True)\n"
             "            _handoff_upload(dpath, it, wait, base_iter=_BASE[\"iter\"], seq=_BASE[\"seq\"])\n"
             "            return\n"
@@ -594,6 +687,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "        _BASE[\"iter\"] = it  # this base roots the next delta chain\n"
             "        _BASE[\"seq\"] = 0\n"
             "        t.reset_dirty()\n"
+            "        _ROLL[\"last_ts\"] = time.time()  # a base also resets the hybrid rolling clock\n"
             "    print(f\"CKPT_SERIALIZE iters_done={it} bytes={nbytes} wall={time.time() - t0:.1f}s (direct-to-file)\", flush=True)\n"
             "    _handoff_upload(path, it, wait)\n"
             "\n"
@@ -637,6 +731,17 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "            _STOP[\"rebal_done\"] = True\n"
             "            print(f\"REBALANCE early-signal ckpt at iters_done={t.iters_done()}\", flush=True)\n"
             "            _ckpt(t)\n"
+            "        if (DELTA_CKPT and t.iters_done() < upto and not _STOP[\"reclaim\"]\n"
+            "                and not os.path.exists(RECLAIM_FLAG)):\n"
+            "            # HYBRID rolling trigger (time/size, mid-window only -- boundaries are gates/ITERS\n"
+            "            # and get their checkpoint from the main loop). With _BASE unarmed (fresh start)\n"
+            "            # the first fire writes the chain-root FULL BASE via _ckpt's fall-through. Skipped\n"
+            "            # when a reclaim is pending: the emergency flush banks the window SYNCHRONOUSLY\n"
+            "            # instead (a detached upload would die with the box and lose the reset window).\n"
+            "            why = _roll_due(t)\n"
+            "            if why is not None:\n"
+            "                print(f\"ROLLING ckpt ({why}) at iters_done={t.iters_done()}\", flush=True)\n"
+            "                _ckpt(t)\n"
             "\n"
             "\n"
             "def _emergency_flush(t):\n"
@@ -1794,7 +1899,23 @@ def main() -> None:
                         "the last checkpoint (NLDLT001 sidecar); full NLCFR001 bases at gate iters. "
                         "Resume = base + verified contiguous delta chain (driver-sim: final state "
                         "byte-identical to uninterrupted). Cuts the per-checkpoint pause + upload from "
-                        "full-blob-sized to dirty-set-sized -- the spot-storm lever at short cadence.")
+                        "full-blob-sized to dirty-set-sized -- the spot-storm lever at short cadence. "
+                        "Rolling cadence on this path is the HYBRID --ckpt-secs/--ckpt-max-dirty-gb "
+                        "time/size triggers (2026-07-06); --checkpoint-every is then inert (harmless).")
+    p.add_argument("--ckpt-secs", type=int, default=600,
+                   help="HYBRID rolling-checkpoint TIME trigger (delta path only, 2026-07-06): a rolling "
+                        "delta checkpoint fires when wall-clock since the last checkpoint reaches this "
+                        "many seconds (bounds replay loss when dirty growth is slow, e.g. post-pruning). "
+                        "0 disables the time trigger. Only meaningful with --delta-ckpt; non-delta paths "
+                        "keep the --checkpoint-every iter cadence unchanged. Exported as "
+                        "POKERBOT_CKPT_SECS in the v3 env block.")
+    p.add_argument("--ckpt-max-dirty-gb", type=float, default=24.0,
+                   help="HYBRID rolling-checkpoint SIZE trigger (delta path only): fires when ESTIMATED "
+                        "dirty bytes (dirty_counts() rows x an EMA bytes/row learned from each actual "
+                        "delta save, seeded 60 B/row) reach this many GB -- keeps the graceful-reclaim "
+                        "emergency flush (serialize ~0.85 GB/s + sync upload ~0.5 GB/s ~= 3.2 s/GB) "
+                        "inside the 2-min notice + 100 s grace. 0 disables the size trigger. Exported "
+                        "as POKERBOT_CKPT_MAX_DIRTY_GB in the v3 env block.")
     p.add_argument("--profile-run", action="store_true", default=False,
                    help="COMPUTE PROFILER sidecar on the box: mpstat -P ALL 30 (per-core utilization) "
                         "+ pidstat -u -r 30 on the driver (CPU%%/RSS churn) + ONE steady-state "
@@ -1903,7 +2024,8 @@ def main() -> None:
         work_steal=args.work_steal, dcfr=args.dcfr,
         dcfr_prune_threshold=args.dcfr_prune_threshold, dcfr_explore_frac=args.dcfr_explore_frac,
         v3=v3_cfg, row_budget=args.row_budget, no_cache_fetch=args.no_cache_fetch,
-        delta_ckpt=args.delta_ckpt, profile_run=args.profile_run,
+        delta_ckpt=args.delta_ckpt, ckpt_secs=args.ckpt_secs,
+        ckpt_max_dirty_gb=args.ckpt_max_dirty_gb, profile_run=args.profile_run,
         wall_guard_secs=wall_guard_secs, awscli_zip=awscli_zip,
     )
     bootstrap_key = f"{args.prefix}/{run_subdir}/code/bootstrap.sh"
@@ -1960,7 +2082,7 @@ def main() -> None:
     # InstanceType is set per-attempt by _launch_with_fallback; drop the static key so the helper owns it.
     run_kwargs.pop("InstanceType", None)
     instance_types = (
-        _spotpick_chain(args.instance_type, args.arch, args.spotpick_n)
+        _sps_rank_chain(_spotpick_chain(args.instance_type, args.arch, args.spotpick_n), args.region)
         if args.spotpick else [args.instance_type]
     )
     if len(instance_types) > 1:

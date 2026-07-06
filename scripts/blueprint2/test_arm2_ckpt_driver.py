@@ -12,14 +12,34 @@ against a FAKE filesystem-backed boto3 and a FAKE deterministic battery_native t
      PARTIAL upload (blob, no marker) and a CORRUPT candidate (marker with wrong sha) ABOVE it.
   3. RESUME run         -> must reject the corrupt candidate, ignore the partial, resume from the
      newest VERIFIED marker, and finish with a final state IDENTICAL to run 1.
-  4. DELTA run          -> bases at gates, deltas between; + rebalance-recommendation flag banks
-     one extra mid-window delta through the normal detached path (chunked train loop).
+  4. DELTA run          -> hybrid-trigger mode: chain-root base + size-triggered deltas between
+     iter-exact gate bases; + rebalance-recommendation flag banks one extra mid-window delta
+     through the normal detached path (chunked train loop).
   5. DELTA kill+resume  -> base + contiguous verified delta chain -> identical final state.
   6. EMERGENCY FLUSH    -> reclaim flag mid-window -> synchronous delta + marker banked at a
      NON-cadence iter, exit 0; a fresh resume applies base + emergency delta -> identical final.
   7. PRESTAGE valid     -> bootstrap-prestaged base+chain consumed (S3 blobs deleted to PROVE no
      download happened) -> identical final.
   8. PRESTAGE stale     -> manifest points at a superseded marker -> clean fallback download.
+  9. CHAIN CONTINUATION -> post-resume re-arm: first ckpt after resume is a DELTA (seq N+1),
+     not a full base (the load-wipes-arming bug).
+ 10. HYBRID SIZE        -> size trigger fires mid-window at an ARBITRARY (odd) iter; chain stays
+     contiguous; kill+resume -> identical final.
+ 11. HYBRID TIME        -> time trigger (small CKPT_SECS) fires when dirty accumulation is slow;
+     rolling checkpoints land at non-gate iters; identical final.
+ 12. GATE EXACTNESS     -> gate bases + snapshots land ITER-EXACT even when a rolling trigger
+     fired one iter earlier.
+ 13. MIN-GAP GUARD      -> CKPT_MIN_GAP_SECS suppresses back-to-back triggers under an
+     always-firing size cap.
+
+HYBRID ROLLING CADENCE (2026-07-06): on the delta path the rolling-checkpoint cadence is no
+longer CKPT_EVERY iters but the time/size triggers (POKERBOT_CKPT_SECS /
+POKERBOT_CKPT_MAX_DIRTY_GB, min-interval POKERBOT_CKPT_MIN_GAP_SECS). Delta scenarios pin all
+three explicitly (see delta_env) and pad fake deltas to a fixed 60 B/dirty-row
+(FAKE_DELTA_PAD_BPR), freezing the driver's EMA bytes/row at its seed so size-trigger fire
+points are DETERMINISTIC: with CHUNK=1 the trigger fires when 120 * n_dirty_iters >= cap bytes
+(cap 240 B => every 2nd mid-window iter counted from the last checkpoint, cap 120 B => every
+mid-window iter, cap 360 B => every 3rd).
 
 No AWS, no network, no real trainer: this validates the driver/uploader/marker/retention logic
 only (the trainer-level resume bit-identity is covered by the ab_train Rust smoke; the chunked
@@ -205,6 +225,17 @@ class NlheCFRTrainer:
         if self._dirty is None:
             return None
         b = self._blob(self.MAGIC_DELTA, self._dirty, base_iter, seq)
+        # FAKE_DELTA_PAD_BPR (hybrid-trigger sim): zero-pad the delta file to exactly BPR bytes
+        # per dirty ROW (dirty_counts() reports (n, n) => 2n rows), pinning the driver's EMA
+        # bytes/row at its 60 B/row seed so size-trigger fire points are deterministic. The
+        # padding sits after the sha tail: apply_delta parses length-prefixed members and never
+        # reads it, and the .ok marker's bytes/sha are computed from the written file, so
+        # verification stays consistent.
+        bpr = float(os.environ.get("FAKE_DELTA_PAD_BPR", "0"))
+        if bpr > 0:
+            want = int(bpr * 2 * len(self._dirty))
+            if want > len(b):
+                b += bytes(want - len(b))
         with open(path, "wb") as f:
             f.write(b)
         return len(b)
@@ -313,6 +344,18 @@ def setup_env(tmp: Path, tag: str):
     return box, env
 
 
+def delta_env(env, cap_gb, secs="0", mingap="0", chunk="1", pad="60"):
+    """Delta-mode env with the HYBRID rolling-trigger knobs pinned (2026-07-06). Defaults:
+    time trigger OFF (secs=0), min-gap OFF (deterministic size-only cadence), CHUNK=1 (every
+    iter is a mid-window trigger opportunity), fake deltas padded to 60 B/dirty-row so the
+    size estimate is exactly 120 * n_dirty_iters bytes. cap_gb is the POKERBOT_CKPT_MAX_DIRTY_GB
+    string: "2.4e-7" = 240 B (fires every 2nd dirty iter), "1.2e-7" = 120 B (every dirty iter),
+    "3.6e-7" = 360 B (every 3rd), "0" = size trigger off."""
+    return dict(env, POKERBOT_DELTA_CKPT="1", POKERBOT_CKPT_CHUNK=chunk,
+                POKERBOT_CKPT_SECS=secs, POKERBOT_CKPT_MAX_DIRTY_GB=cap_gb,
+                POKERBOT_CKPT_MIN_GAP_SECS=mingap, FAKE_DELTA_PAD_BPR=pad)
+
+
 def s3_keys(box: Path):
     base = box / "s3" / "fakebucket"
     out = []
@@ -397,7 +440,7 @@ def main():
     print(f"[smoke] sandbox {tmp}", flush=True)
     try:
         # ---------- run 1: uninterrupted reference ----------
-        print("[smoke] 1/9 uninterrupted reference run...", flush=True)
+        print("[smoke] 1/13 uninterrupted reference run...", flush=True)
         box1, env1 = setup_env(tmp, "ref")
         rc, out = run_driver(box1, env1)
         assert rc == 0, f"reference run rc={rc}\n{out}"
@@ -424,7 +467,7 @@ def main():
               f"kept={marker_iters(box1)} snaps={snap_iters}", flush=True)
 
         # ---------- run 2: kill mid-run after the iter-6 marker ----------
-        print("[smoke] 2/9 kill-mid-run (simulated spot reclaim after iter-6 marker)...", flush=True)
+        print("[smoke] 2/13 kill-mid-run (simulated spot reclaim after iter-6 marker)...", flush=True)
         box2, env2 = setup_env(tmp, "killed")
         rc, out = run_driver(box2, env2, sleep="0.5", kill_after_marker=6)
         assert rc != 0
@@ -442,7 +485,7 @@ def main():
               flush=True)
 
         # ---------- run 3: resume ----------
-        print("[smoke] 3/9 resume run (must reject corrupt@9, ignore partial@7, resume@6)...",
+        print("[smoke] 3/13 resume run (must reject corrupt@9, ignore partial@7, resume@6)...",
               flush=True)
         rc, out = run_driver(box2, env2)
         assert rc == 0, f"resume run rc={rc}\n{out}"
@@ -454,16 +497,17 @@ def main():
             "resumed final state != uninterrupted final state"
         print("[smoke]   OK resumed@6 -> final state IDENTICAL to the uninterrupted run", flush=True)
 
-        # ---------- run 4: DELTA-mode uninterrupted (POKERBOT_DELTA_CKPT=1) ----------
-        # A gate (iter 5,10) and the first checkpoint write a full base; the rolling checkpoints in between
-        # write NLDLT001-shaped deltas. Final state must equal run-1's, and delta blobs must exist on S3.
-        print("[smoke] 4/9 delta-mode run (base at gates, deltas between; final == uninterrupted)...",
-              flush=True)
+        # ---------- run 4: DELTA-mode uninterrupted (POKERBOT_DELTA_CKPT=1, HYBRID cadence) ----------
+        # HYBRID triggers govern the rolling checkpoints: cap 240 B (est = 120 * dirty iters) fires
+        # every 2nd mid-window iter counted from the last checkpoint; gates (5,10) + final (12) are
+        # iter-exact full bases; the chain-root base is written by the FIRST rolling fire (iter 2).
+        # Pre-touched rebalance flag banks ONE extra detached delta at iter 3 (first armed mid-window
+        # chunk), which resets the dirty window, shifting the deterministic schedule to:
+        #   bases [2, 5, 10, 12], deltas [3(rebal), 7, 9].
+        print("[smoke] 4/13 delta-mode run (hybrid size cadence; gates iter-exact; final == "
+              "uninterrupted)...", flush=True)
         box4, env4 = setup_env(tmp, "delta")
-        # CHUNK=1 (< CKPT_EVERY) so the chunked train loop has mid-window boundaries; pre-touch the
-        # rebalance flag so the driver banks ONE extra detached delta mid-window (graceful-reclaim
-        # rework item d), then keeps training to an identical final state.
-        env4 = dict(env4, POKERBOT_DELTA_CKPT="1", POKERBOT_CKPT_CHUNK="1")
+        env4 = delta_env(env4, "2.4e-7")
         (box4 / "tmp" / "spot_rebalance").write_text("1", encoding="utf-8")
         rc, out = run_driver(box4, env4)
         if os.environ.get("DELTA_DEBUG"):
@@ -471,21 +515,19 @@ def main():
         assert rc == 0, f"delta run rc={rc}\n{out}"
         # post-wipe-fix banner: fresh start arms AFTER the (absent) load, in the else branch
         assert "DELTA_CKPT armed (fresh start)" in out, f"delta arm banner missing:\n{out}"
+        assert "ROLLING ckpt (size" in out, f"size trigger never fired:\n{out}"
         wait_uploads(box4, {ITERS})
         assert final_blob(box4, ITERS) == ref_final, "delta-mode final base != uninterrupted final state"
-        # Deltas were WRITTEN at the non-gate rolling checkpoints (from the driver log) — and bases only
-        # at the first checkpoint + gate boundaries. (Deltas rooted at a SUPERSEDED base are pruned by
-        # design once a newer base lands, so we assert on the log, not the final S3 state.)
+        # Deltas were WRITTEN at the size-triggered rolling checkpoints (from the driver log) — and
+        # bases only at the chain-root fire + gate boundaries. (Deltas rooted at a SUPERSEDED base are
+        # pruned by design once a newer base lands, so we assert on the log, not the final S3 state.)
         delta_writes = sorted(int(m.group(1)) for m in
                               re.finditer(r"CKPT_DELTA iters_done=(\d+)", out))
         base_writes = sorted(int(m.group(1)) for m in
                              re.finditer(r"CKPT_SERIALIZE iters_done=(\d+)", out))
-        assert delta_writes, f"no deltas written in delta mode:\n{out}"
+        assert base_writes == [2, 5, 10, 12], f"base schedule wrong: {base_writes}"
+        assert delta_writes == [3, 7, 9], f"delta schedule wrong: {delta_writes}"
         assert all(di % GATE_EVERY != 0 for di in delta_writes), f"a gate got a delta: {delta_writes}"
-        # First checkpoint (iter 2) + every gate (5,10) + final (12) are full bases.
-        assert 2 in base_writes and GATES <= set(base_writes), f"base schedule wrong: {base_writes}"
-        # No boundary is both a base and a delta.
-        assert not (set(delta_writes) & set(base_writes)), "boundary both base and delta"
         # Rebalance recommendation banked exactly ONE extra mid-window delta (a non-boundary iter).
         assert out.count("REBALANCE early-signal ckpt") == 1, \
             f"rebalance ckpt should fire exactly once:\n{out}"
@@ -496,20 +538,21 @@ def main():
               f"rebalance@{rebal_iter}, final IDENTICAL", flush=True)
 
         # ---------- run 5: DELTA-mode kill + resume (base + delta chain) ----------
-        print("[smoke] 5/9 delta-mode kill + resume (base@5 + delta chain -> identical final)...",
+        # Hybrid cap 240 B, no rebalance: deterministic schedule bases [2,5,10,12], deltas [4,7,9].
+        print("[smoke] 5/13 delta-mode kill + resume (base@5 + delta chain -> identical final)...",
               flush=True)
         box5, env5 = setup_env(tmp, "delta_resume")
-        env5 = dict(env5, POKERBOT_DELTA_CKPT="1")
-        # Kill AFTER the iter-8 delta marker lands (base 5 + deltas 6,8 durable) so resume must apply the
-        # delta chain. all_marker_iters counts delta markers too (iter 8 is a .nldlt.ok).
-        rc, out = run_driver(box5, env5, sleep="0.5", kill_after_marker=8,
+        env5 = delta_env(env5, "2.4e-7")
+        # Kill AFTER the iter-7 delta marker lands (base 5 + delta seq1@7 durable) so resume must
+        # apply the delta chain. all_marker_iters counts delta markers too (iter 7 is a .nldlt.ok).
+        rc, out = run_driver(box5, env5, sleep="0.5", kill_after_marker=7,
                              marker_fn=all_marker_iters)
         assert rc != 0
         have5 = set(all_marker_iters(box5))
-        assert 8 in have5 and ITERS not in have5, f"unexpected markers after delta kill: {have5}"
+        assert 7 in have5 and ITERS not in have5, f"unexpected markers after delta kill: {have5}"
         rc, out = run_driver(box5, env5)
         assert rc == 0, f"delta resume rc={rc}\n{out}"
-        # Resume must load base 5 and apply the delta chain (seq 1 -> iter 6, seq 2 -> iter 8).
+        # Resume must load base 5 and apply the delta chain (seq 1 -> iter 7, + any later stragglers).
         assert re.search(r"RESUME applied delta seq=\d+", out), \
             f"delta resume did not exercise the chain:\n{out}"
         assert "base_iter=5" in out, f"resume base should be gate 5:\n{out}"
@@ -523,10 +566,12 @@ def main():
         # spot_watch touches the reclaim flag; the CHUNKED train loop notices it mid-window, banks
         # the un-checkpointed iters as ONE synchronous delta at a NON-cadence iter (+ .ok marker),
         # and exits 0. A fresh resume must land on base + emergency delta.
-        print("[smoke] 6/9 emergency flush (reclaim flag mid-window -> banked delta @ "
+        print("[smoke] 6/13 emergency flush (reclaim flag mid-window -> banked delta @ "
               "non-cadence iter)...", flush=True)
         box6, env6 = setup_env(tmp, "emergency")
-        env6 = dict(env6, POKERBOT_DELTA_CKPT="1", POKERBOT_CKPT_CHUNK="1")
+        # cap 240 B: chain-root base fires at iter 2 (as before); the flag lands mid-window right
+        # after its marker, so the flush banks iter 3 -- a NON-cadence iter on every axis.
+        env6 = delta_env(env6, "2.4e-7")
         reclaim_flag = box6 / "tmp" / "spot_reclaim"
         rc, out = run_driver(box6, env6, sleep="2.0", flag_delay=0.2,
                              touch_flag_after=(2, str(reclaim_flag)))
@@ -553,15 +598,26 @@ def main():
               f"IDENTICAL final", flush=True)
 
         # ---------- run 7: PRESTAGE valid (bootstrap-prestaged base+chain; NO blob download) ----------
-        print("[smoke] 7/9 prestage-valid resume (S3 blobs deleted -> prestaged copies used)...",
+        print("[smoke] 7/13 prestage-valid resume (S3 blobs deleted -> prestaged copies used)...",
               flush=True)
         box7, env7 = setup_env(tmp, "prestage")
-        env7 = dict(env7, POKERBOT_DELTA_CKPT="1")
-        rc, out = run_driver(box7, env7, sleep="0.5", kill_after_marker=8,
+        # cap 120 B: a delta fires at EVERY mid-window iter -> gate base@5 roots a chain at 6,7(,8..);
+        # kill after the iter-7 delta marker so >= 2 chain links are durable.
+        env7 = delta_env(env7, "1.2e-7")
+        rc, out = run_driver(box7, env7, sleep="0.5", kill_after_marker=7,
                              marker_fn=all_marker_iters)
         assert rc != 0
         ck7 = (box7 / "s3" / "fakebucket" / "pokerbot" / "prod6000" / "native_cfr" / "smoke_arm2"
                / "checkpoints")
+        # QUIESCE: the detached uploaders survive the driver kill; wait for the durable marker set
+        # to go stable before snapshotting the chain (hybrid deltas land at timing-decided iters).
+        prev, t0q = None, time.time()
+        while time.time() - t0q < 15:
+            cur = all_marker_iters(box7)
+            if cur == prev:
+                break
+            prev = cur
+            time.sleep(1.0)
         ckdir = box7 / "opt" / "ckpt"
         ckdir.mkdir(parents=True, exist_ok=True)
         pfx = "pokerbot/prod6000/native_cfr/smoke_arm2/checkpoints/"
@@ -572,35 +628,48 @@ def main():
                         "path": str(bpath).replace("\\", "/"), "iters_done": 5,
                         "bytes": base_meta["bytes"], "sha256": base_meta["sha256"]},
                "deltas": []}
-        for seq, it in [(1, 6), (2, 8)]:
-            dmeta = json.loads((ck7 / f"iter_{it:06d}.nldlt.ok").read_text(encoding="utf-8"))
+        # discover the CONTIGUOUS durable chain rooted at base 5 from the .ok markers
+        chain = {}
+        for mk in ck7.glob("iter_*.nldlt.ok"):
+            meta = json.loads(mk.read_text(encoding="utf-8"))
+            if meta.get("base_iter") == 5:
+                chain[int(meta["seq"])] = int(meta["iters_done"])
+        seq, chain_blobs, chain_end = 1, [], 5
+        while seq in chain:
+            it7_ = chain[seq]
+            dmeta = json.loads((ck7 / f"iter_{it7_:06d}.nldlt.ok").read_text(encoding="utf-8"))
             dpath = ckdir / f"prestage_delta_{seq:04d}.nldlt"
-            shutil.copyfile(ck7 / f"iter_{it:06d}.nldlt", dpath)
-            man["deltas"].append({"marker": pfx + f"iter_{it:06d}.nldlt.ok",
+            shutil.copyfile(ck7 / f"iter_{it7_:06d}.nldlt", dpath)
+            man["deltas"].append({"marker": pfx + f"iter_{it7_:06d}.nldlt.ok",
                                   "path": str(dpath).replace("\\", "/"), "seq": seq,
                                   "base_iter": 5, "bytes": dmeta["bytes"],
                                   "sha256": dmeta["sha256"]})
+            chain_blobs.append(f"iter_{it7_:06d}.nldlt")
+            chain_end = it7_
+            seq += 1
+        n_chain = len(chain_blobs)
+        assert n_chain >= 2, f"expected >= 2 durable chain deltas rooted at base 5: {chain}"
         (ckdir / "prestage_manifest.json").write_text(json.dumps(man), encoding="utf-8")
         (ckdir / "prestage.started").write_text("1", encoding="utf-8")
         (ckdir / "prestage.done").write_text("done", encoding="utf-8")
         # DELETE the blobs from fake S3 (markers stay): a successful resume PROVES the driver used
         # the prestaged files and never issued a blob download.
-        for blob in ["iter_000005.nlcfr", "iter_000006.nldlt", "iter_000008.nldlt"]:
+        for blob in ["iter_000005.nlcfr"] + chain_blobs:
             (ck7 / blob).unlink()
         rc, out = run_driver(box7, env7)
         assert rc == 0, f"prestage resume rc={rc}\n{out}"
-        assert out.count("RESUME using prestaged") == 3, \
-            f"expected 3 prestaged consumptions (base + 2 deltas):\n{out}"
-        assert "RESUMED from latest checkpoint at iters_done=8" in out, out
-        assert "(base_iter=5, +2 deltas)" in out, out
+        assert out.count("RESUME using prestaged") == 1 + n_chain, \
+            f"expected {1 + n_chain} prestaged consumptions (base + {n_chain} deltas):\n{out}"
+        assert f"RESUMED from latest checkpoint at iters_done={chain_end}" in out, out
+        assert f"(base_iter=5, +{n_chain} deltas)" in out, out
         wait_uploads(box7, {ITERS})
         assert final_blob(box7, ITERS) == ref_final, \
             "prestaged resume final state != uninterrupted final state"
-        print("[smoke]   OK prestaged base+2 deltas consumed (blobs absent on S3) -> IDENTICAL "
-              "final", flush=True)
+        print(f"[smoke]   OK prestaged base+{n_chain} deltas consumed (blobs absent on S3) -> "
+              f"IDENTICAL final", flush=True)
 
         # ---------- run 8: PRESTAGE stale (newer marker appeared) -> clean fallback download ----------
-        print("[smoke] 8/9 prestage-stale resume (manifest points at an old marker -> fresh "
+        print("[smoke] 8/13 prestage-stale resume (manifest points at an old marker -> fresh "
               "download)...", flush=True)
         stale_path = ckdir / "prestage_base.nlcfr"
         shutil.copyfile(ck7 / "iter_000010.nlcfr", stale_path)
@@ -626,22 +695,23 @@ def main():
         # AFTER load + delta apply, reset_dirty, and roots _BASE at the resumed marker -- so the
         # FIRST post-resume cadence checkpoint must be a cheap DELTA continuing the chain (seq N+1
         # on the same base), and a subsequent kill+resume must apply base + N+1 deltas.
-        print("[smoke] 9/9 post-resume chain continuation (first ckpt after resume is a DELTA, "
+        print("[smoke] 9/13 post-resume chain continuation (first ckpt after resume is a DELTA, "
               "seq N+1)...", flush=True)
         box9, env9 = setup_env(tmp, "chain_cont")
-        env9 = dict(env9, POKERBOT_DELTA_CKPT="1")
-        # Kill after the iter-6 delta marker: durable state = base@5 + delta seq1@6 (N=1); the
-        # next boundary (8) is NOT a gate, so a correctly re-armed driver must write a DELTA there.
-        rc, out = run_driver(box9, env9, sleep="0.5", kill_after_marker=6,
+        # Leg 1 (cap 240 B -> deltas at 4,7): kill after the iter-7 delta marker; durable state =
+        # base@5 + delta seq1@7 (N=1).
+        rc, out = run_driver(box9, delta_env(env9, "2.4e-7"), sleep="0.5", kill_after_marker=7,
                              marker_fn=all_marker_iters)
         assert rc != 0
-        # resume run, killed right after the first post-resume cadence checkpoint's marker (8)
-        rc, out = run_driver(box9, env9, sleep="0.5", kill_after_marker=8,
+        # Leg 2 (cap 120 B -> the size trigger fires at the FIRST post-resume mid-window iter, 8):
+        # a correctly re-armed driver must write a DELTA there (seq 2 on the same base 5), not a
+        # full base. Killed right after that delta's marker (8) lands.
+        rc, out = run_driver(box9, delta_env(env9, "1.2e-7"), sleep="1.5", kill_after_marker=8,
                              marker_fn=all_marker_iters)
         assert rc != 0
         assert "DELTA_CKPT armed post-load; chain rooted at base=5 seq=1" in out, \
             f"post-load arm banner missing/wrong:\n{out}"
-        assert "RESUMED from latest checkpoint at iters_done=6 (base_iter=5, +1 deltas)" in out, out
+        assert "RESUMED from latest checkpoint at iters_done=7 (base_iter=5, +1 deltas)" in out, out
         first_ckpt = re.search(r"CKPT_(SERIALIZE|DELTA) iters_done=(\d+)(?: base=(\d+) seq=(\d+))?",
                                out)
         assert first_ckpt, f"no checkpoint line in resume run:\n{out}"
@@ -653,8 +723,8 @@ def main():
                / "checkpoints")
         mk8 = json.loads((ck9 / "iter_000008.nldlt.ok").read_text(encoding="utf-8"))
         assert mk8["base_iter"] == 5 and mk8["seq"] == 2 and mk8["iters_done"] == 8, mk8
-        # final resume: must apply base@5 + BOTH deltas (6, 8) and finish identical to run 1
-        rc, out = run_driver(box9, env9)
+        # final resume: must apply base@5 + BOTH deltas (7, 8) and finish identical to run 1
+        rc, out = run_driver(box9, delta_env(env9, "2.4e-7"))
         assert rc == 0, f"chain-continuation final resume rc={rc}\n{out}"
         assert "DELTA_CKPT armed post-load; chain rooted at base=5 seq=2" in out, out
         assert "RESUMED from latest checkpoint at iters_done=8 (base_iter=5, +2 deltas)" in out, out
@@ -663,6 +733,108 @@ def main():
             "chain-continuation resumed final state != uninterrupted final state"
         print("[smoke]   OK resume re-armed post-load: first ckpt = DELTA@8 (base 5, seq 2); "
               "kill+resume applied base+2 deltas -> IDENTICAL final", flush=True)
+
+        # ---------- run 10: HYBRID SIZE trigger at an ARBITRARY iter + kill + resume ----------
+        # cap 360 B (est = 120 * dirty iters => fires every 3rd): the chain-root base lands at
+        # iter 3 -- an ODD iter no CKPT_EVERY cadence could produce -- and the base-5 chain's
+        # delta at iter 8. Kill after that marker; resume must apply the chain and finish
+        # byte-identical.
+        print("[smoke] 10/13 hybrid SIZE trigger (arbitrary-iter ckpts; kill+resume identical)...",
+              flush=True)
+        box10, env10 = setup_env(tmp, "hybrid_size")
+        env10 = delta_env(env10, "3.6e-7")
+        rc, out = run_driver(box10, env10, sleep="0.5", kill_after_marker=8,
+                             marker_fn=all_marker_iters)
+        assert rc != 0
+        assert "ROLLING ckpt (size" in out, f"size trigger never fired:\n{out}"
+        assert re.search(r"CKPT_SERIALIZE iters_done=3 ", out), \
+            f"chain-root base must land at the size-trigger iter 3 (arbitrary/odd):\n{out}"
+        assert re.search(r"CKPT_DELTA iters_done=8 base=5 seq=1", out), \
+            f"size-triggered delta @8 (base 5, seq 1) missing:\n{out}"
+        rc, out = run_driver(box10, env10)
+        assert rc == 0, f"hybrid-size resume rc={rc}\n{out}"
+        assert "(base_iter=5, +1 deltas)" in out, f"chain not applied on resume:\n{out}"
+        wait_uploads(box10, {ITERS})
+        assert final_blob(box10, ITERS) == ref_final, \
+            "hybrid-size resumed final state != uninterrupted final state"
+        print("[smoke]   OK size trigger fired @3 (base) and @8 (delta, base 5 seq 1); resume "
+              "IDENTICAL final", flush=True)
+
+        # ---------- run 11: HYBRID TIME trigger (slow dirty accumulation) ----------
+        # Size trigger OFF, CKPT_SECS=2 s, ~0.9 s/iter: rolling checkpoints fire on wall-clock
+        # roughly every 2-3 iters at timing-decided (non-gate) iters; gates stay iter-exact.
+        # Wide-margin asserts only (timing-based).
+        print("[smoke] 11/13 hybrid TIME trigger (CKPT_SECS=2; rolling ckpts on wall-clock)...",
+              flush=True)
+        box11, env11 = setup_env(tmp, "hybrid_time")
+        env11 = delta_env(env11, "0", secs="2")
+        rc, out = run_driver(box11, env11, sleep="0.9")
+        assert rc == 0, f"hybrid-time run rc={rc}\n{out}"
+        assert out.count("ROLLING ckpt (time") >= 1, f"time trigger never fired:\n{out}"
+        delta_writes = sorted(int(m.group(1)) for m in
+                              re.finditer(r"CKPT_DELTA iters_done=(\d+)", out))
+        base_writes = sorted(int(m.group(1)) for m in
+                             re.finditer(r"CKPT_SERIALIZE iters_done=(\d+)", out))
+        assert all(di % GATE_EVERY != 0 for di in delta_writes), \
+            f"a gate got a delta under the time trigger: {delta_writes}"
+        assert GATES <= set(base_writes), f"gate bases missing/inexact: {base_writes}"
+        wait_uploads(box11, {ITERS})
+        assert final_blob(box11, ITERS) == ref_final, \
+            "hybrid-time final state != uninterrupted final state"
+        print(f"[smoke]   OK time trigger fired {out.count('ROLLING ckpt (time')}x "
+              f"(bases={base_writes} deltas={delta_writes}); final IDENTICAL", flush=True)
+
+        # ---------- run 12: GATE EXACTNESS under rolling fires ----------
+        # cap 240 B, no rebalance: deterministic schedule bases [2,5,10,12] / deltas [4,7,9] --
+        # the delta at 9 fires ONE iter before gate 10, and the gate must still land ITER-EXACT
+        # as a full base with the v3 extras (snapshots ONLY at gates).
+        print("[smoke] 12/13 gate exactness (rolling delta 1 iter before an iter-exact gate "
+              "base)...", flush=True)
+        box12, env12 = setup_env(tmp, "gate_exact")
+        env12 = delta_env(env12, "2.4e-7")
+        rc, out = run_driver(box12, env12)
+        assert rc == 0, f"gate-exactness run rc={rc}\n{out}"
+        delta_writes = sorted(int(m.group(1)) for m in
+                              re.finditer(r"CKPT_DELTA iters_done=(\d+)", out))
+        base_writes = sorted(int(m.group(1)) for m in
+                             re.finditer(r"CKPT_SERIALIZE iters_done=(\d+)", out))
+        assert base_writes == [2, 5, 10, 12], f"gate bases must land iter-exact: {base_writes}"
+        assert delta_writes == [4, 7, 9], f"delta schedule wrong: {delta_writes}"
+        assert 9 in delta_writes and 10 in base_writes, "rolling@9 + gate@10 adjacency missing"
+        wait_uploads(box12, {ITERS})
+        snaps12 = sorted(int(re.search(r"snap_(\d+)\.nlsnap$", k).group(1))
+                         for k in s3_keys(box12) if k.endswith(".nlsnap"))
+        assert snaps12 == [5, 10, 12], \
+            f"snapshots must land ONLY at gate iters despite rolling fires: {snaps12}"
+        assert final_blob(box12, ITERS) == ref_final, \
+            "gate-exactness final state != uninterrupted final state"
+        print(f"[smoke]   OK delta@9 then FULL base@10 iter-exact; snaps={snaps12}; final "
+              f"IDENTICAL", flush=True)
+
+        # ---------- run 13: MIN-INTERVAL guard suppresses back-to-back triggers ----------
+        # Always-firing size cap (1 byte) + CKPT_MIN_GAP_SECS=2 s @ ~0.5 s/iter: without the
+        # guard EVERY mid-window iter would checkpoint (adjacent iters); with it, consecutive
+        # rolling fires must be >= 2 iters apart (wall-clock floor ~4 iters; margin 2) and only
+        # a few of the ~9 mid-window opportunities may fire. Wide-margin asserts (timing-based).
+        print("[smoke] 13/13 min-interval guard (always-firing cap throttled by "
+              "CKPT_MIN_GAP_SECS)...", flush=True)
+        box13, env13 = setup_env(tmp, "min_gap")
+        env13 = delta_env(env13, "1e-9", mingap="2.0")
+        rc, out = run_driver(box13, env13, sleep="0.5")
+        assert rc == 0, f"min-gap run rc={rc}\n{out}"
+        roll_iters = [int(m.group(1)) for m in
+                      re.finditer(r"ROLLING ckpt \(.*?\) at iters_done=(\d+)", out)]
+        assert roll_iters, f"no rolling fire at all (cap=1 byte should fire once >=2s in):\n{out}"
+        assert len(roll_iters) <= 5, \
+            f"min-gap failed to throttle the 1-byte cap: fires at {roll_iters}"
+        gaps = [b - a for a, b in zip(roll_iters, roll_iters[1:])]
+        assert all(g >= 2 for g in gaps), \
+            f"back-to-back rolling fires slipped past the min-gap guard: {roll_iters}"
+        wait_uploads(box13, {ITERS})
+        assert final_blob(box13, ITERS) == ref_final, \
+            "min-gap final state != uninterrupted final state"
+        print(f"[smoke]   OK min-gap throttled fires to {roll_iters} (gaps {gaps}); final "
+              f"IDENTICAL", flush=True)
 
         print(f"[smoke] ALL PASS in {time.time() - t_start:.1f}s", flush=True)
     finally:
