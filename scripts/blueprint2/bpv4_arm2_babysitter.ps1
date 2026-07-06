@@ -83,7 +83,7 @@
     -CheckpointEvery 250 `
     -GateEvery 2500 `
     -CkptVolumeGb 400 `
-    -InstanceType "c6a.32xlarge" `
+    -InstanceType "m6i.32xlarge" `
     -Spotpick `
     -MaxHours 20 `
     -NoConvergeStop `
