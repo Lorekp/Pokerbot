@@ -90,6 +90,10 @@ MENUS = {
     # Pluribus-shaped: rich early, thin late is NOT expressible per-node without a tree
     # spec; this approximates "rich pre + moderate post"
     "richpre": {"pre": list(range(7)), "post": [0, 1, 3, 4, 5]},
+    # arm-3 (SPLIT preflop): FIRST raise (no raise yet this hand, current_bet <= BB) uses the
+    # widened 5-size menu; RE-raises (3-bet+, current_bet > BB) keep the legacy 3-size menu.
+    # "pre_rr" is optional per menu; when absent, "pre" applies at all preflop nodes (legacy).
+    "arm3": {"pre": [2, 3, 4, 5, 6], "pre_rr": [4, 5, 6], "post": [0, 1, 3, 4, 5]},
 }
 
 def menu_masks(menu):
@@ -101,7 +105,14 @@ def menu_masks(menu):
         pre[BET0 + b] = True
     for b in menu["post"]:
         post[BET0 + b] = True
-    return pre, post
+    pre_rr = None
+    if "pre_rr" in menu:
+        pre_rr = [False] * 11
+        for i in (FOLD, CHECK, CALL, ALL_IN):
+            pre_rr[i] = True
+        for b in menu["pre_rr"]:
+            pre_rr[BET0 + b] = True
+    return pre, pre_rr, post
 
 def arr(state):
     return np.frombuffer(state, np.int64)
@@ -124,24 +135,47 @@ def action_amount(a, action):
         return to_call + max(target - committed, 0)
     return 0
 
-def allowed_actions(state, a, pre_mask, post_mask, dedupe, mrr=False):
+def allowed_actions(state, a, pre_mask, post_mask, dedupe, mrr=False, flop_rr_keep=None,
+                    pre_rr_mask=None, bb=0):
     """legal AND menu, with equal-final-commit aggressive actions deduped (lowest idx kept).
 
+    Preflop menu split (arm-3): when pre_rr_mask is not None, preflop nodes at which a raise
+    already exists (current_bet > bb) use pre_rr_mask instead of pre_mask; first-raise nodes
+    (current_bet <= bb, i.e. unopened/limped pot) keep the widened pre_mask. bb = big-blind
+    amount (root current_bet). Betting-state-only inputs, so memo-consistent.
+
     mrr=True applies Pluribus's deep-node rule (design M-RR, §4.2.2 / P-supp p.12-13): POSTFLOP,
-    a RE-raise (raising while FACING a live bet) is thinned to {1x pot, all-in}; the FIRST bet of
-    a street keeps the full postflop menu. This is action-abstraction thinning (perfect recall of
-    the *thinned* actions preserved), NOT history/key truncation — the design's "structural relief
-    valve, ahead of key truncation" that collapses the ~10^30 history space toward Pluribus's
-    finite 664.8M-class scale."""
+    two thinning rules apply (mirrors trainer.rs abstracted_legal_mrr, lines 994-1007):
+      (a) RE-raise (facing a live bet, street>=1): thinned to {1x pot, all-in} (keep [4]).
+          On the FLOP (street==1) the raise-size keep-list is overridable via flop_rr_keep
+          (arm-3 uses [1, 4] = {1/2 pot, 1x pot, all-in}); turn/river re-raise stays [4].
+      (b) Turn/river FIRST raise (street>=2, not facing a live bet): thinned to
+          {1/2 pot, 1x pot, all-in} (BET0+1 and BET0+4).
+    The FIRST bet on flop (street==1, not facing bet) keeps the full postflop menu in all cases.
+    This is action-abstraction thinning (perfect recall of the *thinned* actions preserved), NOT
+    history/key truncation -- the design's "structural relief valve" that collapses the ~10^30
+    history space toward Pluribus's finite 664.8M-class scale."""
     legal = bn.legal_action_mask(state, -1)
     street = int(a[O_STREET])
-    menu = pre_mask if street == 0 else post_mask
+    if street == 0:
+        menu = pre_mask
+        if pre_rr_mask is not None and int(a[O_CURRENT_BET]) > bb:
+            menu = pre_rr_mask  # a raise already exists this hand -> RE-raise menu
+    else:
+        menu = post_mask
     acts = [i for i in range(11) if legal[i] and menu[i]]
     if mrr and street >= 1:
         seat = int(a[O_ACTION_SEAT])
         facing_bet = int(a[O_CURRENT_BET]) > int(a[O_COMMITTED_STREET + seat])
-        if facing_bet:  # RE-raise decision -> thin raise sizes to {1x pot, all-in}
-            keep = {FOLD, CHECK, CALL, ALL_IN, BET0 + 4}  # BET0+4 = 1.0x pot bucket
+        if facing_bet:
+            # (a) RE-raise: raise sizes thinned to keep-list [4] ({1x pot, all-in});
+            # on the flop, flop_rr_keep (when given) overrides the keep-list.
+            rr_buckets = flop_rr_keep if (street == 1 and flop_rr_keep is not None) else [4]
+            keep = {FOLD, CHECK, CALL, ALL_IN} | {BET0 + b for b in rr_buckets}
+            acts = [i for i in acts if i in keep]
+        elif street >= 2:
+            # (b) Turn/river first raise: thin to {1/2 pot, 1x pot, all-in}.
+            keep = {FOLD, CHECK, CALL, ALL_IN, BET0 + 1, BET0 + 4}  # BET0+1 = 0.5x, BET0+4 = 1.0x
             acts = [i for i in acts if i in keep]
     if not any(acts):
         acts = [i for i in range(11) if legal[i]][:1]  # engine guarantees CHECK fallback
@@ -229,10 +263,11 @@ def add(u, v):
     return tuple(x + y for x, y in zip(u, v))
 
 def enumerate_menu(menu_name, dedupe, max_states, log_every, progress, preflop_only=False,
-                   mrr=False):
-    pre_mask, post_mask = menu_masks(MENUS[menu_name])
+                   mrr=False, flop_rr_keep=None):
+    pre_mask, pre_rr_mask, post_mask = menu_masks(MENUS[menu_name])
     deck = list(range(52))
     root = bn.init_hand(0, [10000] * 6, [1] * 6, 0, deck, [1, 2])
+    bb = int(arr(root)[O_CURRENT_BET])  # big blind = root current_bet
     memo = {}
     key_groups = set()      # (pos, betting6) at preflop decision nodes  (deployed keying)
     key_groups_h3 = set()   # (pos, betting6, hist3)                     (bp3 keying anchor)
@@ -306,7 +341,8 @@ def enumerate_menu(menu_name, dedupe, max_states, log_every, progress, preflop_o
                     b6 = betting6(a, seat)
                     key_groups.add((pos, b6))
                     key_groups_h3.add((pos, b6, hist3(a)))
-                acts = allowed_actions(state, a, pre_mask, post_mask, dedupe, mrr)
+                acts = allowed_actions(state, a, pre_mask, post_mask, dedupe, mrr,
+                                       flop_rr_keep, pre_rr_mask, bb)
                 frame[1] = [bn.apply_action(state, act) for act in acts]
                 frame[2] = 0
                 frame[3] = tuple(d)
@@ -329,6 +365,7 @@ def enumerate_menu(menu_name, dedupe, max_states, log_every, progress, preflop_o
     return {
         "menu": menu_name,
         "mrr": mrr,
+        "flop_rr_keep": flop_rr_keep,
         "dedupe_equal_amount": dedupe,
         "aborted_at_max_states": aborted[0],
         "distinct_betting_states": len(memo),
@@ -341,13 +378,16 @@ def enumerate_menu(menu_name, dedupe, max_states, log_every, progress, preflop_o
         "elapsed_s": round(time.time() - t0, 1),
     }
 
-def walk_census(menu_name, dedupe, n_deals, seed, progress, snap_every=1000, mrr=False):
+def walk_census(menu_name, dedupe, n_deals, seed, progress, snap_every=1000, mrr=False,
+                flop_rr_keep=None):
     """Trainer-visitation census: for each deal, run 6 hero traversals (hero branches ALL
     allowed actions; opponents sample ONE uniform-over-allowed). Count distinct FULL-HISTORY
     rows per street: key = (street, actor-derived pos [pre] , card-class/bucket, action hist).
     Card part: preflop = 169-class of hero; postflop = made-hand bucket 200 via
     bn.fingerprint_fast digest (cheap, deployed-shape); the history part is exact."""
-    pre_mask, post_mask = menu_masks(MENUS[menu_name])
+    pre_mask, pre_rr_mask, post_mask = menu_masks(MENUS[menu_name])
+    bb = int(arr(bn.init_hand(0, [10000] * 6, [1] * 6, 0, list(range(52)), [1, 2]))[
+        O_CURRENT_BET])  # big blind = root current_bet
     rng = np.random.default_rng(seed)
     rows = [set(), set(), set(), set()]        # full-history keys per street
     rows_summary = [set(), set(), set(), set()]  # deployed summary keys (digest) per street
@@ -374,7 +414,8 @@ def walk_census(menu_name, dedupe, n_deals, seed, progress, snap_every=1000, mrr
         rows_summary[street].add(digest)
         rows[street].add((digest[:5], hist))  # digest[:5] carries card-bucket byte-space;
         # (bucket,hist) distinctness == (digest_cardpart,hist): betting6 is hist-redundant
-        acts = allowed_actions(state, a, pre_mask, post_mask, dedupe, mrr)
+        acts = allowed_actions(state, a, pre_mask, post_mask, dedupe, mrr,
+                               flop_rr_keep, pre_rr_mask, bb)
         if seat == hero:
             for act in acts:
                 traverse(bn.apply_action(state, act), hero)
@@ -404,8 +445,8 @@ def walk_census(menu_name, dedupe, n_deals, seed, progress, snap_every=1000, mrr
             curve.append(snap)
             progress(json.dumps(snap))
     return {
-        "menu": menu_name, "mrr": mrr, "dedupe_equal_amount": dedupe, "deals": done_deals,
-        "seed": seed,
+        "menu": menu_name, "mrr": mrr, "flop_rr_keep": flop_rr_keep, "dedupe_equal_amount": dedupe,
+        "deals": done_deals, "seed": seed,
         "rows_fullhist_final": {"preflop": len(rows[0]), "flop": len(rows[1]),
                                  "turn": len(rows[2]), "river": len(rows[3])},
         "rows_summary_final": {"preflop": len(rows_summary[0]), "flop": len(rows_summary[1]),
@@ -426,21 +467,31 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--preflop-only", action="store_true")
     ap.add_argument("--mrr", action="store_true",
-                    help="apply Pluribus deep-node rule: postflop re-raises thinned to {1x pot, all-in}")
+                    help="apply Pluribus deep-node rule: postflop re-raises thinned to {1x pot, all-in}"
+                         " AND turn/river first-raises thinned to {1/2 pot, 1x pot, all-in}")
+    ap.add_argument("--flop-rr-keep", default="",
+                    help="(only meaningful with --mrr) comma list of bet-bucket indices kept for"
+                         " FLOP re-raise nodes, e.g. '1,4' = {1/2 pot, 1x pot, all-in}."
+                         " Absent = legacy [4]. Turn/river re-raise keep stays [4].")
     args = ap.parse_args()
+    flop_rr_keep = None
+    if args.flop_rr_keep:
+        flop_rr_keep = [int(x) for x in args.flop_rr_keep.split(",")]
 
     def progress(msg):
         tag = "+mrr" if args.mrr else ""
+        if args.mrr and flop_rr_keep is not None:
+            tag += "+frr" + ".".join(str(b) for b in flop_rr_keep)
         print(f"[census {args.mode} {args.menu}{tag}] {msg}", flush=True)
 
     if args.mode == "enumerate":
         res = enumerate_menu(args.menu, not args.no_dedupe, args.max_states,
                              args.log_every, progress, preflop_only=args.preflop_only,
-                             mrr=args.mrr)
+                             mrr=args.mrr, flop_rr_keep=flop_rr_keep)
         res["preflop_only"] = args.preflop_only
     else:
         res = walk_census(args.menu, not args.no_dedupe, args.deals, args.seed, progress,
-                          mrr=args.mrr)
+                          mrr=args.mrr, flop_rr_keep=flop_rr_keep)
     js = json.dumps(res, indent=2)
     print(js)
     if args.out:

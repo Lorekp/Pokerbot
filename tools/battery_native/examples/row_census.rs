@@ -16,8 +16,8 @@
 use battery_native::core::{apply_action, is_chance_node, sample_chance, EnvStateN, NUM_PLAYERS};
 use battery_native::playout::Rng;
 use battery_native::trainer::{
-    abstracted_legal_pub, allowed_mask, deal_root_pub, deserialize, fingerprint_fast_depth_memo_emd,
-    sample_action_pub, uniform_over_legal_pub, TrainerCfg,
+    abstracted_legal_pub, deal_root_pub, deserialize, fingerprint_fast_depth_memo_emd,
+    keep_mask_from_env, sample_action_pub, uniform_over_legal_pub, TrainerCfg,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
@@ -127,8 +127,9 @@ fn main() {
     let cfg = TrainerCfg {
         num_buckets,
         depth_edges: vec![],
-        allowed_pre: allowed_mask(&[4, 5, 6]),
-        allowed_post: allowed_mask(&[0, 1, 3, 4, 5]),
+        // Arm-3 menu envs (absent => legacy, byte-identical) — must match the run being censused.
+        allowed_pre: keep_mask_from_env("POKERBOT_PRE_KEEP", &[4, 5, 6]),
+        allowed_post: keep_mask_from_env("POKERBOT_POST_KEEP", &[0, 1, 3, 4, 5]),
         n_deals_per_iter: 200,
         base_seed: 0xC0FFEE,
         n_seats: 6,

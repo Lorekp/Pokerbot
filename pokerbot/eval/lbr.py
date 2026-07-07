@@ -159,7 +159,40 @@ _STREET_NAMES = {0: "preflop", 1: "flop", 2: "turn", 3: "river"}
 # Default OFF ⇒ byte-identical (mask untouched). Mirrors trainer.rs mrr_reraise_keep / mrr_tr_first_keep
 # (bucket ids 4 = 1.0x pot and 1 = 0.5x pot are both in the deployed post-list (0,1,3,4,5), so
 # intersecting the already-post-masked mask == the trainer's direct keep-list application).
-_MRR_ON = os.environ.get("POKERBOT_MRR", "0") not in ("0", "", "false", "False")
+# EXACT-TWIN parse rule: mirror the Rust trainer's env_flag predicate byte-for-byte
+# (`v == "1" || v.eq_ignore_ascii_case("true")`) — the old loose `not in ("0","","false","False")`
+# accepted values (e.g. "yes") the trainer ignores, a silent train/serve skew.
+def _env_flag(name: str) -> bool:
+    v = os.environ.get(name, "")
+    return v == "1" or v.lower() == "true"
+
+
+def _env_keep(name: str, default: tuple[int, ...] | None) -> tuple[int, ...] | None:
+    """Comma-separated bet-bucket keep list (trainer twin). Absent/empty -> ``default``.
+
+    Malformed tokens raise ValueError (fail LOUD, mirroring the Rust parse — a silent fallback
+    would serve a wrong menu and skew every downstream EV comparison)."""
+    raw = os.environ.get(name, "")
+    ids = tuple(int(tok) for tok in (t.strip() for t in raw.split(",")) if tok)
+    return ids if ids else default
+
+
+_MRR_ON = _env_flag("POKERBOT_MRR")
+# blueprint-v4 arm-3: trainer keep-list twins, parsed once at import like the abstraction envs (set
+# them BEFORE importing pokerbot). All-unset defaults are byte-identical legacy behavior.
+#   POKERBOT_PRE_KEEP     preflop FIRST-raise menu — applies while no raise exists yet this hand
+#                         (current_bet <= BB_CHIPS; limps/SB-completes don't move current_bet).
+#                         Default (4,5,6).
+#   POKERBOT_PRE_RR_KEEP  preflop RE-raise (3-bet+) menu — applies when current_bet > BB_CHIPS.
+#                         Unset/empty -> None => the PRE_KEEP mask applies everywhere preflop (legacy).
+#   POKERBOT_POST_KEEP    postflop menu. Default (0,1,3,4,5).
+#   POKERBOT_FLOP_RR_KEEP under MRR only: FLOP (street==1) re-raise keep-list. Unset/empty -> None =>
+#                         legacy MRR thin {4} (1.0x pot + jam). Turn/river re-raises ALWAYS stay {4}
+#                         regardless of this env.
+_PRE_KEEP = _env_keep("POKERBOT_PRE_KEEP", (4, 5, 6))
+_PRE_RR_KEEP = _env_keep("POKERBOT_PRE_RR_KEEP", None)
+_POST_KEEP = _env_keep("POKERBOT_POST_KEEP", (0, 1, 3, 4, 5))
+_FLOP_RR_KEEP = _env_keep("POKERBOT_FLOP_RR_KEEP", None)
 
 
 def bp_coverage_reset() -> None:
@@ -379,24 +412,44 @@ def make_blueprint_policy(snapshot: dict[bytes, np.ndarray], *, client_bet_sizin
     from pokerbot.encoding.fingerprint_native import fingerprint_fast
 
     weva = default_weva_bucket_table()
-    allowed_pre = _build_allowed_action_mask((4, 5, 6)) if client_bet_sizing else None
-    allowed_post = _build_allowed_action_mask((0, 1, 3, 4, 5)) if client_bet_sizing else None
+    allowed_pre = _build_allowed_action_mask(_PRE_KEEP) if client_bet_sizing else None
+    # arm-3 preflop split (POKERBOT_PRE_RR_KEEP): separate RE-raise (3-bet+) menu. None when unset =>
+    # allowed_pre applies everywhere preflop (legacy, byte-identical).
+    allowed_pre_rr = (_build_allowed_action_mask(_PRE_RR_KEEP)
+                      if client_bet_sizing and _PRE_RR_KEEP is not None else None)
+    allowed_post = _build_allowed_action_mask(_POST_KEEP) if client_bet_sizing else None
     # M-RR serve twin (POKERBOT_MRR, see module comment): postflop re-raise / turn-river first-raise
     # keep-lists mirroring trainer.rs. None when off ⇒ the mask logic below is byte-identical.
     mrr_reraise = _build_allowed_action_mask((4,)) if _MRR_ON else None
+    # arm-3 (POKERBOT_FLOP_RR_KEEP): FLOP re-raise keep-list override under MRR. None when unset =>
+    # the legacy {1.0x pot} thin applies on every postflop street (byte-identical).
+    mrr_flop_rr = (_build_allowed_action_mask(_FLOP_RR_KEEP)
+                   if _MRR_ON and _FLOP_RR_KEEP is not None else None)
     mrr_tr_first = _build_allowed_action_mask((1, 4)) if _MRR_ON else None
 
     def policy(env, seat: int) -> np.ndarray:
         mask = legal_action_mask_np(env, seat).astype(bool)
+        street = int(env.street)
         if client_bet_sizing:
-            mask = _apply_abstraction_mask(mask, int(env.street), allowed_pre, allowed_post).astype(bool)
-        if _MRR_ON and int(env.street) != 0:
+            if street == 0 and allowed_pre_rr is not None and float(env.current_bet) > float(CHIP_UNIT):
+                # arm-3 preflop RE-raise node: a raise already exists this hand (current_bet > BB;
+                # limps/SB-completes leave current_bet == BB_CHIPS == CHIP_UNIT — same chip units as
+                # the facing-bet predicate below). PRE_KEEP stays the FIRST-raise-only menu.
+                mask = mask & allowed_pre_rr
+            else:
+                mask = _apply_abstraction_mask(mask, street, allowed_pre, allowed_post).astype(bool)
+        if _MRR_ON and street != 0:
             # trainer::abstracted_legal_mrr node classification: "facing a live bet" == any raise here
             # is a RE-raise (same predicate: current_bet > committed_street[seat]). F/X/C/ALL_IN are in
             # every keep-list, so the masked set can never go empty.
             if float(env.current_bet) > float(env.committed_street[seat]):
-                mask = mask & mrr_reraise
-            elif int(env.street) >= 2:
+                if street == 1 and mrr_flop_rr is not None:
+                    # arm-3 FLOP re-raise keep-list (POKERBOT_FLOP_RR_KEEP). Turn/river re-raises
+                    # ALWAYS stay the legacy {1.0x pot} thin regardless of this env.
+                    mask = mask & mrr_flop_rr
+                else:
+                    mask = mask & mrr_reraise
+            elif street >= 2:
                 mask = mask & mrr_tr_first
         key = fingerprint_fast(env, seat, weva_table=weva)
         row = snapshot.get(key)

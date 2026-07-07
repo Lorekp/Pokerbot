@@ -281,7 +281,7 @@ bash /tmp/bootstrap.sh
 def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_deals, num_buckets,
                    depth_edges, checkpoint_every, gate_every=0, keep_alive=False, emd_frozen_rel="", emd_sha="",
                    river_ochs_rel="", river_ochs_sha="", preflop_hist_key=False,
-                   fullhist_key=False, mrr=False,
+                   fullhist_key=False, mrr=False, pre_keep="", pre_rr_keep="", flop_rr_keep="",
                    work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
                    v3=None, row_budget=None, no_cache_fetch=False, delta_ckpt=False,
                    ckpt_secs=600, ckpt_max_dirty_gb=48.0, ckpt_min_gap_secs=300, profile_run=False,
@@ -314,6 +314,35 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
         )
     else:
         fullhist_block = ""
+    # arm-3 Pluribus-grade menu knobs (amendment sec 24). ADDITIVE + default-off BYTE-IDENTICAL:
+    # all three empty => all blocks are "" => zero extra bytes vs arm-2b. Comma-sep bet-bucket keep
+    # lists passed straight to ab_train (trainer reads them via env; absent/empty = legacy menu):
+    # POKERBOT_PRE_KEEP     : preflop FIRST-raise (open) menu; legacy {4,5,6} when absent.
+    # POKERBOT_PRE_RR_KEEP  : preflop 3-bet+ (re-raise) menu; legacy when absent.
+    # POKERBOT_FLOP_RR_KEEP : flop re-raise keep list under M-RR (which buckets the M-RR re-raise
+    #   thinning retains on the flop); original M-RR thinning when absent.
+    # Serve/eval MUST set the same envs (train/serve abstraction-skew guard).
+    if pre_keep:
+        pre_keep_block = (
+            f"\nexport POKERBOT_PRE_KEEP={pre_keep}\n"
+            f'echo "PRE_KEEP=$POKERBOT_PRE_KEEP"'
+        )
+    else:
+        pre_keep_block = ""
+    if pre_rr_keep:
+        pre_rr_keep_block = (
+            f"\nexport POKERBOT_PRE_RR_KEEP={pre_rr_keep}\n"
+            f'echo "PRE_RR_KEEP=$POKERBOT_PRE_RR_KEEP"'
+        )
+    else:
+        pre_rr_keep_block = ""
+    if flop_rr_keep:
+        flop_rr_keep_block = (
+            f"\nexport POKERBOT_FLOP_RR_KEEP={flop_rr_keep}\n"
+            f'echo "FLOP_RR_KEEP=$POKERBOT_FLOP_RR_KEEP"'
+        )
+    else:
+        flop_rr_keep_block = ""
     # blueprint-v4 v3 TRAINER SCHEDULE (LCFR + hard negative-regret pruning + snapshot averaging +
     # coverage metric — artifacts/blueprint_v4_amendment_v3.md). ADDITIVE + default-off BYTE-IDENTICAL,
     # gated exactly like ``fullhist_block``: with ``v3=None`` all three placeholders render as "" (each is
@@ -1661,7 +1690,7 @@ export PYTHONPATH=/opt/pokerbot RUST_BACKTRACE=1
 # stamps + guards it). "0" is byte-identical to the shipped key space.
 export POKERBOT_PREFLOP_HIST_KEY={hist_flag}
 echo "PREFLOP_HIST_KEY=$POKERBOT_PREFLOP_HIST_KEY"
-{fullhist_block}{v3_env_block}{row_budget_env}
+{fullhist_block}{pre_keep_block}{pre_rr_keep_block}{flop_rr_keep_block}{v3_env_block}{row_budget_env}
 # S2: verify the shipped EMD frozen blob matches its known sha256 BEFORE training. A same-K CORRUPTED blob
 # (truncated S3 round-trip) -> wrong potential-aware buckets -> a broken blueprint that the convergence-stop
 # (abstraction-agnostic) cannot catch and only the final ranking gate would; the ctor's num_buckets==K check
@@ -1885,6 +1914,23 @@ def main() -> None:
                         "from ~10^31 to a Pluribus-class ~413M rows (bpv4-mrr-relief-valve). Default off => "
                         "byte-identical bootstrap. Any in-model probe/eval MUST also set POKERBOT_MRR=1 "
                         "(train/probe abstraction skew otherwise biases the verdict).")
+    p.add_argument("--pre-keep", default="", dest="pre_keep",
+                   help="arm-3 Pluribus-grade preflop FIRST-raise (open) menu: comma-sep bet-bucket keep "
+                        "list exported as POKERBOT_PRE_KEEP on the box. E.g. '2,3,4,5,6' = opens "
+                        "2.0/2.12/2.5/3.25/4.0bb (amendment sec 24). Empty (default) = absent = legacy "
+                        "{4,5,6} keep list = byte-identical bootstrap. Serve/eval MUST set the same env "
+                        "(train/serve abstraction-skew guard).")
+    p.add_argument("--pre-rr-keep", default="", dest="pre_rr_keep",
+                   help="arm-3: preflop 3-bet+ (re-raise) menu: comma-sep bet-bucket keep list exported "
+                        "as POKERBOT_PRE_RR_KEEP on the box (amendment sec 24). Empty (default) = absent "
+                        "= legacy re-raise menu = byte-identical bootstrap. Serve/eval MUST set the "
+                        "same env.")
+    p.add_argument("--flop-rr-keep", default="", dest="flop_rr_keep",
+                   help="arm-3: flop re-raise keep list under M-RR: comma-sep bet-bucket list exported "
+                        "as POKERBOT_FLOP_RR_KEEP on the box -- which buckets the M-RR re-raise "
+                        "thinning retains on the FLOP (turn/river keep the original M-RR thinning). "
+                        "Empty (default) = absent = original M-RR on all streets = byte-identical "
+                        "bootstrap. Pair with --mrr. Serve/eval MUST set the same env.")
     p.add_argument("--work-steal", action="store_true",
                    help="atomic deal-counter + rayon::broadcast scheduler (closes the deep-deal load "
                         "imbalance; +33%% deals/s @64c measured). Statistically-equivalent, default OFF.")
@@ -2067,6 +2113,7 @@ def main() -> None:
         river_ochs_rel=args.river_ochs, river_ochs_sha=river_ochs_sha,
         preflop_hist_key=args.preflop_hist_key,
         fullhist_key=args.fullhist_key, mrr=args.mrr,
+        pre_keep=args.pre_keep, pre_rr_keep=args.pre_rr_keep, flop_rr_keep=args.flop_rr_keep,
         work_steal=args.work_steal, dcfr=args.dcfr,
         dcfr_prune_threshold=args.dcfr_prune_threshold, dcfr_explore_frac=args.dcfr_explore_frac,
         v3=v3_cfg, row_budget=args.row_budget, no_cache_fetch=args.no_cache_fetch,

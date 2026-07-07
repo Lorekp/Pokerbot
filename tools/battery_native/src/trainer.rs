@@ -932,6 +932,13 @@ fn accumulate_local_into(acc: &mut NlheTables, local: &mut LocalDelta) {
 /// explicit `InfosetCfg` field in Stage 1). Do NOT assume serve inherits the thinning from this knob —
 /// a v4 blueprint trained under thinned menus but served on the full menu is the train/serve action-
 /// abstraction skew §4.2.2 exists to prevent.
+///
+/// ARM-3 MENU ENVS (amendment sec 24; all absent => byte-identical legacy; Python twin =
+/// `pokerbot/eval/lbr.py`):
+///   POKERBOT_PRE_KEEP  / POKERBOT_POST_KEEP  — constructor-site keep lists (`keep_mask_from_env`,
+///     read by ab_train / row_census / the pyclass ctor). PRE applies at the preflop FIRST raise.
+///   POKERBOT_PRE_RR_KEEP  — preflop RE-raise (3-bet+) keep list; absent => allowed_pre everywhere.
+///   POKERBOT_FLOP_RR_KEEP — flop re-raise keep under M-RR; absent => {1x pot, all-in}.
 fn mrr_enabled() -> bool {
     use std::sync::OnceLock;
     static ENV: OnceLock<bool> = OnceLock::new();
@@ -962,6 +969,79 @@ fn mrr_tr_first_keep() -> &'static [bool; NUM_ACTIONS] {
     M.get_or_init(|| allowed_mask(&[1, 4]))
 }
 
+/// Parse a comma-separated bet-bucket keep list (e.g. "2,3,4,5,6"). Bucket indices are
+/// `BET_BUCKETS_F32` positions 0..=6 (action id = `BET_BUCKET_START + index`). Errors (malformed
+/// token, out-of-range bucket, or an empty list) are returned so env-driven callers can FAIL LOUD —
+/// a typo'd menu env silently falling back to the default is exactly the dead-knob class the
+/// 2026-07-02 tree-divergence postmortem exists to prevent.
+pub fn parse_keep_list(s: &str) -> Result<Vec<usize>, String> {
+    let mut v = Vec::new();
+    for tok in s.split(',') {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let i: usize = t
+            .parse()
+            .map_err(|_| format!("bad bet-bucket token {t:?}"))?;
+        if i >= core::N_BUCKETS {
+            return Err(format!(
+                "bet bucket {i} out of range 0..={}",
+                core::N_BUCKETS - 1
+            ));
+        }
+        v.push(i);
+    }
+    if v.is_empty() {
+        return Err("empty keep list".into());
+    }
+    Ok(v)
+}
+
+/// Read a keep-list env var into a mask. Absent/blank => `None` (caller uses its compiled default);
+/// present-but-malformed => PANIC at first use (visible in the ab_train console banner path — never
+/// a silent fallback).
+fn keep_env_mask(var: &'static str) -> Option<[bool; NUM_ACTIONS]> {
+    match std::env::var(var) {
+        Ok(s) if !s.trim().is_empty() => {
+            let keep =
+                parse_keep_list(&s).unwrap_or_else(|e| panic!("{var}={s:?} invalid: {e}"));
+            Some(allowed_mask(&keep))
+        }
+        _ => None,
+    }
+}
+
+/// Env-defaulted keep mask for constructor sites (`ab_train`, `row_census`, the pyclass ctor):
+/// `POKERBOT_PRE_KEEP` / `POKERBOT_POST_KEEP` override the compiled defaults [4,5,6] / [0,1,3,4,5].
+pub fn keep_mask_from_env(var: &'static str, default_keep: &[usize]) -> [bool; NUM_ACTIONS] {
+    keep_env_mask(var).unwrap_or_else(|| allowed_mask(default_keep))
+}
+
+/// ARM-3 MENU KNOB `POKERBOT_PRE_RR_KEEP` (read once): PREFLOP RE-RAISE keep list. Applies at
+/// preflop nodes where a raise already exists this hand (`current_bet > BB_CHIPS`, i.e. any raise
+/// here is a 3-bet+). Absent => `cfg.allowed_pre` everywhere preflop (legacy, byte-identical).
+/// Rationale (amendment sec 24): Pluribus's round-1 menu is fine-grained "depending on the
+/// particular decision point" — wide at the FIRST raise, coarse in re-raise wars; applying a
+/// widened menu at every preflop raise level enumerates >=11.2x the history space (census).
+fn pre_rr_keep_env() -> Option<&'static [bool; NUM_ACTIONS]> {
+    use std::sync::OnceLock;
+    static M: OnceLock<Option<[bool; NUM_ACTIONS]>> = OnceLock::new();
+    M.get_or_init(|| keep_env_mask("POKERBOT_PRE_RR_KEEP")).as_ref()
+}
+
+/// ARM-3 MENU KNOB `POKERBOT_FLOP_RR_KEEP` (read once): FLOP RE-RAISE keep list under M-RR.
+/// Absent => `mrr_reraise_keep()` = {1x pot, all-in} (legacy, byte-identical). Arm-3 sets "1,4"
+/// ({1/2 pot, 1x pot, all-in}) — a measured widening of the one node class where our M-RR thins
+/// MORE than Pluribus (whose rounds-3/4-only re-raise rule leaves round 2 unspecified). Only
+/// consulted when `POKERBOT_MRR=1` and street == 1 facing a live bet; turn/river re-raises stay
+/// on the Pluribus-exact {1x pot, all-in} regardless.
+fn flop_rr_keep_env() -> Option<&'static [bool; NUM_ACTIONS]> {
+    use std::sync::OnceLock;
+    static M: OnceLock<Option<[bool; NUM_ACTIONS]>> = OnceLock::new();
+    M.get_or_init(|| keep_env_mask("POKERBOT_FLOP_RR_KEEP")).as_ref()
+}
+
 #[inline]
 fn abstracted_legal<const N: usize>(
     s: &EnvStateN<N>,
@@ -973,7 +1053,9 @@ fn abstracted_legal<const N: usize>(
 
 /// The `abstracted_legal` body with M-RR as an explicit parameter (so unit tests can exercise both
 /// arms without touching the process-global env OnceLock). `mrr == false` is the EXACT legacy body
-/// (pre/post split), preserving byte-identity when the env is unset.
+/// (pre/post split), preserving byte-identity when the env is unset. The two arm-3 menu envs are
+/// consulted here (OnceLock, both absent => legacy body verbatim); tests exercise them via
+/// `abstracted_legal_menus` with explicit `Option` masks.
 #[inline]
 fn abstracted_legal_mrr<const N: usize>(
     s: &EnvStateN<N>,
@@ -981,8 +1063,25 @@ fn abstracted_legal_mrr<const N: usize>(
     cfg: &TrainerCfg,
     mrr: bool,
 ) -> [bool; NUM_ACTIONS] {
+    abstracted_legal_menus(s, seat, cfg, mrr, pre_rr_keep_env(), flop_rr_keep_env())
+}
+
+/// Menu-parameterized `abstracted_legal` body. `pre_rr`/`flop_rr` are the arm-3 overrides
+/// (`POKERBOT_PRE_RR_KEEP` / `POKERBOT_FLOP_RR_KEEP` at the env-driven call site); `None` for both
+/// is the EXACT pre-arm-3 body.
+#[inline]
+fn abstracted_legal_menus<const N: usize>(
+    s: &EnvStateN<N>,
+    seat: usize,
+    cfg: &TrainerCfg,
+    mrr: bool,
+    pre_rr: Option<&[bool; NUM_ACTIONS]>,
+    flop_rr: Option<&[bool; NUM_ACTIONS]>,
+) -> [bool; NUM_ACTIONS] {
     let full = core::legal_action_mask(s, seat as i32);
-    // Preflop: legacy menu, UNTOUCHED (served direct, its fineness is load-bearing — design §4.2.2).
+    // Preflop: `allowed_pre` at the FIRST raise (no raise yet this hand <=> current_bet is still the
+    // blind: `current_bet <= BB_CHIPS`; limps/SB-completes don't move it), `pre_rr` (if set) once a
+    // raise exists — any raise there is a 3-bet+.
     // Postflop under M-RR: choose the thinned menu for this node. F/X/C/AI are in EVERY keep-list, so
     // the masked set is never empty (the same CHECK-fallback invariant the census relies on). `seat` is
     // the acting seat (== `s.action_seat` at every call site — `legal_action_mask` above is computed for
@@ -992,11 +1091,19 @@ fn abstracted_legal_mrr<const N: usize>(
     // [0,1,3,4,5] since both kept bet buckets (id4=½, id7=1x) ARE in it. If a future menu config drops
     // bucket 1 or 4 from `allowed_post`, intersect the keep-lists with it here (Stage-1 `InfosetCfg`).
     let allowed: &[bool; NUM_ACTIONS] = if s.street == 0 {
-        &cfg.allowed_pre
+        if s.current_bet > core::BB_CHIPS {
+            pre_rr.unwrap_or(&cfg.allowed_pre)
+        } else {
+            &cfg.allowed_pre
+        }
     } else if mrr {
         let facing_bet = s.current_bet > s.committed_street[seat];
         if facing_bet {
-            mrr_reraise_keep()
+            if s.street == 1 {
+                flop_rr.unwrap_or_else(|| mrr_reraise_keep())
+            } else {
+                mrr_reraise_keep()
+            }
         } else if s.street >= 2 {
             mrr_tr_first_keep()
         } else {
@@ -5371,6 +5478,159 @@ mod tests {
             tr_off,
             legacy(&turn, ts, &cfg.allowed_post),
             "turn first-raise OFF == legacy allowed_post"
+        );
+    }
+
+    /// Arm-3 menu knobs — exercises `abstracted_legal_menus` with explicit `Option` masks (NOT the
+    /// process-global env OnceLocks). Same engine-built node idiom as `test_mrr_menu_thinning`.
+    /// Covers: (a) `None,None` == `abstracted_legal_mrr` legacy body at every probed node class;
+    /// (b) preflop FIRST raise ignores `pre_rr` (widened `allowed_pre` visible instead);
+    /// (c) preflop RE-raise (3-bet node) uses `pre_rr` when set; (d) flop re-raise uses `flop_rr`
+    /// when set (widened past {1x,AI}) while the TURN re-raise stays on `mrr_reraise_keep`;
+    /// (e) `parse_keep_list` accepts/rejects correctly.
+    #[test]
+    fn test_arm3_menu_knobs() {
+        let x = core::CHECK;
+        let bbs = core::BET_BUCKET_START;
+        let mut cfg = test_cfg(64);
+
+        // (e) parse_keep_list.
+        assert_eq!(parse_keep_list("2,3,4,5,6").unwrap(), vec![2, 3, 4, 5, 6]);
+        assert_eq!(parse_keep_list(" 1 , 4 ").unwrap(), vec![1, 4]);
+        assert!(parse_keep_list("7").is_err(), "bucket 7 out of range");
+        assert!(parse_keep_list("").is_err(), "empty list rejected");
+        assert!(parse_keep_list("1,x").is_err(), "non-numeric rejected");
+
+        let stacks = [100 * core::BB_CHIPS; 6];
+        let occ = [true; 6];
+        let mut deck = [0i32; 52];
+        for (i, d) in deck.iter_mut().enumerate() {
+            *d = i as i32;
+        }
+        let pre_root = core::init_hand_n::<6>(0, &stacks, &occ, 0, &deck, [0u32, 0u32]);
+        assert!(
+            pre_root.current_bet <= core::BB_CHIPS,
+            "unopened preflop pot: current_bet is the blind"
+        );
+
+        // NB: at a 3-bet node the ADDED small buckets (0.66/0.75 pot) sit below the engine's
+        // min-raise and are engine-illegal, so "wide allowed_pre vs pre_rr=[4,5,6]" is not
+        // observable there. Use a THINNER pre_rr ([4] = 1x pot only) whose removals (1.5x/2x,
+        // always min-raise-legal) are provable.
+        let pre_rr_mask = allowed_mask(&[4]);
+        let flop_rr_mask = allowed_mask(&[1, 4]);
+        let wide_pre = allowed_mask(&[2, 3, 4, 5, 6]);
+
+        // (b) FIRST raise: pre_rr override is ignored; a widened allowed_pre IS visible.
+        let seat0 = pre_root.action_seat as usize;
+        let first_default =
+            abstracted_legal_menus(&pre_root, seat0, &cfg, false, Some(&pre_rr_mask), None);
+        assert_eq!(
+            first_default,
+            abstracted_legal_mrr(&pre_root, seat0, &cfg, false),
+            "pre_rr must not touch the preflop FIRST raise"
+        );
+        cfg.allowed_pre = wide_pre;
+        let first_wide =
+            abstracted_legal_menus(&pre_root, seat0, &cfg, false, Some(&pre_rr_mask), None);
+        assert!(
+            first_wide[bbs + 2] || first_wide[bbs + 3],
+            "widened allowed_pre exposes an added open size at the first-raise node"
+        );
+        assert_ne!(first_wide, first_default, "widening changed the open menu");
+
+        // (c) RE-raise: UTG opens 1x-pot => a raise exists; pre_rr (if set) governs, else allowed_pre.
+        let threbet = core::apply_action(&pre_root, bbs + 4);
+        assert_eq!(threbet.street, 0, "still preflop");
+        assert!(
+            threbet.current_bet > core::BB_CHIPS,
+            "a raise exists: 3-bet node"
+        );
+        let s = threbet.action_seat as usize;
+        let rr_none = abstracted_legal_menus(&threbet, s, &cfg, false, None, None);
+        let rr_set =
+            abstracted_legal_menus(&threbet, s, &cfg, false, Some(&pre_rr_mask), None);
+        assert_eq!(
+            rr_none,
+            abstracted_legal_mrr(&threbet, s, &cfg, false),
+            "None,None == legacy at the 3-bet node"
+        );
+        for a in bbs..core::ALL_IN {
+            if rr_set[a] {
+                assert_eq!(a, bbs + 4, "pre_rr keep [4] governs 3-bet sizes, got id {a}");
+            }
+        }
+        // Premise bites: 1.5x/2x-pot 3-bets are min-raise-legal here, present without pre_rr.
+        assert!(
+            rr_none[bbs + 5] && rr_none[bbs + 6],
+            "premise: 1.5x/2x-pot 3-bets legal under allowed_pre"
+        );
+        assert!(
+            !rr_set[bbs + 5] && !rr_set[bbs + 6],
+            "pre_rr actually thinned the 3-bet node"
+        );
+
+        // (d) Flop re-raise: reuse the 3-bet-then-call script to reach a flop facing-bet node.
+        cfg.allowed_pre = allowed_mask(&[4, 5, 6]); // restore legacy pre for the script's ids
+        let script: [(i32, usize); 8] = [
+            (3, bbs + 4),
+            (4, core::FOLD),
+            (5, core::FOLD),
+            (0, core::FOLD),
+            (1, core::FOLD),
+            (2, bbs + 5),
+            (3, core::CALL),
+            (2, x),
+        ];
+        let mut env = pre_root;
+        for (seat, action) in script {
+            assert_eq!(env.action_seat, seat, "script actor mismatch");
+            env = core::apply_action(&env, action);
+        }
+        while core::is_chance_node(&env) {
+            env = core::sample_chance(&env);
+        }
+        assert_eq!(env.street, core::STREET_FLOP);
+        let facing = core::apply_action(&env, bbs + 4); // seat 2 pots, seat 3 faces the bet
+        let fs = facing.action_seat as usize;
+        assert!(facing.current_bet > facing.committed_street[fs]);
+        let f_none = abstracted_legal_menus(&facing, fs, &cfg, true, None, None);
+        let f_wide =
+            abstracted_legal_menus(&facing, fs, &cfg, true, None, Some(&flop_rr_mask));
+        assert_eq!(
+            f_none,
+            abstracted_legal_mrr(&facing, fs, &cfg, true),
+            "None,None == legacy M-RR at the flop re-raise"
+        );
+        for a in bbs..core::ALL_IN {
+            if f_wide[a] {
+                assert!(
+                    a == bbs + 1 || a == bbs + 4,
+                    "flop_rr keep [1,4]: aggressive ids are 1/2- and 1x-pot only, got {a}"
+                );
+            }
+        }
+        assert!(
+            f_wide[bbs + 1] && !f_none[bbs + 1],
+            "flop_rr added the 1/2-pot re-raise vs legacy M-RR"
+        );
+
+        // Turn re-raise unaffected by flop_rr: check/check to the turn, bet, face it.
+        let mut turn = core::apply_action(&env, x);
+        turn = core::apply_action(&turn, x);
+        while core::is_chance_node(&turn) {
+            turn = core::sample_chance(&turn);
+        }
+        assert_eq!(turn.street, 2);
+        let t_facing = core::apply_action(&turn, bbs + 4);
+        let ts = t_facing.action_seat as usize;
+        assert!(t_facing.current_bet > t_facing.committed_street[ts]);
+        let t_wide =
+            abstracted_legal_menus(&t_facing, ts, &cfg, true, None, Some(&flop_rr_mask));
+        assert_eq!(
+            t_wide,
+            abstracted_legal_mrr(&t_facing, ts, &cfg, true),
+            "turn re-raise ignores flop_rr (stays Pluribus-exact {{1x, AI}})"
         );
     }
 

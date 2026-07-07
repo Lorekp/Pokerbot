@@ -97,8 +97,13 @@ def available() -> bool:
 
 
 def _allowed_masks():
-    pre = _build_allowed_action_mask((4, 5, 6))
-    post = _build_allowed_action_mask((0, 1, 3, 4, 5))
+    # Trainer keep-list twins (POKERBOT_PRE_KEEP/POKERBOT_POST_KEEP, blueprint-v4 arm-3): the masks
+    # handed to the native Lbr6Harness are the TARGET blueprint's trained menu, so they must match the
+    # checkpoint. Defaults (4,5,6)/(0,1,3,4,5) => byte-identical when the envs are unset.
+    from pokerbot.eval.lbr import _POST_KEEP, _PRE_KEEP
+
+    pre = _build_allowed_action_mask(_PRE_KEEP)
+    post = _build_allowed_action_mask(_POST_KEEP)
     return [bool(x) for x in pre], [bool(x) for x in post]
 
 

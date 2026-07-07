@@ -20,6 +20,16 @@ Usage:
   python scripts/blueprint2/bpv4_stage0_gates.py --arm H200 \
       --dir runs/native_cfr/bpv4_stage0/H200 --key-mode fullhist \
       --out artifacts/bpv4_stage0_gates_H200.json
+
+PRE-MENU (arm-3): pass --pre-menu arm3 (or env POKERBOT_PRE_MENU=arm3) for an arm trained with the
+WIDENED preflop raise menu, engine ids 5/6/7/8/9 = 0.66/0.75/1.0/1.5/2.0 pot (trainer env
+POKERBOT_PRE_KEEP="2,3,4,5,6"; RFI raise-to 2.0/2.12/2.5/3.25/4.0bb). This (a) counts ids 5/6 as
+opens in every open% / G1 / G2 / G6 aggregate, (b) adds the two BB-response nodes vs the NEW BTN
+open sizes (vsopen_BB_200 / vsopen_BB_212), and (c) extends the G4 open-size weighting across all
+5 sizes (weighted by the arm's own BTN open-size mix, identical construction to the 3-size form).
+DEFAULT IS BYTE-IDENTICAL to the pre-arm-3 instrument (arm-2b gate JSON reproducible with
+defaults); off-default runs stamp "pre_menu" into the output JSON so evidence is self-describing
+(absence of the field == default 3-size menu).
 """
 from __future__ import annotations
 
@@ -39,8 +49,21 @@ import preflop_root_diag as prd  # noqa: E402
 NUM_ACTIONS = 11
 ROW = 16 + NUM_ACTIONS * 8
 FOLD, CHECK, CALL, ALL_IN = 0, 1, 2, 10
-RAISES = (7, 8, 9)
+RAISES = (7, 8, 9)  # default 3-size menu; the LIVE menu is prd.RAISE_SET (prd.set_pre_menu)
 DETAIL_HANDS = ("AA", "KK", "QQ", "AKs", "AKo", "K9s", "A5o", "76s", "72o", "T9s")
+
+# G4 BB-response node -> the BTN open-size action label that weights it (the arm's own open mix).
+# Order matters for byte-identical default output: the default 3 sizes keep their historical order.
+BB_SIZE_WEIGHTS_DEFAULT = (("vsopen_BB", "B1.0p"), ("vsopen_BB_325", "B1.5p"),
+                           ("vsopen_BB_400", "B2.0p"))
+BB_SIZE_WEIGHTS_ARM3 = (("vsopen_BB", "B1.0p"), ("vsopen_BB_325", "B1.5p"),
+                        ("vsopen_BB_400", "B2.0p"), ("vsopen_BB_200", "B.66p"),
+                        ("vsopen_BB_212", "B.75p"))
+
+
+def bb_size_weights():
+    """The active G4 (BB-vs-BTN-open) size-weighting table, per the selected pre-menu."""
+    return BB_SIZE_WEIGHTS_ARM3 if prd.PRE_MENU == "arm3" else BB_SIZE_WEIGHTS_DEFAULT
 
 
 def scan_checkpoint(path: str, wanted: set[bytes]):
@@ -157,8 +180,15 @@ def main() -> int:
     ap.add_argument("--arm", required=True)
     ap.add_argument("--dir", required=True)
     ap.add_argument("--key-mode", choices=("summary", "fullhist"), required=True)
+    ap.add_argument("--pre-menu", choices=("default", "arm3"),
+                    default=os.environ.get("POKERBOT_PRE_MENU", "default"),
+                    help="preflop raise menu of the arm's trainer: 'default' = 3-size ids 7/8/9 "
+                         "(byte-identical historical instrument) | 'arm3' = widened 5-size ids "
+                         "5/6/7/8/9 (POKERBOT_PRE_KEEP=2..6). Env POKERBOT_PRE_MENU sets the "
+                         "default.")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    prd.set_pre_menu(args.pre_menu)
 
     ckpts = []
     for name in os.listdir(args.dir):
@@ -196,11 +226,11 @@ def main() -> int:
         aa = btn["detail"].get("AA", {}).get("avg", {})
         aa_limp = aa.get("CALL")
         opens = {n: open_pct(nodes[n]) for n in rfi}
-        # BB fold vs BTN open (fullhist: weight per-size rows by the arm's own BTN open-size mix)
+        # BB fold vs BTN open (fullhist: weight per-size rows by the arm's own BTN open-size mix;
+        # arm3 pre-menu extends the table to all 5 open sizes, identical construction)
         if args.key_mode == "fullhist":
             mix = btn["avg"]["by_action"] if btn["avg"] else {}
-            w = {"vsopen_BB": mix.get("B1.0p", 0.0), "vsopen_BB_325": mix.get("B1.5p", 0.0),
-                 "vsopen_BB_400": mix.get("B2.0p", 0.0)}
+            w = {node: mix.get(lbl, 0.0) for node, lbl in bb_size_weights()}
             tot = sum(w.values())
             bb_fold = None
             per_size = {}
@@ -302,6 +332,11 @@ def main() -> int:
         "window_35k_40k_rfi_BTN": (win or {}).get("rfi_BTN") if win else None,
         "m1_rows": m1,
     }
+    if args.pre_menu != "default":
+        # stamped ONLY off-default: the default JSON stays byte-identical to the pre-arm-3
+        # instrument (absence of "pre_menu" == default 3-size menu).
+        result["pre_menu"] = args.pre_menu
+        result["open_raise_ids"] = list(prd.RAISE_SET)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=1)

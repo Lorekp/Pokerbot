@@ -28,6 +28,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from pokerbot.engine.jax_engine import CHIP_UNIT as _CHIP_UNIT  # BB_CHIPS == CHIP_UNIT (chip units)
 from pokerbot.engine.np_engine import (
     ALL_IN,
     BET_BUCKET_START,
@@ -139,15 +140,22 @@ class TabularBlueprintAdapter:
 
     def __post_init__(self) -> None:
         # Reuse the LBR blueprint policy verbatim: numpy engine + fingerprint_fast == trained key space.
-        from pokerbot.eval.lbr import make_blueprint_policy
+        # _PRE_KEEP/_PRE_RR_KEEP/_POST_KEEP are the trainer keep-list twins (POKERBOT_PRE_KEEP /
+        # POKERBOT_PRE_RR_KEEP / POKERBOT_POST_KEEP, blueprint-v4 arm-3); all-unset defaults
+        # ((4,5,6) everywhere preflop / (0,1,3,4,5)) => byte-identical.
+        from pokerbot.eval.lbr import _POST_KEEP, _PRE_KEEP, _PRE_RR_KEEP, make_blueprint_policy
 
         self._policy = make_blueprint_policy(self.snapshot, client_bet_sizing=self.client_bet_sizing)
         # Precompute the street action-abstraction masks ONCE (rebuilding per-leaf is wasteful).
         if self.client_bet_sizing:
-            self._allowed_pre = _build_allowed_action_mask((4, 5, 6))
-            self._allowed_post = _build_allowed_action_mask((0, 1, 3, 4, 5))
+            self._allowed_pre = _build_allowed_action_mask(_PRE_KEEP)
+            # Preflop RE-raise (3-bet+) menu; None when the env is unset => _allowed_pre everywhere.
+            self._allowed_pre_rr = (_build_allowed_action_mask(_PRE_RR_KEEP)
+                                    if _PRE_RR_KEEP is not None else None)
+            self._allowed_post = _build_allowed_action_mask(_POST_KEEP)
         else:
             self._allowed_pre = None
+            self._allowed_pre_rr = None
             self._allowed_post = None
 
     def blueprint(self, env, seat: int) -> np.ndarray:
@@ -171,9 +179,16 @@ class TabularBlueprintAdapter:
         mult = self.bias_mult if bias_mult is None else float(bias_mult)
         mask = legal_action_mask_np(env, seat).astype(bool)
         if self.client_bet_sizing:
-            mask = _apply_abstraction_mask(
-                mask, int(env.street), self._allowed_pre, self._allowed_post
-            ).astype(bool)
+            # arm-3 preflop split, same predicate as lbr.make_blueprint_policy: a preflop node with a
+            # raise already in (current_bet > BB_CHIPS == CHIP_UNIT; limps don't move current_bet)
+            # uses the RE-raise menu when POKERBOT_PRE_RR_KEEP is set. Unset => byte-identical.
+            if (self._allowed_pre_rr is not None and int(env.street) == 0
+                    and float(env.current_bet) > float(_CHIP_UNIT)):
+                mask = (mask & self._allowed_pre_rr).astype(bool)
+            else:
+                mask = _apply_abstraction_mask(
+                    mask, int(env.street), self._allowed_pre, self._allowed_post
+                ).astype(bool)
         bp = self.blueprint(env, seat)
         out = np.empty((NUM_CONTINUATIONS, NUM_ACTIONS), dtype=np.float64)
         for r, group in enumerate(_BIAS_GROUPS):

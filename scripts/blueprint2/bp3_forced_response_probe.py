@@ -108,6 +108,17 @@ def _configure_env(args) -> None:
         os.environ["POKERBOT_MRR"] = "1"
     else:
         os.environ.pop("POKERBOT_MRR", None)
+    # blueprint-v4 arm-3 serve twins (read AT IMPORT by lbr, like POKERBOT_MRR). Explicit set/pop keeps
+    # the probe env HERMETIC: a baseline shard must not inherit a stale arm-3 env from the shell.
+    for flag, env_name in (("pre_keep", "POKERBOT_PRE_KEEP"),
+                           ("pre_rr_keep", "POKERBOT_PRE_RR_KEEP"),
+                           ("post_keep", "POKERBOT_POST_KEEP"),
+                           ("flop_rr_keep", "POKERBOT_FLOP_RR_KEEP")):
+        val = getattr(args, flag, None)
+        if val:
+            os.environ[env_name] = str(val)
+        else:
+            os.environ.pop(env_name, None)
     if args.postflop_mode == "emd":
         os.environ["POKERBOT_POSTFLOP_MODE"] = "emd"
         os.environ["POKERBOT_POSTFLOP_EMD_FROZEN"] = os.path.abspath(args.emd_frozen)
@@ -612,6 +623,24 @@ def main() -> int:
                         "abstracted_legal_mrr keep-lists mirrored in lbr.make_blueprint_policy) — "
                         "REQUIRED for fullhist+M-RR-trained arms (train/probe menu skew otherwise). "
                         "Default off = byte-identical bp3/summary behavior.")
+    r.add_argument("--pre-keep", default=None,
+                   help="arm-3 preflop FIRST-raise keep-list (POKERBOT_PRE_KEEP), comma-separated "
+                        "bet-bucket ids e.g. '2,3,4,5,6' — applies while no raise exists yet this "
+                        "hand (current_bet <= BB). Default None = trainer default (4,5,6), "
+                        "byte-identical. MUST match the probed checkpoint's trained menu.")
+    r.add_argument("--pre-rr-keep", default=None,
+                   help="arm-3 preflop RE-raise (3-bet+) keep-list (POKERBOT_PRE_RR_KEEP), "
+                        "comma-separated bet-bucket ids e.g. '4,5,6' — applies at preflop nodes with "
+                        "a raise already in (current_bet > BB). Default None = the --pre-keep menu "
+                        "applies everywhere preflop (legacy, byte-identical).")
+    r.add_argument("--post-keep", default=None,
+                   help="arm-3 postflop keep-list (POKERBOT_POST_KEEP), comma-separated bet-bucket "
+                        "ids. Default None = trainer default (0,1,3,4,5), byte-identical.")
+    r.add_argument("--flop-rr-keep", default=None,
+                   help="arm-3 FLOP re-raise keep-list under --mrr (POKERBOT_FLOP_RR_KEEP), "
+                        "comma-separated bet-bucket ids e.g. '1,4'. Turn/river re-raises always stay "
+                        "the legacy {4} thin. Default None = legacy M-RR flop thin {4}, "
+                        "byte-identical. Only meaningful with --mrr.")
     r.add_argument("--postflop-field", choices=("blueprint", "checkcall"), default="blueprint",
                    help="postflop continuation field for the EV rollout. 'blueprint' (default) = the "
                         "legacy frozen-blueprint field (byte-identical behavior; coverage-gated by "

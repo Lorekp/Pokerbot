@@ -1254,8 +1254,14 @@ mod py {
                 cfg: nlhe_trainer::TrainerCfg {
                     num_buckets,
                     depth_edges,
-                    allowed_pre: nlhe_trainer::allowed_mask(&[4, 5, 6]),
-                    allowed_post: nlhe_trainer::allowed_mask(&[0, 1, 3, 4, 5]),
+                    // Arm-3 menu envs (absent => legacy, byte-identical): POKERBOT_PRE_KEEP /
+                    // POKERBOT_POST_KEEP; the trainer also reads POKERBOT_PRE_RR_KEEP /
+                    // POKERBOT_FLOP_RR_KEEP inside abstracted_legal (trainer.rs docs).
+                    allowed_pre: nlhe_trainer::keep_mask_from_env("POKERBOT_PRE_KEEP", &[4, 5, 6]),
+                    allowed_post: nlhe_trainer::keep_mask_from_env(
+                        "POKERBOT_POST_KEEP",
+                        &[0, 1, 3, 4, 5],
+                    ),
                     n_deals_per_iter,
                     base_seed: 0xC0FFEE,
                     n_seats,

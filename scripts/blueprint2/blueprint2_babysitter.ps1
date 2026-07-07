@@ -50,6 +50,20 @@ param(
   [switch]$Mrr,                       # blueprint-v4 Stage-0: pass --mrr (POKERBOT_MRR=1; M-RR action-thinning
                                       #   that makes fullhist convergent, ~10^31 -> ~413M rows). Probe/eval
                                       #   MUST also set POKERBOT_MRR=1 (train/probe abstraction-skew guard).
+  [string]$PreKeep = "",              # arm-3: pass --pre-keep (POKERBOT_PRE_KEEP=<val>; Pluribus-grade
+                                      #   preflop FIRST-raise/open bet-bucket keep list, e.g.
+                                      #   "2,3,4,5,6"). "" = omit = legacy {4,5,6} = byte-identical
+                                      #   bootstrap (amendment sec 24). Serve/eval MUST set
+                                      #   POKERBOT_PRE_KEEP to the same value.
+  [string]$PreRrKeep = "",            # arm-3: pass --pre-rr-keep (POKERBOT_PRE_RR_KEEP=<val>; preflop
+                                      #   3-bet+ re-raise bet-bucket keep list). "" = omit = legacy
+                                      #   re-raise menu = byte-identical bootstrap. Serve/eval MUST set
+                                      #   POKERBOT_PRE_RR_KEEP to the same value.
+  [string]$FlopRrKeep = "",           # arm-3: pass --flop-rr-keep (POKERBOT_FLOP_RR_KEEP=<val>; flop
+                                      #   re-raise keep list under M-RR -- which buckets the M-RR
+                                      #   re-raise thinning retains on the FLOP; turn/river keep the
+                                      #   original thinning). "" = omit = original M-RR on all streets.
+                                      #   Serve/eval MUST set POKERBOT_FLOP_RR_KEEP to the same value.
   [switch]$WorkSteal,                 # pass --work-steal (+33% deals/s @64c measured; pass it)
   [switch]$Dcfr,                      # NOT recommended (CFR+ > DCFR at iter16000 for 6-max)
   [double]$DcfrPruneThreshold = -300000.0,
@@ -269,6 +283,9 @@ function Invoke-Launch {
   if ($PreflopHistKey) { $argsList += "--preflop-hist-key" }
   if ($FullHistKey) { $argsList += "--fullhist-key" }
   if ($Mrr)        { $argsList += "--mrr" }
+  if ($PreKeep)    { $argsList += @("--pre-keep", $PreKeep) }
+  if ($PreRrKeep)  { $argsList += @("--pre-rr-keep", $PreRrKeep) }
+  if ($FlopRrKeep) { $argsList += @("--flop-rr-keep", $FlopRrKeep) }
   if ($WorkSteal)  { $argsList += "--work-steal" }
   if ($Dcfr)       { $argsList += @("--dcfr", "--dcfr-prune-threshold", $DcfrPruneThreshold,
                                     "--dcfr-explore-frac", $DcfrExploreFrac) }

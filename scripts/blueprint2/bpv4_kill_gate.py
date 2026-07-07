@@ -44,6 +44,14 @@ a live progress bar + a working cert bundle), then point the gate at the local f
   aws s3 cp s3://video-processing-6789/pokerbot/prod6000/native_cfr/bpv4_h200/checkpoints/iter_020000.nlcfr \
       artifacts/bpv4_ladder/bpv4_h200_iter20000.nlcfr --region eu-central-1
   python scripts/blueprint2/bpv4_kill_gate.py --checkpoint artifacts/bpv4_ladder/bpv4_h200_iter20000.nlcfr
+
+PRE-MENU (arm-3): for an arm trained with the WIDENED preflop raise menu (engine ids 5/6/7/8/9 =
+0.66/0.75/1.0/1.5/2.0 pot, trainer env POKERBOT_PRE_KEEP="2,3,4,5,6"), pass --pre-menu arm3 (or
+env POKERBOT_PRE_MENU=arm3). Ids 5/6 then count as opens in G1/G2/G6, the two BB-response nodes
+vs the NEW BTN open sizes (vsopen_BB_200 / vsopen_BB_212) are added, and the G4 weighting spans
+all 5 sizes (weighted by the arm's own BTN open-size mix, identical construction). DEFAULT IS
+BYTE-IDENTICAL to the pre-arm-3 instrument; off-default runs stamp "pre_menu" +
+"open_raise_ids" into params so evidence files are self-describing (absence == default 3-size).
 """
 from __future__ import annotations
 
@@ -182,11 +190,11 @@ def _aa_limp(nodes) -> float | None:
 
 
 def _bb_fold_weighted(nodes) -> tuple[float | None, dict]:
-    """BB fold vs BTN open, weighted by the arm's own BTN open-size mix (mirrors bpv4_stage0_gates)."""
+    """BB fold vs BTN open, weighted by the arm's own BTN open-size mix (mirrors bpv4_stage0_gates;
+    under --pre-menu arm3 the g0.bb_size_weights() table spans all 5 open sizes)."""
     btn = nodes["rfi_BTN"]["avg"]
     mix = btn["by_action"] if btn else {}
-    w = {"vsopen_BB": mix.get("B1.0p", 0.0), "vsopen_BB_325": mix.get("B1.5p", 0.0),
-         "vsopen_BB_400": mix.get("B2.0p", 0.0)}
+    w = {node: mix.get(lbl, 0.0) for node, lbl in g0.bb_size_weights()}
     per_size = {}
     acc = used = 0.0
     for n, wt in w.items():
@@ -322,10 +330,17 @@ def main() -> int:
     ap.add_argument("--trend-hard-iters", type=int, default=30000,
                     help="G2/G3 trend clauses are ADVISORY below this and HARD from it (design 6.3: "
                          "trend forms added AT the 30k check; early positive-control arms slide)")
+    ap.add_argument("--pre-menu", choices=("default", "arm3"),
+                    default=os.environ.get("POKERBOT_PRE_MENU", "default"),
+                    help="preflop raise menu of the arm's trainer: 'default' = 3-size ids 7/8/9 "
+                         "(byte-identical historical instrument) | 'arm3' = widened 5-size ids "
+                         "5/6/7/8/9 (POKERBOT_PRE_KEEP=2..6). Env POKERBOT_PRE_MENU sets the "
+                         "default.")
     ap.add_argument("--cache-dir", default=os.path.join(REPO, "artifacts", "bpv4_ladder"))
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     out = args.out or os.path.join(REPO, "artifacts", f"bpv4_kill_gate_{args.run_subdir}.json")
+    prd.set_pre_menu(args.pre_menu)
 
     # --- build the fullhist node list + keys ONCE (engine-replayed, exact) -------------------------
     node_list = g0.build_nodes("fullhist")
@@ -422,7 +437,12 @@ def main() -> int:
             "params": {"mono_tol_pt": args.mono_tol_pt, "btn_floor_pct": args.btn_floor_pct,
                        "aa_limp_cap": args.aa_limp_cap, "bb_fold_cap": args.bb_fold_cap,
                        "jam_cap": args.jam_cap, "decline_floor_pt": args.decline_floor_pt,
-                       "trend_hard_iters": args.trend_hard_iters},
+                       "trend_hard_iters": args.trend_hard_iters,
+                       # stamped ONLY off-default so the default JSON stays byte-identical to
+                       # the pre-arm-3 instrument (absence == default 3-size menu).
+                       **({"pre_menu": args.pre_menu,
+                           "open_raise_ids": list(prd.RAISE_SET)}
+                          if args.pre_menu != "default" else {})},
         }, f, indent=2)
     print(f"wrote {out}")
     return 0 if ok else 1

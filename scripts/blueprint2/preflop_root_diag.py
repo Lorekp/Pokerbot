@@ -24,6 +24,17 @@ Usage:
   python scripts/blueprint2/preflop_root_diag.py --out artifacts/x.json ckpt1.nlcfr [ckpt2.nlcfr ...]
   --deltas : also emit window current policy between consecutive checkpoints (sorted by iters)
   --hands  : comma list of extra hand classes to detail (default premium+consensus-open probes)
+
+PRE-MENU MODES (pre-registered instrument -- default behavior is BYTE-IDENTICAL to the historical
+3-size tool; arm-2b evidence stays reproducible with defaults):
+  default : preflop raise menu = engine ids 7/8/9 (keep-list buckets 4/5/6 = 1.0/1.5/2.0 pot
+            -> RFI raise-to 2.5/3.25/4.0bb). No behavior change vs the pre-arm-3 script.
+  arm3    : blueprint-v4 arm-3 WIDENED preflop menu = engine ids 5/6/7/8/9 (keep-list buckets
+            2/3/4/5/6 = 0.66/0.75/1.0/1.5/2.0 pot -> RFI raise-to 2.0/2.12/2.5/3.25/4.0bb,
+            mirroring trainer env POKERBOT_PRE_KEEP="2,3,4,5,6"). Opt-in ONLY, via
+            --pre-menu arm3 or env POKERBOT_PRE_MENU=arm3. Adds ids 5/6 to the open/raise
+            aggregation, widens the fullhist replay legal mask, and appends the two BB-response
+            nodes vs the NEW BTN open sizes (vsopen_BB_200 / vsopen_BB_212).
 """
 from __future__ import annotations
 
@@ -43,6 +54,23 @@ FOLD, CHECK, CALL, ALL_IN = 0, 1, 2, 10
 ACTION_NAMES = ["FOLD", "CHECK", "CALL", "B1/3p", "B1/2p", "B.66p",
                 "B.75p", "B1.0p", "B1.5p", "B2.0p", "ALLIN"]
 RAISE_SET = (7, 8, 9)          # keep-list (4,5,6) -> actions 7/8/9 = 1.0/1.5/2.0 pot
+# Pre-menu selection (see module docstring). set_pre_menu("arm3") widens RAISE_SET to the arm-3
+# 5-size menu; the module-level default is NEVER changed (byte-identical default instrument).
+PRE_MENU = "default"
+_PRE_MENU_RAISE_SETS = {
+    "default": (7, 8, 9),           # 1.0/1.5/2.0 pot -> RFI 2.5/3.25/4.0bb
+    "arm3": (5, 6, 7, 8, 9),        # + 0.66/0.75 pot -> RFI 2.0/2.12bb (POKERBOT_PRE_KEEP=2..6)
+}
+
+
+def set_pre_menu(mode: str) -> None:
+    """Select the preflop raise menu: 'default' (3-size, historical) | 'arm3' (widened 5-size)."""
+    global PRE_MENU, RAISE_SET
+    assert mode in _PRE_MENU_RAISE_SETS, f"unknown pre-menu mode {mode!r}"
+    PRE_MENU = mode
+    RAISE_SET = _PRE_MENU_RAISE_SETS[mode]
+
+
 POS = {"UTG": 0, "HJ": 1, "CO": 2, "BTN": 3, "SB": 4, "BB": 5}
 _RANKS = "23456789TJQKA"
 
@@ -149,6 +177,14 @@ FULLHIST_NODE_SEQS = [
     ("vs3bet_BTN_3b8", "BTN", [0, 0, 0, 7, 0, 8]),
 ]
 
+# arm-3 (widened preflop menu) EXTRA nodes: BB response vs the two NEW BTN open sizes
+# (engine ids 5/6 = 0.66/0.75 pot -> RFI raise-to 2.0/2.12bb). Appended by nodes_fullhist()
+# ONLY under set_pre_menu("arm3"), so the default node-key set stays byte-identical.
+ARM3_EXTRA_FULLHIST_SEQS = [
+    ("vsopen_BB_200", "BB", [0, 0, 0, 5, 0]),      # BTN opens 2.0bb (id 5, 0.66 pot)
+    ("vsopen_BB_212", "BB", [0, 0, 0, 6, 0]),      # BTN opens 2.12bb (id 6, 0.75 pot)
+]
+
 
 def nodes_fullhist():
     """Replay each canonical sequence -> (label, pos_enum, betting6, legal, hist3, fullhist)."""
@@ -194,8 +230,13 @@ def nodes_fullhist():
 
     pos_by_offset = (3, 4, 5, 0, 1, 2)
     allowed_pre = {0, 1, 2, 7, 8, 9, 10}  # keep-list (4,5,6) trainer mask over engine ids
+    seqs = list(FULLHIST_NODE_SEQS)
+    if PRE_MENU == "arm3":
+        # widened keep-list (2,3,4,5,6) -> ids 5/6 also trainer-legal (POKERBOT_PRE_KEEP="2,3,4,5,6")
+        allowed_pre |= {5, 6}
+        seqs += ARM3_EXTRA_FULLHIST_SEQS
     out = []
-    for label, pos_name, seq in FULLHIST_NODE_SEQS:
+    for label, pos_name, seq in seqs:
         env = to_numpy_state(init_hand(jax.random.PRNGKey(0), button=0))
         for a in seq:
             while is_chance_node_np(env):
@@ -324,11 +365,18 @@ def main() -> int:
     ap.add_argument("--full-hist", action="store_true",
                     help="checkpoint was trained with POKERBOT_FULLHIST_KEY=1 (blueprint-v4 "
                          "Stage 0); nodes are engine-replayed exact-history keys")
+    ap.add_argument("--pre-menu", choices=tuple(_PRE_MENU_RAISE_SETS),
+                    default=os.environ.get("POKERBOT_PRE_MENU", "default"),
+                    help="preflop raise menu of the checkpoint's trainer: 'default' = 3-size "
+                         "ids 7/8/9 (byte-identical historical instrument) | 'arm3' = widened "
+                         "5-size ids 5/6/7/8/9 (POKERBOT_PRE_KEEP=2..6). Env POKERBOT_PRE_MENU "
+                         "sets the default.")
     args = ap.parse_args()
     global HIST_KEY, FULL_HIST
     HIST_KEY = bool(args.hist_key)
     FULL_HIST = bool(args.full_hist)
     assert not (HIST_KEY and FULL_HIST), "--hist-key and --full-hist are mutually exclusive"
+    set_pre_menu(args.pre_menu)
 
     detail = set() if args.no_detail else {
         CLASS_BY_NAME[h] for h in args.hands.split(",") if h in CLASS_BY_NAME}
@@ -348,6 +396,12 @@ def main() -> int:
         "current=regret-matched cum_regret (CFR+ positive floor)": True,
         "avg=row-normalized strat_sum (linear averaging, weight t)": True,
     }, "checkpoints": []}
+    if PRE_MENU != "default":
+        # stamped ONLY off-default so the historical (arm-2b) default JSON stays byte-identical;
+        # absence of "pre_menu" in an evidence file therefore means the 3-size default menu.
+        results["meta"]["pre_menu"] = PRE_MENU
+        results["meta"]["open_sizes_bb_at_rfi"]["B.66p"] = 2.0
+        results["meta"]["open_sizes_bb_at_rfi"]["B.75p"] = 2.12
 
     loaded = []
     for path in args.checkpoints:

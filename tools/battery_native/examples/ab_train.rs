@@ -43,7 +43,7 @@
 //! blob is f64 for BOTH builds (cross-precision-portable), so Python diffing needs no native import.
 
 use battery_native::trainer::{
-    allowed_mask, coverage_probe, deserialize, regret_stats, serialize,
+    coverage_probe, deserialize, keep_mask_from_env, regret_stats, serialize,
     serialize_current_strategy, NlheTables, TrainerCfg,
 };
 use std::sync::Arc;
@@ -94,8 +94,11 @@ fn main() {
     let cfg = TrainerCfg {
         num_buckets,
         depth_edges: vec![],
-        allowed_pre: allowed_mask(&[4, 5, 6]),
-        allowed_post: allowed_mask(&[0, 1, 3, 4, 5]),
+        // Arm-3 menu envs (absent => legacy, byte-identical): POKERBOT_PRE_KEEP widens the preflop
+        // FIRST-raise menu; POKERBOT_PRE_RR_KEEP / POKERBOT_FLOP_RR_KEEP are read inside the
+        // trainer's abstracted_legal (see trainer.rs docs). allowed_mask stays for the defaults.
+        allowed_pre: keep_mask_from_env("POKERBOT_PRE_KEEP", &[4, 5, 6]),
+        allowed_post: keep_mask_from_env("POKERBOT_POST_KEEP", &[0, 1, 3, 4, 5]),
         n_deals_per_iter: n_deals,
         base_seed: 0xC0FFEE,
         n_seats: 6,
@@ -116,10 +119,19 @@ fn main() {
         "f64"
     };
     let fullhist = env_flag("POKERBOT_FULLHIST_KEY");
+    // Menu banner: the human-visible record of the action abstraction this run trained with
+    // (arm-3 knobs; "-" = compiled default). Malformed keep-list envs already panicked above
+    // (keep_mask_from_env fails loud — no silent fallback).
+    let menu_env = |v: &str| std::env::var(v).ok().filter(|s| !s.trim().is_empty());
+    let pre_keep = menu_env("POKERBOT_PRE_KEEP").unwrap_or_else(|| "-".into());
+    let post_keep = menu_env("POKERBOT_POST_KEEP").unwrap_or_else(|| "-".into());
+    let pre_rr = menu_env("POKERBOT_PRE_RR_KEEP").unwrap_or_else(|| "-".into());
+    let flop_rr = menu_env("POKERBOT_FLOP_RR_KEEP").unwrap_or_else(|| "-".into());
     eprintln!(
         "[ab_train] precision={precision} iters={iters} n_deals={n_deals} batch_deals={batch_deals} \
          num_buckets={num_buckets} dcfr={dcfr} work_steal={work_steal} fullhist={fullhist} \
-         emd={} ochs={} ckpts={:?} -> {out_path}",
+         emd={} ochs={} ckpts={:?} pre_keep={pre_keep} post_keep={post_keep} pre_rr_keep={pre_rr} \
+         flop_rr_keep={flop_rr} -> {out_path}",
         cfg.emd_frozen.is_some(),
         cfg.river_ochs.is_some(),
         checkpoints,

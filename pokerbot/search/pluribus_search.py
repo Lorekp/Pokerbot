@@ -521,9 +521,12 @@ _NATIVE_FIT_PROBE_ITERS = 200
 def _abstraction_masks(client_bet_sizing: bool):
     if not client_bet_sizing:
         return None, None
+    from pokerbot.eval.lbr import _POST_KEEP, _PRE_KEEP  # trainer keep-list twins (arm-3 envs)
     from pokerbot.training.sd_cfr_nlhe import build_allowed_action_mask
 
-    return build_allowed_action_mask((4, 5, 6)), build_allowed_action_mask((0, 1, 3, 4, 5))
+    # POKERBOT_PRE_KEEP/POKERBOT_POST_KEEP (blueprint-v4 arm-3) override the deployed defaults
+    # (4,5,6)/(0,1,3,4,5) so the search tree's blueprint-node menu matches the trained checkpoint.
+    return build_allowed_action_mask(_PRE_KEEP), build_allowed_action_mask(_POST_KEEP)
 
 
 class PluribusReBeLSolver:
