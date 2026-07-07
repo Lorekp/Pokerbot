@@ -83,6 +83,13 @@
 # window on any 2-min reclaim notice -- so cadence no longer bounds graceful-reclaim loss, only
 # hard deaths (<=~42s compute at 250). 100 -> 250 lifts the compute fraction ~55% -> ~75%; the
 # flush delta (~20-25GB at 250) still fits the notice window. Amendment sec 17.
+# CKPT SIZE CAP 24->48GB (2026-07-07, user-approved): the HYBRID rolling trigger's SIZE cap was
+# binding every ~4-5 min (dirty ~24GB per ~450-550 iters at iter ~12000), which the user judged
+# too frequent -- ~10-min cadence is enough. Raised the cap to 48GB (+ min-gap floor 60->300s).
+# At 48GB the emergency flush (~150s serialize+upload) may NOT fit the 2-min notice for near-cap
+# windows: the flush stays BEST-EFFORT (pkill fallback at 100s) and the user explicitly accepted
+# up to ~10 min of replay loss on a reclaim in exchange for the lower checkpoint overhead. Once
+# pruning matures and the dirty rate drops, the CkptSecs 600s TIME trigger takes over at ~10 min.
 # 1TB FLOOR (2026-07-06 ~20:45, sec 18): cum_rows 756M @2250 (+19-21M/100, decay slow) -- the
 # 609M M-RR census is refuted and the 900M budget would fire ~iter 3000. Budget 1.4B (reaches
 # the iter-5000 pruning onset with margin; ~532GB at 0.38GB/M rows) requires 1TB boxes: all
@@ -116,7 +123,8 @@ $env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n,c6i,c6in,c6id,c7a,m6i,
     -DeltaCkpt `
     -CheckpointEvery 250 `
     -CkptSecs 600 `
-    -CkptMaxDirtyGb 24 `
+    -CkptMaxDirtyGb 48 `
+    -CkptMinGapSecs 300 `
     -GateEvery 2500 `
     -CkptVolumeGb 800 `
     -InstanceType "x2idn.32xlarge" `

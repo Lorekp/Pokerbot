@@ -284,7 +284,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
                    fullhist_key=False, mrr=False,
                    work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
                    v3=None, row_budget=None, no_cache_fetch=False, delta_ckpt=False,
-                   ckpt_secs=600, ckpt_max_dirty_gb=24.0, profile_run=False,
+                   ckpt_secs=600, ckpt_max_dirty_gb=48.0, ckpt_min_gap_secs=300, profile_run=False,
                    wall_guard_secs=21600, awscli_zip="awscli-exe-linux-x86_64.zip") -> str:
     """The full on-box bootstrap (was inline user-data until it exceeded EC2's 16KB cap).
     Uploaded to S3 by main() and exec'd by user_data_stub(). Content is otherwise the proven
@@ -339,7 +339,9 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             # non-delta / legacy paths never read them). Exported like POKERBOT_DELTA_CKPT above.
             f"export POKERBOT_CKPT_SECS={int(ckpt_secs)}",
             f"export POKERBOT_CKPT_MAX_DIRTY_GB={float(ckpt_max_dirty_gb)}",
-            'echo "CKPT_SECS=$POKERBOT_CKPT_SECS CKPT_MAX_DIRTY_GB=$POKERBOT_CKPT_MAX_DIRTY_GB"',
+            f"export POKERBOT_CKPT_MIN_GAP_SECS={int(ckpt_min_gap_secs)}",
+            'echo "CKPT_SECS=$POKERBOT_CKPT_SECS CKPT_MAX_DIRTY_GB=$POKERBOT_CKPT_MAX_DIRTY_GB '
+            'CKPT_MIN_GAP_SECS=$POKERBOT_CKPT_MIN_GAP_SECS"',
             f"export POKERBOT_LCFR={'1' if v3.get('lcfr') else '0'}",
             'echo "LCFR=$POKERBOT_LCFR"',
             f"export POKERBOT_SIGNED_REGRETS={'1' if v3.get('signed_regrets') else '0'}",
@@ -608,17 +610,24 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "\n"
             "# HYBRID TIME/SIZE ROLLING TRIGGER (2026-07-06, delta path only -- replaces the CKPT_EVERY iter\n"
             "# cadence there; non-delta keeps CKPT_EVERY). A rolling checkpoint fires between training chunks\n"
-            "# when EITHER (a) estimated dirty bytes >= CKPT_MAX_DIRTY_BYTES -- keeps the graceful-reclaim\n"
-            "# EMERGENCY flush (serialize ~0.85 GB/s + sync upload ~0.5 GB/s ~= 3.2 s/GB) inside the 2-min\n"
-            "# reclaim notice + 100 s grace -- OR (b) wall-clock since the last checkpoint >= CKPT_SECS\n"
-            "# (bounds replay loss when dirty growth is slow, e.g. post-pruning). CKPT_MIN_GAP_SECS floors\n"
-            "# the interval so a burst can't thrash. Dirty bytes are ESTIMATED as dirty_counts() total rows\n"
-            "# x an EMA bytes/row seeded at 60 B/row and updated from every ACTUAL delta save (_ckpt).\n"
-            "# 0 disables a trigger. Gates are untouched: _next_stop still clamps the train loop to the\n"
-            "# gate ladder + ITERS, so gate checkpoints stay iter-exact full bases.\n"
+            "# when EITHER (a) estimated dirty bytes >= CKPT_MAX_DIRTY_BYTES -- OR (b) wall-clock since the\n"
+            "# last checkpoint >= CKPT_SECS (bounds replay loss when dirty growth is slow, e.g. post-\n"
+            "# pruning). CKPT_MIN_GAP_SECS floors the interval so a burst can't thrash. Dirty bytes are\n"
+            "# ESTIMATED as dirty_counts() total rows x an EMA bytes/row seeded at 60 B/row and updated\n"
+            "# from every ACTUAL delta save (_ckpt). 0 disables a trigger. Gates are untouched: _next_stop\n"
+            "# still clamps the train loop to the gate ladder + ITERS, so gate checkpoints stay iter-exact\n"
+            "# full bases.\n"
+            "# RECLAIM-vs-CADENCE TRADEOFF (2026-07-07): with the 48 GB SIZE cap (default) the graceful-\n"
+            "# reclaim EMERGENCY flush (serialize ~0.85 GB/s + sync upload ~0.5 GB/s ~= 3.2 s/GB, i.e.\n"
+            "# ~150 s at a full 48 GB window) may EXCEED the 2-min reclaim notice + 100 s grace for near-\n"
+            "# cap windows -- so it stays BEST-EFFORT (spot_watch's pkill fallback fires at 100 s and the\n"
+            "# in-flight flush is lost). The user EXPLICITLY accepted up to ~10 min of replay loss on a\n"
+            "# reclaim in exchange for the lower checkpoint overhead (the SIZE cap binds every ~10 min at\n"
+            "# the current dirty rate). CKPT_MAX_DIRTY_GB=24 would keep the flush inside the notice window\n"
+            "# but doubles the checkpoint cadence.\n"
             "CKPT_SECS = float(os.environ.get(\"POKERBOT_CKPT_SECS\", \"600\"))\n"
-            "CKPT_MAX_DIRTY_BYTES = float(os.environ.get(\"POKERBOT_CKPT_MAX_DIRTY_GB\", \"24\")) * 1e9\n"
-            "CKPT_MIN_GAP_SECS = float(os.environ.get(\"POKERBOT_CKPT_MIN_GAP_SECS\", \"60\"))\n"
+            "CKPT_MAX_DIRTY_BYTES = float(os.environ.get(\"POKERBOT_CKPT_MAX_DIRTY_GB\", \"48\")) * 1e9\n"
+            "CKPT_MIN_GAP_SECS = float(os.environ.get(\"POKERBOT_CKPT_MIN_GAP_SECS\", \"300\"))\n"
             "_ROLL = {\"last_ts\": time.time(), \"bpr\": 60.0}  # last-ckpt wall time + EMA delta bytes/dirty-row\n"
             "\n"
             "\n"
@@ -1100,6 +1109,13 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
         )
         next_stop_expr = "_next_stop(t.iters_done())"
         ckpt_stmt = "_ckpt(t)"
+        # BUG FIX (2026-07-07): _ROLL["last_ts"] is seeded at driver MODULE init, but the resume
+        # prologue (download + mmap-load + delta replay) runs 12-16 min AFTER that on a spot respawn,
+        # so the first rolling window opens with most of its CKPT_SECS time budget already consumed --
+        # the first rolling checkpoint then fired ~4 iters post-resume, banking a near-empty delta
+        # (observed: iter 10004). Reset the hybrid clock HERE, at TRAINING START (after resume + arm +
+        # _BASE rooting, just before the main train loop), so the first window gets its full budget.
+        roll_reset = "    _ROLL[\"last_ts\"] = time.time()  # start the hybrid rolling clock at TRAINING START (post-resume)\n"
         # Graceful-reclaim loop shape: chunked train + flush-and-exit on the reclaim flag. The
         # emergency flush runs BEFORE the row-budget check (a full-base row-budget checkpoint can
         # never fit the reclaim window).
@@ -1185,6 +1201,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
         next_stop_expr = "min(t.iters_done() + CKPT_EVERY, ITERS)"
         ckpt_stmt = "_upload(t.save_bytes(), t.iters_done())"
         ckpt_wait_block = ""
+        roll_reset = ""  # legacy path has no hybrid rolling clock (byte-identical render)
         # Legacy path: ORIGINAL single train call, no reclaim machinery (byte-identical render).
         train_stmt = "t.train(step)"
         reclaim_break = ""
@@ -1730,7 +1747,7 @@ def main():
     start = t.iters_done()
     print(f"TRAIN target={{ITERS}} from={{start}} n_deals={{N_DEALS}} num_buckets={{NUM_BUCKETS}} "
           f"depth_edges={{DEPTH_EDGES}}", flush=True)
-    t0 = time.time()
+{roll_reset}    t0 = time.time()
     while t.iters_done() < ITERS:{row_budget_pre}
         nxt = {next_stop_expr}
         step = nxt - t.iters_done()
@@ -1929,13 +1946,22 @@ def main() -> None:
                         "0 disables the time trigger. Only meaningful with --delta-ckpt; non-delta paths "
                         "keep the --checkpoint-every iter cadence unchanged. Exported as "
                         "POKERBOT_CKPT_SECS in the v3 env block.")
-    p.add_argument("--ckpt-max-dirty-gb", type=float, default=24.0,
+    p.add_argument("--ckpt-max-dirty-gb", type=float, default=48.0,
                    help="HYBRID rolling-checkpoint SIZE trigger (delta path only): fires when ESTIMATED "
                         "dirty bytes (dirty_counts() rows x an EMA bytes/row learned from each actual "
-                        "delta save, seeded 60 B/row) reach this many GB -- keeps the graceful-reclaim "
-                        "emergency flush (serialize ~0.85 GB/s + sync upload ~0.5 GB/s ~= 3.2 s/GB) "
-                        "inside the 2-min notice + 100 s grace. 0 disables the size trigger. Exported "
-                        "as POKERBOT_CKPT_MAX_DIRTY_GB in the v3 env block.")
+                        "delta save, seeded 60 B/row) reach this many GB. NOTE: at 48 GB the graceful-"
+                        "reclaim emergency flush (serialize ~0.85 GB/s + sync upload ~0.5 GB/s ~= 3.2 "
+                        "s/GB) may exceed the 2-min notice + 100 s grace for near-cap windows -- it "
+                        "stays BEST-EFFORT (pkill fallback at 100 s); the user accepted up to ~10 min "
+                        "of replay loss on a reclaim in exchange for the lower checkpoint overhead "
+                        "(2026-07-07). 0 disables the size trigger. Exported as "
+                        "POKERBOT_CKPT_MAX_DIRTY_GB in the v3 env block.")
+    p.add_argument("--ckpt-min-gap-secs", type=int, default=300,
+                   help="HYBRID rolling-checkpoint anti-thrash FLOOR (delta path only): a rolling delta "
+                        "checkpoint may not fire until at least this many seconds have elapsed since the "
+                        "last checkpoint, even if the size/time trigger is already satisfied -- so a "
+                        "burst of dirty growth can't thrash the checkpointer. Only meaningful with "
+                        "--delta-ckpt. Exported as POKERBOT_CKPT_MIN_GAP_SECS in the v3 env block.")
     p.add_argument("--profile-run", action="store_true", default=False,
                    help="COMPUTE PROFILER sidecar on the box: mpstat -P ALL 30 (per-core utilization) "
                         "+ pidstat -u -r 30 on the driver (CPU%%/RSS churn) + ONE steady-state "
@@ -2045,7 +2071,8 @@ def main() -> None:
         dcfr_prune_threshold=args.dcfr_prune_threshold, dcfr_explore_frac=args.dcfr_explore_frac,
         v3=v3_cfg, row_budget=args.row_budget, no_cache_fetch=args.no_cache_fetch,
         delta_ckpt=args.delta_ckpt, ckpt_secs=args.ckpt_secs,
-        ckpt_max_dirty_gb=args.ckpt_max_dirty_gb, profile_run=args.profile_run,
+        ckpt_max_dirty_gb=args.ckpt_max_dirty_gb, ckpt_min_gap_secs=args.ckpt_min_gap_secs,
+        profile_run=args.profile_run,
         wall_guard_secs=wall_guard_secs, awscli_zip=awscli_zip,
     )
     bootstrap_key = f"{args.prefix}/{run_subdir}/code/bootstrap.sh"
