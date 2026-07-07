@@ -109,6 +109,21 @@ param(
                                                # concurrent crate edits are expected during the run
   [switch]$Spotpick,
   [switch]$OnDemand,
+  # --- TWO-PHASE MIGRATION (2026-07-07): run the FAST 128-vCPU box until RAM headroom is consumed,
+  #     then switch to the big-RAM X box. Enabled iff -Phase1InstanceType is set; otherwise single-
+  #     phase (uses -InstanceType, byte-identical control flow). The on-box driver plants
+  #     <run>/migrate_request.json when its RAM/row watermark fires; this babysitter, in phase 1,
+  #     sees the flag, writes a DURABLE <run>/migrated_to_phase2.json marker to S3, switches
+  #     $InstanceType to -Phase2InstanceType, deletes the flag (re-arm), and relaunches (resume from
+  #     S3). The phase is re-derived from the S3 marker on every babysitter restart. ---
+  [string]$Phase1InstanceType = "",   # FAST box (e.g. r6a.32xlarge 128vCPU/1TB). "" = single-phase.
+  [string]$Phase2InstanceType = "",   # big-RAM X box (e.g. x2iedn.16xlarge 64vCPU/2TB) used post-migrate
+  [string]$MigrateMinAvailGb = "",    # --migrate-min-avail-gb on PHASE 1 only (RAM headroom watermark, GiB)
+  [string]$MigrateMaxRows = "",       # --migrate-max-rows on PHASE 1 only (deterministic backstop rows)
+  [string]$Phase1ExcludeFamilies = "",# SPOTPICK_EXCLUDE_FAMILIES for phase 1 (MUST exclude X families so
+                                      #   the 128-vCPU fallback chain can't eat the X quota reserved for
+                                      #   phase 2). "" = leave the caller's env untouched. (Phase 2 is
+                                      #   single-type -- no exclude needed, there is no 2TB alternate.)
   # --- storm + wall guards (verbatim from the proven babysitter) ---
   [int]$MaxLaunch = 12,
   [int]$MaxNoCkptRelaunches = 3,      # CHURN-ABORT (2026-07-05, user directive after 5 boxes burned
@@ -167,8 +182,61 @@ $lastConvIters = -1
 # 2026-07-06: fast-poll mode flag (set when reclaim notice detected for tracked box)
 $fastPollActive = $false
 
+# --- TWO-PHASE MIGRATION state ------------------------------------------------------------------
+$twoPhase          = [bool]$Phase1InstanceType
+$MIGRATE_FLAG_KEY  = "$RUN_PREFIX/migrate_request.json"       # on-box driver plants this at its watermark
+$PHASE2_MARKER_KEY = "$RUN_PREFIX/migrated_to_phase2.json"    # DURABLE truth: run has moved to the X box
+$phase             = 0   # 0 = single-phase; 1 = fast box; 2 = migrated to X box
+
+# Small S3 object helpers (head/put/delete) -- s3api head-object exit code is the existence test.
+function Test-S3Object([string]$key) {
+  aws s3api head-object --bucket $Bucket --key $key --region $Region 2>$null | Out-Null
+  return ($LASTEXITCODE -eq 0)
+}
+function Write-S3Marker([string]$key, [string]$json) {
+  $tmp = Join-Path $env:TEMP ("bp2_marker_{0}.json" -f ([guid]::NewGuid().ToString('N')))
+  Set-Content -Path $tmp -Value $json -Encoding ascii
+  aws s3 cp $tmp "s3://$Bucket/$key" --region $Region 2>$null | Out-Null
+  $ok = ($LASTEXITCODE -eq 0)
+  Remove-Item $tmp -ErrorAction SilentlyContinue
+  return $ok
+}
+function Remove-S3Object([string]$key) {
+  aws s3api delete-object --bucket $Bucket --key $key --region $Region 2>$null | Out-Null
+}
+
+if ($twoPhase) {
+  # Derive the phase from the DURABLE S3 marker so a babysitter restart resumes the right box (never
+  # relaunches a 1TB box that would instantly re-migrate). Marker present => already on the X box.
+  if (Test-S3Object $PHASE2_MARKER_KEY) {
+    $phase = 2
+    $InstanceType = $Phase2InstanceType
+    # Phase 2 is SINGLE-TYPE (no spotpick fallback): the only 2TB box at 64-vCPU X quota is
+    # x2iedn.16xlarge; any same-vCPU fallback would be a <2TB box that OOMs at the row-heavy tail.
+    $Spotpick = $false
+    Write-Host "TWO-PHASE: migrated_to_phase2 marker present -> resuming in PHASE 2 on $InstanceType (single-type, no fallback)" -ForegroundColor Cyan
+  } else {
+    $phase = 1
+    $InstanceType = $Phase1InstanceType
+    # Phase 1 keeps spotpick for capacity resilience across the 1TB r-family (the exclude list keeps
+    # the 128-vCPU X boxes OUT so the fallback chain can't eat the X quota reserved for phase 2).
+    $Spotpick = $true
+    Write-Host "TWO-PHASE: PHASE 1 on $InstanceType (fast, spotpick fallback); migrate watermark avail<${MigrateMinAvailGb}GiB / rows>=$MigrateMaxRows -> switch to $Phase2InstanceType" -ForegroundColor Cyan
+  }
+}
+
+# Set SPOTPICK_EXCLUDE_FAMILIES for the CURRENT phase (only when a per-phase list was given; else the
+# caller's env is left untouched -- backward compatible with the single-phase wrappers).
+function Set-PhaseExclude {
+  if (-not $twoPhase) { return }
+  # Only phase 1 uses the spotpick fallback chain; phase 2 is single-type (no exclude needed).
+  if ($phase -eq 1 -and $Phase1ExcludeFamilies) { $env:SPOTPICK_EXCLUDE_FAMILIES = $Phase1ExcludeFamilies }
+}
+Set-PhaseExclude
+
 # AUTO-PICK cheapest spot-available type via the shared spotpick lib when -InstanceType was not given.
-if (-not $InstanceType) {
+# SKIPPED in two-phase mode (the phase owns the instance type).
+if (-not $twoPhase -and -not $InstanceType) {
   $SpotpickPy = "spotpick.py"
   $picked = ""
   if (Test-Path $SpotpickPy) {
@@ -314,6 +382,12 @@ function Invoke-Launch {
     if ($V3Regstats) { $argsList += "--v3-regstats" }
   }
   if ($RowBudget -gt 0) { $argsList += @("--row-budget", $RowBudget) }
+  # PHASE-MIGRATION watermark: pass the migrate triggers ONLY in phase 1 (the fast box). Omitting them
+  # in phase 2 leaves MIGRATE_* at 0 on the X box, so it never re-migrates on resume.
+  if ($twoPhase -and $phase -eq 1) {
+    if ($MigrateMinAvailGb) { $argsList += @("--migrate-min-avail-gb", $MigrateMinAvailGb) }
+    if ($MigrateMaxRows)    { $argsList += @("--migrate-max-rows", $MigrateMaxRows) }
+  }
   if ($DeltaCkpt)  { $argsList += "--delta-ckpt" }
   if ($CkptSecs -gt 0)       { $argsList += @("--ckpt-secs", $CkptSecs) }
   if ($CkptMaxDirtyGb -gt 0) { $argsList += @("--ckpt-max-dirty-gb", $CkptMaxDirtyGb) }
@@ -336,6 +410,11 @@ Write-Host "=== blueprint-v2 babysitter: $Run ===" -ForegroundColor Cyan
 Write-Host "    target=$Iters it  n_deals=$NDeals  flop/turn=EMD K$NumBuckets  river=OCHS ($([System.IO.Path]::GetFileName($RiverOchs)))"
 Write-Host "    LEVERS=$leverTxt" -ForegroundColor Green
 Write-Host "    caps: ${capH}h wall / $MaxLaunch launches / >=${MinRelaunchGapSec}s between launches / churn-abort after $MaxNoCkptRelaunches no-ckpt relaunches"
+if ($twoPhase) {
+  Write-Host "    TWO-PHASE: P1=$Phase1InstanceType (fast) --[migrate avail<${MigrateMinAvailGb}GiB / rows>=$MigrateMaxRows]--> P2=$Phase2InstanceType (big-RAM X);  now in PHASE $phase" -ForegroundColor Cyan
+} else {
+  Write-Host "    single-phase: InstanceType=$InstanceType" -ForegroundColor Cyan
+}
 Write-Host "    convergence-stop=$(-not $NoConvergeStop) (threshold=$ConvThreshold, K=$ConvK, MIN-ITERS FLOOR=$ConvMinIters)"
 Write-Host "    resume: a relaunch reuses --run-subdir '$Run' so the new box loads s3://$Bucket/$LATEST"
 
@@ -455,6 +534,24 @@ while ($true) {
   if ($stopFlag) {
     Write-Host "HARD-STOP: $RUN_PREFIX/row_budget_stop.json present -- the run hit its ROW_BUDGET (G8). Raise -RowBudget (and the RAM floor if needed), DELETE the flag object, then relaunch. NOT relaunching." -ForegroundColor Red
     break
+  }
+  # 2026-07-07 PHASE-MIGRATION: in phase 1, a migrate_request.json means the fast box consumed its RAM
+  # headroom. Switch to the big-RAM X box: write the DURABLE phase-2 marker FIRST (so a crash mid-switch
+  # still resumes on X), THEN delete the flag (re-arm). Idempotent -- a re-entered switch just re-writes
+  # the marker. The migrating box made progress (churn streak already reset above).
+  if ($twoPhase -and $phase -eq 1 -and (Test-S3Object $MIGRATE_FLAG_KEY)) {
+    Write-Host "PHASE-MIGRATION: $RUN_PREFIX/migrate_request.json present at $done iters -- switching PHASE 1 ($InstanceType) -> PHASE 2 ($Phase2InstanceType, big-RAM X box)." -ForegroundColor Magenta
+    if (Write-S3Marker $PHASE2_MARKER_KEY ("{{`"from`":`"{0}`",`"to`":`"{1}`",`"iters`":{2}}}" -f $InstanceType, $Phase2InstanceType, $done)) {
+      $phase = 2
+      $InstanceType = $Phase2InstanceType
+      $Spotpick = $false   # phase 2 is single-type (no <2TB fallback that would OOM the tail)
+      Set-PhaseExclude
+      Remove-S3Object $MIGRATE_FLAG_KEY
+      $noCkptRelaunches = 0   # a phase switch is not a churn death
+      Write-Host "  now in PHASE 2 on $InstanceType (single-type); migrate triggers OFF; resume from S3." -ForegroundColor Magenta
+    } else {
+      Write-Host "  WARNING: failed to write $PHASE2_MARKER_KEY -- staying in PHASE 1 this cycle; will retry the switch next relaunch." -ForegroundColor Yellow
+    }
   }
   $reason = if ($done -ge 0) { "preempted at $done/$Iters -> resume from S3" } else { "no box + no ckpt -> initial launch" }
   Write-Host "  no live box; $reason. Launching #$($launches+1)..." -ForegroundColor Cyan

@@ -283,7 +283,8 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
                    river_ochs_rel="", river_ochs_sha="", preflop_hist_key=False,
                    fullhist_key=False, mrr=False, pre_keep="", pre_rr_keep="", flop_rr_keep="",
                    work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
-                   v3=None, row_budget=None, no_cache_fetch=False, delta_ckpt=False,
+                   v3=None, row_budget=None, migrate_min_avail_gb=None, migrate_max_rows=None,
+                   no_cache_fetch=False, delta_ckpt=False,
                    ckpt_secs=600, ckpt_max_dirty_gb=48.0, ckpt_min_gap_secs=300, profile_run=False,
                    wall_guard_secs=21600, awscli_zip="awscli-exe-linux-x86_64.zip") -> str:
     """The full on-box bootstrap (was inline user-data until it exceeded EC2's 16KB cap).
@@ -472,6 +473,17 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
                           '\necho "ROW_BUDGET=$POKERBOT_ROW_BUDGET"')
     else:
         row_budget_env = ""
+    # PHASE-MIGRATION watermark exports (2026-07-07). Both None => "" => byte-identical bootstrap. The
+    # babysitter passes these ONLY when launching the FAST phase-1 (128-vCPU) box; on the phase-2 X box
+    # it omits them so MIGRATE_* default to 0 (off) and the driver never re-migrates in a loop.
+    migrate_env_parts = []
+    if migrate_min_avail_gb is not None:
+        migrate_env_parts.append(f"\nexport POKERBOT_MIGRATE_MIN_AVAIL_GB={float(migrate_min_avail_gb)}"
+                                 '\necho "MIGRATE_MIN_AVAIL_GB=$POKERBOT_MIGRATE_MIN_AVAIL_GB"')
+    if migrate_max_rows is not None:
+        migrate_env_parts.append(f"\nexport POKERBOT_MIGRATE_MAX_ROWS={int(migrate_max_rows)}"
+                                 '\necho "MIGRATE_MAX_ROWS=$POKERBOT_MIGRATE_MAX_ROWS"')
+    migrate_env = "".join(migrate_env_parts)
     # Checkpoint machinery. The fullhist+M-RR arm's ``save_bytes()`` blob is ~3-58 GB, which EXCEEDS
     # S3's 5 GiB single-PutObject HARD LIMIT, and a SYNCHRONOUS upload stalls training for minutes per
     # checkpoint. SPOT-RESILIENCE redesign (arm-2 operational addendum, 2026-07-05; the bpv4_h200_arm2
@@ -940,6 +952,111 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
         row_budget_const = ""
         row_budget_pre = ""
         row_budget_block = ""
+    # ---- PHASE-MIGRATION watermark (2026-07-07): "run the fast 128-vCPU box until RAM headroom is
+    # actually consumed, then switch to the 2TB X box". This is a SOFT stop (checkpoint durably +
+    # plant migrate_request.json + break) -- distinct from ROW_BUDGET_STOP, which is a TERMINAL hard-
+    # stop needing human intervention. The babysitter sees the flag, switches the instance type to the
+    # big-RAM X box, DELETES the flag (re-arm), and relaunches (resume from S3). Rendered ONLY when the
+    # caller passes a migrate watermark AND we are on the fullhist/mrr path (the flag/_ckpt infra it
+    # calls exists only there); a run without migration is BYTE-IDENTICAL (all three vars stay "").
+    #
+    # DUAL TRIGGER by design: MIGRATE_MIN_AVAIL_GB is the primary RAM-headroom watermark (box-adaptive
+    # -- migrates when /proc/meminfo MemAvailable drops below it, regardless of total box RAM), and
+    # MIGRATE_MAX_ROWS is a DETERMINISTIC backstop against a broken RAM probe (the 2026-07-06 incident:
+    # a silently-failing GetProcessMemoryInfo returned 0 and "no memory pressure" was wrong). Whichever
+    # fires first wins. A FAILED /proc read never reads as "infinite headroom" -- it logs LOUDLY and
+    # leaves the row backstop as the sole trigger for that chunk.
+    migrate_requested = (migrate_min_avail_gb is not None) or (migrate_max_rows is not None)
+    if migrate_requested and not (fullhist_key or mrr):
+        # Fail LOUD, not a silent no-op (dead-knob rule): the migrate flag/_ckpt/json/s3 infra it calls
+        # is emitted only on the fullhist/mrr path, so migration outside it would render a driver that
+        # references undefined names.
+        raise ValueError("phase-migration (--migrate-min-avail-gb / --migrate-max-rows) requires "
+                         "--fullhist-key or --mrr (the migrate infra lives on that path only)")
+    if migrate_requested and (fullhist_key or mrr):
+        migrate_const = (
+            "\n"
+            "MIGRATE_MIN_AVAIL_GB = float(os.environ.get(\"POKERBOT_MIGRATE_MIN_AVAIL_GB\", \"0\"))  # RAM-headroom migrate watermark (GiB); 0=off\n"
+            "MIGRATE_MAX_ROWS = int(os.environ.get(\"POKERBOT_MIGRATE_MAX_ROWS\", \"0\"))  # deterministic row backstop for migrate; 0=off\n"
+            "\n"
+            "\n"
+            "def _mem_available_gb():\n"
+            "    # Robust MemAvailable probe (GiB). Returns None on ANY failure -- the caller then relies on\n"
+            "    # the deterministic ROW backstop and logs LOUDLY. NEVER treat a failed read as infinite\n"
+            "    # headroom (the 2026-07-06 broken-probe trap: a silent 0 made 'no memory pressure' invalid).\n"
+            "    try:\n"
+            "        with open(\"/proc/meminfo\") as f:\n"
+            "            for line in f:\n"
+            "                if line.startswith(\"MemAvailable:\"):\n"
+            "                    kb = float(line.split()[1])  # /proc/meminfo values are in kB\n"
+            "                    return (kb / (1024.0 * 1024.0)) if kb > 0 else None\n"
+            "    except Exception as e:\n"
+            "        print(f\"MIGRATE probe: /proc/meminfo read failed ({e!r}) -- relying on row backstop\", flush=True)\n"
+            "        return None\n"
+            "    return None\n"
+            "\n"
+            "\n"
+            "def _migrate_should(t):\n"
+            "    # Return a reason string if we should migrate to the big-RAM box NOW, else \"\".\n"
+            "    if MIGRATE_MAX_ROWS > 0:\n"
+            "        rows = max(t.n_infosets(), t.n_cum_infosets())\n"
+            "        if rows >= MIGRATE_MAX_ROWS:\n"
+            "            return f\"rows={rows} >= MIGRATE_MAX_ROWS={MIGRATE_MAX_ROWS} (deterministic backstop)\"\n"
+            "    if MIGRATE_MIN_AVAIL_GB > 0:\n"
+            "        avail = _mem_available_gb()\n"
+            "        if avail is None:\n"
+            "            print(\"MIGRATE probe: MemAvailable unavailable this chunk; row backstop is the sole \"\n"
+            "                  \"trigger (a broken probe must NOT read as infinite headroom)\", flush=True)\n"
+            "        elif avail < MIGRATE_MIN_AVAIL_GB:\n"
+            "            return f\"avail={avail:.1f}GiB < MIGRATE_MIN_AVAIL_GB={MIGRATE_MIN_AVAIL_GB} (RAM headroom)\"\n"
+            "    return \"\"\n"
+            "\n"
+            "\n"
+            "def _flag_migrate_request(t, reason):\n"
+            "    # Plant migrate_request.json under the run prefix. The babysitter (phase 1) switches the\n"
+            "    # instance type to the big-RAM X box, deletes the flag (re-arm), and relaunches (resume from\n"
+            "    # S3). SOFT stop -- NOT the terminal row_budget_stop.json (which needs human intervention).\n"
+            "    try:\n"
+            "        s3.put_object(Bucket=BUCKET, Key=RUN_PREFIX + \"/migrate_request.json\",\n"
+            "                      Body=json.dumps({\"iters_done\": t.iters_done(),\n"
+            "                                       \"strat_rows\": t.n_infosets(),\n"
+            "                                       \"cum_rows\": t.n_cum_infosets(),\n"
+            "                                       \"reason\": reason}).encode())\n"
+            "        print(f\"MIGRATE_REQUEST flag planted (migrate_request.json): {reason} -- babysitter will \"\n"
+            "              \"switch to the big-RAM X box and resume\", flush=True)\n"
+            "    except Exception as e:\n"
+            "        print(f\"MIGRATE_REQUEST flag upload failed: {e!r}\", flush=True)"
+        )
+        # PRE-TRAIN guard: a resumed phase-1 box that is ALREADY at/over the watermark on entry flags +
+        # breaks WITHOUT training a chunk or re-serializing (the checkpoint it just resumed from is the
+        # durable S3 one -- the X box resumes from the same object). Mirrors the ROW_BUDGET pre-train
+        # guard; keeps a tight box from growing another chunk before the post-chunk check can fire.
+        migrate_pre = (
+            "\n"
+            "        _mig_reason = _migrate_should(t)\n"
+            "        if _mig_reason:\n"
+            "            print(f\"MIGRATE (resume/pre-train) {_mig_reason} -- resumed at/over the watermark; \"\n"
+            "                  \"requesting box switch without a new chunk (last checkpoint already durable)\", flush=True)\n"
+            "            _flag_migrate_request(t, _mig_reason)\n"
+            "            break"
+        )
+        # POST-CHUNK: after training a chunk we grew past the last checkpoint, so write a FRESH durable
+        # checkpoint (SYNC via _ckpt(wait=True); delta or base per delta-mode -- resume handles both) so
+        # the X box resumes from the latest state, THEN flag + break.
+        migrate_block = (
+            "\n"
+            "        _mig_reason = _migrate_should(t)\n"
+            "        if _mig_reason:\n"
+            "            _ckpt(t, wait=True)\n"
+            "            _flag_migrate_request(t, _mig_reason)\n"
+            "            print(f\"MIGRATE post-chunk {_mig_reason} -- wrote durable checkpoint, requesting box \"\n"
+            "                  \"switch (soft stop; NOT terminal)\", flush=True)\n"
+            "            break"
+        )
+    else:
+        migrate_const = ""
+        migrate_pre = ""
+        migrate_block = ""
     # ---- spot-resilience template variables (fullhist path only; legacy renders keep the ORIGINAL
     # text verbatim so bp2/bp3 drivers stay byte-identical) ----
     if fullhist_key or mrr:
@@ -1690,7 +1807,7 @@ export PYTHONPATH=/opt/pokerbot RUST_BACKTRACE=1
 # stamps + guards it). "0" is byte-identical to the shipped key space.
 export POKERBOT_PREFLOP_HIST_KEY={hist_flag}
 echo "PREFLOP_HIST_KEY=$POKERBOT_PREFLOP_HIST_KEY"
-{fullhist_block}{pre_keep_block}{pre_rr_keep_block}{flop_rr_keep_block}{v3_env_block}{row_budget_env}
+{fullhist_block}{pre_keep_block}{pre_rr_keep_block}{flop_rr_keep_block}{v3_env_block}{row_budget_env}{migrate_env}
 # S2: verify the shipped EMD frozen blob matches its known sha256 BEFORE training. A same-K CORRUPTED blob
 # (truncated S3 round-trip) -> wrong potential-aware buckets -> a broken blueprint that the convergence-stop
 # (abstraction-agnostic) cannot catch and only the final ranking gate would; the ctor's num_buckets==K check
@@ -1728,7 +1845,7 @@ REGION = "{region}"
 ITERS = {iters}
 N_DEALS = {n_deals}
 NUM_BUCKETS = {num_buckets}
-CKPT_EVERY = {checkpoint_every}{row_budget_const}
+CKPT_EVERY = {checkpoint_every}{row_budget_const}{migrate_const}
 DEPTH_EDGES = [float(x) for x in "{depth_csv}".split(",") if x]
 # Optional shared frozen EMD (hole,board)->bucket lookup (relative to /opt/pokerbot). When set, the
 # trainer keys postflop flop/turn buckets from this table (river/preflop stay made-hand) — the SAME blob
@@ -1777,10 +1894,10 @@ def main():
     print(f"TRAIN target={{ITERS}} from={{start}} n_deals={{N_DEALS}} num_buckets={{NUM_BUCKETS}} "
           f"depth_edges={{DEPTH_EDGES}}", flush=True)
 {roll_reset}    t0 = time.time()
-    while t.iters_done() < ITERS:{row_budget_pre}
+    while t.iters_done() < ITERS:{row_budget_pre}{migrate_pre}
         nxt = {next_stop_expr}
         step = nxt - t.iters_done()
-        {train_stmt}{reclaim_break}{row_budget_block}
+        {train_stmt}{reclaim_break}{row_budget_block}{migrate_block}
         {ckpt_stmt}{v3_ckpt_call}
         el = time.time() - t0
         done = t.iters_done() - start
@@ -2020,6 +2137,20 @@ def main() -> None:
                         "driver's 400M default and a byte-identical bootstrap. The v3 amendment's "
                         "550M was pre-registered but never exported (found in arm-2 prep) — always "
                         "pass this explicitly for fullhist arms.")
+    p.add_argument("--migrate-min-avail-gb", type=float, default=None,
+                   help="PHASE-MIGRATION RAM watermark (2026-07-07): export POKERBOT_MIGRATE_MIN_AVAIL_GB "
+                        "on the box. When /proc/meminfo MemAvailable drops below this many GiB, the driver "
+                        "checkpoints durably, plants migrate_request.json, and exits cleanly so the "
+                        "babysitter switches to the big-RAM X box (resume from S3). Box-adaptive (the "
+                        "measure is real headroom, not a row proxy). Requires --fullhist-key/--mrr. Omit = "
+                        "off = byte-identical bootstrap. Pass ONLY for the fast phase-1 box (never phase 2, "
+                        "or the X box re-migrates on resume).")
+    p.add_argument("--migrate-max-rows", type=int, default=None,
+                   help="PHASE-MIGRATION deterministic row backstop: export POKERBOT_MIGRATE_MAX_ROWS. "
+                        "Migrates when max(strat,cum) rows reach this, independent of the RAM probe -- the "
+                        "guard against a silently-broken /proc read (the 2026-07-06 broken-probe incident). "
+                        "Whichever of the two triggers fires first wins. Requires --fullhist-key/--mrr. "
+                        "Omit = off. Pair with --migrate-min-avail-gb on the phase-1 box.")
     p.add_argument("--v3-regstats", action="store_true",
                    help="v3: print REGSTATS regret-percentile lines at checkpoint cadence")
     args = p.parse_args()
@@ -2116,7 +2247,9 @@ def main() -> None:
         pre_keep=args.pre_keep, pre_rr_keep=args.pre_rr_keep, flop_rr_keep=args.flop_rr_keep,
         work_steal=args.work_steal, dcfr=args.dcfr,
         dcfr_prune_threshold=args.dcfr_prune_threshold, dcfr_explore_frac=args.dcfr_explore_frac,
-        v3=v3_cfg, row_budget=args.row_budget, no_cache_fetch=args.no_cache_fetch,
+        v3=v3_cfg, row_budget=args.row_budget,
+        migrate_min_avail_gb=args.migrate_min_avail_gb, migrate_max_rows=args.migrate_max_rows,
+        no_cache_fetch=args.no_cache_fetch,
         delta_ckpt=args.delta_ckpt, ckpt_secs=args.ckpt_secs,
         ckpt_max_dirty_gb=args.ckpt_max_dirty_gb, ckpt_min_gap_secs=args.ckpt_min_gap_secs,
         profile_run=args.profile_run,
