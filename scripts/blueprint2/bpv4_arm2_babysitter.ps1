@@ -90,6 +90,10 @@
 # CHURN CURATION (2026-07-06 ~21:40, spot-advisor probe): r6i is in the >20% interruption band
 # for eu-central-1 (worst) -- excluded. x2idn.32xlarge (2TB, <5% band, $2.86-2.91 = cheaper than
 # r6a in 1a/1b) stays IN the chain as a preferred alternate.
+# SEC-21 (2026-07-07, post-audit relaunch, user-approved): census undercount confirmed (sec 20,
+# run CLEAN) -> budget 2.2B (safe 1TB ceiling; carries to ~K1@20000 at the projected 2.0-2.2B),
+# ckpt volume 400->800GB (base blob ~240GB at 20k; prestage + fresh serialize must coexist).
+# Back half (20k->40k, ~3.5B rows) awaits the user's X-family spot quota -> x2idn 2TB + budget ~4B.
 $env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n,c6i,c6in,c6id,c7a,m6i,m6id,m6in,m6idn,m6a,m7a,r6i,x1,x1e"
 & (Join-Path $PSScriptRoot "blueprint2_babysitter.ps1") `
     -Run "bpv4_emd160_arm2b" `
@@ -103,7 +107,7 @@ $env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n,c6i,c6in,c6id,c7a,m6i,
     -V3SnapStart "3200" `
     -V3CovHands 2048 `
     -V3Regstats `
-    -RowBudget 1400000000 `
+    -RowBudget 2200000000 `
     -Iters 40000 `
     -NDeals 8192 `
     -NumBuckets 160 `
@@ -114,7 +118,7 @@ $env:SPOTPICK_EXCLUDE_FAMILIES = "c6a,c5,c5a,c5ad,c5d,c5n,c6i,c6in,c6id,c7a,m6i,
     -CkptSecs 600 `
     -CkptMaxDirtyGb 24 `
     -GateEvery 2500 `
-    -CkptVolumeGb 400 `
+    -CkptVolumeGb 800 `
     -InstanceType "x2idn.32xlarge" `
     -Spotpick `
     -MaxHours 20 `
