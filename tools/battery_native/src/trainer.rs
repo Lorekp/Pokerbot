@@ -4604,6 +4604,52 @@ pub const SNAP_MAGIC: &[u8; 8] = b"NLSNAP01";
 const SNAP_ROW_BYTES: usize = 16 + 4 * NUM_ACTIONS; // key16 + 11 f32 probs
 const NLCFR_ROW_BYTES: u64 = 16 + 8 * NUM_ACTIONS as u64; // key16 + 11 f64
 
+/// The current-strategy probability row for one cum_regret row: the regret-matched positive part,
+/// normalized over ALL 11 lanes (illegal lanes carry regret 0 by construction, so this equals
+/// regret-matching over the legal set whenever any positive mass exists). A row with NO positive mass
+/// is ALL-ZERO. This is the ONE per-row math the NLSNAP01 blob is built from — the in-RAM
+/// (`serialize_current_strategy`) and file (`serialize_current_strategy_to_file`) paths both call it, so
+/// they cannot drift.
+#[inline]
+fn snap_row_from_regret(r: &[RegretT; NUM_ACTIONS]) -> [f32; NUM_ACTIONS] {
+    let rr = widen_r(r);
+    let mut pos = [0.0f64; NUM_ACTIONS];
+    let mut s = 0.0;
+    for a in 0..NUM_ACTIONS {
+        let v = rr[a].max(0.0);
+        pos[a] = v;
+        s += v;
+    }
+    let mut row = [0.0f32; NUM_ACTIONS];
+    if s > 0.0 {
+        for a in 0..NUM_ACTIONS {
+            row[a] = (pos[a] / s) as f32;
+        }
+    }
+    row
+}
+
+/// Encode ONE NLSNAP01 row into `slot` (exactly `SNAP_ROW_BYTES`): 16-byte key then 11 f32 LE probs.
+/// Shared by both the in-RAM and file paths so the byte layout cannot drift.
+#[inline]
+fn encode_snap_row(slot: &mut [u8], key: &[u8; 16], row: &[f32; NUM_ACTIONS]) {
+    slot[..16].copy_from_slice(&key[..]);
+    let mut o = 16;
+    for &v in row {
+        slot[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        o += 4;
+    }
+}
+
+/// The 24-byte NLSNAP01 header: magic (8) + iters_done LE (8) + n_rows LE (8).
+fn snap_header(iters_done: u64, n_rows: u64) -> [u8; 24] {
+    let mut h = [0u8; 24];
+    h[..8].copy_from_slice(SNAP_MAGIC);
+    h[8..16].copy_from_slice(&iters_done.to_le_bytes());
+    h[16..24].copy_from_slice(&n_rows.to_le_bytes());
+    h
+}
+
 /// Serialize the CURRENT strategy — the regret-matched positive part of every cum_regret row — as an
 /// `NLSNAP01` blob: magic, iters_done u64, n_rows u64, then (16-byte key, 11 x f32 LE probs) in ONE
 /// global ascending key order (same sort discipline as `serialize`, so streams k-way-merge). Rows are
@@ -4616,28 +4662,10 @@ const NLCFR_ROW_BYTES: u64 = 16 + 8 * NUM_ACTIONS as u64; // key16 + 11 f64
 pub fn serialize_current_strategy(tab: &NlheTables) -> Vec<u8> {
     let n = tab.total_cum_len();
     let mut out = Vec::with_capacity(24 + n * SNAP_ROW_BYTES);
-    out.extend_from_slice(SNAP_MAGIC);
-    out.extend_from_slice(&tab.iters_done.to_le_bytes());
-    out.extend_from_slice(&(n as u64).to_le_bytes());
+    out.extend_from_slice(&snap_header(tab.iters_done, n as u64));
     let mut pairs: Vec<(&[u8; 16], [f32; NUM_ACTIONS])> = tab
         .iter_all_cum()
-        .map(|(k, r)| {
-            let rr = widen_r(r);
-            let mut pos = [0.0f64; NUM_ACTIONS];
-            let mut s = 0.0;
-            for a in 0..NUM_ACTIONS {
-                let v = rr[a].max(0.0);
-                pos[a] = v;
-                s += v;
-            }
-            let mut row = [0.0f32; NUM_ACTIONS];
-            if s > 0.0 {
-                for a in 0..NUM_ACTIONS {
-                    row[a] = (pos[a] / s) as f32;
-                }
-            }
-            (k, row)
-        })
+        .map(|(k, r)| (k, snap_row_from_regret(r)))
         .collect();
     // PERF (checkpoint-speed ops, 2026-07-06): parallel sort + parallel fixed-width encode, matching
     // the `write_map_sharded` treatment. Keys are UNIQUE (HashMap keys), so unstable-vs-stable cannot
@@ -4651,21 +4679,11 @@ pub fn serialize_current_strategy(tab: &NlheTables) -> Vec<u8> {
     out.resize(base + n_rows * SNAP_ROW_BYTES, 0u8);
     let dst = &mut out[base..];
 
-    #[inline]
-    fn encode_snap_one(slot: &mut [u8], key: &[u8; 16], row: &[f32; NUM_ACTIONS]) {
-        slot[..16].copy_from_slice(&key[..]);
-        let mut o = 16;
-        for &v in row {
-            slot[o..o + 4].copy_from_slice(&v.to_le_bytes());
-            o += 4;
-        }
-    }
-
     const PAR_MIN_ROWS: usize = 1 << 20;
     if n_rows < PAR_MIN_ROWS {
         for (i, (k, row)) in pairs.iter().enumerate() {
             let off = i * SNAP_ROW_BYTES;
-            encode_snap_one(&mut dst[off..off + SNAP_ROW_BYTES], k, row);
+            encode_snap_row(&mut dst[off..off + SNAP_ROW_BYTES], k, row);
         }
     } else {
         let rows_per_chunk = n_rows.div_ceil(rayon::current_num_threads().max(1) * 4).max(1);
@@ -4674,11 +4692,51 @@ pub fn serialize_current_strategy(tab: &NlheTables) -> Vec<u8> {
             .for_each(|(byte_chunk, pair_chunk)| {
                 for (i, (k, row)) in pair_chunk.iter().enumerate() {
                     let off = i * SNAP_ROW_BYTES;
-                    encode_snap_one(&mut byte_chunk[off..off + SNAP_ROW_BYTES], k, row);
+                    encode_snap_row(&mut byte_chunk[off..off + SNAP_ROW_BYTES], k, row);
                 }
             });
     }
     out
+}
+
+/// Stream the CURRENT strategy (`NLSNAP01`) DIRECTLY to `path` WITHOUT materializing the blob, returning
+/// the bytes written. Byte-for-byte identical to `std::fs::write(path, serialize_current_strategy(tab))`:
+/// `gather_sorted_all(&tab.shards, |sh| &sh.cum_regret)` yields the SAME ascending unique-key order as
+/// the in-RAM path's `par_sort` (both sort the identical unique key set), and each row is the same fixed
+/// `SNAP_ROW_BYTES` produced by `snap_row_from_regret` + `encode_snap_row`. The file is `set_len` up
+/// front and row chunks stream through parallel positioned writes (mirrors `write_sections_to_file`), so
+/// transient RAM drops from pairs+full-blob (~112 B/row) to the 24 B/row sorted ref vector plus ~8 MiB
+/// per rayon task. fsync opt-in (`ckpt_fsync_enabled`). Runs entirely under `py.detach()` on the PyO3
+/// path.
+pub fn serialize_current_strategy_to_file(tab: &NlheTables, path: &str) -> std::io::Result<usize> {
+    let rows = gather_sorted_all(&tab.shards, |sh| &sh.cum_regret);
+    let n = rows.len();
+    let header = snap_header(tab.iters_done, n as u64);
+    let total = header.len() + n * SNAP_ROW_BYTES;
+    let f = std::fs::File::create(path)?;
+    f.set_len(total as u64)?;
+    write_all_at(&f, &header, 0)?;
+    let base = header.len() as u64;
+    let jr = ((8 * 1024 * 1024) / SNAP_ROW_BYTES).max(1);
+    (0..n.div_ceil(jr)).into_par_iter().try_for_each_init(
+        Vec::<u8>::new,
+        |buf, j| -> std::io::Result<()> {
+            let lo = j * jr;
+            let hi = (lo + jr).min(n);
+            buf.clear();
+            buf.resize((hi - lo) * SNAP_ROW_BYTES, 0u8);
+            for (i, (k, r)) in rows[lo..hi].iter().enumerate() {
+                let row = snap_row_from_regret(r);
+                let off = i * SNAP_ROW_BYTES;
+                encode_snap_row(&mut buf[off..off + SNAP_ROW_BYTES], k, &row);
+            }
+            write_all_at(&f, &buf[..], base + (lo * SNAP_ROW_BYTES) as u64)
+        },
+    )?;
+    if ckpt_fsync_enabled() {
+        f.sync_all()?;
+    }
+    Ok(total)
 }
 
 /// Streaming reader for an `NLSNAP01` blob (any `Read`; the offline tool wraps `BufReader<File>`,
@@ -8160,6 +8218,56 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, rd.n_rows);
+    }
+
+    /// SNAPSHOT FILE-WRITER GATE — the streaming positioned-write path
+    /// (`serialize_current_strategy_to_file`) must emit the EXACT NLSNAP01 bytes the in-RAM
+    /// `serialize_current_strategy` produces (same global sort of the unique cum keys, same 24-byte
+    /// header, same fixed-width f32 rows). The offline averager + `SnapshotStream` reader depend on the
+    /// exact bytes, and the file path exists ONLY to avoid materializing the multi-GB blob at scale — so
+    /// byte-identity is the gate. Covers a real trained table AND the empty-table edge (0 rows).
+    #[test]
+    fn snapshot_to_file_is_byte_identical() {
+        let tmp = |tag: &str| {
+            let mut p = std::env::temp_dir();
+            p.push(format!("nlsnap_ser2file_{}_{}.snap", tag, std::process::id()));
+            p.to_str().unwrap().to_string()
+        };
+
+        // Trained table (matches snapshot_current_strategy_roundtrip's build).
+        let cfg = test_cfg(64);
+        let mut tab = NlheTables::new();
+        for _ in 0..3 {
+            tab.train_iteration_v3(&cfg, &V3Cfg::default());
+        }
+        let want = serialize_current_strategy(&tab);
+        let p = tmp("trained");
+        let n = serialize_current_strategy_to_file(&tab, &p).expect("serialize_current_strategy_to_file");
+        assert_eq!(n, want.len(), "returned byte count mismatch");
+        let got = std::fs::read(&p).expect("read back");
+        assert_eq!(got, want, "snapshot file bytes differ from in-RAM serialize_current_strategy");
+        // Re-open via the reader the averager uses: header must round-trip.
+        let mut rd = SnapshotStream::open(std::io::Cursor::new(&got)).expect("open snapshot file blob");
+        assert_eq!(rd.iters_done, 3, "iters_done mismatch");
+        assert_eq!(rd.n_rows as usize, tab.total_cum_len(), "n_rows mismatch");
+        let mut seen = 0u64;
+        while rd.next_row().expect("row").is_some() {
+            seen += 1;
+        }
+        assert_eq!(seen, rd.n_rows, "row count mismatch on re-read");
+        let _ = std::fs::remove_file(&p);
+
+        // Empty-table edge: 0 rows, header-only blob.
+        let empty = NlheTables::new();
+        let want_e = serialize_current_strategy(&empty);
+        let pe = tmp("empty");
+        let ne = serialize_current_strategy_to_file(&empty, &pe).expect("empty serialize_to_file");
+        let got_e = std::fs::read(&pe).expect("read empty back");
+        assert_eq!(ne, want_e.len(), "empty byte count mismatch");
+        assert_eq!(got_e, want_e, "empty-table snapshot file bytes differ");
+        let rd_e = SnapshotStream::open(std::io::Cursor::new(&got_e)).expect("open empty snapshot");
+        assert_eq!(rd_e.n_rows, 0, "empty table must have 0 rows");
+        let _ = std::fs::remove_file(&pe);
     }
 
     /// Offline snapshot averaging: hand-built snapshots + checkpoint exercise the merge rules --

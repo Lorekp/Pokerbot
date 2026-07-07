@@ -1574,6 +1574,24 @@ mod py {
             Ok(PyBytes::new(py, &nlhe_trainer::serialize_current_strategy(&self.tab)))
         }
 
+        /// Serialize the CURRENT strategy (`NLSNAP01`) DIRECTLY to `path` (Rust file write under
+        /// `py.detach()`), returning the number of bytes written. Byte-identical to writing
+        /// `save_current_strategy_bytes()` to disk, but WITHOUT materializing the multi-GB blob (an owned
+        /// `pairs` vector PLUS the full `out` Vec) in RAM and copying it AGAIN into PyBytes — the OOM-at-
+        /// scale path this replaces. The streaming writer keeps the exact NLSNAP01 bytes (same global
+        /// sort, same fixed-width f32 rows) so the offline averager / `SnapshotStream` reader are
+        /// unaffected. Not supported on the hogwild path (the v3 snapshot modes are fork-merge-only).
+        fn save_current_strategy_to_file(&self, py: Python<'_>, path: &str) -> PyResult<usize> {
+            #[cfg(feature = "hogwild")]
+            if self.hog.is_some() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "save_current_strategy_to_file: unsupported on the hogwild path",
+                ));
+            }
+            py.detach(|| nlhe_trainer::serialize_current_strategy_to_file(&self.tab, path))
+                .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
+        }
+
         /// blueprint-v4 v3 (coverage as a first-class metric): ON-POLICY coverage probe — play
         /// `n_hands` self-play hands on the CURRENT strategy and count, per street, how many of the
         /// strategy's own lookups hit the trained table (`trainer::coverage_probe`; the Stage-0

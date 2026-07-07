@@ -104,6 +104,11 @@ param(
                                       #   an account-side pipeline reacts to code-tarball uploads and
                                       #   plants an untrusted .so in the build cache; no upload = no
                                       #   trigger. Requires the S3 tarball to already match the tree.)
+  [switch]$NoCacheFetch,              # pass --no-cache-fetch on EVERY launch (2026-07-06 incident: the
+                                      #   account-side pipeline plants an untrusted .so under the correct
+                                      #   cache key AFTER each code-tarball upload, and the on-box cache
+                                      #   verify is self-referential, so every box must BUILD from the
+                                      #   verified tarball -- never fetch the cache. Pairs with -ReuseCode.)
   [string]$CrateSrc = "tools/battery_native",  # the LIVE crate carries river_ochs.rs (the frozen copy at
                                                # runs/bp_crate_frozen does NOT); freeze a new copy first if
                                                # concurrent crate edits are expected during the run
@@ -188,10 +193,32 @@ $MIGRATE_FLAG_KEY  = "$RUN_PREFIX/migrate_request.json"       # on-box driver pl
 $PHASE2_MARKER_KEY = "$RUN_PREFIX/migrated_to_phase2.json"    # DURABLE truth: run has moved to the X box
 $phase             = 0   # 0 = single-phase; 1 = fast box; 2 = migrated to X box
 
-# Small S3 object helpers (head/put/delete) -- s3api head-object exit code is the existence test.
+# Small S3 object helpers (head/put/delete).
+# Test-S3Object returns a STATE STRING "present" / "absent" / "unknown" (NOT a bare bool):
+#   * "present" -- head-object succeeded (exit 0).
+#   * "absent"  -- head-object failed with a GENUINE 404 / "Not Found" / NoSuchKey (the object
+#                  really does not exist).
+#   * "unknown" -- an AMBIGUOUS non-zero (throttle, expired credential, DNS, timeout, ...). The
+#                  old code mapped ALL non-zero to "absent", so a transient blip at (re)start
+#                  mis-derived PHASE 1 and launched a 1TB box against a >1TB post-migration table
+#                  -> OOM loop + a false "spot capacity storm" abort. We now RETRY a few times with
+#                  a short backoff, and only if it STILL cannot be resolved do we return "unknown"
+#                  (fail-closed -- see the phase-derivation block).
 function Test-S3Object([string]$key) {
-  aws s3api head-object --bucket $Bucket --key $key --region $Region 2>$null | Out-Null
-  return ($LASTEXITCODE -eq 0)
+  $attempts = 3
+  for ($i = 1; $i -le $attempts; $i++) {
+    $err = & aws s3api head-object --bucket $Bucket --key $key --region $Region 2>&1
+    $code = $LASTEXITCODE
+    if ($code -eq 0) { return "present" }
+    $errTxt = ($err | Out-String)
+    # A genuine "the object does not exist" answer -- definitively ABSENT. The AWS CLI reports a
+    # missing key as a 404 with "Not Found" (head-object has no body so no NoSuchKey XML, but the
+    # SDK error text still carries these tokens); match all three forms defensively.
+    if ($errTxt -match '(?i)\b404\b|Not\s*Found|NoSuchKey') { return "absent" }
+    # Ambiguous non-zero (throttle / expired creds / DNS / timeout). Retry with a short backoff.
+    if ($i -lt $attempts) { Start-Sleep -Seconds (2 * $i) }
+  }
+  return "unknown"
 }
 function Write-S3Marker([string]$key, [string]$json) {
   $tmp = Join-Path $env:TEMP ("bp2_marker_{0}.json" -f ([guid]::NewGuid().ToString('N')))
@@ -208,15 +235,29 @@ function Remove-S3Object([string]$key) {
 if ($twoPhase) {
   # Derive the phase from the DURABLE S3 marker so a babysitter restart resumes the right box (never
   # relaunches a 1TB box that would instantly re-migrate). Marker present => already on the X box.
-  if (Test-S3Object $PHASE2_MARKER_KEY) {
+  $markerState = Test-S3Object $PHASE2_MARKER_KEY
+  # FAIL CLOSED on an ambiguous head-object (throttle / expired creds / DNS at (re)start). We choose
+  # to default to PHASE 2 rather than abort: the 2TB X box safely resumes ANY table (pre- OR
+  # post-migration), so treating "unknown" as phase 2 can NEVER OOM. The only cost of a wrong guess
+  # here is running the slower/pricier X box for a pre-migration table -- a benign cost overrun, not a
+  # data-loss or crash. The DANGEROUS mistake -- launching a 1TB phase-1 box against a >1TB
+  # post-migration table (guaranteed OOM loop + false capacity-storm abort) -- is exactly what the old
+  # "any non-zero => absent" behaviour did, and is what this fail-closed default prevents.
+  if ($markerState -eq "unknown") {
+    Write-Host "TWO-PHASE: could not determine phase from $PHASE2_MARKER_KEY (transient S3/credential error after retries) -> FAILING CLOSED to PHASE 2 (the 2TB X box safely resumes any table; a 1TB phase-1 box could OOM a post-migration table)." -ForegroundColor Yellow
     $phase = 2
+  } elseif ($markerState -eq "present") {
+    $phase = 2
+  } else {
+    $phase = 1
+  }
+  if ($phase -eq 2) {
     $InstanceType = $Phase2InstanceType
     # Phase 2 is SINGLE-TYPE (no spotpick fallback): the only 2TB box at 64-vCPU X quota is
     # x2iedn.16xlarge; any same-vCPU fallback would be a <2TB box that OOMs at the row-heavy tail.
     $Spotpick = $false
-    Write-Host "TWO-PHASE: migrated_to_phase2 marker present -> resuming in PHASE 2 on $InstanceType (single-type, no fallback)" -ForegroundColor Cyan
+    Write-Host "TWO-PHASE: resuming in PHASE 2 on $InstanceType (single-type, no fallback)" -ForegroundColor Cyan
   } else {
-    $phase = 1
     $InstanceType = $Phase1InstanceType
     # Phase 1 keeps spotpick for capacity resilience across the 1TB r-family (the exclude list keeps
     # the 128-vCPU X boxes OUT so the fallback chain can't eat the X quota reserved for phase 2).
@@ -396,6 +437,7 @@ function Invoke-Launch {
   if ($OnDemand)   { $argsList += "--on-demand" }
   if ($CrateSrc)   { $argsList += @("--crate-src", $CrateSrc) }
   if ($ReuseCode -or $launches -ge 1) { $argsList += "--reuse-code" }
+  if ($NoCacheFetch) { $argsList += "--no-cache-fetch" }
   Write-Host "  launching: python $($argsList -join ' ')"
   $out = (& python @argsList 2>&1)
   $out | ForEach-Object { Write-Host "    $_" }
@@ -492,13 +534,29 @@ while ($true) {
 
   # 4) NO live box and target NOT reached -> preemption (or never-launched). Relaunch, with storm guards.
   if ($launches -ge $MaxLaunch) { Write-Host "STOP: max launches ($MaxLaunch) reached (storm guard)."; break }
+  # A pending phase-1->2 migration must NOT count against the churn streak: a box that fired its RAM
+  # watermark and planted migrate_request.json did its job (it deliberately handed off), so its death
+  # with "no new checkpoint since launch" is a HAND-OFF, not a capacity-storm churn death. Resolve the
+  # flag ONCE per cycle (tri-state present/absent/unknown) and reuse it in both 4a and the migrate
+  # handler below. On "unknown" we do NOT treat it as a pending migration (fail closed to the normal
+  # churn accounting -- a spurious skip could mask a real storm), but the head-object is retried inside
+  # Test-S3Object so a transient blip rarely reaches here as "unknown".
+  $migratePending = $false
+  if ($twoPhase -and $phase -eq 1) {
+    $migratePending = ((Test-S3Object $MIGRATE_FLAG_KEY) -eq "present")
+  }
   # 4a) CHURN-ABORT: the box that just died saved NO new checkpoint since its own launch -> streak++.
   # A streak of $MaxNoCkptRelaunches means capacity is being reclaimed faster than the checkpoint
   # cadence; every further relaunch is pure burn. Abort loudly instead (S3 state is preserved).
   # NOTE: emergency-flush delta markers from the reclaim notice handler count as progress (correct --
   # a box that banked its dying delta DID make progress, so $done > $doneAtLastLaunch and streak resets).
   if ($launches -gt 0) {
-    if ($done -le $doneAtLastLaunch) {
+    if ($migratePending) {
+      # A pending migration is not a churn death -- mirror the success-path reset so a hand-off box
+      # can never contribute to (or trip) the capacity-storm abort.
+      $noCkptRelaunches = 0
+      Write-Host "  churn guard: migrate_request.json pending (phase-1 RAM watermark fired) -- treating as a hand-off, NOT a churn death; no-progress streak reset to 0" -ForegroundColor Gray
+    } elseif ($done -le $doneAtLastLaunch) {
       $noCkptRelaunches++
       Write-Host "  churn guard: box died with NO new checkpoint (iters still $doneTxt); no-progress streak = $noCkptRelaunches/$MaxNoCkptRelaunches" -ForegroundColor Yellow
       if ($noCkptRelaunches -ge $MaxNoCkptRelaunches) {
@@ -530,6 +588,15 @@ while ($true) {
   # here (box resumes, instantly self-stops, banks nothing), so the overnight loop relaunched
   # at-budget boxes for ~8 cycles. The driver now plants <run>/row_budget_stop.json; HARD-STOP on
   # it -- a config change (raise -RowBudget) + deleting the flag object is the only way forward.
+  # 2026-07-07 GATE-KILL STOP FLAG: the pre-launch monitor (or an operator) plants
+  # <run>/gate_kill_stop.json when a pre-registered kill-gate (K0/K1a/K1) returns KILL. HARD-STOP on it
+  # exactly like the row-budget flag -- a KILLed arm must not be relaunched/funded further. Re-arm by
+  # DELETING the flag object (only after a design change; a KILL is normally terminal per sec 24.3).
+  $gateStop = (aws s3api head-object --bucket $Bucket --key "$RUN_PREFIX/gate_kill_stop.json" --region $Region 2>$null)
+  if ($gateStop) {
+    Write-Host "HARD-STOP: $RUN_PREFIX/gate_kill_stop.json present -- a pre-registered KILL-GATE failed. The arm is KILLED (limp-trap / shape pathology per amendment sec 24.3); NOT relaunching. DELETE the flag only after a design change." -ForegroundColor Red
+    break
+  }
   $stopFlag = (aws s3api head-object --bucket $Bucket --key "$RUN_PREFIX/row_budget_stop.json" --region $Region 2>$null)
   if ($stopFlag) {
     Write-Host "HARD-STOP: $RUN_PREFIX/row_budget_stop.json present -- the run hit its ROW_BUDGET (G8). Raise -RowBudget (and the RAM floor if needed), DELETE the flag object, then relaunch. NOT relaunching." -ForegroundColor Red
@@ -538,8 +605,9 @@ while ($true) {
   # 2026-07-07 PHASE-MIGRATION: in phase 1, a migrate_request.json means the fast box consumed its RAM
   # headroom. Switch to the big-RAM X box: write the DURABLE phase-2 marker FIRST (so a crash mid-switch
   # still resumes on X), THEN delete the flag (re-arm). Idempotent -- a re-entered switch just re-writes
-  # the marker. The migrating box made progress (churn streak already reset above).
-  if ($twoPhase -and $phase -eq 1 -and (Test-S3Object $MIGRATE_FLAG_KEY)) {
+  # the marker. The migrating box made progress (churn streak already reset above). $migratePending was
+  # resolved above (tri-state -> present only).
+  if ($migratePending) {
     Write-Host "PHASE-MIGRATION: $RUN_PREFIX/migrate_request.json present at $done iters -- switching PHASE 1 ($InstanceType) -> PHASE 2 ($Phase2InstanceType, big-RAM X box)." -ForegroundColor Magenta
     if (Write-S3Marker $PHASE2_MARKER_KEY ("{{`"from`":`"{0}`",`"to`":`"{1}`",`"iters`":{2}}}" -f $InstanceType, $Phase2InstanceType, $done)) {
       $phase = 2
@@ -550,7 +618,13 @@ while ($true) {
       $noCkptRelaunches = 0   # a phase switch is not a churn death
       Write-Host "  now in PHASE 2 on $InstanceType (single-type); migrate triggers OFF; resume from S3." -ForegroundColor Magenta
     } else {
-      Write-Host "  WARNING: failed to write $PHASE2_MARKER_KEY -- staying in PHASE 1 this cycle; will retry the switch next relaunch." -ForegroundColor Yellow
+      # MARKER-WRITE FAILURE: do NOT fall through to a phase-1 relaunch -- that box would instantly
+      # re-migrate with no progress, churning until a false capacity-storm abort. RETRY the switch
+      # (no box spawned) after a short backoff; the migrate flag is still present so next iteration
+      # re-enters this handler. This cycle also did not spawn a box, so the churn streak is untouched.
+      Write-Host "  WARNING: failed to write $PHASE2_MARKER_KEY (transient S3 error) -- NOT relaunching phase-1 (would re-migrate with no progress). Retrying the switch in ${PollSec}s." -ForegroundColor Yellow
+      Start-Sleep -Seconds $PollSec
+      continue
     }
   }
   $reason = if ($done -ge 0) { "preempted at $done/$Iters -> resume from S3" } else { "no box + no ckpt -> initial launch" }
@@ -578,22 +652,53 @@ if ($convergedStop) {
   Write-Host "Run COMPLETE (iters backstop)." -ForegroundColor Green
 } else {
   Write-Host "Run NOT complete (hit a cap or stall). The S3 latest checkpoint is preserved for a manual resume:" -ForegroundColor Yellow
-  $resume = "python scripts\launch_native_cfr_training_spot.py --run-subdir $Run --iters $Iters --n-deals $NDeals --num-buckets $NumBuckets --checkpoint-every $CheckpointEvery"
+  # This echo MIRRORS Invoke-Launch flag-for-flag (accurate to the CURRENT phase) so a hand-copied
+  # resume never silently drops a correctness knob -- omitting --pre-*-keep/--flop-rr-keep would run the
+  # legacy {4,5,6} menu (train/serve abstraction skew), omitting --row-budget would revert to the 400M
+  # default (an instant terminal ROW_BUDGET stop), and omitting --fullhist-key/--mrr would train a
+  # totally different key space. If you edit Invoke-Launch, edit this block too.
+  $resume = "python scripts\launch_native_cfr_training_spot.py --run-subdir $Run --iters $Iters --n-deals $NDeals --num-buckets $NumBuckets --checkpoint-every $CheckpointEvery --max-hours $($MaxHours + 1) --instance-type $InstanceType --arch $Arch"
   if ($GateEvery -gt 0) { $resume += " --gate-every $GateEvery" }
   if ($CkptVolumeGb -gt 0) { $resume += " --ckpt-volume-gb $CkptVolumeGb" }
   if ($EmdFrozen) { $resume += " --emd-frozen $EmdFrozen" }
   if ($RiverOchs) { $resume += " --river-ochs $RiverOchs" }
+  if ($DepthEdges) { $resume += " --depth-edges $DepthEdges" }
   if ($PreflopHistKey) { $resume += " --preflop-hist-key" }
   if ($FullHistKey) { $resume += " --fullhist-key" }
   if ($Mrr) { $resume += " --mrr" }
+  if ($PreKeep) { $resume += " --pre-keep $PreKeep" }
+  if ($PreRrKeep) { $resume += " --pre-rr-keep $PreRrKeep" }
+  if ($FlopRrKeep) { $resume += " --flop-rr-keep $FlopRrKeep" }
   if ($WorkSteal) { $resume += " --work-steal" }
-  if ($V3Lcfr) { $resume += " --v3-lcfr --v3-lcfr-d $V3LcfrD --v3-lcfr-w $V3LcfrW"
+  if ($Dcfr) { $resume += " --dcfr --dcfr-prune-threshold $DcfrPruneThreshold --dcfr-explore-frac $DcfrExploreFrac" }
+  if ($V3Lcfr) { $resume += " --v3-lcfr --v3-lcfr-d $V3LcfrD --v3-lcfr-w $V3LcfrW --v3-prune-explore $V3PruneExplore"
     if ($V3PruneC) { $resume += " --v3-prune-c $V3PruneC" }
-    if ($V3PruneStart) { $resume += " --v3-prune-start $V3PruneStart" } }
+    if ($V3PruneStart) { $resume += " --v3-prune-start $V3PruneStart" }
+    if ($V3RegretFloor) { $resume += " --v3-regret-floor $V3RegretFloor" } }
+  if ($V3SignedRegrets) { $resume += " --v3-signed-regrets --v3-prune-explore $V3PruneExplore"
+    if ($V3PruneC) { $resume += " --v3-prune-c $V3PruneC" }
+    if ($V3PruneStart) { $resume += " --v3-prune-start $V3PruneStart" }
+    if ($V3RegretFloor) { $resume += " --v3-regret-floor $V3RegretFloor" } }
   if ($V3SnapshotAvg) { $resume += " --v3-snapshot-avg"
     if ($V3SnapStart) { $resume += " --v3-snap-start $V3SnapStart" } }
-  if ($V3Lcfr -or $V3SnapshotAvg) { $resume += " --v3-cov-hands $V3CovHands"
+  if ($V3Lcfr -or $V3SignedRegrets -or $V3SnapshotAvg) { $resume += " --v3-cov-hands $V3CovHands"
     if ($V3Regstats) { $resume += " --v3-regstats" } }
+  if ($RowBudget -gt 0) { $resume += " --row-budget $RowBudget" }
+  # Migrate triggers are PHASE-1 ONLY (like Invoke-Launch): on the phase-2 X box they stay OFF so it
+  # never re-migrates on resume.
+  if ($twoPhase -and $phase -eq 1) {
+    if ($MigrateMinAvailGb) { $resume += " --migrate-min-avail-gb $MigrateMinAvailGb" }
+    if ($MigrateMaxRows) { $resume += " --migrate-max-rows $MigrateMaxRows" }
+  }
+  if ($DeltaCkpt) { $resume += " --delta-ckpt" }
+  if ($CkptSecs -gt 0) { $resume += " --ckpt-secs $CkptSecs" }
+  if ($CkptMaxDirtyGb -gt 0) { $resume += " --ckpt-max-dirty-gb $CkptMaxDirtyGb" }
+  if ($CkptMinGapSecs -gt 0) { $resume += " --ckpt-min-gap-secs $CkptMinGapSecs" }
+  if ($Spotpick) { $resume += " --spotpick" }
+  if ($OnDemand) { $resume += " --on-demand" }
+  if ($CrateSrc) { $resume += " --crate-src $CrateSrc" }
+  $resume += " --reuse-code"   # a manual resume always reuses the existing S3 tarball
+  if ($NoCacheFetch) { $resume += " --no-cache-fetch" }
   Write-Host "  $resume"
 }
 if ($final -ge 0 -and ($convergedStop -or $final -ge $Iters)) {

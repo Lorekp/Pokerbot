@@ -12,7 +12,9 @@
 # 128-vCPU X quota we do NOT have, so the affordable X box has HALF the compute of the original plan. That
 # makes "run the fast 128-vCPU box as long as possible, switch to X only when RAM forces it" a clear win on
 # BOTH cost and speed:
-#   PHASE 1  r6a.32xlarge  128 vCPU / 1TB / $2.87/hr  -- cheapest 128-vCPU >=1TB box; 2x compute vs phase 2.
+#   PHASE 1  r8i.32xlarge  128 vCPU / 1TB / ~$1.9-2.0/hr live spot  -- primary: deepest spot placement
+#            score (3-in-all-AZs), best 128-vCPU >=1TB box; 2x compute vs phase 2. r6a.32xlarge
+#            (128 vCPU / 1TB / ~$2.87/hr) stays a spotpick FALLBACK (not in the phase-1 exclude list).
 #   PHASE 2  x2iedn.16xlarge 64 vCPU / 2TB / $3.72/hr  -- the tail, once the table outgrows 1TB.
 # The on-box driver plants <run>/migrate_request.json when MemAvailable drops below -MigrateMinAvailGb OR
 # rows reach -MigrateMaxRows (a deterministic backstop against a broken RAM probe -- the 2026-07-06
@@ -52,6 +54,7 @@
     -PreRrKeep "4,5,6" `
     -FlopRrKeep "1,4" `
     -WorkSteal `
+    -NoCacheFetch `
     -V3SignedRegrets `
     -V3PruneC "-1000000" `
     -V3PruneStart "5000" `
@@ -60,7 +63,7 @@
     -V3CovHands 2048 `
     -V3Regstats `
     -RowBudget 4500000000 `
-    -Phase1InstanceType "r6a.32xlarge" `
+    -Phase1InstanceType "r8i.32xlarge" `
     -Phase2InstanceType "x2iedn.16xlarge" `
     -MigrateMinAvailGb "150" `
     -MigrateMaxRows "2300000000" `
