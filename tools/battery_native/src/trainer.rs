@@ -1552,8 +1552,116 @@ fn emd_bucket_memoed_profile(
         v
     })
 }
+// ---------------------------------------------------------------------------------------------
+// POKERBOT_FP_AUDIT (bpv4 cum-row audit, 2026-07-07) — env-gated default-OFF diagnostic.
+//
+// PURPOSE: the fullhist table keys are opaque blake2b16 digests, so a size/skew audit cannot
+// classify the blob post-hoc; it must instrument key GENERATION. When POKERBOT_FP_AUDIT_FILE is
+// set, every DISTINCT digest produced by the trainer's key function is appended once as a CSV
+// line `button;street;seat;hist_seats;hist_actions` (the exact A-segment inputs plus the seats
+// needed for engine replay). artifacts/_fp_audit_replay.py replays each line through the engine
+// and re-validates every recorded action against the M-RR canonical grammar (the census
+// definition) — a violation there is the "non-canonical keys leak into cum_regret" bug class.
+//
+// OFF (env unset, the shipped default): `fp_audit_sink()` is a OnceLock read returning None —
+// no state, no writes, digests untouched; byte-identity is pinned by the arm2b golden gate
+// (artifacts/_golden_ab.py sha256 77bc2aa8…). Dedupe is on the first 8 digest bytes (collision
+// odds ~n²/2⁶⁵, negligible at the ≤2e7-line default cap).
+// ---------------------------------------------------------------------------------------------
+struct FpAuditState {
+    file: std::fs::File,
+    seen: rustc_hash::FxHashSet<u64>,
+    max_lines: u64,
+    n_lines: u64,
+}
+
+fn fp_audit_sink() -> Option<&'static std::sync::Mutex<FpAuditState>> {
+    use std::sync::OnceLock;
+    static SINK: OnceLock<Option<std::sync::Mutex<FpAuditState>>> = OnceLock::new();
+    SINK.get_or_init(|| {
+        let path = std::env::var("POKERBOT_FP_AUDIT_FILE").ok().filter(|p| !p.is_empty())?;
+        let max_lines = std::env::var("POKERBOT_FP_AUDIT_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000_000u64);
+        let file = std::fs::File::create(&path).ok()?;
+        Some(std::sync::Mutex::new(FpAuditState {
+            file,
+            seen: rustc_hash::FxHashSet::default(),
+            max_lines,
+            n_lines: 0,
+        }))
+    })
+    .as_ref()
+}
+
+#[cold]
+fn fp_audit_record<const N: usize>(
+    sink: &std::sync::Mutex<FpAuditState>,
+    s: &EnvStateN<N>,
+    seat: usize,
+    key: &[u8; 16],
+) {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+    let kh = u64::from_le_bytes(key[0..8].try_into().unwrap());
+    let mut g = match sink.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if g.n_lines >= g.max_lines || !g.seen.insert(kh) {
+        return;
+    }
+    let len = (s.hist_len.max(0) as usize).min(crate::core::MAX_HISTORY);
+    let mut line = String::with_capacity(24 + 8 * len);
+    let _ = write!(line, "{};{};{};", s.button, s.street, seat);
+    for i in 0..len {
+        if i > 0 {
+            line.push(',');
+        }
+        let _ = write!(line, "{}", s.hist_seat[i]);
+    }
+    line.push(';');
+    for i in 0..len {
+        if i > 0 {
+            line.push(',');
+        }
+        let _ = write!(line, "{}", s.hist_action[i]);
+    }
+    line.push('\n');
+    let _ = g.file.write_all(line.as_bytes());
+    g.n_lines += 1;
+}
+
 #[inline]
 pub fn fingerprint_fast_depth_memo_emd<const N: usize>(
+    s: &EnvStateN<N>,
+    seat: usize,
+    num_buckets: i32,
+    depth_edges: &[f64],
+    emd_frozen: Option<&FrozenEMDLookup>,
+    river_ochs: Option<&crate::river_ochs::RiverOchs>,
+    memo: &mut FpMemo,
+) -> [u8; 16] {
+    let key = fingerprint_fast_depth_memo_emd_impl(
+        s,
+        seat,
+        num_buckets,
+        depth_edges,
+        emd_frozen,
+        river_ochs,
+        memo,
+    );
+    // POKERBOT_FP_AUDIT hook (see block comment above): None unless POKERBOT_FP_AUDIT_FILE is set.
+    if let Some(sink) = fp_audit_sink() {
+        fp_audit_record(sink, s, seat, &key);
+    }
+    key
+}
+
+/// The pre-audit `fingerprint_fast_depth_memo_emd` body, verbatim (pure code motion for the
+/// POKERBOT_FP_AUDIT wrapper above — bytes emitted are identical).
+fn fingerprint_fast_depth_memo_emd_impl<const N: usize>(
     s: &EnvStateN<N>,
     seat: usize,
     num_buckets: i32,
