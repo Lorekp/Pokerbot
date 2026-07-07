@@ -21,6 +21,10 @@ function Get-Iters {
 }
 while ((Get-Date) -lt $deadline) {
   if (Test-Path "artifacts\_arm2_retry.stop") { Write-Output "[retry] stop sentinel -> exit"; break }
+  # 2026-07-07: HARD-STOP on the driver's terminal row_budget_stop.json flag (see babysitter note;
+  # the overnight burn loop relaunched at-budget boxes for ~8 cycles). Delete the flag to re-arm.
+  $rbFlag = (aws s3api head-object --bucket video-processing-6789 --key "pokerbot/prod6000/native_cfr/bpv4_emd160_arm2b/row_budget_stop.json" --region eu-central-1 2>$null)
+  if ($rbFlag) { Write-Output "[retry] HARD-STOP: row_budget_stop.json present (ROW_BUDGET hit) -> exit; raise the budget + delete the flag to re-arm"; break }
   $itBefore = Get-Iters
   if ($itBefore -ge 40000) { Write-Output "[retry] target reached ($itBefore) -> exit"; break }
   $cycleNum++

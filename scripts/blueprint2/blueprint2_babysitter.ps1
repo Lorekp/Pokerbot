@@ -426,6 +426,15 @@ while ($true) {
     Start-Sleep -Seconds $wait
     continue
   }
+  # 2026-07-07 TERMINAL-STOP FLAG: a ROW_BUDGET_STOP is indistinguishable from a dry spot death
+  # here (box resumes, instantly self-stops, banks nothing), so the overnight loop relaunched
+  # at-budget boxes for ~8 cycles. The driver now plants <run>/row_budget_stop.json; HARD-STOP on
+  # it -- a config change (raise -RowBudget) + deleting the flag object is the only way forward.
+  $stopFlag = (aws s3api head-object --bucket $Bucket --key "$RUN_PREFIX/row_budget_stop.json" --region $Region 2>$null)
+  if ($stopFlag) {
+    Write-Host "HARD-STOP: $RUN_PREFIX/row_budget_stop.json present -- the run hit its ROW_BUDGET (G8). Raise -RowBudget (and the RAM floor if needed), DELETE the flag object, then relaunch. NOT relaunching." -ForegroundColor Red
+    break
+  }
   $reason = if ($done -ge 0) { "preempted at $done/$Iters -> resume from S3" } else { "no box + no ckpt -> initial launch" }
   Write-Host "  no live box; $reason. Launching #$($launches+1)..." -ForegroundColor Cyan
   $doneAtLastLaunch = $done

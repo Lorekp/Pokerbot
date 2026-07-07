@@ -833,7 +833,25 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
     if fullhist_key or mrr:
         row_budget_const = (
             "\n"
-            "ROW_BUDGET = int(os.environ.get(\"POKERBOT_ROW_BUDGET\", \"400000000\"))  # G8 RAM backstop (rows); 0=off"
+            "ROW_BUDGET = int(os.environ.get(\"POKERBOT_ROW_BUDGET\", \"400000000\"))  # G8 RAM backstop (rows); 0=off\n"
+            "\n"
+            "\n"
+            "def _flag_row_budget_stop(t):\n"
+            "    # TERMINAL-STOP FLAG (2026-07-07): a budget stop looks exactly like a dry spot death\n"
+            "    # to the babysitter, which relaunched at-budget boxes all night (~15-20 wasted\n"
+            "    # prologues). Plant row_budget_stop.json under the run prefix; the babysitter +\n"
+            "    # retry supervisor HARD-STOP on it. Re-arm after a config change by deleting the\n"
+            "    # flag object. Best-effort: the ROW_BUDGET_STOP train.log line is the fallback.\n"
+            "    try:\n"
+            "        s3.put_object(Bucket=BUCKET, Key=RUN_PREFIX + \"/row_budget_stop.json\",\n"
+            "                      Body=json.dumps({\"iters_done\": t.iters_done(),\n"
+            "                                       \"strat_rows\": t.n_infosets(),\n"
+            "                                       \"cum_rows\": t.n_cum_infosets(),\n"
+            "                                       \"budget\": ROW_BUDGET}).encode())\n"
+            "        print(\"ROW_BUDGET_STOP flag planted (row_budget_stop.json) -- babysitter will \"\n"
+            "              \"HARD-STOP; delete the flag after raising the budget to re-arm\", flush=True)\n"
+            "    except Exception as e:\n"
+            "        print(f\"ROW_BUDGET_STOP flag upload failed: {e!r}\", flush=True)"
         )
         # G8 PRE-TRAIN guard (requirement d): a spot-resumed box that LOADED an already-at/past-budget
         # checkpoint must stop BEFORE allocating another CKPT_EVERY chunk — otherwise t.train(step) runs a
@@ -861,6 +879,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "                  f\"iters_done={t.iters_done()} -- already at/past \"\n"
             "                  f\"budget on entry, stopping cleanly (no new chunk; last checkpoint already \"\n"
             "                  f\"durable) (G8 partial evidence, design 7.1.2)\", flush=True)\n"
+            "            _flag_row_budget_stop(t)\n"
             "            break"
         )
         row_budget_block = (
@@ -876,6 +895,7 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "                  f\"cum_rows={t.n_cum_infosets()} \"\n"
             "                  f\"iters_done={t.iters_done()} -- wrote FINAL checkpoint (versioned + latest), \"\n"
             "                  f\"stopping cleanly (G8 partial evidence, design 7.1.2)\", flush=True)\n"
+            "            _flag_row_budget_stop(t)\n"
             "            break"
         )
     else:
