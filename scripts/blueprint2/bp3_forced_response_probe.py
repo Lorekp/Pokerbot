@@ -65,6 +65,16 @@ sys.path.insert(0, _ROOT)  # aof_equity_grids lives at repo root (tournament.sim
 # jam == (0,6,3,0,0,1) -- all present in the checkpoint.
 ARMS = ("own", "limp", "open325", "open400", "jam")
 ARM_IDX = {"own": None, "limp": 2, "open325": 8, "open400": 9, "jam": 10}
+# blueprint-v4 v3 root-cause coda: the BB-defend-vs-fold node target. Instead of forcing the BTN's
+# first action (folded-to-BTN, seat 3), we RIG THE BIG BLIND (seat 5), let UTG/HJ/CO fold + the BTN
+# OPEN (forced to a fixed modal open, default idx 8 = 3.25bb raise-to, the smallest sized open present
+# in the serve tree — its BB response row (0,1,2,5,0,1)+hist(0,1,BTN+1) is the trainer row the `rows`
+# mode already verified present) + the SB FOLD, then force the BB to CALL (defend) vs FOLD and measure
+# the BB's paired EV(defend)-EV(fold). ARMS_BB[0] ("fold") is the CRN baseline (EV of the fold = the
+# BB's already-posted -1bb, deterministic; kept as an arm so the paired structure/merge is reused
+# verbatim). Under --postflop-field checkcall this is a PURE-EQUITY-REALIZATION defend test.
+ARMS_BB = ("fold", "defend")
+ARM_BB_IDX = {"fold": 0, "defend": 2}  # engine action ids: FOLD=0, CALL=2
 PROGRESS_LOG = os.path.join(_ROOT, "artifacts", "bp3_probe_progress.log")
 
 
@@ -309,7 +319,22 @@ def _rollout_main(args) -> int:
 
     agents = {s: TabularBlueprintAgent(snap, random.Random(1000 + s)) for s in range(6)}
 
-    # --- hero hole-card rigging: seat 3 (BTN under button_seat=3) draws deck slots 6:8 ------------
+    # node target: legacy folded-to-BTN (hero=seat 3) vs the BB-defend coda (hero=seat 5).
+    node_target = getattr(args, "node_target", "btn_open")
+    arm_set = ARMS_BB if node_target == "bb_defend" else ARMS
+    # Which deck slots the rigged hand occupies. new_hand deals hole cards in seat order 0..5, each
+    # taking 2 slots (deal_hole_cards loops p in self.players by seat): seat s -> slots (2s, 2s+1).
+    # seat 3 (BTN) -> (6,7); seat 5 (BB) -> (10,11). (The legacy btn_open path hard-coded (6,7).)
+    hero_seat = 5 if node_target == "bb_defend" else 3
+    rig_slots = (2 * hero_seat, 2 * hero_seat + 1)
+    # Forced BTN open size for the bb_defend node (idx into ACTION_VOCAB). Default 8 = 3.25bb raise-to
+    # (BET_SIZE_BUCKETS[8-3]=1.5x pot; the smallest sized open present in the serve tree — see the
+    # module note lines 59-65 and the `rows`-mode BB_vs_BTN_open row). Forcing a FIXED size makes every
+    # reached deal key the SAME BB-facing node (clean pot odds + clean coverage). The BTN action is
+    # FORCED (not served) so no menu-skew on the BTN; the SB/BB response rows it hits ARE in the table.
+    btn_open_idx = int(getattr(args, "btn_open_idx", 8) or 8)
+
+    # --- hero hole-card rigging: draw rig_slots to hold the forced hand class -----------------------
     hand = args.hand.strip()
     def rig_deck(state, rng) -> None:
         cards = state._deck._cards
@@ -325,9 +350,103 @@ def _rollout_main(args) -> int:
             else:
                 s1, s2 = rng.sample(list(Suit), 2)
             want = [Card(r1, s1), Card(r2, s2)]
-        for slot, c in zip((6, 7), want):
+        for slot, c in zip(rig_slots, want):
             j = cards.index(c)
             cards[slot], cards[j] = cards[j], cards[slot]
+
+    def play_arm_bb(h: int, arm: str):
+        """One arm of one deal for the BB-defend node target. Returns record dict or None if unreached.
+
+        Node reached (all guarded): UTG(0)/HJ(1)/CO(2) FOLD -> BTN(3) forced OPEN (fixed idx
+        ``btn_open_idx``, default 3.25bb) -> SB(4) folds PER BLUEPRINT (else abort: we condition on the
+        clean SB-out BB-closing spot with defined pot odds) -> BB(5, rigged hand) forced to ``arm``
+        (fold | defend=CALL). CRN: identical deck + per-seat agent seeds + settle rng across arms, so
+        the BTN open and the SB fold are IDENTICAL between the fold and defend arms -> per-deal delta
+        pairs exactly. Only the BB's own action differs. ``delta`` is seat 5's chip delta in bb."""
+        rng = random.Random(args.seed * 77 + h)
+        state = GameState.new_hand(rng=rng)  # button_seat=3 -> seats: 0 UTG .. 3 BTN, 4 SB, 5 BB
+        rig_deck(state, rng)
+        for s, ag in agents.items():
+            ag.reseed(args.seed * 1_000_003 + h * 31 + s)  # arm-independent -> CRN
+        settle_seed = 987_001 + h
+        forced_idx = ARM_BB_IDX[arm]  # 0=FOLD, 2=CALL
+        st = {"btn_opened": False, "sb_folded": False, "bb_acted": False,
+              "btn_open": None, "pot_before_bb": None, "to_call_bb": None}
+
+        def early_fold_policy(seat):
+            """UTG/HJ/CO: must fold, else this deal never reaches the folded-to-BTN open."""
+            ag = agents[seat]
+            def pol(state):
+                a = ag(state)
+                if a.action_type != ActionType.FOLD:
+                    raise AbortHand()
+                return a
+            return pol
+
+        def btn_policy(state):
+            # Guard: BTN acts folded-to (UTG/HJ/CO all folded). Force the fixed modal open.
+            hist = state._history
+            if not (len(hist) == 3 and all(a.action_type == ActionType.FOLD for _s, a in hist)):
+                raise AbortHand()
+            a = _index_to_action(state, 3, btn_open_idx)
+            # Require it to actually be a RAISE (an open). At 100bb the 3.25bb raise is always legal, so
+            # this holds; the guard protects against a short-stack/edge nearest-map to CALL/CHECK.
+            if a.action_type not in (ActionType.RAISE, ActionType.BET):
+                raise AbortHand()
+            st["btn_opened"] = True
+            st["btn_open"] = round(getattr(a, "amount_bb", 0.0) or 0.0, 2)
+            return a
+
+        def sb_policy(state):
+            # SB plays the BLUEPRINT facing the BTN open; we condition on it FOLDING (clean HU BB spot).
+            a = agents[4](state)
+            if a.action_type != ActionType.FOLD:
+                raise AbortHand()
+            st["sb_folded"] = True
+            return a
+
+        def bb_policy(state):
+            if not st["bb_acted"]:
+                st["bb_acted"] = True
+                # node guard: BTN opened + SB folded + BB is closing action. history == 3 folds + BTN
+                # raise + SB fold == 5 entries; BB (seat 5) faces the open with SB out.
+                hist = state._history
+                assert st["btn_opened"] and st["sb_folded"] and len(hist) == 5, "bb node guard"
+                player = state.players[5]
+                st["pot_before_bb"] = round(state.pot_bb, 3)
+                st["to_call_bb"] = round(max(0.0, state.current_bet_bb - player.committed_street_bb), 3)
+                return _index_to_action(state, 5, forced_idx)
+            return agents[5](state)
+
+        policies = {0: early_fold_policy(0), 1: early_fold_policy(1), 2: early_fold_policy(2),
+                    3: btn_policy, 4: sb_policy, 5: bb_policy}
+        if args.postflop_field == "checkcall":
+            def _postflop_fixed(seat, pol):
+                def wrapped(state):
+                    if len(state.board) > 0:
+                        legal = state.legal_actions(seat)
+                        for want in (ActionType.CHECK, ActionType.CALL):
+                            for a in legal:
+                                if a.action_type == want:
+                                    return a
+                        return legal[0]
+                    return pol(state)
+                return wrapped
+            policies = {s: _postflop_fixed(s, pol) for s, pol in policies.items()}
+        settle = lambda s, nb: equity_allin_settle(  # noqa: E731
+            s, nb, n_runouts=args.runouts, rng=random.Random(settle_seed))
+        try:
+            final, deltas = play_hand(policies, state=state, allin_settle=settle)
+        except AbortHand:
+            return None
+        if not st["bb_acted"]:
+            return None
+        return {
+            "delta": float(deltas.get(5, 0.0)),
+            "btn_open": st["btn_open"], "pot_before_bb": st["pot_before_bb"],
+            "to_call_bb": st["to_call_bb"],
+            "end_street": len(final.board),
+        }
 
     def play_arm(h: int, arm: str):
         """One arm of one deal. Returns record dict or None if node unreached."""
@@ -419,9 +538,14 @@ def _rollout_main(args) -> int:
         }
 
     # --- deal loop: h indexes candidate deals; keep the first --deals REACHED ones ---------------
-    out = {arm: [] for arm in ARMS}
-    meta = {"hero_first_own": {}, "resp": {arm: {"sb": {}, "bb": {}} for arm in ARMS},
-            "end_street": {arm: {} for arm in ARMS}}
+    _play = play_arm_bb if node_target == "bb_defend" else play_arm
+    out = {arm: [] for arm in arm_set}
+    if node_target == "bb_defend":
+        meta = {"btn_open": {}, "pot_before_bb": {}, "to_call_bb": {},
+                "end_street": {arm: {} for arm in arm_set}}
+    else:
+        meta = {"hero_first_own": {}, "resp": {arm: {"sb": {}, "bb": {}} for arm in arm_set},
+                "end_street": {arm: {} for arm in arm_set}}
     reached = 0
     tried = 0
     h = args.start
@@ -429,14 +553,14 @@ def _rollout_main(args) -> int:
     last_hb = t0
     while reached < args.deals:
         tried += 1
-        rec0 = play_arm(h, "own")
+        rec0 = _play(h, arm_set[0])
         if rec0 is None:
             h += 1
             continue
-        recs = {"own": rec0}
+        recs = {arm_set[0]: rec0}
         ok = True
-        for arm in ARMS[1:]:
-            r = play_arm(h, arm)
+        for arm in arm_set[1:]:
+            r = _play(h, arm)
             if r is None:  # cannot happen (prefix identical) but stay safe
                 ok = False
                 break
@@ -445,17 +569,23 @@ def _rollout_main(args) -> int:
         if not ok:
             continue
         reached += 1
-        for arm in ARMS:
+        for arm in arm_set:
             r = recs[arm]
             out[arm].append(r["delta"])
-            for side in ("sb", "bb"):
-                if r[side]:
-                    d = meta["resp"][arm][side]
-                    d[r[side]] = d.get(r[side], 0) + 1
+            if node_target != "bb_defend":
+                for side in ("sb", "bb"):
+                    if r[side]:
+                        d = meta["resp"][arm][side]
+                        d[r[side]] = d.get(r[side], 0) + 1
             es = meta["end_street"][arm]
             es[str(r["end_street"])] = es.get(str(r["end_street"]), 0) + 1
-        hf = str(rec0["hero_first"])
-        meta["hero_first_own"][hf] = meta["hero_first_own"].get(hf, 0) + 1
+        if node_target == "bb_defend":
+            for fld in ("btn_open", "pot_before_bb", "to_call_bb"):
+                k = str(rec0[fld])
+                meta[fld][k] = meta[fld].get(k, 0) + 1
+        else:
+            hf = str(rec0["hero_first"])
+            meta["hero_first_own"][hf] = meta["hero_first_own"].get(hf, 0) + 1
         now = time.time()
         if now - last_hb > 30:
             last_hb = now
@@ -474,6 +604,7 @@ def _rollout_main(args) -> int:
     bp_cov = _lbr.bp_coverage_report()
     res = {
         "mode": "rollout", "hand": hand, "blueprint": args.blueprint, "seed": args.seed,
+        "node_target": node_target,
         "start": args.start, "deals": reached, "tried": tried,
         "reach_rate": reached / max(1, tried), "runouts": args.runouts,
         "postflop_field": args.postflop_field,
@@ -608,35 +739,60 @@ def _merge_main(args) -> int:
     by_hand = {}
     for s in shards:
         by_hand.setdefault(s["hand"], []).append(s)
-    out = {"mode": "merged", "hands": {}}
+    # node target is uniform across a merge set; pick the arm set + pairing accordingly.
+    nt = shards[0].get("node_target", "btn_open")
+    arm_set = ARMS_BB if nt == "bb_defend" else ARMS
+    out = {"mode": "merged", "node_target": nt, "hands": {}}
     for hand, ss in by_hand.items():
         deltas = {arm: np.concatenate([np.asarray(x["deltas_bb"][arm]) for x in ss])
-                  for arm in ARMS}
-        n = len(deltas["own"])
+                  for arm in arm_set}
+        n = len(deltas[arm_set[0]])
         stats = {}
-        for arm in ARMS:
+        for arm in arm_set:
             d = deltas[arm]
             stats[arm] = {"n": int(n), "ev_bb100": float(d.mean() * 100),
                           "se_bb100": float(d.std(ddof=1) / math.sqrt(n) * 100)}
         paired = {}
-        for arm in ("own", "open325", "open400", "jam"):
-            diff = deltas[arm] - deltas["limp"]
-            paired[f"{arm}_minus_limp"] = {
+        if nt == "bb_defend":
+            # THE discriminator: BB's paired EV(defend=CALL) - EV(fold), per deal (CRN: identical BTN
+            # open + SB fold across the two arms). Positive => defending is +EV under this postflop
+            # field for the average reached hand.
+            diff = deltas["defend"] - deltas["fold"]
+            paired["defend_minus_fold"] = {
                 "delta_bb100": float(diff.mean() * 100),
                 "se_bb100": float(diff.std(ddof=1) / math.sqrt(n) * 100),
                 "t": float(diff.mean() / (diff.std(ddof=1) / math.sqrt(n)) if diff.std(ddof=1) > 0 else 0.0),
+                "frac_defend_positive": float((diff > 1e-9).mean()),
             }
-        meta = {"hero_first_own": {}, "resp": {a: {"sb": {}, "bb": {}} for a in ARMS},
-                "end_street": {a: {} for a in ARMS}}
+        else:
+            for arm in ("own", "open325", "open400", "jam"):
+                diff = deltas[arm] - deltas["limp"]
+                paired[f"{arm}_minus_limp"] = {
+                    "delta_bb100": float(diff.mean() * 100),
+                    "se_bb100": float(diff.std(ddof=1) / math.sqrt(n) * 100),
+                    "t": float(diff.mean() / (diff.std(ddof=1) / math.sqrt(n)) if diff.std(ddof=1) > 0 else 0.0),
+                }
+        if nt == "bb_defend":
+            meta = {"btn_open": {}, "pot_before_bb": {}, "to_call_bb": {},
+                    "end_street": {a: {} for a in arm_set}}
+        else:
+            meta = {"hero_first_own": {}, "resp": {a: {"sb": {}, "bb": {}} for a in arm_set},
+                    "end_street": {a: {} for a in arm_set}}
         tried = sum(x["tried"] for x in ss)
         for x in ss:
             m = x["meta"]
-            for k, v in m["hero_first_own"].items():
-                meta["hero_first_own"][k] = meta["hero_first_own"].get(k, 0) + v
-            for a in ARMS:
-                for side in ("sb", "bb"):
-                    for k, v in m["resp"][a][side].items():
-                        meta["resp"][a][side][k] = meta["resp"][a][side].get(k, 0) + v
+            if nt == "bb_defend":
+                for fld in ("btn_open", "pot_before_bb", "to_call_bb"):
+                    for k, v in m.get(fld, {}).items():
+                        meta[fld][k] = meta[fld].get(k, 0) + v
+            else:
+                for k, v in m["hero_first_own"].items():
+                    meta["hero_first_own"][k] = meta["hero_first_own"].get(k, 0) + v
+                for a in arm_set:
+                    for side in ("sb", "bb"):
+                        for k, v in m["resp"][a][side].items():
+                            meta["resp"][a][side][k] = meta["resp"][a][side].get(k, 0) + v
+            for a in arm_set:
                 for k, v in m["end_street"][a].items():
                     meta["end_street"][a][k] = meta["end_street"][a].get(k, 0) + v
         # Aggregate per-street fingerprint coverage across this hand's shards so the A1/A2 verdict step
@@ -653,14 +809,19 @@ def _merge_main(args) -> int:
                        for st, (h, m) in cov_agg.items()}
         pf_h = sum(cov_agg.get(st, [0, 0])[0] for st in ("flop", "turn", "river"))
         pf_m = sum(cov_agg.get(st, [0, 0])[1] for st in ("flop", "turn", "river"))
+        pair_key = "paired_defend_vs_fold" if nt == "bb_defend" else "paired_vs_limp"
         out["hands"][hand] = {"n_deals": int(n), "tried": tried,
                               "reach_rate": n / max(1, tried),
-                              "arms": stats, "paired_vs_limp": paired, "meta": meta,
+                              "arms": stats, pair_key: paired, "meta": meta,
                               "fallback_rates": [x["adapter_fallback_rate"] for x in ss],
                               "bp_coverage": bp_coverage,
                               "postflop_miss_rate": pf_m / max(1, pf_h + pf_m)}
         _plog(f"merge {hand}: n={n}  " + "  ".join(
-            f"{a}={stats[a]['ev_bb100']:+.1f}±{stats[a]['se_bb100']:.1f}" for a in ARMS))
+            f"{a}={stats[a]['ev_bb100']:+.1f}±{stats[a]['se_bb100']:.1f}" for a in arm_set))
+        if nt == "bb_defend":
+            p = paired["defend_minus_fold"]
+            _plog(f"merge {hand}: defend-fold = {p['delta_bb100']:+.1f}±{p['se_bb100']:.1f} bb/100 "
+                  f"(t={p['t']:.1f}, frac_defend_+EV={p['frac_defend_positive']:.3f})")
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=1)
     _plog(f"merge -> {args.out}")
@@ -728,6 +889,18 @@ def main() -> int:
                         "serves the TRAINED current-strategy INCL POSTFLOP (the .nlcfr strat section is "
                         "preflop-only under snapshot_avg). For the root-cause probe: EV under the TRAINED "
                         "postflop field vs --postflop-field checkcall. Takes precedence over --snapshot-index.")
+    r.add_argument("--node-target", choices=("btn_open", "bb_defend"), default="btn_open",
+                   help="which forced node to measure. 'btn_open' (default, byte-identical legacy) = the "
+                        "folded-to-BTN first-action arms (own/limp/open325/open400/jam). 'bb_defend' = the "
+                        "BB-defend-vs-fold coda: rig the BIG BLIND (seat 5), let UTG/HJ/CO fold + the BTN "
+                        "force-OPEN (--btn-open-idx) + the SB fold PER BLUEPRINT, then force the BB to "
+                        "CALL(defend) vs FOLD and measure the BB's paired EV(defend)-EV(fold). Arms = "
+                        "(fold, defend). Use with --postflop-field checkcall for a pure-equity-realization "
+                        "defend test.")
+    r.add_argument("--btn-open-idx", type=int, default=8,
+                   help="bb_defend only: ACTION_VOCAB index the BTN open is forced to. Default 8 = 3.25bb "
+                        "raise-to (BET_SIZE_BUCKETS[5]=1.5x pot), the smallest sized open in the serve "
+                        "tree (its BB response row is verified present). 9 = 4.0bb.")
     r.add_argument("--out", required=True)
 
     w = sub.add_parser("rows")
