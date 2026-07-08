@@ -209,7 +209,9 @@ fn main() {
             let c = coverage_probe(tab, cfg, cov_hands, 0xC0FFEE ^ it);
             eprintln!(
                 "[ab_train] COVERAGE iter={} hands={} miss% pre={:.1} flop={:.1} turn={:.1} \
-                 river={:.1} postflop={:.1} pre_allin_runout={:.1} decisions={:?} wall_s={:.1}",
+                 river={:.1} postflop={:.1} raised_postflop={:.1} raised_flop={:.1} raised_turn={:.1} \
+                 raised_river={:.1} raised_decisions={} pre_allin_runout={:.1} decisions={:?} \
+                 wall_s={:.1}",
                 it,
                 c.hands,
                 100.0 * c.miss_rate(0),
@@ -217,6 +219,11 @@ fn main() {
                 100.0 * c.miss_rate(2),
                 100.0 * c.miss_rate(3),
                 100.0 * c.postflop_miss_rate(),
+                100.0 * c.raised_postflop_miss_rate(),
+                100.0 * c.raised_miss_rate(1),
+                100.0 * c.raised_miss_rate(2),
+                100.0 * c.raised_miss_rate(3),
+                c.raised_postflop_decisions(),
                 100.0 * c.preflop_allin_runout_rate(),
                 c.decisions,
                 t0.elapsed().as_secs_f64(),

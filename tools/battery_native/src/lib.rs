@@ -1601,15 +1601,18 @@ mod py {
         /// `n_hands` self-play hands on the CURRENT strategy and count, per street, how many of the
         /// strategy's own lookups hit the trained table (`trainer::coverage_probe`; the Stage-0
         /// §3.1 on-policy diagnostic at checkpoint cadence). Returns
-        /// `(hands, decisions[4], misses[4], preflop_allin_runouts)`, streets ordered
-        /// preflop/flop/turn/river. Read-only; deterministic in (table, seed).
+        /// `(hands, decisions[4], misses[4], preflop_allin_runouts, raised_decisions[4],
+        /// raised_misses[4])`, streets ordered preflop/flop/turn/river. The two trailing vecs are the
+        /// K-COV (blueprint-v4 blocker D) raised-pot ("opener-faced", preflop n_raises>=1) postflop
+        /// subclass — raised-pot miss rate = sum(raised_misses[1..4]) / sum(raised_decisions[1..4]).
+        /// Read-only; deterministic in (table, seed).
         #[pyo3(signature = (n_hands=1024, seed=0xC0FFEE))]
         fn coverage(
             &self,
             py: Python<'_>,
             n_hands: u64,
             seed: u64,
-        ) -> PyResult<(u64, Vec<u64>, Vec<u64>, u64)> {
+        ) -> PyResult<(u64, Vec<u64>, Vec<u64>, u64, Vec<u64>, Vec<u64>)> {
             #[cfg(feature = "hogwild")]
             if self.hog.is_some() {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -1618,7 +1621,14 @@ mod py {
             }
             let (tab, cfg) = (&self.tab, &self.cfg);
             let c = py.detach(|| nlhe_trainer::coverage_probe(tab, cfg, n_hands, seed));
-            Ok((c.hands, c.decisions.to_vec(), c.misses.to_vec(), c.preflop_allin_runouts))
+            Ok((
+                c.hands,
+                c.decisions.to_vec(),
+                c.misses.to_vec(),
+                c.preflop_allin_runouts,
+                c.raised_decisions.to_vec(),
+                c.raised_misses.to_vec(),
+            ))
         }
 
         /// blueprint-v4 v3 (hard-prune-C calibration): one-pass log-histogram percentiles of the

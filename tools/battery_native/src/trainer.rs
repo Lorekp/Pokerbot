@@ -5006,6 +5006,14 @@ pub struct CoverageStats {
     /// Hands that reached a FULL 5-card board with ZERO postflop decision nodes — the preflop-all-in
     /// runout share (the Stage-0 verdict's postflop-starvation signature: H200@20k had 65% here).
     pub preflop_allin_runouts: u64,
+    /// K-COV (blueprint-v4 blocker D): postflop on-policy decisions/misses in RAISED ("opener-faced")
+    /// pots ONLY — pots whose preflop pot-type has `n_raises >= 1` (`fingerprint::preflop_pot_type`),
+    /// the region the limp-trap starves and the exact pot-type buckets presum collapses. Indexed by
+    /// street; index 0 is always 0 (raised classification is postflop-only). The limped/walk-pot
+    /// complement is `decisions - raised_decisions` (well-covered on the fullhist baseline), so the
+    /// raised-vs-limped coverage GAP is the pathology signal.
+    pub raised_decisions: [u64; 4],
+    pub raised_misses: [u64; 4],
 }
 
 impl CoverageStats {
@@ -5033,6 +5041,32 @@ impl CoverageStats {
         } else {
             self.preflop_allin_runouts as f64 / self.hands as f64
         }
+    }
+    /// K-COV gate quantity (blueprint-v4 blocker D): on-policy miss rate among RAISED-pot postflop
+    /// decisions (flop+turn+river). Coverage = 1 - this. This is the number the presum K-COV gate
+    /// pre-registers against — on the fullhist baseline it is near the `postflop_miss_rate` ceiling
+    /// (raised pots are starved), and presum's coverage win drives it down.
+    pub fn raised_postflop_miss_rate(&self) -> f64 {
+        let d: u64 = self.raised_decisions[1..4].iter().sum();
+        let m: u64 = self.raised_misses[1..4].iter().sum();
+        if d == 0 {
+            0.0
+        } else {
+            m as f64 / d as f64
+        }
+    }
+    /// Per-street raised-pot on-policy miss rate (street 1..=3 = flop/turn/river; street 0 is 0).
+    pub fn raised_miss_rate(&self, street: usize) -> f64 {
+        if self.raised_decisions[street] == 0 {
+            0.0
+        } else {
+            self.raised_misses[street] as f64 / self.raised_decisions[street] as f64
+        }
+    }
+    /// Total raised-pot postflop decisions sampled — the K-COV denominator (a raised-pot miss rate
+    /// over too few visits is noise, so the gate requires a minimum raised-pot sample).
+    pub fn raised_postflop_decisions(&self) -> u64 {
+        self.raised_decisions[1..4].iter().sum()
     }
 }
 
@@ -5064,6 +5098,9 @@ pub fn coverage_probe(
         let mut rng = Rng::seed_from_u64(deal_seed);
         let mut env = deal_root::<{ NUM_PLAYERS }>(&mut rng, h);
         let mut had_postflop_decision = false;
+        // K-COV: the preflop pot-type is fixed once preflop closes, so classify raised-vs-limped ONCE
+        // per hand at the first postflop decision and reuse. -1 = not yet computed this hand.
+        let mut hand_n_raises: i32 = -1;
         loop {
             if env.done {
                 break;
@@ -5091,14 +5128,29 @@ pub fn coverage_probe(
             );
             let st = (env.street.clamp(0, 3)) as usize;
             stats.decisions[st] += 1;
-            if st > 0 {
+            let raised_pot = if st > 0 {
                 had_postflop_decision = true;
-            }
+                if hand_n_raises < 0 {
+                    // preflop_pot_type replays the preflop prefix (O(n_preflop)); n_raises is constant
+                    // for the whole hand, so this runs at most once per hand.
+                    hand_n_raises = crate::fingerprint::preflop_pot_type(&env).1 as i32;
+                }
+                let is_raised = hand_n_raises >= 1;
+                if is_raised {
+                    stats.raised_decisions[st] += 1;
+                }
+                is_raised
+            } else {
+                false
+            };
             let row = tab.shards[shard_of(&key)].cum_regret.get(&key);
             let strat = match row {
                 Some(r) => regret_match(&widen_r(r), &legal),
                 None => {
                     stats.misses[st] += 1;
+                    if raised_pot {
+                        stats.raised_misses[st] += 1;
+                    }
                     uniform_over_legal(&legal)
                 }
             };
@@ -8411,21 +8463,41 @@ mod tests {
     fn coverage_probe_empty_then_trained() {
         let cfg = test_cfg(64);
         let empty = NlheTables::new();
-        let c0 = coverage_probe(&empty, &cfg, 64, 0xC0FFEE);
-        assert_eq!(c0.hands, 64);
+        // 512 hands (not 64): this abstraction drives ~85% of hands to a preflop all-in, so raised-pot
+        // postflop decisions are scarce (~3 at 64 hands, ~24% of seeds give 0). 512 gives the K-COV
+        // raised_postflop_decisions()>0 assertion real headroom (deterministic in seed regardless).
+        let c0 = coverage_probe(&empty, &cfg, 512, 0xC0FFEE);
+        assert_eq!(c0.hands, 512);
         assert!(c0.decisions[0] > 0, "no preflop decisions probed");
         assert_eq!(c0.misses, c0.decisions, "empty table must miss everything");
+        // K-COV invariants on the empty table: raised-pot decisions are a postflop-only subset of all
+        // decisions, and every raised-pot decision misses (empty table).
+        assert_eq!(c0.raised_decisions[0], 0, "raised classification must be postflop-only");
+        for st in 1..4 {
+            assert!(
+                c0.raised_decisions[st] <= c0.decisions[st],
+                "raised decisions exceed total at street {st}"
+            );
+        }
+        assert_eq!(
+            c0.raised_misses, c0.raised_decisions,
+            "empty table must miss every raised-pot decision"
+        );
+        assert!(
+            c0.raised_postflop_decisions() > 0,
+            "no raised-pot postflop decisions sampled — K-COV would be blind"
+        );
         let mut tab = NlheTables::new();
         for _ in 0..20 {
             tab.train_iteration_v3(&cfg, &V3Cfg::default());
         }
         let before = serialize(&tab);
-        let c1 = coverage_probe(&tab, &cfg, 64, 0xC0FFEE);
-        let c2 = coverage_probe(&tab, &cfg, 64, 0xC0FFEE);
+        let c1 = coverage_probe(&tab, &cfg, 512, 0xC0FFEE);
+        let c2 = coverage_probe(&tab, &cfg, 512, 0xC0FFEE);
         assert_eq!(serialize(&tab), before, "probe mutated the table");
         assert_eq!(
-            (c1.decisions, c1.misses, c1.preflop_allin_runouts),
-            (c2.decisions, c2.misses, c2.preflop_allin_runouts),
+            (c1.decisions, c1.misses, c1.preflop_allin_runouts, c1.raised_decisions, c1.raised_misses),
+            (c2.decisions, c2.misses, c2.preflop_allin_runouts, c2.raised_decisions, c2.raised_misses),
             "probe not deterministic"
         );
         assert!(
@@ -8434,6 +8506,16 @@ mod tests {
             c1.misses[0],
             c1.decisions[0]
         );
+        // K-COV: raised-pot misses are a subset of all postflop misses at every street.
+        for st in 1..4 {
+            assert!(
+                c1.raised_misses[st] <= c1.misses[st] && c1.raised_misses[st] <= c1.raised_decisions[st],
+                "raised misses not a subset at street {st}: raised_miss={} miss={} raised_dec={}",
+                c1.raised_misses[st],
+                c1.misses[st],
+                c1.raised_decisions[st]
+            );
+        }
     }
 
     /// The batched-MLP path must FALL BACK to the recursive path when any v3 iter mode is active

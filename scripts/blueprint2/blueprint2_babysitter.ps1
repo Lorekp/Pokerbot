@@ -50,6 +50,9 @@ param(
   [switch]$Mrr,                       # blueprint-v4 Stage-0: pass --mrr (POKERBOT_MRR=1; M-RR action-thinning
                                       #   that makes fullhist convergent, ~10^31 -> ~413M rows). Probe/eval
                                       #   MUST also set POKERBOT_MRR=1 (train/probe abstraction-skew guard).
+  [switch]$PresumKey,                 # blueprint-v4 arm-6: pass --presum-key (POKERBOT_PRESUM_KEY=1; postflop
+                                      #   preflop-summary key). REFINES fullhist -- use WITH -FullHistKey and
+                                      #   -Mrr. Serve/eval MUST use the same env.
   [string]$PreKeep = "",              # arm-3: pass --pre-keep (POKERBOT_PRE_KEEP=<val>; Pluribus-grade
                                       #   preflop FIRST-raise/open bet-bucket keep list, e.g.
                                       #   "2,3,4,5,6"). "" = omit = legacy {4,5,6} = byte-identical
@@ -392,6 +395,7 @@ function Invoke-Launch {
   if ($PreflopHistKey) { $argsList += "--preflop-hist-key" }
   if ($FullHistKey) { $argsList += "--fullhist-key" }
   if ($Mrr)        { $argsList += "--mrr" }
+  if ($PresumKey)  { $argsList += "--presum-key" }
   if ($PreKeep)    { $argsList += @("--pre-keep", $PreKeep) }
   if ($PreRrKeep)  { $argsList += @("--pre-rr-keep", $PreRrKeep) }
   if ($FlopRrKeep) { $argsList += @("--flop-rr-keep", $FlopRrKeep) }
@@ -447,7 +451,7 @@ function Invoke-Launch {
 }
 
 $capH = [int]($MAXSEC / 3600)
-$leverTxt = (@(if ($PreflopHistKey) { "preflop_hist_key" }; if ($FullHistKey) { "fullhist_key" }; if ($Mrr) { "mrr" }; if ($WorkSteal) { "work_steal" }; if ($Dcfr) { "dcfr" }; if ($V3Lcfr) { "v3_lcfr(D=$V3LcfrD,W=$V3LcfrW,C=$V3PruneC)" }; if ($V3SignedRegrets) { "v3_signed_regrets(C=$V3PruneC,start=$V3PruneStart)" }; if ($V3SnapshotAvg) { "v3_snapshot_avg" }) -join "+"); if (-not $leverTxt) { $leverTxt = "NONE (baseline)" }
+$leverTxt = (@(if ($PreflopHistKey) { "preflop_hist_key" }; if ($FullHistKey) { "fullhist_key" }; if ($Mrr) { "mrr" }; if ($PresumKey) { "presum_key" }; if ($WorkSteal) { "work_steal" }; if ($Dcfr) { "dcfr" }; if ($V3Lcfr) { "v3_lcfr(D=$V3LcfrD,W=$V3LcfrW,C=$V3PruneC)" }; if ($V3SignedRegrets) { "v3_signed_regrets(C=$V3PruneC,start=$V3PruneStart)" }; if ($V3SnapshotAvg) { "v3_snapshot_avg" }) -join "+"); if (-not $leverTxt) { $leverTxt = "NONE (baseline)" }
 Write-Host "=== blueprint-v2 babysitter: $Run ===" -ForegroundColor Cyan
 Write-Host "    target=$Iters it  n_deals=$NDeals  flop/turn=EMD K$NumBuckets  river=OCHS ($([System.IO.Path]::GetFileName($RiverOchs)))"
 Write-Host "    LEVERS=$leverTxt" -ForegroundColor Green
@@ -666,6 +670,7 @@ if ($convergedStop) {
   if ($PreflopHistKey) { $resume += " --preflop-hist-key" }
   if ($FullHistKey) { $resume += " --fullhist-key" }
   if ($Mrr) { $resume += " --mrr" }
+  if ($PresumKey) { $resume += " --presum-key" }
   if ($PreKeep) { $resume += " --pre-keep $PreKeep" }
   if ($PreRrKeep) { $resume += " --pre-rr-keep $PreRrKeep" }
   if ($FlopRrKeep) { $resume += " --flop-rr-keep $FlopRrKeep" }

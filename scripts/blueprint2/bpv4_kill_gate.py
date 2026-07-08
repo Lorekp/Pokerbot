@@ -105,6 +105,7 @@ sys.path.insert(0, os.path.join(_HERE, ".."))
 # The FULLHIST node/key machinery (preflop_root_diag --full-hist) + the memory-safe streaming
 # extractor, reused verbatim from the final Stage-0 gate evaluator (single source of truth).
 import bpv4_stage0_gates as g0  # noqa: E402
+import bpv4_kcov as kcov  # noqa: E402
 import preflop_root_diag as prd  # noqa: E402
 
 DEFAULT_BUCKET = "video-processing-6789"
@@ -434,10 +435,13 @@ def main() -> int:
     ap.add_argument("--btn-floor-pct", type=float, default=20.0)
     ap.add_argument("--aa-limp-cap", type=float, default=0.30,
                     help="K1 (>= --k1-hard-iters) hard AA-BTN-limp cap (design 24.3: 0.30 @20k)")
-    ap.add_argument("--k1a-aa-cap", type=float, default=0.50,
+    ap.add_argument("--k1a-aa-cap", type=float, default=None,
                     help="K1a (< --k1-hard-iters) EARLY-KILL AA-BTN-limp cap -- the SOLE hard clause "
-                         "below --k1-hard-iters (design 24.3: >=50%% @10k => KILL; arm-2b signature "
-                         "was 61.8%%). All other reads below --k1-hard-iters are advisory.")
+                         "below --k1-hard-iters. Default resolves to 0.50 for a fullhist arm (design "
+                         "24.3: >=50%% @10k => KILL; arm-2b signature was 61.8%%) or 0.40 under "
+                         "--presum (design 36: presum should FIX the limp-trap, so AA-limp <= 40%% "
+                         "@10k is the pre-registered target). All other reads below --k1-hard-iters "
+                         "are advisory.")
     ap.add_argument("--k1-hard-iters", type=int, default=20000,
                     help="the K1a->K1 boundary (design 24.3). BELOW it (K1a regime) the ONLY hard "
                          "kill clause is AA-limp >= --k1a-aa-cap; G1/G2-level/G4/G6/G3-at-0.30 are "
@@ -455,9 +459,32 @@ def main() -> int:
                          "(byte-identical historical instrument) | 'arm3' = widened 5-size ids "
                          "5/6/7/8/9 (POKERBOT_PRE_KEEP=2..6). Env POKERBOT_PRE_MENU sets the "
                          "default.")
+    ap.add_argument("--presum", action="store_true",
+                    help="blueprint-v4 arm-6 presum run (design 36): (a) resolves the K1a AA-limp cap "
+                         "to 0.40 (presum should FIX the limp-trap), and (b) ACTIVATES the K-COV "
+                         "gate (opener-faced raised-pot on-policy coverage, from the train log's "
+                         "COVERAGE line) as a verdict clause. Presum's PREFLOP nodes are fullhist-keyed "
+                         "(presum only rewrites POSTFLOP keys), so G1-G6 + the node/negative-control "
+                         "machinery are unchanged. WITHOUT --presum the K-COV read is advisory-only "
+                         "(printed, never folded), so the historical fullhist verdict is unchanged.")
+    ap.add_argument("--train-log", default=None,
+                    help="local train log for the K-COV COVERAGE lines (default: fetch "
+                         "s3://.../{run_subdir}/logs/train.log when going through S3).")
+    ap.add_argument("--kcov-cap", type=float, default=kcov.CAP_PCT,
+                    help="K1 K-COV: raised-pot postflop MISS%% must be <= this (coverage >= 100-cap).")
+    ap.add_argument("--kcov-early-kill", type=float, default=kcov.EARLY_KILL_PCT,
+                    help="K1a K-COV EARLY-KILL: raised-pot postflop MISS%% > this => KILL.")
+    ap.add_argument("--kcov-min-sample", type=int, default=kcov.MIN_SAMPLE,
+                    help="raised_decisions below this => K-COV INSUFFICIENT_DATA (advisory, never folds).")
+    ap.add_argument("--k1a-drift-pt", type=float, default=kcov.DRIFT_PT,
+                    help="advisory leading indicator: AA-limp and raised-pot miss should each fall >= "
+                         "this many pt vs the prior checkpoint (design 36: >=5pt 7.5k->10k).")
     ap.add_argument("--cache-dir", default=os.path.join(REPO, "artifacts", "bpv4_ladder"))
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    # Resolve the K1a AA cap default per --presum (kept None above so the fullhist path stays 0.50).
+    if args.k1a_aa_cap is None:
+        args.k1a_aa_cap = 0.40 if args.presum else 0.50
     out = args.out or os.path.join(REPO, "artifacts", f"bpv4_kill_gate_{args.run_subdir}.json")
     prd.set_pre_menu(args.pre_menu)
 
@@ -476,6 +503,7 @@ def main() -> int:
     detail_cls = {prd.CLASS_BY_NAME[h] for h in DETAIL_HANDS}
 
     latest_path, prior_path = args.checkpoint, args.prior_checkpoint
+    train_log_path = args.train_log
     latest_iters = prior_iters = None
     if latest_path is None:
         import boto3  # noqa: PLC0415
@@ -504,6 +532,17 @@ def main() -> int:
             prior_iters, prior_key = ladder[idx - 1]
             prior_path = _download(s3, args.bucket, prior_key,
                                    os.path.join(args.cache_dir, f"{args.run_subdir}_iter{prior_iters}.nlcfr"))
+        # K-COV source: the tee'd train log (the driver uploads it at every checkpoint, key
+        # {run_prefix}/logs/train.log). Tiny; a miss (run too early / no COVERAGE probing) is fine --
+        # K-COV then reads INSUFFICIENT_DATA (advisory). Never aborts the gate.
+        if train_log_path is None:
+            tl_dst = os.path.join(args.cache_dir, f"{args.run_subdir}_train.log")
+            try:
+                s3.download_file(args.bucket, f"{run_prefix}/logs/train.log", tl_dst)
+                train_log_path = tl_dst
+                print(f"[kill-gate] fetched train log -> {tl_dst}", flush=True)
+            except Exception as e:  # noqa: BLE001 - absence is expected early; K-COV degrades gracefully
+                print(f"[kill-gate] no train log yet ({e!r}) -- K-COV will read INSUFFICIENT_DATA", flush=True)
 
     os.makedirs(args.cache_dir, exist_ok=True)
 
@@ -577,16 +616,68 @@ def main() -> int:
     print(f"  M1: strat_rows={latest_m1['strat_rows']:,} cum_rows={latest_m1['cum_rows']:,} "
           f"blob={latest_m1['blob_bytes']/1e9:.2f}GB  neg_control_rows={latest_neg} (must be 0)")
 
+    # --- K-COV (opener-faced raised-pot on-policy coverage; design 36) -------------------------------
+    # Sourced from the train log's COVERAGE line (trainer coverage_probe raised-pot subclass), NOT the
+    # checkpoint. Under --presum it is a verdict clause (hard early-kill @K1a / hard cap @K1); without
+    # --presum it is advisory-only (printed, never folded) so the historical fullhist verdict is
+    # byte-identical.
+    cov_list = kcov.parse_coverage(train_log_path) if (train_log_path and os.path.exists(train_log_path)) else []
+    cov_latest = kcov.cov_at(cov_list, int(latest_it))
+    cov_prior = kcov.cov_at(cov_list, int(prior_m1["iters"])) if prior_m1 else None
+    kcov_res = kcov.evaluate_kcov(
+        cov_latest, cov_prior, k1a_regime=k1a_regime, cap_pct=args.kcov_cap,
+        early_kill_pct=args.kcov_early_kill, min_sample=args.kcov_min_sample, drift_pt=args.k1a_drift_pt)
+    print("  " + kcov_res["line"] + ("" if args.presum else "  [advisory: --presum not set, not folded]"))
+    kcov_killed = False
+    if args.presum and kcov_res["hard"]:
+        kcov_killed = not bool(kcov_res["passed"])
+        ok &= bool(kcov_res["passed"])
+    # FAIL-LOUD (design 36 calibration fix): under --presum, an INSUFFICIENT_DATA K-COV read means the
+    # spend-gate coverage clause could NOT be evaluated here -- most likely raised_decisions <
+    # --kcov-min-sample because --v3-cov-hands is too small for the measured jam-heavy raised-pot
+    # density (~0.07-0.10/hand; need ~40000 hands to clear 2000). A dark clause is NOT a pass; make it
+    # impossible to mistake for one (printed loud + stamped kcov_dark). It does NOT auto-KILL (an early
+    # checkpoint legitimately lacks data), but it must never read as a silent clean K-COV.
+    kcov_dark = bool(args.presum and kcov_res["status"] == "INSUFFICIENT_DATA")
+    if kcov_dark:
+        ndec = kcov_res["detail"].get("raised_decisions")
+        print(f"  !! K-COV DARK: the presum coverage spend-gate clause was NOT evaluated at iters="
+              f"{latest_it} (INSUFFICIENT_DATA"
+              + (f", raised_decisions={ndec} < min_sample={args.kcov_min_sample}" if ndec is not None
+                 else ", no COVERAGE data")
+              + "). This is NOT a K-COV pass -- the raised-pot coverage pathology is UNCHECKED here. "
+              "Raise --v3-cov-hands (~40000 at the measured density; see README_LAUNCH.md) and re-gate.")
+
+    # AA-limp drift advisory (design 36 K1a leading indicator: AA-limp should fall >=5pt 7.5k->10k).
+    aa_now, aa_pre = _aa_limp(latest_nodes), (_aa_limp(prior_nodes) if prior_nodes else None)
+    aa_drift = None if (aa_now is None or aa_pre is None) else (aa_pre - aa_now)
+    if aa_drift is not None:
+        print(f"  AA-limp drift (advisory): fell {aa_drift*100:+.1f}pt "
+              f"({'>=' if aa_drift*100 >= args.k1a_drift_pt else '<'} {args.k1a_drift_pt:.0f}pt target) "
+              f"[{aa_pre*100:.1f}% -> {aa_now*100:.1f}%]")
+
     verdict = "PASS" if ok else "KILL"
-    print(f"\nVERDICT: {verdict}  [regime {regime}; AA cap {aa_cap_applied*100:.0f}%]")
+    print(f"\nVERDICT: {verdict}  [regime {regime}; AA cap {aa_cap_applied*100:.0f}%"
+          + ("; +K-COV" if args.presum else "") + "]")
     if not ok:
         if k1a_regime:
-            print(f"KILL @K1a EARLY-KILL: AA-BTN-limp breached the {aa_cap_applied*100:.0f}% cap "
-                  "(the SOLE hard clause below --k1-hard-iters). Any G1/G2/G4/G6 WARN above is "
+            # List ONLY the clauses that actually breached (G3 pass=False, and/or K-COV kill); under
+            # --presum a run can be killed by K-COV alone with AA-limp passing, so do not mislabel.
+            hard_clauses = []
+            if not gdetail.get("G3", {}).get("pass", False):
+                hard_clauses.append(f"AA-BTN-limp > {aa_cap_applied*100:.0f}% cap")
+            if kcov_killed:
+                hard_clauses.append(f"K-COV raised-pot miss > {args.kcov_early_kill:.0f}%")
+            print(f"KILL @K1a EARLY-KILL: breached {' and/or '.join(hard_clauses) or 'a hard clause'} "
+                  "(the hard clause(s) below --k1-hard-iters). Any G1/G2/G4/G6 WARN above is "
                   "advisory and did NOT contribute to this verdict.")
+        elif kcov_killed:
+            print(f"KILL: K-COV raised-pot coverage below the {100-args.kcov_cap:.0f}% floor "
+                  "(presum failed to fix the postflop-coverage pathology).")
         print("KILL the run now: terminate the box (aws ec2 terminate-instances --instance-ids "
               "<iid> --region " + args.region + ") + stop the babysitter. The limp-trap pathology "
-              "reproduced under fullhist -- do not fund it to the backstop.")
+              + ("persisted under presum" if args.presum else "reproduced under fullhist")
+              + " -- do not fund it to the backstop.")
 
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
@@ -598,6 +689,12 @@ def main() -> int:
             "trend_hard": trend_hard, "gates": lines, "gate_detail": gdetail,
             "m1_latest": latest_m1, "m1_prior": prior_m1,
             "neg_control_rows": latest_neg, "menu_read": latest_menu,
+            # K-COV (design 36): folded into the verdict only under --presum; advisory otherwise.
+            # kcov_dark = INSUFFICIENT_DATA under --presum: the clause could not be evaluated (sample
+            # too small / no data) -- NOT a pass; raise --v3-cov-hands. Fails loud, never silent.
+            "presum": args.presum, "kcov_status": kcov_res["status"], "kcov_folded": args.presum,
+            "kcov_dark": kcov_dark, "kcov": kcov_res["detail"],
+            "aa_limp_drift_pt": (round(aa_drift * 100, 2) if aa_drift is not None else None),
             "params": {"mono_tol_pt": args.mono_tol_pt, "btn_floor_pct": args.btn_floor_pct,
                        "aa_limp_cap": args.aa_limp_cap, "k1a_aa_cap": args.k1a_aa_cap,
                        "k1_hard_iters": args.k1_hard_iters, "bb_fold_cap": args.bb_fold_cap,
@@ -607,7 +704,12 @@ def main() -> int:
                        # the pre-arm-3 instrument (absence == default 3-size menu).
                        **({"pre_menu": args.pre_menu,
                            "open_raise_ids": list(prd.RAISE_SET)}
-                          if args.pre_menu != "default" else {})},
+                          if args.pre_menu != "default" else {}),
+                       # presum K-COV thresholds stamped only under --presum (self-describing evidence).
+                       **({"presum": True, "kcov_cap": args.kcov_cap,
+                           "kcov_early_kill": args.kcov_early_kill,
+                           "kcov_min_sample": args.kcov_min_sample,
+                           "k1a_drift_pt": args.k1a_drift_pt} if args.presum else {})},
         }, f, indent=2)
     print(f"wrote {out}")
     return 0 if ok else 1

@@ -139,12 +139,16 @@ while ($true) {
       $di = [int]$mDone.Groups[1].Value
       if ($di -gt $curIter) { $curIter = $di; $stratRows = [double]$mDone.Groups[2].Value }
     }
-    # COVERAGE lines -> upsert into $covHist (postflop miss% is THE first-class v3 gate metric)
-    foreach ($m in [regex]::Matches($console, "COVERAGE iters_done=(\d+) hands=\d+ miss% pre=([0-9.]+) flop=([0-9.]+) turn=([0-9.]+) river=([0-9.]+) postflop=([0-9.]+) pre_allin_runout=([0-9.]+)")) {
+    # COVERAGE lines -> upsert into $covHist (postflop miss% is THE first-class v3 gate metric; the
+    # raised_* fields are the presum K-COV subclass -- opener-faced raised-pot coverage, design 36).
+    # The raised_* fields sit BETWEEN postflop= and pre_allin_runout=, so match them explicitly (an
+    # adjacency regex silently stops matching every current-code COVERAGE line).
+    foreach ($m in [regex]::Matches($console, "COVERAGE iters_done=(\d+) hands=\d+ miss% pre=([0-9.]+) flop=([0-9.]+) turn=([0-9.]+) river=([0-9.]+) postflop=([0-9.]+) raised_postflop=([0-9.]+) raised_flop=[0-9.]+ raised_turn=[0-9.]+ raised_river=[0-9.]+ raised_decisions=(\d+) pre_allin_runout=([0-9.]+)")) {
       $ci = [int]$m.Groups[1].Value
       $covHist[$ci] = @{ pre=[double]$m.Groups[2].Value; flop=[double]$m.Groups[3].Value;
                          turn=[double]$m.Groups[4].Value; river=[double]$m.Groups[5].Value;
-                         post=[double]$m.Groups[6].Value; allin=[double]$m.Groups[7].Value }
+                         post=[double]$m.Groups[6].Value; rpost=[double]$m.Groups[7].Value;
+                         rdec=[int]$m.Groups[8].Value; allin=[double]$m.Groups[9].Value }
     }
     # REGSTATS lines -> cum-regret rows (the RAM lever) + neg_p999 (prune-C sanity)
     foreach ($m in [regex]::Matches($console, "REGSTATS iters_done=(\d+) rows=(\d+) neg_vals=\d+ pos_vals=\d+ neg_p50=[0-9.eE+-]+ neg_p90=[0-9.eE+-]+ neg_p99=[0-9.eE+-]+ neg_p999=([0-9.eE+-]+) neg_max=([0-9.eE+-]+)")) {
@@ -350,8 +354,13 @@ while ($true) {
         $gate = "(pre-C1: trend only)"
       }
       $gcolor = if ($ci -lt $C1_ITER) { "DarkGray" } elseif ($pass) { "Green" } else { "Red" }
-      Write-Host ("  iter {0,6}:  postflop {1,5:N1}%   flop {2,5:N1}%   allin-runout {3,5:N1}%   {4}" -f `
-          $ci, $post, $covHist[$ci].flop, $covHist[$ci].allin, $gate) -ForegroundColor $gcolor
+      # K-COV (design 36): raised-pot ("opener-faced") coverage = 100 - raised_postflop miss. The
+      # presum thesis is that THIS is high where fullhist is ~5%; shown as coverage% (n = raised-pot
+      # decisions sampled; <2000 is an INSUFFICIENT_DATA read for the kill-gate).
+      $rpost = $covHist[$ci].rpost; $rcov = if ($null -ne $rpost) { 100.0 - $rpost } else { $null }
+      $kcovTxt = if ($null -ne $rcov) { "  K-COV(raised) {0,5:N1}% cov (n={1})" -f $rcov, $covHist[$ci].rdec } else { "" }
+      Write-Host (("  iter {0,6}:  postflop {1,5:N1}%   flop {2,5:N1}%   allin-runout {3,5:N1}%   {4}" -f `
+          $ci, $post, $covHist[$ci].flop, $covHist[$ci].allin, $gate) + $kcovTxt) -ForegroundColor $gcolor
     }
     # K3 monotonicity kill: postflop miss RISING >5pt over the previous checkpoint at any iter>=15k
     if ($covIters.Count -ge 2) {

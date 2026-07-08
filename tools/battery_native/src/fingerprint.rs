@@ -703,6 +703,22 @@ fn preflop_summary_bytes<const N: usize>(s: &EnvStateN<N>, n_preflop: usize) -> 
     [n_calls, n_raises, (opener_pos + 1) as u8, presum_n_active(s)]
 }
 
+/// The presum PREFLOP pot-type of a state, exposed for the K-COV on-policy coverage instrument
+/// (blueprint-v4 blocker D). Returns `(n_calls, n_raises, opener_pos_enum, n_active)` computed over
+/// the reconstructed preflop prefix — the SAME classification `push_presum_hist_bytes` keys on, so
+/// K-COV subclasses coverage in EXACTLY the pot-type buckets presum collapses. `n_raises == 0` is a
+/// limped/walk pot (opener_pos = -1); `n_raises >= 1` is a RAISED ("opener-faced") pot — the region
+/// the limp-trap starves. Valid on any state (it replays the preflop history through the real engine
+/// via `n_preflop_boundary`; on a preflop state it summarizes the actions taken so far). Cost is
+/// O(n_preflop) apply_action calls — call it ONCE per hand (the pot-type is fixed once preflop
+/// closes) and reuse. Independent of the key space (pure history count), so it classifies correctly
+/// whether or not presum/fullhist is enabled.
+pub fn preflop_pot_type<const N: usize>(s: &EnvStateN<N>) -> (u8, u8, i8, u8) {
+    let n_preflop = n_preflop_boundary(s);
+    let [n_calls, n_raises, opener_plus1, n_active] = preflop_summary_bytes(s, n_preflop);
+    (n_calls, n_raises, (opener_plus1 as i8) - 1, n_active)
+}
+
 /// Recover `n_preflop` = the number of leading `hist_action` entries that were PREFLOP decisions
 /// (the count of actions taken before the preflop betting round first closed). Per-entry street is
 /// NOT stored in EnvStateN, so this REPLAYS the recorded history through the REAL engine

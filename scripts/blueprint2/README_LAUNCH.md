@@ -482,3 +482,39 @@ G5′ via `bp3_forced_response_probe.py rollout … --key-mode fullhist --mrr --
 (the SYMMETRIC FIXED continuation field — the fix for the Stage-0 coverage-BLOCK above; the M-RR
 postflop-miss caveat in the previous section is MOOT under checkcall since no postflop blueprint
 lookups occur). Serve/eval env unchanged: `POKERBOT_FULLHIST_KEY=1 POKERBOT_MRR=1`.
+
+---
+
+## Blueprint-v4 **arm-6** — postflop preflop-summary (presum) key (bpv4_presum)
+
+Adds the **presum** postflop key (`POKERBOT_PRESUM_KEY=1`, read by `fingerprint.rs::presum_key_enabled`).
+Presum is a **REFINEMENT of fullhist**, not a standalone axis: the env only takes effect when
+`POKERBOT_FULLHIST_KEY=1` is also set, so this arm is always launched **WITH** `-FullHistKey` and
+`-Mrr`. Default off => byte-identical bootstrap (the export/echo lines simply do not exist), and
+serve/eval MUST set the SAME env (`POKERBOT_FULLHIST_KEY=1 POKERBOT_MRR=1 POKERBOT_PRESUM_KEY=1`).
+
+**Launch (one terminal, leave open):** `blueprint2_babysitter.ps1` with the presum lever added to the
+v3 fullhist arm (a v3 schedule lever is required for the per-street COVERAGE line — see below) and the
+coverage-hands knob sized for a stable K-COV sample:
+
+    powershell -ExecutionPolicy Bypass -File scripts\blueprint2\blueprint2_babysitter.ps1 `
+        -FullHistKey -Mrr -PresumKey `
+        -V3Lcfr -V3LcfrD 250 -V3LcfrW 10000 -V3PruneC -30000 -V3PruneStart 5000 -V3SnapshotAvg `
+        -V3CovHands 40000 -V3Regstats
+
+`-PresumKey` (babysitter) forwards `--presum-key` (launcher). Coverage probing is a v3-schedule
+feature: `-V3CovHands` only takes effect alongside a v3 lever (`-V3Lcfr`/`-V3SignedRegrets`/
+`-V3SnapshotAvg`), where it forwards `--v3-cov-hands` -> the driver's `V3_COV_HANDS` constant that
+gates the per-street `COVERAGE iters_done=…` line, which the presum K-COV gate reads.
+
+**Size it for the K-COV sample, not just for a stable postflop miss%.** The K-COV clause needs
+`raised_decisions >= 2000` (`bpv4_kcov.MIN_SAMPLE`) or it reads INSUFFICIENT_DATA and cannot bind. The
+MEASURED raised-pot-postflop decision density on jam-heavy runs is only ~0.07-0.10 per probe hand
+(grounding: presum 286/4000, fullhist 361/4000) -- and a BROKEN presum run stays jam-heavy (high
+preflop-all-in rate), so it is exactly the run you most need to kill that has the LOWEST density. At
+0.07/hand you need ~28k hands to clear 2000; **use `-V3CovHands 40000`** for margin (~2800 raised
+decisions at the jam-heavy density; a healthy converging run sees more flops so density and sample
+both rise). The probe is cheap (~ms-to-seconds/checkpoint). If a gate checkpoint still reads K-COV
+INSUFFICIENT_DATA under `--presum`, `bpv4_kill_gate.py` prints a LOUD warning and stamps `kcov_dark`
+-- treat that as "coverage NOT evaluated", never as a pass, and raise `-V3CovHands`. Everything else
+is the v3 fullhist arm (above) verbatim; any extra `blueprint2_babysitter.ps1` parameter is forwarded.

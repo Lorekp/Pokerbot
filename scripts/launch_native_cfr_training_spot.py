@@ -281,7 +281,7 @@ bash /tmp/bootstrap.sh
 def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_deals, num_buckets,
                    depth_edges, checkpoint_every, gate_every=0, keep_alive=False, emd_frozen_rel="", emd_sha="",
                    river_ochs_rel="", river_ochs_sha="", preflop_hist_key=False,
-                   fullhist_key=False, mrr=False, pre_keep="", pre_rr_keep="", flop_rr_keep="",
+                   fullhist_key=False, mrr=False, presum_key=False, pre_keep="", pre_rr_keep="", flop_rr_keep="",
                    work_steal=False, dcfr=False, dcfr_prune_threshold=-300000.0, dcfr_explore_frac=0.05,
                    v3=None, row_budget=None, migrate_min_avail_gb=None, migrate_max_rows=None,
                    no_cache_fetch=False, delta_ckpt=False,
@@ -315,6 +315,12 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
         )
     else:
         fullhist_block = ""
+    # blueprint-v4 arm-6 PRESUM key (postflop preflop-summary). ADDITIVE + default-off BYTE-IDENTICAL:
+    # when off ``presum_key_block`` is "" (zero extra bytes vs arm-2b). NOTE: presum is a REFINEMENT of
+    # fullhist — POKERBOT_PRESUM_KEY only takes effect when POKERBOT_FULLHIST_KEY is also on
+    # (fingerprint.rs::presum_key_enabled gates on fullhist). The launcher does not enforce the pairing;
+    # pass --presum-key together with --fullhist-key (and --mrr). Serve/eval MUST set the same env.
+    presum_key_block = "" if not presum_key else "\nexport POKERBOT_PRESUM_KEY=1\necho \"PRESUM_KEY=$POKERBOT_PRESUM_KEY\""
     # arm-3 Pluribus-grade menu knobs (amendment sec 24). ADDITIVE + default-off BYTE-IDENTICAL:
     # all three empty => all blocks are "" => zero extra bytes vs arm-2b. Comma-sep bet-bucket keep
     # lists passed straight to ab_train (trainer reads them via env; absent/empty = legacy menu):
@@ -444,12 +450,17 @@ def bootstrap_body(*, bucket, prefix, region, code_key, run_subdir, iters, n_dea
             "            except OSError:\n"
             "                pass\n"
             "    if gate and V3_COV_HANDS > 0:\n"
-            "        hands, dec, mis, allin = t.coverage(V3_COV_HANDS, 0xC0FFEE ^ it)\n"
+            "        hands, dec, mis, allin, rdec, rmis = t.coverage(V3_COV_HANDS, 0xC0FFEE ^ it)\n"
             "        pct = lambda i: (100.0 * mis[i] / dec[i]) if dec[i] else 0.0\n"
+            "        rpct = lambda i: (100.0 * rmis[i] / rdec[i]) if rdec[i] else 0.0\n"
             "        pf_d, pf_m = sum(dec[1:4]), sum(mis[1:4])\n"
             "        pf = (100.0 * pf_m / pf_d) if pf_d else 0.0\n"
+            "        rpf_d, rpf_m = sum(rdec[1:4]), sum(rmis[1:4])\n"
+            "        rpf = (100.0 * rpf_m / rpf_d) if rpf_d else 0.0\n"
             "        print(f\"COVERAGE iters_done={it} hands={hands} miss% pre={pct(0):.1f} \"\n"
             "              f\"flop={pct(1):.1f} turn={pct(2):.1f} river={pct(3):.1f} postflop={pf:.1f} \"\n"
+            "              f\"raised_postflop={rpf:.1f} raised_flop={rpct(1):.1f} raised_turn={rpct(2):.1f} \"\n"
+            "              f\"raised_river={rpct(3):.1f} raised_decisions={rpf_d} \"\n"
             "              f\"pre_allin_runout={100.0 * allin / max(hands, 1):.1f} decisions={dec}\",\n"
             "              flush=True)\n"
             "    if gate and V3_REGSTATS:\n"
@@ -1853,7 +1864,7 @@ export PYTHONPATH=/opt/pokerbot RUST_BACKTRACE=1
 # stamps + guards it). "0" is byte-identical to the shipped key space.
 export POKERBOT_PREFLOP_HIST_KEY={hist_flag}
 echo "PREFLOP_HIST_KEY=$POKERBOT_PREFLOP_HIST_KEY"
-{fullhist_block}{pre_keep_block}{pre_rr_keep_block}{flop_rr_keep_block}{v3_env_block}{row_budget_env}{migrate_env}
+{fullhist_block}{presum_key_block}{pre_keep_block}{pre_rr_keep_block}{flop_rr_keep_block}{v3_env_block}{row_budget_env}{migrate_env}
 # S2: verify the shipped EMD frozen blob matches its known sha256 BEFORE training. A same-K CORRUPTED blob
 # (truncated S3 round-trip) -> wrong potential-aware buckets -> a broken blueprint that the convergence-stop
 # (abstraction-agnostic) cannot catch and only the final ranking gate would; the ctor's num_buckets==K check
@@ -2077,6 +2088,9 @@ def main() -> None:
                         "from ~10^31 to a Pluribus-class ~413M rows (bpv4-mrr-relief-valve). Default off => "
                         "byte-identical bootstrap. Any in-model probe/eval MUST also set POKERBOT_MRR=1 "
                         "(train/probe abstraction skew otherwise biases the verdict).")
+    p.add_argument("--presum-key", action="store_true", dest="presum_key",
+                   help="blueprint-v4 arm-6: postflop preflop-summary (presum) key; REFINES fullhist "
+                        "(requires --fullhist-key). Byte-identical when absent.")
     p.add_argument("--pre-keep", default="", dest="pre_keep",
                    help="arm-3 Pluribus-grade preflop FIRST-raise (open) menu: comma-sep bet-bucket keep "
                         "list exported as POKERBOT_PRE_KEEP on the box. E.g. '2,3,4,5,6' = opens "
@@ -2289,7 +2303,7 @@ def main() -> None:
         emd_frozen_rel=args.emd_frozen, emd_sha=emd_sha,
         river_ochs_rel=args.river_ochs, river_ochs_sha=river_ochs_sha,
         preflop_hist_key=args.preflop_hist_key,
-        fullhist_key=args.fullhist_key, mrr=args.mrr,
+        fullhist_key=args.fullhist_key, mrr=args.mrr, presum_key=args.presum_key,
         pre_keep=args.pre_keep, pre_rr_keep=args.pre_rr_keep, flop_rr_keep=args.flop_rr_keep,
         work_steal=args.work_steal, dcfr=args.dcfr,
         dcfr_prune_threshold=args.dcfr_prune_threshold, dcfr_explore_frac=args.dcfr_explore_frac,
