@@ -211,6 +211,59 @@ class _IndexedSnap:
         return default if out is None else out
 
 
+class _MmapSortedSnap:
+    """Serve current-iterate probs from a SORTED NLSNAP01 file by DIRECT mmap binary search — no
+    separate A/B/O index. The snapshot is globally key-sorted (gather_sorted_all), so binary search
+    over the mmapped fixed-width rows suffices. A 3.9B-row snapshot's index would be ~94 GB + ~94 GB
+    temp; this needs ZERO extra disk. Same .get(key) contract as _IndexedSnap / _IndexedSnapFile
+    (np.float64[11] or None). Row = 16-byte key + 11 f32 probs (LE)."""
+
+    _MISS = object()
+    _CACHE_CAP = 2_000_000
+    ROW = 60
+    HDR = 24
+
+    def __init__(self, path: str):
+        import mmap as _mmap
+
+        import numpy as np
+        f = open(path, "rb")
+        hdr = f.read(self.HDR)
+        assert hdr[:8] == b"NLSNAP01", f"bad magic {hdr[:8]!r}"
+        self.iters = struct.unpack_from("<Q", hdr, 8)[0]
+        self._n = struct.unpack_from("<Q", hdr, 16)[0]
+        self._mm = _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ)
+        self._np = np
+        self._cache: dict[bytes, object] = {}
+
+    def __len__(self) -> int:
+        return self._n
+
+    def get(self, key, default=None):
+        c = self._cache.get(key, self._MISS)
+        if c is not self._MISS:
+            return default if c is None else c
+        mm, ROW, HDR = self._mm, self.ROW, self.HDR
+        lo, hi, out = 0, self._n, None
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            off = HDR + mid * ROW
+            k = mm[off:off + 16]
+            if k == key:                       # lexicographic == the serializer's BE-u128 order
+                row = struct.unpack_from("<11f", mm, off + 16)
+                tot = sum(row)
+                out = (self._np.asarray([x / tot for x in row], dtype=self._np.float64)
+                       if tot > 0.0 else self._np.full(11, 1.0 / 11.0, dtype=self._np.float64))
+                break
+            if k < key:
+                lo = mid + 1
+            else:
+                hi = mid
+        if len(self._cache) < self._CACHE_CAP:
+            self._cache[key] = out
+        return default if out is None else out
+
+
 def _rollout_main(args) -> int:
     _configure_env(args)
     import random
@@ -227,7 +280,20 @@ def _rollout_main(args) -> int:
     import numpy as np
 
     tag = f"{args.hand}/s{args.start}"
-    if args.snapshot_index:
+    if getattr(args, "snapshot_nlsnap_file", None):
+        # SORTED NLSNAP01 served by direct mmap binary search — no index (a 3.9B-row snapshot's index
+        # is ~94 GB and would not fit). Trained current-iterate incl POSTFLOP.
+        _plog(f"{tag} NLSNAP mmap-sorted (no index) {args.snapshot_nlsnap_file}")
+        snap = _MmapSortedSnap(args.snapshot_nlsnap_file)
+    elif getattr(args, "snapshot_nlsnap_index", None):
+        # TRAINED-POSTFLOP field source: an NLSNAP01 current-iterate snapshot (16B key + 11 f32 probs).
+        # Under snapshot_avg the .nlcfr STRAT section is PREFLOP-ONLY, so the trained POSTFLOP strategy
+        # lives only in the .nlsnap current-iterate. Same .get() contract as _IndexedSnap (reused verbatim
+        # from bpv4_onpolicy_coverage_snap). Used by the root-cause probe (trained vs check-call fields).
+        from bpv4_onpolicy_coverage_snap import _IndexedSnapFile
+        _plog(f"{tag} NLSNAP mmap-index {args.snapshot_nlsnap_index}")
+        snap = _IndexedSnapFile(args.snapshot_nlsnap_index)
+    elif args.snapshot_index:
         # blueprint-v4 Stage-0 CLOUD arm: 347.7M rows / 55.3 GB blob — mmap-backed lookup (the full
         # in-RAM snapshot needs >100 GB). Values/coverage semantics identical to the in-RAM path.
         _plog(f"{tag} mmap-index {args.snapshot_index} over {args.blueprint}")
@@ -653,6 +719,15 @@ def main() -> int:
                    help="dir built by bpv4_nlcfr_index.py — mmap-backed snapshot lookup instead of the "
                         "full in-RAM load (REQUIRED for the 55 GB cloud fullhist blobs). Default None "
                         "= historical in-RAM path, byte-identical.")
+    r.add_argument("--snapshot-nlsnap-file", default=None,
+                   help="path to a SORTED NLSNAP01 snapshot — served by DIRECT mmap binary search (no "
+                        "index; a multi-billion-row snapshot's A/B/O index would be ~90 GB). Trained "
+                        "current-iterate INCL POSTFLOP. Highest precedence among snapshot sources.")
+    r.add_argument("--snapshot-nlsnap-index", default=None,
+                   help="dir built by bpv4_nlsnap_index.py over an NLSNAP01 current-iterate snapshot — "
+                        "serves the TRAINED current-strategy INCL POSTFLOP (the .nlcfr strat section is "
+                        "preflop-only under snapshot_avg). For the root-cause probe: EV under the TRAINED "
+                        "postflop field vs --postflop-field checkcall. Takes precedence over --snapshot-index.")
     r.add_argument("--out", required=True)
 
     w = sub.add_parser("rows")
