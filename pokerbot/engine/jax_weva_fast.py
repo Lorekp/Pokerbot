@@ -17,7 +17,10 @@ from pokerbot.engine.jax_engine import (
     CHECK,
     CHIP_UNIT,
     FOLD,
+    MAX_HISTORY,
+    NUM_ACTIONS,
     SEAT_EMPTY,
+    STREET_FLOP,
     EnvState,
     NUM_PLAYERS,
 )
@@ -292,6 +295,199 @@ def full_hist_bytes(state: EnvState | Any) -> bytes:
     return bytes([street] + [int(hist_action[i]) & 0xFF for i in range(n)])
 
 
+def _presum_n_preflop_boundary(state: EnvState | Any) -> int:
+    """Serve twin of ``fingerprint.rs::n_preflop_boundary``: the number of leading ``hist_action``
+    entries that were PREFLOP decisions (actions taken before the preflop betting round first closed).
+
+    Per-entry street is not stored, so this REPLAYS the recorded history through the REAL engine
+    (``np_engine.apply_action_np``, which reuses the same ``_street_complete`` as the Rust core) — zero
+    divergence from the trainer transitions. Reconstruction mirrors the Rust exactly:
+      * starting stack of seat i = ``stacks[i] + committed_total[i]`` (undo every chip committed; ante=0
+        in the trainer so committed_total is the reconstructable pre-blind commitment);
+      * re-init the hand root via a pure-numpy ``init_hand_n`` twin with the SAME button, those starting
+        stacks, occupancy = (seat_status != EMPTY), ante=0, a DUMMY deck [0..52], the SAME rng_key;
+      * replay ``hist_action[0..min(hist_len, MAX_HISTORY)]`` one at a time; STOP at the first action
+        after which ``street >= 1`` OR ``pending_deal`` (the preflop round just closed — before any board
+        card is dealt). Returns i+1 at that first close, else the full replayed length.
+    """
+    from pokerbot.engine import np_engine as _np
+
+    hist_len = int(np.asarray(state.hist_len))
+    hist_len = max(0, min(hist_len, MAX_HISTORY))
+    if hist_len == 0:
+        return 0
+    stacks = np.asarray(state.stacks)
+    committed_total = np.asarray(state.committed_total)
+    seat_status = np.asarray(state.seat_status)
+    button = int(np.asarray(state.button))
+    rng_key = np.asarray(state.rng_key)
+    n_seats = int(stacks.shape[0])
+    start_stacks = [int(stacks[i]) + int(committed_total[i]) for i in range(n_seats)]
+    occupancy = [int(seat_status[i]) != _SEAT_EMPTY_I for i in range(n_seats)]
+    root = _reconstruct_root_np(button, start_stacks, occupancy, rng_key, n_seats)
+    hist_seat = np.asarray(state.hist_seat)
+    hist_action = np.asarray(state.hist_action)
+    r = root
+    for i in range(hist_len):
+        action = int(hist_action[i])
+        if not (0 <= action < NUM_ACTIONS):
+            return hist_len
+        # (Debug parity: the engine picks action_seat; it must equal the recorded hist_seat[i].)
+        assert int(r.action_seat) == int(hist_seat[i]), (
+            f"presum n_preflop replay diverged: engine action_seat {int(r.action_seat)} != recorded "
+            f"hist_seat {int(hist_seat[i])} at i={i}")
+        r = _np.apply_action_np(r, action)
+        if int(r.street) >= STREET_FLOP or bool(r.pending_deal):
+            return i + 1
+    return hist_len
+
+
+def _reconstruct_root_np(button: int, start_stacks, occupancy, rng_key, n_seats: int):
+    """Pure-numpy twin of ``core::init_hand_n`` (blinds + status + first actor), JAX-free. Deals a
+    DUMMY deck so holes/board are placeholder (the preflop-boundary replay never draws board cards);
+    the fields ``apply_action_np`` reads for the betting transition are reproduced EXACTLY. ante=0."""
+    from pokerbot.engine.jax_engine import MAX_BOARD, STREET_PREFLOP
+    from pokerbot.engine.np_engine import EnvState as _NPEnvState
+
+    SEAT_EMPTY_, SEAT_LIVE_, SEAT_ALLIN_ = 0, 2, 3
+    SB_CHIPS = CHIP_UNIT // 2
+    BB_CHIPS = CHIP_UNIT
+
+    seat_status = np.array(
+        [SEAT_LIVE_ if occupancy[i] else SEAT_EMPTY_ for i in range(n_seats)], dtype=np.int8)
+    stacks = np.array([int(start_stacks[i]) for i in range(n_seats)], dtype=np.int32)
+
+    def _first_live_after(from_seat: int) -> int:
+        for off in range(1, n_seats + 1):
+            seat = (from_seat + off) % n_seats
+            if seat_status[seat] == SEAT_LIVE_:
+                return seat
+        return -1
+
+    def _nth_live_after(from_seat: int, k: int) -> int:
+        seat = from_seat
+        for _ in range(k):
+            seat = _first_live_after(seat)
+        return seat
+
+    sb = _nth_live_after(button, 1)
+    bb = _nth_live_after(button, 2)
+    committed = np.zeros(n_seats, dtype=np.int32)
+    sb_live = 1 if seat_status[sb] != SEAT_EMPTY_ else 0
+    bb_live = 1 if seat_status[bb] != SEAT_EMPTY_ else 0
+    sb_paid = min(SB_CHIPS * sb_live, max(int(stacks[sb]), 0))
+    bb_paid = min(BB_CHIPS * bb_live, max(int(stacks[bb]), 0))
+    stacks[sb] -= sb_paid
+    stacks[bb] -= bb_paid
+    committed[sb] = sb_paid
+    committed[bb] = bb_paid
+    committed_total = committed.copy()  # ante=0 => committed_total == committed
+    # A live seat that committed its whole stack is all-in (B2).
+    for i in range(n_seats):
+        if seat_status[i] != SEAT_EMPTY_ and int(stacks[i]) == 0:
+            seat_status[i] = SEAT_ALLIN_
+    current_bet = int(committed.max()) if n_seats else 0
+    min_raise = BB_CHIPS
+
+    # Dummy holes from a [0..52] deck (placeholders; the boundary replay is card-independent).
+    deck = np.arange(52, dtype=np.int32)
+    holes = np.full((n_seats, 2), -1, dtype=np.int32)
+    p = 0
+    for i in range(n_seats):
+        if seat_status[i] != SEAT_EMPTY_:
+            holes[i, 0] = deck[p]
+            holes[i, 1] = deck[p + 1]
+            p += 2
+    n_live = int(np.sum((seat_status == SEAT_LIVE_) | (seat_status == SEAT_ALLIN_)))
+    btn_first = _nth_live_after(button, 1)
+    utg = _nth_live_after(button, 3)
+    action_seat = btn_first if n_live <= 2 else utg
+
+    return _NPEnvState(
+        holes=holes,
+        board=np.full(MAX_BOARD, -1, dtype=np.int32),
+        seat_status=seat_status,
+        stacks=stacks,
+        committed_street=committed,
+        committed_total=committed_total,
+        street=np.asarray(STREET_PREFLOP, dtype=np.int32),
+        pot_dead=np.asarray(0, dtype=np.int32),
+        current_bet=np.asarray(current_bet, dtype=np.int32),
+        min_raise=np.asarray(min_raise, dtype=np.int32),
+        button=np.asarray(button, dtype=np.int32),
+        action_seat=np.asarray(action_seat, dtype=np.int32),
+        last_aggressor=np.asarray(-1, dtype=np.int32),
+        acted=np.zeros(n_seats, dtype=np.bool_),
+        last_raise_full=np.asarray(True, dtype=np.bool_),
+        deck=deck,
+        deck_ptr=np.asarray(p, dtype=np.int32),
+        rng_key=np.asarray(rng_key, dtype=np.uint32),
+        hist_seat=np.full(MAX_HISTORY, -1, dtype=np.int32),
+        hist_action=np.full(MAX_HISTORY, -1, dtype=np.int32),
+        hist_amount=np.zeros(MAX_HISTORY, dtype=np.int32),
+        hist_len=np.asarray(0, dtype=np.int32),
+        done=np.asarray(False, dtype=np.bool_),
+        rewards=np.zeros(n_seats, dtype=np.int32),
+        pending_deal=np.asarray(False, dtype=np.bool_),
+    )
+
+
+def presum_hist_bytes(state: EnvState | Any) -> bytes:
+    """Serve twin of ``fingerprint.rs::push_presum_hist_bytes`` (blueprint-v4 arm-4 POSTFLOP
+    preflop-summary key, POKERBOT_PRESUM_KEY=1 alongside POKERBOT_FULLHIST_KEY=1 — design of record
+    artifacts/bpv4_arm4_design_and_review.md §35). Layout (the digest prepends ``b"A"``):
+
+        street(1 byte) + [4 preflop-summary bytes] + [EXACT postflop action bytes]
+
+    where the 4 summary bytes = (n_calls_before_first_raise cap3, n_raises cap3, opener_pos_enum+1,
+    n_active) over ONLY hist_action[0..n_preflop] (+ n_active over the CURRENT state), and the postflop
+    bytes = raw hist_action[n_preflop..min(hist_len, MAX_HISTORY)]. Only emitted on POSTFLOP nodes
+    (street >= 1); the preflop branch keeps the plain full_hist_bytes (see the encoder). Semantics MUST
+    stay byte-identical to fingerprint.rs (parity-gated by tests/test_fullhist_key_parity.py --presum)."""
+    n_preflop = _presum_n_preflop_boundary(state)
+    hist_action = np.asarray(state.hist_action)
+    hist_seat = np.asarray(state.hist_seat)
+    hl = int(np.asarray(state.hist_len))
+    n = max(0, min(hl, MAX_HISTORY))
+    street = int(np.asarray(state.street)) & 0xFF
+    # 4-byte preflop pot-type summary over the first n_preflop entries.
+    n_calls = 0
+    n_raises = 0
+    opener_seat = -1
+    for i in range(min(n_preflop, MAX_HISTORY)):
+        a = int(hist_action[i])
+        if a == CALL:
+            if n_raises == 0 and n_calls < 3:
+                n_calls += 1
+        elif BET_BUCKET_START <= a <= ALL_IN:
+            if n_raises == 0:
+                opener_seat = int(hist_seat[i])
+            if n_raises < 3:
+                n_raises += 1
+    if opener_seat >= 0:
+        opener_pos = int(_POS_BY_OFFSET[(opener_seat - int(np.asarray(state.button))) % NUM_PLAYERS])
+    else:
+        opener_pos = -1
+    seat_status = np.asarray(state.seat_status)
+    n_active = int(np.sum((seat_status == _SEAT_ALLIN_I) | (seat_status == 2)))  # SEAT_LIVE=2
+    out = [street, n_calls & 0xFF, n_raises & 0xFF, (opener_pos + 1) & 0xFF, n_active & 0xFF]
+    out += [int(hist_action[i]) & 0xFF for i in range(n_preflop, n)]
+    return bytes(out)
+
+
+def _hist_a_segment_bytes(state: EnvState | Any, bucket: int) -> bytes:
+    """A-segment payload (the bytes after the digest's ``b"A"`` prefix) for the full-history / presum
+    key. Twin of the Rust ``push_hist_bytes`` dispatcher: on a POSTFLOP node (``bucket >= 0`` ⇔ street
+    >= 1, i.e. >=3 board cards) with POKERBOT_PRESUM_KEY on, the payload is the preflop-summary form
+    (``presum_hist_bytes``); otherwise (preflop, or presum off) it is the plain ``full_hist_bytes``.
+    Callers guard this behind ``_FULLHIST_KEY`` (presum only ever refines the fullhist A-segment)."""
+    from pokerbot.engine.jax_weva_encode import _PRESUM_KEY
+
+    if _PRESUM_KEY and bucket >= 0:
+        return presum_hist_bytes(state)
+    return full_hist_bytes(state)
+
+
 def encode_actions_numpy(
     *,
     holes: np.ndarray,
@@ -449,13 +645,14 @@ def encode_nlhe_bundle_fast(
         _DEPTH_BUCKETS,
         _FULLHIST_KEY,
         _PREFLOP_HIST_KEY,
+        _PRESUM_KEY,
         compute_postflop_bucket,
     )
 
     bucket = compute_postflop_bucket(holes[seat], board)
     dbucket = depth_bucket(state) if _DEPTH_BUCKETS else -1  # hashed preflop only; -1 => not hashed
     phist = preflop_hist_bytes(state) if (_PREFLOP_HIST_KEY and bucket < 0) else b""
-    fhist = full_hist_bytes(state) if _FULLHIST_KEY else b""  # blueprint-v4: hashed on ALL streets
+    fhist = _hist_a_segment_bytes(state, bucket) if _FULLHIST_KEY else b""
     return NLHEEncodeBundle(
         weva_id=weva_id,
         cards=cards,
@@ -490,6 +687,7 @@ def fingerprint_fast(state: EnvState | Any, seat: int, *, weva_table: np.ndarray
         _DEPTH_BUCKETS,
         _FULLHIST_KEY,
         _PREFLOP_HIST_KEY,
+        _PRESUM_KEY,
         NLHEEncodeBundle,
         compute_postflop_bucket,
     )
@@ -520,7 +718,8 @@ def fingerprint_fast(state: EnvState | Any, seat: int, *, weva_table: np.ndarray
     phist = preflop_hist_bytes(state) if (_PREFLOP_HIST_KEY and bucket < 0) else b""
     # Full-history key (blueprint-v4 Stage 0): hashed on ALL streets when the flag is on. Serve
     # twin of the trainer's fingerprint.rs push_full_hist_bytes (byte-identical; parity-gated).
-    fhist = full_hist_bytes(state) if _FULLHIST_KEY else b""
+    # arm-4 presum: on POSTFLOP nodes the A-segment is the preflop-summary form when _PRESUM_KEY.
+    fhist = _hist_a_segment_bytes(state, bucket) if _FULLHIST_KEY else b""
     return NLHEEncodeBundle(
         weva_id=weva_id, cards=_FP_FAST_EMPTY, actions=_FP_FAST_EMPTY, position=_FP_FAST_EMPTY,
         spot_scope=_FP_FAST_EMPTY, policy_position=_FP_FAST_EMPTY, postflop_bucket_id=bucket,

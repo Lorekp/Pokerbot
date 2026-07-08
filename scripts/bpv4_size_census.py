@@ -94,6 +94,13 @@ MENUS = {
     # widened 5-size menu; RE-raises (3-bet+, current_bet > BB) keep the legacy 3-size menu.
     # "pre_rr" is optional per menu; when absent, "pre" applies at all preflop nodes (legacy).
     "arm3": {"pre": [2, 3, 4, 5, 6], "pre_rr": [4, 5, 6], "post": [0, 1, 3, 4, 5]},
+    # arm-5 design-of-record menu grade (design blueprint_pluribus_grade_design_v2 §menu_grade):
+    # preflop MENU reverted to deployed [4,5,6]+jam (the arm-4-measured ~90%-of-reached-rows RAM
+    # dominator that never fixed the trap); FLOP first-raise thinned to {0.5p,1p,AI} = post [1,4]
+    # (POKERBOT_POST_KEEP=1,4). Runs WITH --mrr so turn/river first-raise = mrr_tr_first_keep [1,4]+jam
+    # and every postflop RE-raise = mrr_reraise_keep [4]+jam. This is the design's Pluribus-grade
+    # postflop menu; the A/B pairs fullhist-key vs T1-key UNDER THIS SAME MENU (single-variable = key).
+    "t1menu": {"pre": [4, 5, 6], "post": [1, 4]},
 }
 
 def menu_masks(menu):
@@ -245,6 +252,92 @@ def hist3(a):
         op = -1
     return (n_calls, n_raises, op + 1)
 
+# ---------------------------------------------------------------------------
+# T1 BOUNDED-RECALL POSTFLOP KEY (arm-5 design of record, blueprint_pluribus_grade_design_v2 §4.1).
+#
+# Twin of the designed fingerprint.rs::push_full_hist_bytes edit (573-581): PREFLOP stays fullhist
+# (exact recall, uncapped), each POSTFLOP street keeps EXACT action-id bytes up to AND INCLUDING the
+# byte that lands the Nth RAISE (aggressive: id>=BET0 or id==ALL_IN) on that street; FOLD/CHECK/CALL
+# are ALWAYS emitted verbatim and do NOT count toward the cap. Once the current street's raise count
+# reaches N, the tail is replaced by ONE summary token and the street advances. Prior (closed) streets
+# are already bounded (their cap fired at street close) and emitted exact-and-full.
+#
+# Summary token (design summary byte, here a tuple for the census; same information content):
+#   ( war_depth = min(subsequent_raises_beyond_Nth, 3),
+#     spr_bucket at the cap point (0..5 via SPR_EDGES),
+#     pot_bucket at the cap point (0..7 via POT_EDGES; design packs to 0..3, kept finer here so the
+#                 census is a CONSERVATIVE upper bound on distinct rows),
+#     opener_flag = 1 if last aggressor at cap point is the preflop opener )
+# All four features are read from the SAME state fields betting6/betting_abstraction_key already touch,
+# so no extra traversal. The census tags each history entry with the street of the node that produced
+# it (threaded down the recursion) -> exact street membership, no boundary-reconstruction heuristic
+# (the Rust twin reconstructs the identical boundaries by transition-tracking the same forward scan).
+# ---------------------------------------------------------------------------
+
+def t1_cap_point_buckets(a, seat, opener_seat):
+    """SPR/pot bucket + initiative flag at the CAP-POINT state `a` (the state right after the Nth
+    raise closed on a street). Reuses betting6's SPR/pot bucketing (== betting_abstraction_key)."""
+    _, pot_b, _tocall_b, spr_b, _is_btn, _facing = betting6(a, seat)
+    la = int(a[O_LAST_AGGRESSOR])
+    opener_flag = 1 if (la >= 0 and la == opener_seat) else 0
+    return (spr_b, min(pot_b, 7), opener_flag)
+
+
+def t1_postflop_key(entries, cap):
+    """Build the bounded-recall POSTFLOP key from street-tagged history entries.
+
+    entries: list of dicts, one per postflop history entry (street>=1), in order, each
+      {street, action, is_raise, cap_buckets} where cap_buckets = (spr_b, pot_b, opener_flag) at the
+      CAP-POINT is set ONLY on the entry that lands the Nth raise on its street (None otherwise).
+      PREFLOP entries are excluded (the caller keeps them exact in the preflop portion of the row key).
+    cap: N (per-street raise cap). Returns a hashable tuple.
+
+    Per street: emit exact action ids (folds/checks/calls always; only raises counted) until the Nth
+    raise, then emit ONE summary token
+        ("T1", war_depth=min(raises_beyond_Nth,3), spr_b, pot_b, opener_flag)
+    and stop emitting per-action ids for that street. war_depth distinguishes 0/1/2/3+ further raises
+    (design summary-byte bits[0-1]) -> at most 4 distinct tails per (cap_buckets), which is exactly
+    why the postflop set is FINITE and saturates (vs the uncapped chain that grew unboundedly)."""
+    out = []
+    cur_street = None
+    raises_this_street = 0
+    capped = False
+    cap_buckets = None
+    further = 0
+
+    def flush_summary():
+        # emit the summary token for the just-closed capped street (if any)
+        if cap_buckets is not None:
+            spr_b, pot_b, opener_flag = cap_buckets
+            out.append(("T1", min(further, 3), spr_b, pot_b, opener_flag))
+
+    for e in entries:
+        st = e["street"]
+        if st != cur_street:
+            flush_summary()
+            cur_street = st
+            raises_this_street = 0
+            capped = False
+            cap_buckets = None
+            further = 0
+            out.append(("st", st))
+        if e["is_raise"]:
+            raises_this_street += 1
+            if raises_this_street < cap:
+                out.append(("a", e["action"]))
+            elif raises_this_street == cap:
+                out.append(("a", e["action"]))  # emit the Nth raise exactly
+                cap_buckets = e["cap_buckets"]   # record cap-point summary buckets
+                capped = True
+            else:
+                further += 1                      # war depth beyond the Nth (aliased to a count)
+        elif not capped:
+            out.append(("a", e["action"]))        # fold/check/call before cap: exact
+        # fold/check/call AFTER cap are dropped (subsumed by the summary; they carry no new size info)
+    flush_summary()
+    return tuple(out)
+
+
 def memo_key(state_bytes):
     """Betting-relevant canonical state (excludes cards/deck/history/rng), hashed to a
     96-bit digest to keep the memo memory-lean (collision prob ~(n^2)/2^97, negligible at
@@ -379,28 +472,75 @@ def enumerate_menu(menu_name, dedupe, max_states, log_every, progress, preflop_o
     }
 
 def walk_census(menu_name, dedupe, n_deals, seed, progress, snap_every=1000, mrr=False,
-                flop_rr_keep=None):
+                flop_rr_keep=None, postflop_key="fullhist", t1_raise_cap=3):
     """Trainer-visitation census: for each deal, run 6 hero traversals (hero branches ALL
     allowed actions; opponents sample ONE uniform-over-allowed). Count distinct FULL-HISTORY
     rows per street: key = (street, actor-derived pos [pre] , card-class/bucket, action hist).
     Card part: preflop = 169-class of hero; postflop = made-hand bucket 200 via
-    bn.fingerprint_fast digest (cheap, deployed-shape); the history part is exact."""
+    bn.fingerprint_fast digest (cheap, deployed-shape); the history part is exact.
+
+    postflop_key: "fullhist" = exact flat action history (baseline; the CURRENT shipped fullhist
+      key). "t1" = arm-5 BOUNDED-RECALL postflop key: PREFLOP stays exact, each POSTFLOP street keeps
+      exact action bytes up to+including the Nth (t1_raise_cap) raise then one summary token. The
+      SATURATION arm: measures whether the T1 reached-row curve PLATEAUS vs fullhist's linear growth.
+
+    Both key modes are computed on EVERY node in the SAME traversal, so preflop rows are IDENTICAL
+    between arms by construction (T1 only rewrites the postflop portion) -> the sanity check is free."""
+    use_t1 = (postflop_key == "t1")
+    use_presum = (postflop_key == "presum")
     pre_mask, pre_rr_mask, post_mask = menu_masks(MENUS[menu_name])
     bb = int(arr(bn.init_hand(0, [10000] * 6, [1] * 6, 0, list(range(52)), [1, 2]))[
         O_CURRENT_BET])  # big blind = root current_bet
     rng = np.random.default_rng(seed)
-    rows = [set(), set(), set(), set()]        # full-history keys per street
+    rows = [set(), set(), set(), set()]        # postflop-key rows per street (fullhist OR t1)
     rows_summary = [set(), set(), set(), set()]  # deployed summary keys (digest) per street
+    rows_betting = [set(), set(), set(), set()]  # CARD-INDEPENDENT history-only keys per street: the
+    # faithful saturation signal (real card dim is a bounded 200-bucket; digest[:5] over-counts it, so
+    # the row curve's true boundedness is (betting-key count) x 200 -- if betting keys saturate, rows do)
     curve = []
     t0 = time.time()
     nodes = [0]
 
-    def traverse(state, hero):
+    def opener_of(a):
+        """Preflop opener seat (first aggressor in the flat history), -1 if none. Used for the
+        T1 summary's initiative flag; matches hist3's opener detection."""
+        for i in range(int(a[O_HIST_LEN])):
+            act = int(a[O_HIST_ACTION + i])
+            if BET0 <= act <= ALL_IN:
+                return int(a[O_HIST_SEAT + i])
+        return -1
+
+    def pre_summary_of(a, n_pre):
+        """PRESUM (arm-6) preflop pot-type summary carried into POSTFLOP keys: replaces the EXACT
+        preflop-action prefix with (n_calls<=3, n_raises<=3, opener_pos, n_active_to_flop) -- a
+        bp3-hist3-style low-cardinality descriptor computed over ONLY the first n_pre (preflop)
+        history entries. Isolates the preflop-prefix multiplier that menu/recall both failed to move."""
+        nr = nc = 0
+        opener = -1
+        for i in range(n_pre):
+            act = int(a[O_HIST_ACTION + i])
+            if act == CALL:
+                if nr == 0 and nc < 3:
+                    nc += 1
+            elif BET0 <= act <= ALL_IN:
+                if nr == 0:
+                    opener = int(a[O_HIST_SEAT + i])
+                if nr < 3:
+                    nr += 1
+        op = POS_BY_OFFSET[(opener - int(a[O_BUTTON])) % 6] if opener >= 0 else -1
+        n_active = sum(1 for i in range(6) if int(a[O_SEAT_STATUS + i]) in (0, 1))
+        return (nc, nr, op, n_active)
+
+    def traverse(state, hero, post_entries):
+        # post_entries: list of street-tagged POSTFLOP history entries seen on the path so far, in
+        # order. Each = {street, action, is_raise, cap_buckets}. cap_buckets (spr_b,pot_b,opener_flag)
+        # is set only on the entry that lands the Nth raise on its street (buckets read from the state
+        # AFTER that raise = the "cap point"). Preflop entries are excluded (kept exact in the key).
         a = arr(state)
         if int(a[O_DONE]) or int(a[O_STREET]) >= 4:
             return
         if int(a[O_PENDING_DEAL]):
-            traverse(bn.sample_chance(state), hero)
+            traverse(bn.sample_chance(state), hero, post_entries)
             return
         if int(a[O_ACTION_SEAT]) < 0:
             return
@@ -409,19 +549,72 @@ def walk_census(menu_name, dedupe, n_deals, seed, progress, snap_every=1000, mrr
         nodes[0] += 1
         if nodes[0] > 250_000:
             raise RuntimeError("node cap")
-        hist = tuple(int(a[O_HIST_ACTION + i]) for i in range(int(a[O_HIST_LEN])))
         digest = bn.fingerprint_fast(state, seat, 200)
         rows_summary[street].add(digest)
-        rows[street].add((digest[:5], hist))  # digest[:5] carries card-bucket byte-space;
-        # (bucket,hist) distinctness == (digest_cardpart,hist): betting6 is hist-redundant
+        if use_t1:
+            # PREFLOP portion exact (flat preflop actions), POSTFLOP portion bounded-recall.
+            n_pre = int(a[O_HIST_LEN]) - len(post_entries)  # #preflop entries = total - postflop
+            pre_hist = tuple(int(a[O_HIST_ACTION + i]) for i in range(n_pre))
+            post_key = t1_postflop_key(post_entries, t1_raise_cap)
+            rows[street].add((digest[:5], pre_hist, post_key))
+            rows_betting[street].add((pre_hist, post_key))
+        elif use_presum:
+            # arm-6 PRESUM: preflop DECISIONS keep exact fullhist (rows identical to baseline, so the
+            # preflop sanity check still holds); POSTFLOP infosets replace the EXACT preflop-action
+            # prefix with a low-cardinality pot-type SUMMARY (n_calls/n_raises/opener_pos/n_active),
+            # keeping the postflop action sequence EXACT. Isolates the measured dominant multiplier
+            # (exact-preflop-prefix x card) that menu (arm-4) and recall (arm-5) both failed to touch.
+            hl = int(a[O_HIST_LEN])
+            if street == 0:
+                hist = tuple(int(a[O_HIST_ACTION + i]) for i in range(hl))
+                rows[street].add((digest[:5], hist))
+                rows_betting[street].add(hist)
+            else:
+                n_pre = hl - len(post_entries)  # #preflop entries = total - postflop
+                pre_sum = pre_summary_of(a, n_pre)
+                post_hist = tuple(int(a[O_HIST_ACTION + i]) for i in range(n_pre, hl))
+                rows[street].add((digest[:5], pre_sum, post_hist))
+                rows_betting[street].add((pre_sum, post_hist))
+        else:
+            hist = tuple(int(a[O_HIST_ACTION + i]) for i in range(int(a[O_HIST_LEN])))
+            rows[street].add((digest[:5], hist))  # digest[:5] carries card-bucket byte-space;
+            # (bucket,hist) distinctness == (digest_cardpart,hist): betting6 is hist-redundant
+            rows_betting[street].add(hist)
         acts = allowed_actions(state, a, pre_mask, post_mask, dedupe, mrr,
                                flop_rr_keep, pre_rr_mask, bb)
+
+        def child_post_entries(act, child):
+            """Append this action's POSTFLOP entry (street tag known = current street) with its
+            cap_buckets if it lands the Nth raise. Preflop actions (street 0) add nothing.
+            `child` = bn.apply_action(state, act) (reused from the traverse call, no double-apply)."""
+            if (not use_t1 and not use_presum) or street == 0:
+                return post_entries
+            is_raise = (BET0 <= act <= ALL_IN)  # aggressive: any bet-bucket or all-in
+            cap_buckets = None
+            if use_t1:
+                # count raises already on THIS street within post_entries
+                r_this = 0
+                for e in reversed(post_entries):
+                    if e["street"] != street:
+                        break
+                    if e["is_raise"]:
+                        r_this += 1
+                if is_raise and (r_this + 1) == t1_raise_cap:
+                    # this raise lands the Nth on this street -> summary buckets from the CAP-POINT
+                    # state (state AFTER applying this raise = the child), keyed seat-independently.
+                    cap_buckets = t1_cap_point_buckets(arr(child), seat, opener_of(a))
+            return post_entries + [{"street": street, "action": act,
+                                    "is_raise": is_raise, "cap_buckets": cap_buckets}]
+
+        def go(act):
+            child = bn.apply_action(state, act)
+            traverse(child, hero, child_post_entries(act, child))
+
         if seat == hero:
             for act in acts:
-                traverse(bn.apply_action(state, act), hero)
+                go(act)
         else:
-            act = acts[int(rng.integers(len(acts)))]
-            traverse(bn.apply_action(state, act), hero)
+            go(acts[int(rng.integers(len(acts)))])
 
     deck0 = np.arange(52)
     done_deals = 0
@@ -431,26 +624,49 @@ def walk_census(menu_name, dedupe, n_deals, seed, progress, snap_every=1000, mrr
         try:
             nodes[0] = 0
             for hero in range(6):
-                traverse(root, hero)
+                traverse(root, hero, [])
         except (RuntimeError, RecursionError):
             pass
         done_deals += 1
         if done_deals % snap_every == 0:
             snap = {
                 "deals": done_deals,
-                "rows_fullhist": [len(s) for s in rows],
+                "rows": [len(s) for s in rows],
+                "rows_betting": [len(s) for s in rows_betting],
                 "rows_summary": [len(s) for s in rows_summary],
                 "elapsed_s": round(time.time() - t0, 1),
             }
             curve.append(snap)
             progress(json.dumps(snap))
+    # marginal reached-rows per snap_every deals (the SATURATION signal): does the TOTAL postflop
+    # reached-row curve's slope collapse toward zero (plateau) as deals accumulate?
+    marginal = []
+    prev_total = 0
+    prev_bet = 0
+    for snap in curve:
+        total_post = snap["rows"][1] + snap["rows"][2] + snap["rows"][3]
+        bet_post = snap["rows_betting"][1] + snap["rows_betting"][2] + snap["rows_betting"][3]
+        marginal.append({"deals": snap["deals"],
+                         "postflop_total": total_post,
+                         "new_postflop_this_block": total_post - prev_total,
+                         "betting_postflop_total": bet_post,
+                         "new_betting_this_block": bet_post - prev_bet})
+        prev_total = total_post
+        prev_bet = bet_post
     return {
         "menu": menu_name, "mrr": mrr, "flop_rr_keep": flop_rr_keep, "dedupe_equal_amount": dedupe,
+        "postflop_key": postflop_key, "t1_raise_cap": (t1_raise_cap if use_t1 else None),
+        "snap_every": snap_every,
         "deals": done_deals, "seed": seed,
-        "rows_fullhist_final": {"preflop": len(rows[0]), "flop": len(rows[1]),
-                                 "turn": len(rows[2]), "river": len(rows[3])},
+        "rows_final": {"preflop": len(rows[0]), "flop": len(rows[1]),
+                       "turn": len(rows[2]), "river": len(rows[3]),
+                       "postflop_total": len(rows[1]) + len(rows[2]) + len(rows[3])},
+        "rows_betting_final": {"preflop": len(rows_betting[0]), "flop": len(rows_betting[1]),
+                               "turn": len(rows_betting[2]), "river": len(rows_betting[3]),
+                               "postflop_total": len(rows_betting[1]) + len(rows_betting[2]) + len(rows_betting[3])},
         "rows_summary_final": {"preflop": len(rows_summary[0]), "flop": len(rows_summary[1]),
                                 "turn": len(rows_summary[2]), "river": len(rows_summary[3])},
+        "marginal_postflop_per_block": marginal,
         "curve": curve,
         "elapsed_s": round(time.time() - t0, 1),
     }
@@ -473,6 +689,15 @@ def main():
                     help="(only meaningful with --mrr) comma list of bet-bucket indices kept for"
                          " FLOP re-raise nodes, e.g. '1,4' = {1/2 pot, 1x pot, all-in}."
                          " Absent = legacy [4]. Turn/river re-raise keep stays [4].")
+    ap.add_argument("--postflop-key", default="fullhist", choices=["fullhist", "t1", "presum"],
+                    help="postflop infoset-key mode for the WALK census. fullhist = exact flat action"
+                         " history (baseline, the CURRENT shipped fullhist key). t1 = arm-5 BOUNDED-"
+                         "RECALL key: preflop exact, each postflop street exact up to+including the"
+                         " Nth (--t1-raise-cap) raise then one summary token. Measures saturation.")
+    ap.add_argument("--t1-raise-cap", type=int, default=3,
+                    help="(t1 only) per-postflop-street raise cap N. Design of record = 3.")
+    ap.add_argument("--snap-every", type=int, default=1000,
+                    help="deals per curve/marginal snapshot (saturation-trend granularity).")
     args = ap.parse_args()
     flop_rr_keep = None
     if args.flop_rr_keep:
@@ -482,6 +707,8 @@ def main():
         tag = "+mrr" if args.mrr else ""
         if args.mrr and flop_rr_keep is not None:
             tag += "+frr" + ".".join(str(b) for b in flop_rr_keep)
+        if args.mode == "walk" and args.postflop_key == "t1":
+            tag += f"+t1cap{args.t1_raise_cap}"
         print(f"[census {args.mode} {args.menu}{tag}] {msg}", flush=True)
 
     if args.mode == "enumerate":
@@ -491,7 +718,8 @@ def main():
         res["preflop_only"] = args.preflop_only
     else:
         res = walk_census(args.menu, not args.no_dedupe, args.deals, args.seed, progress,
-                          mrr=args.mrr, flop_rr_keep=flop_rr_keep)
+                          snap_every=args.snap_every, mrr=args.mrr, flop_rr_keep=flop_rr_keep,
+                          postflop_key=args.postflop_key, t1_raise_cap=args.t1_raise_cap)
     js = json.dumps(res, indent=2)
     print(js)
     if args.out:

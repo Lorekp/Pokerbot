@@ -264,6 +264,30 @@ def check_blueprint_serve_env(*, strict: bool = False, expected: dict | None = N
                 f"preflop_hist_key mismatch (trained={expected.get('preflop_hist_key', False)}, "
                 f"serve={cfg.get('preflop_hist_key', False)}) — set POKERBOT_PREFLOP_HIST_KEY=1 for "
                 "a hist-key snapshot (and unset it for any other), else every preflop node misses")
+        # Full-history-key guard (blueprint-v4 Stage 0), two-sided with a False default like the
+        # guards above. BACK-FILLED: the field-by-field `mism` loop only iterates `expected`'s keys,
+        # so a serve process with POKERBOT_FULLHIST_KEY=1 against a non-fullhist snapshot (no
+        # "fullhist_key" stamp) was NOT caught — a 100% MISS on EVERY street (the fullhist A-segment
+        # is hashed on both the b"w" and b"B" branches). This explicit two-sided check closes it in
+        # BOTH directions (verify:specs flagged the one-sidedness).
+        if bool(expected.get("fullhist_key", False)) != bool(cfg.get("fullhist_key", False)):
+            problems.append(
+                f"fullhist_key mismatch (trained={expected.get('fullhist_key', False)}, "
+                f"serve={cfg.get('fullhist_key', False)}) — set POKERBOT_FULLHIST_KEY=1 for a "
+                "fullhist snapshot (and unset it for any other), else every node misses on every "
+                "street")
+        # Presum-key guard (blueprint-v4 arm-4), two-sided with a False default. A presum checkpoint
+        # keys POSTFLOP infosets on the preflop pot-type SUMMARY; serving it without POKERBOT_PRESUM_KEY
+        # hashes the EXACT preflop action ids instead (100% postflop MISS), and serving a NON-presum
+        # fullhist checkpoint WITH presum hashes the summary the table never saw (100% postflop MISS).
+        # Both directions caught here. (Presum only refines the fullhist A-segment, so a presum
+        # snapshot is also a fullhist snapshot; the fullhist guard above stays consistent.)
+        if bool(expected.get("presum_key", False)) != bool(cfg.get("presum_key", False)):
+            problems.append(
+                f"presum_key mismatch (trained={expected.get('presum_key', False)}, "
+                f"serve={cfg.get('presum_key', False)}) — set POKERBOT_PRESUM_KEY=1 (with "
+                "POKERBOT_FULLHIST_KEY=1) for a presum snapshot (and unset it for any other), else "
+                "every postflop node misses")
     if problems:
         msg = f"blueprint serve MISCONFIGURED: {'; '.join(problems)}. active={cfg}"
         if strict:

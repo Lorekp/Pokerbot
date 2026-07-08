@@ -32,13 +32,16 @@ _GOOD_STAMP = {
 }
 
 
-def _set_serve_env(monkeypatch, *, preflop_lossless=True, num_buckets=200, depth_buckets=False):
+def _set_serve_env(monkeypatch, *, preflop_lossless=True, num_buckets=200, depth_buckets=False,
+                   fullhist_key=False, presum_key=False):
     """Force ``active_abstraction_config()`` to report a specific baked serve env (no re-import needed)."""
     monkeypatch.setattr(enc, "_BETTING_ABSTRACTION", True)
     monkeypatch.setattr(enc, "_POSTFLOP_BUCKETS_ENABLED", True)
     monkeypatch.setattr(enc, "_POSTFLOP_MODE", "fast")
     monkeypatch.setattr(enc, "_POSTFLOP_NUM_BUCKETS", num_buckets)
     monkeypatch.setattr(enc, "_DEPTH_BUCKETS", depth_buckets)
+    monkeypatch.setattr(enc, "_FULLHIST_KEY", fullhist_key)
+    monkeypatch.setattr(enc, "_PRESUM_KEY", presum_key)
     monkeypatch.setattr(weva_encoder, "_PREFLOP_LOSSLESS", preflop_lossless)
 
 
@@ -73,6 +76,54 @@ def test_serve_guard_accepts_matching_stamp(monkeypatch):
     out = check_blueprint_serve_env(strict=True, expected=dict(_GOOD_STAMP))
     assert out["preflop_lossless"] is True
     assert out["postflop_num_buckets"] == 200
+
+
+# --------------------------------------------------------------------------- #
+# fullhist_key / presum_key two-sided guards (blueprint-v4). Each direction of a skew must RAISE:
+# a stamp-has-flag / serve-lacks-flag AND a serve-has-flag / stamp-lacks-flag. The field-by-field
+# `mism` loop only iterates the stamp's keys, so the serve-has-but-stamp-lacks direction is caught
+# ONLY by the explicit two-sided checks (the back-filled fullhist guard + the new presum guard).
+# --------------------------------------------------------------------------- #
+def test_serve_guard_rejects_fullhist_stamp_serve_off(monkeypatch):
+    # Snapshot trained WITH the full-history key; serve baked it OFF -> 100% miss on every street.
+    _set_serve_env(monkeypatch, fullhist_key=False)
+    stamp = {**_GOOD_STAMP, "fullhist_key": True}
+    with pytest.raises(RuntimeError, match="fullhist_key"):
+        check_blueprint_serve_env(strict=True, expected=stamp)
+
+
+def test_serve_guard_rejects_fullhist_serve_on_stamp_off(monkeypatch):
+    # Serve baked the full-history key ON; a NON-fullhist snapshot (no stamp) -> 100% miss. This is
+    # the direction the field-by-field loop misses (stamp has no "fullhist_key" key) — the back-fill.
+    _set_serve_env(monkeypatch, fullhist_key=True)
+    with pytest.raises(RuntimeError, match="fullhist_key"):
+        check_blueprint_serve_env(strict=True, expected=dict(_GOOD_STAMP))
+
+
+def test_serve_guard_rejects_presum_stamp_serve_off(monkeypatch):
+    # Snapshot keyed POSTFLOP on the preflop pot-type summary; serve baked presum OFF -> the exact
+    # preflop ids get hashed instead => 100% postflop miss. (A presum snapshot is also fullhist.)
+    _set_serve_env(monkeypatch, fullhist_key=True, presum_key=False)
+    stamp = {**_GOOD_STAMP, "fullhist_key": True, "presum_key": True}
+    with pytest.raises(RuntimeError, match="presum_key"):
+        check_blueprint_serve_env(strict=True, expected=stamp)
+
+
+def test_serve_guard_rejects_presum_serve_on_stamp_off(monkeypatch):
+    # Serve baked presum ON against a plain-fullhist snapshot (no presum stamp) -> the summary bytes
+    # the table never saw get hashed => 100% postflop miss. The serve-has / stamp-lacks direction.
+    _set_serve_env(monkeypatch, fullhist_key=True, presum_key=True)
+    stamp = {**_GOOD_STAMP, "fullhist_key": True}
+    with pytest.raises(RuntimeError, match="presum_key"):
+        check_blueprint_serve_env(strict=True, expected=stamp)
+
+
+def test_serve_guard_accepts_matching_presum_stamp(monkeypatch):
+    # Correctly matched presum serve + presum snapshot: no problem raised.
+    _set_serve_env(monkeypatch, fullhist_key=True, presum_key=True)
+    stamp = {**_GOOD_STAMP, "fullhist_key": True, "presum_key": True}
+    out = check_blueprint_serve_env(strict=True, expected=stamp)
+    assert out["presum_key"] is True and out["fullhist_key"] is True
 
 
 # --------------------------------------------------------------------------- #

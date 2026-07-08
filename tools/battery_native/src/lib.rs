@@ -373,6 +373,11 @@ mod py {
             // full action-history key segment on every street (design doc §7.1; default-off
             // byte-identical). Stale .pyds without this cap must not serve a fullhist checkpoint.
             "full_hist_key".to_string(),
+            // blueprint-v4 arm-4: fingerprint.rs carries the env-gated (POKERBOT_PRESUM_KEY=1, only
+            // active alongside POKERBOT_FULLHIST_KEY=1) POSTFLOP preflop-pot-type-summary A-segment
+            // (design doc §35; default-off byte-identical to the fullhist key space). Stale .pyds
+            // without this cap must not serve a presum checkpoint.
+            "presum_key".to_string(),
         ]
     }
 

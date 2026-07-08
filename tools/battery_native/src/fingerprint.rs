@@ -514,6 +514,44 @@ pub fn full_hist_key_enabled() -> bool {
     })
 }
 
+// ---------------------------------------------------------------------------
+// EXPERIMENT (blueprint-v4 arm-4, 2026-07-08): opt-in POSTFLOP PREFLOP-SUMMARY key ("presum").
+//
+// Design of record: artifacts/bpv4_arm4_design_and_review.md §35 (amendment). Measurements proved
+// the fullhist POSTFLOP key's carrying of the EXACT PREFLOP action-history prefix is what makes the
+// reached postflop set unbounded/uncoverable (menu-thinning 1.29x and recall-bounding 1.003x both
+// failed to bend the curve). `presum` fixes exactly that: keep preflop DECISIONS exact (fullhist),
+// but key POSTFLOP infosets on a low-cardinality preflop POT-TYPE SUMMARY instead of the exact
+// preflop action sequence; postflop actions stay EXACT. This is the only lever that bends the
+// growth curve (6.25x @20k, sub-linear per the census).
+//
+// It ONLY takes effect when POKERBOT_FULLHIST_KEY is ALSO on (presum is a REFINEMENT of the
+// fullhist A-segment, never a standalone key): under `full_hist_key_enabled() && presum_key_enabled()`
+// AND a POSTFLOP node (s.street >= 1), the A-segment becomes
+//     b"A" + street(1 byte) + [4 preflop-summary bytes] + [EXACT postflop action bytes]
+// where the 4 summary bytes = (n_calls_before_first_raise cap3, n_raises cap3, opener_pos_enum+1,
+// n_active) computed over ONLY hist_action[0..n_preflop] (+ n_active over the CURRENT state), and the
+// postflop bytes = s.hist_action[i] for i in n_preflop..min(hist_len, MAX_HISTORY) (unchanged bytes).
+// For PREFLOP nodes (street==0), and whenever presum is OFF, the A-segment is the CURRENT fullhist
+// bytes UNCHANGED (byte-identical). The b"S"+betting6 tail is unchanged everywhere.
+//
+// Gated by POKERBOT_PRESUM_KEY=1 read ONCE (OnceLock); default OFF is byte-identical to the fullhist
+// key space (and thus to the shipped key space when fullhist is also off). TRAIN/SERVE SKEW WARNING:
+// a checkpoint trained with this ON must be served with matching keying (Python twin:
+// jax_weva_fast.presum_hist_bytes + the presum branch in jax_weva_encode.NLHEEncodeBundle._digest,
+// parity-gated by scripts/probe_fullhist_key_parity.py --presum + tests/test_fullhist_key_parity.py).
+// native_caps() advertises "presum_key" so stale .pyds fail closed. Two-sided serve guard in
+// lbr.check_blueprint_serve_env + stamp active_abstraction_config()["presum_key"].
+// ---------------------------------------------------------------------------
+
+pub fn presum_key_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("POKERBOT_PRESUM_KEY").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
 /// Minimal byte-sink abstraction so the message-assembly helpers emit IDENTICAL bytes into either a
 /// heap `Vec<u8>` (serve paths, unchanged) or the stack `MsgBuf` (R3 trainer-hot paths). Method
 /// names/semantics match `Vec`'s inherent ones, so the `Vec` impl is a pure passthrough.
@@ -612,6 +650,154 @@ pub fn preflop_hist_bytes<const N: usize>(s: &EnvStateN<N>) -> [u8; 3] {
     [n_calls, n_raises, (opener_pos + 1) as u8]
 }
 
+// ---------------------------------------------------------------------------
+// presum (blueprint-v4 arm-4) helpers.
+// ---------------------------------------------------------------------------
+
+/// n_active = count of seats with seat_status in {SEAT_LIVE, SEAT_ALLIN} in the CURRENT state.
+/// Matches core::eligible_to_win / the Python census twin's `int(seat_status) in (0,1)` where the
+/// census enum maps SEAT_LIVE/SEAT_ALLIN to those two values; here we compare the core.rs sentinels
+/// directly (SEAT_LIVE=2, SEAT_ALLIN=3). Capped at u8 (N<=7, never overflows).
+#[inline]
+fn presum_n_active<const N: usize>(s: &EnvStateN<N>) -> u8 {
+    let mut n: u8 = 0;
+    for i in 0..N {
+        let st = s.seat_status[i];
+        if st == crate::core::SEAT_LIVE || st == crate::core::SEAT_ALLIN {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The 4-byte presum PREFLOP pot-type summary computed over ONLY the first `n_preflop` history
+/// entries: [n_calls_before_first_raise (cap 3), n_raises (cap 3), opener_pos_enum + 1, n_active].
+/// The first 3 bytes reuse `preflop_hist_bytes`' EXACT logic but restricted to hist_action[0..n_pre]
+/// (a preflop-only prefix). The 4th byte is `presum_n_active` over the CURRENT state (post-fold).
+fn preflop_summary_bytes<const N: usize>(s: &EnvStateN<N>, n_preflop: usize) -> [u8; 4] {
+    let mut n_calls: u8 = 0;
+    let mut n_raises: u8 = 0;
+    let mut opener_seat: i32 = -1;
+    let len = n_preflop.min(crate::core::MAX_HISTORY);
+    for i in 0..len {
+        let a = s.hist_action[i];
+        if a == crate::core::CALL as i32 {
+            if n_raises == 0 && n_calls < 3 {
+                n_calls += 1;
+            }
+        } else if a >= crate::core::BET_BUCKET_START as i32 && a <= crate::core::ALL_IN as i32 {
+            if n_raises == 0 {
+                opener_seat = s.hist_seat[i];
+            }
+            if n_raises < 3 {
+                n_raises += 1;
+            }
+        }
+    }
+    let opener_pos: i32 = if opener_seat >= 0 {
+        let offset = (((opener_seat - s.button) % N as i32 + N as i32) % N as i32) as usize;
+        pos_by_offset::<N>(offset)
+    } else {
+        -1
+    };
+    [n_calls, n_raises, (opener_pos + 1) as u8, presum_n_active(s)]
+}
+
+/// Recover `n_preflop` = the number of leading `hist_action` entries that were PREFLOP decisions
+/// (the count of actions taken before the preflop betting round first closed). Per-entry street is
+/// NOT stored in EnvStateN, so this REPLAYS the recorded history through the REAL engine
+/// (`core::apply_action`, which reuses `core::street_complete`) — zero divergence from the trainer's
+/// own transitions. Cost: O(n_preflop) apply_action calls, only at postflop nodes.
+///
+/// Reconstruction: the starting stack of seat i is `stacks[i] + committed_total[i]` (undo every chip
+/// this seat committed across all streets — with ante=0 the engine keeps committed_total == the sum
+/// of every street commit, so this is the pre-blind stack). Re-init the hand root via
+/// `core::init_hand_n` with the SAME button, those starting stacks, the SAME occupancy (seats that
+/// were ever dealt in = status != SEAT_EMPTY), ante=0, a DUMMY deck [0..52], and the SAME rng_key.
+/// Then replay hist_action[0..min(hist_len,MAX_HISTORY)] one at a time; STOP at the first action
+/// after which the replayed state has `street >= 1` OR `pending_deal` is set (the preflop round just
+/// closed — this happens BEFORE any board card is dealt, so the dummy deck is never drawn for the
+/// board). Returns i+1 at that first close. If the loop never closes preflop (all recorded actions
+/// are preflop, e.g. a preflop all-in fold-out that terminated), returns the full replayed length.
+///
+/// Debug builds assert the engine picks the SAME acting seat as the recorded `hist_seat[i]`
+/// (a cheap zero-divergence check; release builds skip it).
+fn n_preflop_boundary<const N: usize>(s: &EnvStateN<N>) -> usize {
+    let hist_len = (s.hist_len.max(0) as usize).min(crate::core::MAX_HISTORY);
+    if hist_len == 0 {
+        return 0;
+    }
+    // Starting stacks = current stack + everything this seat put in the pot (all streets). ante=0 in
+    // the trainer, so committed_total is exactly the reconstructable pre-blind commitment.
+    let mut start_stacks = [0i32; N];
+    let mut occupancy = [false; N];
+    for i in 0..N {
+        start_stacks[i] = s.stacks[i] + s.committed_total[i];
+        // A seat was in the hand iff it is not EMPTY now (folded/live/all-in were all dealt in).
+        occupancy[i] = s.seat_status[i] != crate::core::SEAT_EMPTY;
+    }
+    let dummy_deck: [i32; 52] = std::array::from_fn(|i| i as i32);
+    let mut r = crate::core::init_hand_n::<N>(
+        s.button,
+        &start_stacks,
+        &occupancy,
+        0, // ante: trainer is ante-free (committed_total == committed reconstruction relies on this)
+        &dummy_deck,
+        s.rng_key,
+    );
+    for i in 0..hist_len {
+        debug_assert!(
+            r.action_seat == s.hist_seat[i],
+            "presum n_preflop replay diverged: engine action_seat {} != recorded hist_seat {} at i={}",
+            r.action_seat,
+            s.hist_seat[i],
+            i
+        );
+        let action = s.hist_action[i];
+        // Guard against a corrupt/sentinel action id (shouldn't happen for recorded history).
+        if !(0..crate::core::NUM_ACTIONS as i32).contains(&action) {
+            return hist_len;
+        }
+        r = crate::core::apply_action::<N>(&r, action as usize);
+        if r.street >= crate::core::STREET_FLOP || r.pending_deal {
+            // The preflop round closed at this action (the FIRST street boundary, before any board
+            // card is dealt — close_street sets pending_deal=true with street still 0, and a preflop
+            // all-in run-out would set street>=1). n_preflop = the count of actions up to and incl. i.
+            return i + 1;
+        }
+    }
+    hist_len
+}
+
+/// Append the presum action-history segment for a POSTFLOP node: b"A" + current street byte +
+/// [4 preflop-summary bytes] + [EXACT postflop action bytes]. Only called when
+/// `full_hist_key_enabled() && presum_key_enabled()` AND `s.street >= 1`.
+#[inline]
+fn push_presum_hist_bytes<const N: usize>(s: &EnvStateN<N>, msg: &mut impl PushBytes) {
+    msg.push(b'A');
+    msg.push(s.street as u8);
+    let n_preflop = n_preflop_boundary(s);
+    msg.extend_from_slice(&preflop_summary_bytes(s, n_preflop));
+    let len = (s.hist_len.max(0) as usize).min(crate::core::MAX_HISTORY);
+    // EXACT postflop action bytes (unchanged raw bytes), i in n_preflop..hist_len.
+    for i in n_preflop..len {
+        msg.push(s.hist_action[i] as u8);
+    }
+}
+
+/// The A-segment dispatcher: presum (postflop, both flags on) or the plain fullhist bytes. Callers
+/// invoke this ONLY when `full_hist_key_enabled()` (the outer flag). When presum is off, or the node
+/// is preflop (street==0), this is byte-identical to `push_full_hist_bytes` (the shipped fullhist
+/// layout) — so the fullhist golden config stays byte-identical.
+#[inline]
+fn push_hist_bytes<const N: usize>(s: &EnvStateN<N>, msg: &mut impl PushBytes) {
+    if presum_key_enabled() && s.street >= crate::core::STREET_FLOP {
+        push_presum_hist_bytes(s, msg);
+    } else {
+        push_full_hist_bytes(s, msg);
+    }
+}
+
 /// The digest for an ALREADY-RESOLVED postflop bucket id (or `bucket < 0` => the preflop `b"w"`
 /// branch, including the depth byte when enabled). Pure code motion out of `fingerprint_fast_depth`
 /// — the message assembly is byte-identical to the pre-refactor body (golden digest tests pin it).
@@ -651,7 +837,9 @@ pub fn fingerprint_from_bucket<const N: usize>(
     }
     // blueprint-v4 Stage 0: full action-history segment (both branches; see block comment above).
     if full_hist_key_enabled() {
-        push_full_hist_bytes(s, &mut msg);
+        // presum (arm-4): postflop nodes get the pot-type-summary A-segment when POKERBOT_PRESUM_KEY
+        // is also on; preflop nodes and presum-off are byte-identical to push_full_hist_bytes.
+        push_hist_bytes(s, &mut msg);
     }
     msg.push(b'S');
     msg.extend_from_slice(&betting_state);
@@ -765,7 +953,9 @@ pub fn fingerprint_fast_depth_memo<const N: usize>(
     }
     // blueprint-v4 Stage 0: full action-history segment (both branches; see block comment above).
     if full_hist_key_enabled() {
-        push_full_hist_bytes(s, &mut msg);
+        // presum (arm-4): postflop nodes get the pot-type-summary A-segment when POKERBOT_PRESUM_KEY
+        // is also on; preflop nodes and presum-off are byte-identical to push_full_hist_bytes.
+        push_hist_bytes(s, &mut msg);
     }
     msg.push(b'S');
     msg.extend_from_slice(&betting_state);
@@ -783,7 +973,9 @@ pub fn fingerprint_fast_depth_postflop_bucket<const N: usize>(
     msg.extend_from_slice(&bucket.to_le_bytes());
     // blueprint-v4 Stage 0: full action-history segment (see block comment above).
     if full_hist_key_enabled() {
-        push_full_hist_bytes(s, &mut msg);
+        // presum (arm-4): postflop nodes get the pot-type-summary A-segment when POKERBOT_PRESUM_KEY
+        // is also on; preflop nodes and presum-off are byte-identical to push_full_hist_bytes.
+        push_hist_bytes(s, &mut msg);
     }
     msg.push(b'S');
     msg.extend_from_slice(&betting_state);
@@ -806,9 +998,310 @@ pub fn fingerprint_fast_depth_postflop_bucket_memo<const N: usize>(
     msg.extend_from_slice(&bucket.to_le_bytes());
     // blueprint-v4 Stage 0: full action-history segment (see block comment above).
     if full_hist_key_enabled() {
-        push_full_hist_bytes(s, &mut msg);
+        // presum (arm-4): postflop nodes get the pot-type-summary A-segment when POKERBOT_PRESUM_KEY
+        // is also on; preflop nodes and presum-off are byte-identical to push_full_hist_bytes.
+        push_hist_bytes(s, &mut msg);
     }
     msg.push(b'S');
     msg.extend_from_slice(&betting_state);
     digest_msg_slice_memoed(msg.as_slice(), memo)
+}
+
+// ---------------------------------------------------------------------------
+// presum (blueprint-v4 arm-4) unit tests. These exercise the PURE keying helpers directly (no env
+// OnceLock flip needed — the gates route to these functions, and byte-identity-off is proven by the
+// ab_train golden digest + the fullhist parity gate). Random hands are generated by playing the REAL
+// engine forward (never hand-built nodes), recording each action's ORIGIN street as an INDEPENDENT
+// oracle for the true preflop boundary.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod presum_tests {
+    use crate::core::{
+        self, apply_action, init_hand_n, is_chance_node, legal_action_mask, sample_chance, EnvState,
+        NUM_ACTIONS, NUM_PLAYERS,
+    };
+
+    /// Tiny deterministic xorshift RNG (test-local; not a serve path).
+    struct TestRng(u64);
+    impl TestRng {
+        fn new(seed: u64) -> Self {
+            TestRng(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+    }
+
+    fn shuffled_deck(rng: &mut TestRng) -> [i32; 52] {
+        let mut deck: [i32; 52] = std::array::from_fn(|i| i as i32);
+        for i in (1..52).rev() {
+            let j = rng.below(i + 1);
+            deck.swap(i, j);
+        }
+        deck
+    }
+
+    /// One recorded decision node: the state, the acting seat, and the ORIGIN street.
+    struct Recorded {
+        state: EnvState,
+        origin_street: i32,
+    }
+
+    /// Play a full 6-max hand forward, recording every DECISION node (not chance nodes) with the
+    /// street the action was taken FROM. The action policy is biased toward check/call (like the
+    /// parity probe's) so hands reach POSTFLOP reliably (uniform-over-legal folds out preflop too
+    /// often to exercise the postflop keying). `rng` drives the deck and the choices. Returns the
+    /// decision nodes visited in engine apply order.
+    fn play_hand(rng: &mut TestRng, button: i32) -> Vec<Recorded> {
+        let deck = shuffled_deck(rng);
+        let stacks = [100 * core::CHIP_UNIT; NUM_PLAYERS];
+        let occ = [true; NUM_PLAYERS];
+        let mut s = init_hand_n::<NUM_PLAYERS>(button, &stacks, &occ, 0, &deck, [0u32, 0u32]);
+        let mut rec = Vec::new();
+        let mut guard = 0;
+        while !s.done && guard < 200 {
+            guard += 1;
+            if is_chance_node(&s) {
+                s = sample_chance(&s);
+                continue;
+            }
+            let seat = s.action_seat;
+            if seat < 0 {
+                break;
+            }
+            let mask = legal_action_mask(&s, seat);
+            let legal: Vec<usize> = (0..NUM_ACTIONS).filter(|&a| mask[a]).collect();
+            if legal.is_empty() {
+                break;
+            }
+            rec.push(Recorded {
+                state: s,
+                origin_street: s.street,
+            });
+            // Bias: mostly check/call (reach postflop + long histories), some sized bets/raises
+            // (raise chains), a little jam, few folds.
+            let sized: Vec<usize> = legal
+                .iter()
+                .copied()
+                .filter(|&a| (core::BET_BUCKET_START..core::ALL_IN).contains(&a))
+                .collect();
+            let u = rng.below(1000);
+            let a = if u < 90 && mask[core::FOLD] && legal.len() > 1 {
+                core::FOLD
+            } else if u < 640 && (mask[core::CHECK] || mask[core::CALL]) {
+                if mask[core::CHECK] { core::CHECK } else { core::CALL }
+            } else if u < 940 && !sized.is_empty() {
+                sized[rng.below(sized.len())]
+            } else if mask[core::ALL_IN] && rng.below(4) == 0 {
+                core::ALL_IN
+            } else {
+                legal[rng.below(legal.len())]
+            };
+            s = apply_action(&s, a);
+        }
+        rec
+    }
+
+    /// GATE 2 (boundary correctness): the fingerprint's reconstructed n_preflop equals the TRUE
+    /// preflop action count (independently: the number of leading recorded actions taken from a
+    /// street==0 state) on every decision node of many random hands, all streets.
+    #[test]
+    fn presum_n_preflop_boundary_matches_true_count() {
+        let mut rng = TestRng::new(0xABCD_1234);
+        let mut nodes = 0usize;
+        let mut postflop_nodes = 0usize;
+        let mut hands = 0usize;
+        // >= 50k random decision states across all streets (target from the gate spec).
+        while nodes < 60_000 {
+            let button = (hands % 6) as i32;
+            let rec = play_hand(&mut rng, button);
+            hands += 1;
+            for node in &rec {
+                nodes += 1;
+                let s = &node.state;
+                let got = super::n_preflop_boundary::<NUM_PLAYERS>(s);
+                // Independent truth: among the FIRST hist_len recorded actions of this hand, how many
+                // had origin_street == 0. The node's hist_len == its position in `rec` (chronological
+                // apply order), so the true preflop boundary is the count of leading preflop-origin
+                // actions among the first hist_len recorded nodes.
+                let hist_len = (s.hist_len.max(0) as usize).min(core::MAX_HISTORY);
+                let true_n_pre = rec
+                    .iter()
+                    .take(hist_len)
+                    .filter(|r| r.origin_street == 0)
+                    .count();
+                assert_eq!(
+                    got, true_n_pre,
+                    "n_preflop mismatch: got {} true {} at street {} hist_len {} hand {}",
+                    got, true_n_pre, s.street, hist_len, hands
+                );
+                if s.street >= core::STREET_FLOP {
+                    postflop_nodes += 1;
+                }
+            }
+        }
+        assert!(nodes >= 50_000, "too few nodes: {}", nodes);
+        assert!(postflop_nodes >= 5_000, "too few postflop nodes: {}", postflop_nodes);
+    }
+
+    /// The raw presum A-segment for a state (b"A" + street + 4 summary + postflop bytes), assembled
+    /// via the same helper the digest uses.
+    fn presum_a_segment(s: &EnvState) -> Vec<u8> {
+        let mut v: Vec<u8> = Vec::new();
+        super::push_presum_hist_bytes::<NUM_PLAYERS>(s, &mut v);
+        v
+    }
+
+    /// The plain fullhist A-segment.
+    fn fullhist_a_segment(s: &EnvState) -> Vec<u8> {
+        let mut v: Vec<u8> = Vec::new();
+        super::push_full_hist_bytes::<NUM_PLAYERS>(s, &mut v);
+        v
+    }
+
+    /// GATE 3 (presum key well-formed): on postflop states the presum A-segment is
+    /// b"A" + street + 4 summary bytes + postflop bytes, the 4 summary bytes match
+    /// preflop_summary_bytes over the reconstructed n_preflop, and the postflop bytes equal the raw
+    /// postflop tail of the fullhist segment.
+    #[test]
+    fn presum_a_segment_is_well_formed() {
+        let mut rng = TestRng::new(0x55AA_9931);
+        let mut checked = 0usize;
+        let mut hands = 0usize;
+        while checked < 4_000 && hands < 100_000 {
+            let rec = play_hand(&mut rng, (hands % 6) as i32);
+            hands += 1;
+            for node in &rec {
+                let s = &node.state;
+                if s.street < core::STREET_FLOP {
+                    continue;
+                }
+                checked += 1;
+                let seg = presum_a_segment(s);
+                assert!(seg.len() >= 6, "presum segment too short: {:?}", seg);
+                assert_eq!(seg[0], b'A');
+                assert_eq!(seg[1], s.street as u8);
+                let n_pre = super::n_preflop_boundary::<NUM_PLAYERS>(s);
+                let summary = super::preflop_summary_bytes::<NUM_PLAYERS>(s, n_pre);
+                assert_eq!(&seg[2..6], &summary[..], "summary bytes mismatch");
+                let n_active = super::presum_n_active::<NUM_PLAYERS>(s);
+                assert_eq!(summary[3], n_active);
+                let hist_len = (s.hist_len.max(0) as usize).min(core::MAX_HISTORY);
+                let expect_tail: Vec<u8> =
+                    (n_pre..hist_len).map(|i| s.hist_action[i] as u8).collect();
+                assert_eq!(&seg[6..], &expect_tail[..], "postflop tail mismatch");
+                // presum only rewrites the PREFLOP prefix; the postflop suffix is byte-identical to
+                // the fullhist segment's postflop tail (fh = b"A" + street + hist[0..hist_len]).
+                let fh = fullhist_a_segment(s);
+                assert_eq!(
+                    &seg[6..],
+                    &fh[2 + n_pre..],
+                    "presum postflop tail != fullhist postflop tail"
+                );
+            }
+        }
+        assert!(checked >= 4_000, "too few postflop states checked: {}", checked);
+    }
+
+    /// GATE 3 (collapse + distinctness): two postflop states differing ONLY in preflop bet SIZES
+    /// (same pot-type summary, same postflop actions) collapse to the SAME presum A-segment; two
+    /// differing in postflop actions do NOT.
+    #[test]
+    fn presum_collapses_preflop_sizes_not_postflop() {
+        // Reach the flop with a single preflop open of a given SIZE (bucket), called by BB. Both
+        // sizes yield the SAME pot-type summary (1 raise, opener UTG, same n_active) but DIFFERENT
+        // raw preflop action ids — presum must collapse them; fullhist must not.
+        fn reach_flop_with_open(open_action: usize) -> EnvState {
+            let deck: [i32; 52] = std::array::from_fn(|i| i as i32);
+            let stacks = [100 * core::CHIP_UNIT; NUM_PLAYERS];
+            let occ = [true; NUM_PLAYERS];
+            let mut s = init_hand_n::<NUM_PLAYERS>(0, &stacks, &occ, 0, &deck, [0u32, 0u32]);
+            let mut guard = 0;
+            let mut opened = false;
+            while !s.done && guard < 60 {
+                guard += 1;
+                if is_chance_node(&s) {
+                    s = sample_chance(&s);
+                    continue;
+                }
+                let seat = s.action_seat;
+                if seat < 0 {
+                    break;
+                }
+                if s.street >= core::STREET_FLOP {
+                    return s;
+                }
+                let mask = legal_action_mask(&s, seat);
+                let act = if !opened && mask[open_action] {
+                    opened = true;
+                    open_action
+                } else if mask[core::CALL] && s.current_bet > core::BB_CHIPS {
+                    core::CALL
+                } else if mask[core::FOLD] {
+                    core::FOLD
+                } else {
+                    core::CHECK
+                };
+                s = apply_action(&s, act);
+            }
+            s
+        }
+        let a = reach_flop_with_open(core::BET_BUCKET_START + 4); // ~pot-sized open
+        let b = reach_flop_with_open(core::BET_BUCKET_START + 6); // ~2x-sized open
+        assert!(a.street >= core::STREET_FLOP && b.street >= core::STREET_FLOP);
+        let seg_a = presum_a_segment(&a);
+        let seg_b = presum_a_segment(&b);
+        assert_eq!(
+            seg_a, seg_b,
+            "presum should COLLAPSE preflop bet sizes: {:?} vs {:?}",
+            seg_a, seg_b
+        );
+        // Sanity: fullhist DIFFERS (distinct preflop histories) — the collapse is meaningful.
+        assert_ne!(
+            fullhist_a_segment(&a),
+            fullhist_a_segment(&b),
+            "test setup invalid: fullhist should differ on distinct preflop sizes"
+        );
+        // Differing POSTFLOP action must NOT collapse: apply a flop check on one line and a flop bet
+        // on the other, then compare the resulting postflop decision nodes' presum segments.
+        let seat_a = a.action_seat;
+        let mask_a = legal_action_mask(&a, seat_a);
+        let bet = (core::BET_BUCKET_START..core::ALL_IN)
+            .find(|&x| mask_a[x])
+            .expect("a flop bet must be legal");
+        let a_check = apply_action(&a, if mask_a[core::CHECK] { core::CHECK } else { bet });
+        let a_bet = apply_action(&a, bet);
+        fn next_decision(mut s: EnvState) -> Option<EnvState> {
+            let mut guard = 0;
+            while !s.done && guard < 20 {
+                guard += 1;
+                if is_chance_node(&s) {
+                    s = sample_chance(&s);
+                    continue;
+                }
+                if s.action_seat < 0 {
+                    return None;
+                }
+                return Some(s);
+            }
+            None
+        }
+        if let (Some(sc), Some(sb)) = (next_decision(a_check), next_decision(a_bet)) {
+            if sc.street >= core::STREET_FLOP && sb.street >= core::STREET_FLOP {
+                assert_ne!(
+                    presum_a_segment(&sc),
+                    presum_a_segment(&sb),
+                    "presum must DISTINGUISH differing postflop actions"
+                );
+            }
+        }
+    }
 }

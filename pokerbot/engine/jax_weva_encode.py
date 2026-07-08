@@ -52,6 +52,14 @@ _PREFLOP_HIST_KEY = os.environ.get("POKERBOT_PREFLOP_HIST_KEY", "") == "1"
 # read ONCE at import. Train and serve MUST agree — a skew misses EVERY row on every street.
 # Off (default) => digest byte-identical.
 _FULLHIST_KEY = os.environ.get("POKERBOT_FULLHIST_KEY", "") == "1"
+# Preflop-summary POSTFLOP key (blueprint-v4 arm-4, POKERBOT_PRESUM_KEY=1 — design of record
+# artifacts/bpv4_arm4_design_and_review.md §35). REFINES the full-history key: only active alongside
+# _FULLHIST_KEY, and only on POSTFLOP nodes, where the A-segment carries a low-cardinality preflop
+# POT-TYPE SUMMARY (n_calls, n_raises, opener_pos, n_active over the preflop prefix) instead of the
+# exact preflop action ids; postflop actions stay EXACT. This is the lever that bends the postflop
+# growth curve. EXACT twin of fingerprint.rs::presum_key_enabled: ONLY the literal "1" enables (both
+# sides), read ONCE at import. Off (default) => digest byte-identical to the fullhist key space.
+_PRESUM_KEY = os.environ.get("POKERBOT_PRESUM_KEY", "") == "1"
 _GLOBAL_BUCKETER: Any = None
 # Inline card-abstraction mode: "fast" (one made-hand eval/node, ~2us — the per-node-affordable
 # default) vs "ehs" (Monte-Carlo EHS, accurate but ~ms/cold-key — only for offline precompute).
@@ -292,6 +300,11 @@ def active_abstraction_config() -> dict:
     # stays byte-identical (the preflop_hist_key/river_ochs pattern).
     if _FULLHIST_KEY:
         cfg["fullhist_key"] = True
+    # Preflop-summary POSTFLOP key (blueprint-v4 arm-4): emitted ONLY when enabled (same pattern).
+    # A presum checkpoint is ALSO a fullhist checkpoint (presum refines the fullhist A-segment), so
+    # both stamps are present when presum is on.
+    if _PRESUM_KEY:
+        cfg["presum_key"] = True
     return cfg
 
 

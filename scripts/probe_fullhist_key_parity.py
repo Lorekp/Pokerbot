@@ -53,6 +53,10 @@ if REPO not in sys.path:
 _ap = argparse.ArgumentParser(description=__doc__)
 _ap.add_argument("--fullhist", type=int, choices=(0, 1), required=True,
                  help="1 = POKERBOT_FULLHIST_KEY=1 (v4 Stage-0 key space); 0 = deployed layout")
+_ap.add_argument("--presum", type=int, choices=(0, 1), default=0,
+                 help="1 = POKERBOT_PRESUM_KEY=1 (arm-4 postflop preflop-summary key; requires "
+                      "--fullhist 1). The POSTFLOP A-segment becomes street + 4 summary bytes + "
+                      "exact postflop bytes; preflop is unchanged fullhist. 0 = plain fullhist.")
 _ap.add_argument("--min-states", type=int, default=512)
 _ap.add_argument("--min-postflop", type=int, default=512)
 _ap.add_argument("--max-hands", type=int, default=12000)
@@ -71,10 +75,16 @@ for _k, _v in {
     "POKERBOT_ALLOW_MADE_HAND_BUCKETS": "1",  # parity probe, not a production train
 }.items():
     os.environ.setdefault(_k, _v)
+if ARGS.presum == 1 and ARGS.fullhist != 1:
+    _ap.error("--presum 1 requires --fullhist 1 (presum refines the fullhist A-segment)")
 if ARGS.fullhist == 1:
     os.environ["POKERBOT_FULLHIST_KEY"] = "1"
 else:
     os.environ.pop("POKERBOT_FULLHIST_KEY", None)
+if ARGS.presum == 1:
+    os.environ["POKERBOT_PRESUM_KEY"] = "1"
+else:
+    os.environ.pop("POKERBOT_PRESUM_KEY", None)
 os.environ.pop("POKERBOT_PREFLOP_HIST_KEY", None)  # v4 arms do NOT stack the bp3 3-byte key
 
 import numpy as np  # noqa: E402
@@ -136,6 +146,39 @@ def _ref_fullhist(env) -> bytes:
     return bytes([street] + [int(act[i]) & 0xFF for i in range(hl)])
 
 
+def _ref_presum(env, n_preflop: int) -> bytes:
+    """INDEPENDENT presum A-segment payload (the bytes after b"A"): street + 4 summary bytes +
+    exact postflop action bytes. `n_preflop` is supplied by the walk as GROUND TRUTH (the count of
+    leading actions whose ORIGIN street was preflop — tracked forward during the game walk, NOT
+    recomputed from the twin's engine-replay), so this reference is independent of the twin."""
+    hl = max(0, min(int(np.asarray(env.hist_len)), 64))
+    act = np.asarray(env.hist_action)
+    seat = np.asarray(env.hist_seat)
+    street = int(np.asarray(env.street)) & 0xFF
+    n_calls = 0
+    n_raises = 0
+    opener_seat = -1
+    for i in range(min(n_preflop, hl)):
+        a = int(act[i])
+        if a == 2:  # CALL
+            if n_raises == 0 and n_calls < 3:
+                n_calls += 1
+        elif 3 <= a <= 10:  # BET_BUCKET_START..ALL_IN
+            if n_raises == 0:
+                opener_seat = int(seat[i])
+            if n_raises < 3:
+                n_raises += 1
+    if opener_seat >= 0:
+        opener_pos = _POS_BY_OFFSET_REF[(opener_seat - int(np.asarray(env.button))) % 6]
+    else:
+        opener_pos = -1
+    seat_status = np.asarray(env.seat_status)
+    n_active = int(np.sum((seat_status == 2) | (seat_status == 3)))  # SEAT_LIVE | SEAT_ALLIN
+    out = [street, n_calls & 0xFF, n_raises & 0xFF, (opener_pos + 1) & 0xFF, n_active & 0xFF]
+    out += [int(act[i]) & 0xFF for i in range(n_preflop, hl)]
+    return bytes(out)
+
+
 def _ref_made_hand_bucket(env, seat: int, num_buckets: int) -> int:
     """Independent made-hand bucket via phevaluator (matches fast_made_hand_bucket)."""
     import phevaluator
@@ -157,7 +200,8 @@ def _card_str(idx: int) -> str:
     return _RANKS[idx // 4] + _SUITS[idx % 4]
 
 
-def _ref_key(env, seat: int, fullhist_on: bool, num_buckets: int) -> bytes:
+def _ref_key(env, seat: int, fullhist_on: bool, num_buckets: int,
+             presum_on: bool = False, n_preflop: int = 0) -> bytes:
     holes = np.asarray(env.holes)
     bucket = _ref_made_hand_bucket(env, seat, num_buckets)
     if bucket >= 0:
@@ -169,7 +213,12 @@ def _ref_key(env, seat: int, fullhist_on: bool, num_buckets: int) -> bytes:
         weva_id = pos_enum * 169 + _canon_class(lo, hi)
         msg = b"w" + struct.pack("<i", weva_id)
     if fullhist_on:
-        msg += b"A" + _ref_fullhist(env)
+        # arm-4 presum: POSTFLOP (bucket >= 0) uses the preflop-summary A-segment; preflop is plain
+        # fullhist. Presum off => plain fullhist on every street (the Stage-0 layout).
+        if presum_on and bucket >= 0:
+            msg += b"A" + _ref_presum(env, n_preflop)
+        else:
+            msg += b"A" + _ref_fullhist(env)
     msg += b"S" + _ref_betting6(env, seat)
     return hashlib.blake2b(msg, digest_size=16).digest()
 
@@ -211,8 +260,13 @@ def main() -> int:
         print(f"FATAL: battery_native binary predates the full-hist-key port (caps={sorted(caps)}); "
               "rebuild --features python and reinstall the .pyd", flush=True)
         return 2
-    print(f"fullhist={ARGS.fullhist} num_buckets={ARGS.num_buckets} native_caps={sorted(caps)}",
-          flush=True)
+    presum_on = ARGS.presum == 1
+    if presum_on and "presum_key" not in caps:
+        print(f"FATAL: battery_native binary predates the presum-key port (caps={sorted(caps)}); "
+              "rebuild --features python and reinstall the .pyd", flush=True)
+        return 2
+    print(f"fullhist={ARGS.fullhist} presum={ARGS.presum} num_buckets={ARGS.num_buckets} "
+          f"native_caps={sorted(caps)}", flush=True)
 
     rng = random.Random(ARGS.seed)
     total = 0
@@ -239,6 +293,11 @@ def main() -> int:
         depth = 0
         street_raises = 0
         last_street = 0
+        # GROUND-TRUTH preflop boundary for the presum reference: count of leading actions applied
+        # from a street==0 state (tracked forward, independent of the twin's engine-replay). Once the
+        # hand leaves preflop this stops incrementing, so it is the true n_preflop for every later
+        # (postflop) decision state of this hand.
+        true_n_preflop = 0
         while not bool(env.done) and depth < 64:
             if is_chance_node_np(env):
                 env = sample_chance_np(env)
@@ -254,7 +313,8 @@ def main() -> int:
             py_key = bytes(py_fingerprint(env, seat))
             nat_key = bytes(ext.fingerprint_fast(_ns._to_flat(env).tobytes(), seat,
                                                  ARGS.num_buckets))
-            ref_key = _ref_key(env, seat, fullhist_on, ARGS.num_buckets)
+            ref_key = _ref_key(env, seat, fullhist_on, ARGS.num_buckets,
+                               presum_on=presum_on, n_preflop=true_n_preflop)
             total += 1
             street = int(np.asarray(env.street))
             street_name = {0: "preflop", 1: "flop", 2: "turn", 3: "river"}.get(street)
@@ -296,6 +356,8 @@ def main() -> int:
             a_pick = _pick_action(rng, legal)
             if 3 <= a_pick <= 10:
                 street_raises += 1
+            if street == 0:
+                true_n_preflop += 1  # this action was taken FROM a preflop state
             env = apply_action_np(env, a_pick)
             depth += 1
         if hands % 500 == 0:
@@ -303,12 +365,12 @@ def main() -> int:
                   f"elapsed={time.time()-t0:.0f}s", flush=True)
 
     ok = fails == 0 and covered()
-    print(f"\n=== FULL-HIST KEY PARITY (fullhist={ARGS.fullhist}) ===")
+    print(f"\n=== FULL-HIST KEY PARITY (fullhist={ARGS.fullhist} presum={ARGS.presum}) ===")
     print(f"hands={hands} states={total} mismatches={fails}")
     print(f"coverage: {cov}")
     print(f"PARITY GATE: {'PASS' if ok else 'FAIL'}", flush=True)
-    result = {"fullhist": ARGS.fullhist, "hands": hands, "states": total, "mismatches": fails,
-              "coverage": cov, "covered": covered(), "pass": bool(ok),
+    result = {"fullhist": ARGS.fullhist, "presum": ARGS.presum, "hands": hands, "states": total,
+              "mismatches": fails, "coverage": cov, "covered": covered(), "pass": bool(ok),
               "mismatch_samples": mismatches, "seed": ARGS.seed,
               "num_buckets": ARGS.num_buckets}
     if ARGS.out:

@@ -38,28 +38,26 @@ def _native_built() -> bool:
     )
 
 
-def _run_probe(fullhist: int, tmp_path) -> dict:
-    out = str(tmp_path / f"fullhist_parity_{fullhist}.json")
+def _run_probe(fullhist: int, tmp_path, presum: int = 0) -> dict:
+    out = str(tmp_path / f"fullhist_parity_{fullhist}_{presum}.json")
     env = dict(os.environ)
     env.pop("POKERBOT_FULLHIST_KEY", None)  # the probe sets/clears it itself from --fullhist
+    env.pop("POKERBOT_PRESUM_KEY", None)    # the probe sets/clears it itself from --presum
     env.pop("POKERBOT_PREFLOP_HIST_KEY", None)
     proc = subprocess.run(
-        [sys.executable, _PROBE, "--fullhist", str(fullhist), "--min-states", "512",
-         "--seed", "7", "--out", out],
+        [sys.executable, _PROBE, "--fullhist", str(fullhist), "--presum", str(presum),
+         "--min-states", "512", "--seed", "7", "--out", out],
         cwd=_ROOT, env=env, capture_output=True, text=True, timeout=3600,
     )
     assert proc.returncode == 0, (
-        f"parity probe (fullhist={fullhist}) failed rc={proc.returncode}\n"
+        f"parity probe (fullhist={fullhist} presum={presum}) failed rc={proc.returncode}\n"
         f"stdout:\n{proc.stdout[-4000:]}\nstderr:\n{proc.stderr[-4000:]}"
     )
     with open(out, encoding="utf-8") as f:
         return json.load(f)
 
 
-@pytest.mark.skipif(not _native_built(), reason="battery_native extension not built")
-@pytest.mark.parametrize("fullhist", [0, 1])
-def test_fullhist_key_parity(fullhist, tmp_path):
-    res = _run_probe(fullhist, tmp_path)
+def _assert_coverage(res: dict) -> None:
     assert res["pass"], res
     assert res["states"] >= 512
     assert res["mismatches"] == 0
@@ -71,3 +69,17 @@ def test_fullhist_key_parity(fullhist, tmp_path):
     assert cov["postflop_raise"] >= 40 and cov["postflop_reraise"] >= 8, cov
     assert cov["hist_len_10plus"] >= 40 and cov["hist_len_16plus"] >= 8, cov
     assert cov["limp1"] >= 20 and cov["raise2plus"] >= 12, cov
+
+
+@pytest.mark.skipif(not _native_built(), reason="battery_native extension not built")
+@pytest.mark.parametrize("fullhist", [0, 1])
+def test_fullhist_key_parity(fullhist, tmp_path):
+    _assert_coverage(_run_probe(fullhist, tmp_path))
+
+
+@pytest.mark.skipif(not _native_built(), reason="battery_native extension not built")
+def test_presum_key_parity(tmp_path):
+    """arm-4 presum POSTFLOP preflop-summary key: rust == python == independent reference over the
+    same game-flow floors, with the postflop A-segment = street + 4 summary bytes + exact postflop
+    bytes and the preflop A-segment unchanged (fullhist). Requires --fullhist 1 (presum refines it)."""
+    _assert_coverage(_run_probe(1, tmp_path, presum=1))

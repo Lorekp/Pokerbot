@@ -1340,6 +1340,41 @@ fn dcfr_enabled(cfg: &TrainerCfg) -> bool {
     cfg.dcfr || env_on
 }
 
+/// SHIP GUARD PREDICATE for the `f32_regret` feature: the f32 regret-row safety argument (cum_regret
+/// stays bounded so f32 has ~9 orders of headroom) DEPENDS on the CFR+ positive floor keeping stored
+/// regret >= 0. DCFR (`dcfr_enabled`), LCFR (`v3.lcfr`) and signed-regret mode (`v3.signed_regrets`)
+/// each REMOVE that floor (they store SIGNED regret and floor at a deeply-negative bound instead), so
+/// combining any of them with f32 rows lets a regret magnitude drift past f32's safe range unchecked
+/// — the one demonstrated f32 failure mode. Returns true when the (feature ON) × (any floor-removing
+/// mode) combination is present. `strat_sum` is NEVER narrowed by this feature (it stays f64), so the
+/// guard is only about the regret rows. This predicate is pure (no env read) so it is unit-testable;
+/// the fired-once wrapper is `assert_f32_regret_floor_intact`.
+fn f32_regret_unsafe_combo(dcfr: bool, v3: &V3Cfg) -> bool {
+    // cfg!() is compile-time: on the default f64 build this whole predicate folds to `false`.
+    cfg!(feature = "f32_regret") && (dcfr || v3.lcfr || v3.signed_regrets)
+}
+
+/// Fire the `f32_regret` ship guard ONCE per process (a hard error): abort training rather than
+/// silently produce an f32 blueprint whose regret rows can overflow because a floor-removing mode
+/// (DCFR / LCFR / signed_regrets) is co-enabled. No-op on the default f64 build (`cfg!` folds off).
+fn assert_f32_regret_floor_intact(dcfr: bool, v3: &V3Cfg) {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if f32_regret_unsafe_combo(dcfr, v3) {
+            panic!(
+                "f32_regret ship guard: feature `f32_regret` is ON together with a floor-removing \
+                 CFR mode (dcfr={} lcfr={} signed_regrets={}). f32 regret rows are only safe under \
+                 the CFR+ positive floor (which keeps stored regret >= 0 and bounded); DCFR/LCFR/\
+                 signed_regrets store SIGNED regret and floor at a deeply-negative bound, which can \
+                 drift a regret magnitude past f32's safe range. Rebuild WITHOUT --features \
+                 f32_regret for these modes (strat_sum is never narrowed either way).",
+                dcfr, v3.lcfr, v3.signed_regrets
+            );
+        }
+    });
+}
+
 /// blueprint-v4 **v3 trainer schedule** (Pluribus-faithful LCFR + hard negative-regret pruning +
 /// snapshot averaging — amendment doc `artifacts/blueprint_v4_amendment_v3.md`; primary source
 /// `artifacts/pluribus_blueprint_spec_full.md` §1). ALL knobs default-OFF => the trainer is
@@ -3122,6 +3157,10 @@ impl NlheTables {
     }
 
     pub fn train_iteration_n_v3<const N: usize>(&mut self, cfg: &TrainerCfg, v3: &V3Cfg) {
+        // f32_regret ship guard (fires once/process; no-op on the default f64 build): refuse to run
+        // f32 regret rows under a floor-removing mode (DCFR/LCFR/signed_regrets) that voids the f32
+        // safety argument. Placed at the single per-iteration choke point every training path uses.
+        assert_f32_regret_floor_intact(dcfr_enabled(cfg), v3);
         let t = self.iters_done + 1;
         let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
         // EFFECTIVE per-iteration prune threshold (CHANGE B / Pluribus rule 2 — the prune/explore choice is
@@ -5323,6 +5362,31 @@ fn _assert_n6(_s: &EnvStateN<NUM_PLAYERS>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// f32_regret ship-guard PREDICATE test. On the default f64 build `cfg!(feature="f32_regret")`
+    /// is false, so the predicate is false for EVERY mode combination (the guard is inert — this is
+    /// the byte-identity-preserving property). Under `--features f32_regret` the predicate must fire
+    /// for DCFR / LCFR / signed_regrets and stay false for pure CFR+. We assert both regimes with
+    /// `cfg!` so the single test is correct in either build.
+    #[test]
+    fn f32_regret_guard_predicate_fires_only_on_floor_removing_modes() {
+        let inert = V3Cfg::default(); // lcfr=false, signed_regrets=false
+        let lcfr = V3Cfg { lcfr: true, ..V3Cfg::default() };
+        let signed = V3Cfg { signed_regrets: true, ..V3Cfg::default() };
+        // Pure CFR+ (no dcfr, inert v3) is ALWAYS safe, regardless of the feature.
+        assert!(!f32_regret_unsafe_combo(false, &inert));
+        if cfg!(feature = "f32_regret") {
+            // Each floor-removing mode trips the guard when the feature is on.
+            assert!(f32_regret_unsafe_combo(true, &inert), "dcfr must trip");
+            assert!(f32_regret_unsafe_combo(false, &lcfr), "lcfr must trip");
+            assert!(f32_regret_unsafe_combo(false, &signed), "signed_regrets must trip");
+        } else {
+            // Default f64 build: the guard is inert for every mode (no false ship-block).
+            assert!(!f32_regret_unsafe_combo(true, &inert));
+            assert!(!f32_regret_unsafe_combo(false, &lcfr));
+            assert!(!f32_regret_unsafe_combo(false, &signed));
+        }
+    }
 
     fn test_cfg(n_deals: usize) -> TrainerCfg {
         TrainerCfg {
