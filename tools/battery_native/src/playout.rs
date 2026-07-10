@@ -439,7 +439,9 @@ pub fn playout_fixed<const N: usize>(
         let row = bias_continuation_mult(&bp_row, group, &abst, cfg, bias_mult);
         let u = rng.next_f64();
         let a = sample_action(&row, &full, u);
-        env = core::apply_action(&env, a);
+        // Gated real-NLHE street closure (POKERBOT_CLOSE_CALLED_STREET; default OFF => identity):
+        // leaf rollouts must walk the same closed game as the closure-trained blueprint they query.
+        env = crate::closure::maybe_close_called_street(core::apply_action(&env, a));
         depth += 1;
     }
     env.rewards[hero] as f64 / CHIP_UNIT
@@ -478,7 +480,9 @@ pub fn playout<const N: usize>(
         let row = bias_continuation(&bp_row, group, &abst, cfg);
         let u = rng.next_f64();
         let a = sample_action(&row, &full, u);
-        env = core::apply_action(&env, a);
+        // Gated real-NLHE street closure (POKERBOT_CLOSE_CALLED_STREET; default OFF => identity):
+        // leaf rollouts must walk the same closed game as the closure-trained blueprint they query.
+        env = crate::closure::maybe_close_called_street(core::apply_action(&env, a));
         depth += 1;
     }
     env.rewards[hero] as f64 / CHIP_UNIT

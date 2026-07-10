@@ -2214,7 +2214,10 @@ fn cfv<const N: usize>(
         };
         let u = rng.next_f64();
         let a = sample_action(&strat, &legal, u);
-        let child = core::apply_action(env, a);
+        // Gated real-NLHE street closure (POKERBOT_CLOSE_CALLED_STREET; default OFF => identity):
+        // the SERVE-search subgame must play the same closed game as the closure-trained blueprint
+        // (train/serve consistency; live tables never present the aggressor-reopen node).
+        let child = crate::closure::maybe_close_called_street(core::apply_action(env, a));
         return cfv(&child, hero, depth + 1, ctx, tab, rng, t);
     }
 
@@ -2224,7 +2227,7 @@ fn cfv<const N: usize>(
     let mut av = [0.0f64; NUM_ACTIONS];
     for a in 0..NUM_ACTIONS {
         if legal[a] {
-            let child = core::apply_action(env, a);
+            let child = crate::closure::maybe_close_called_street(core::apply_action(env, a));
             av[a] = cfv(&child, hero, depth + 1, ctx, tab, rng, t);
         }
     }
@@ -2536,7 +2539,8 @@ fn cfv_exploit<const N: usize>(
         let strat = opponent_strategy_exploit(env, actor, &legal, &regrets, cx);
         let u = rng.next_f64();
         let a = sample_action(&strat, &legal, u);
-        let child = core::apply_action(env, a);
+        // Gated real-NLHE street closure (POKERBOT_CLOSE_CALLED_STREET; default OFF => identity).
+        let child = crate::closure::maybe_close_called_street(core::apply_action(env, a));
         return cfv_exploit(&child, hero, depth + 1, cx, tab, rng, t, want_root_q);
     }
 
@@ -2546,7 +2550,7 @@ fn cfv_exploit<const N: usize>(
     let mut av = [0.0f64; NUM_ACTIONS];
     for a in 0..NUM_ACTIONS {
         if legal[a] {
-            let child = core::apply_action(env, a);
+            let child = crate::closure::maybe_close_called_street(core::apply_action(env, a));
             av[a] = cfv_exploit(&child, hero, depth + 1, cx, tab, rng, t, want_root_q);
         }
     }

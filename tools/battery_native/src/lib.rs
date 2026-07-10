@@ -9,6 +9,7 @@
 //! is native.
 
 pub mod cfr_table;
+pub mod closure;
 pub mod core;
 pub mod emd;
 pub mod fingerprint;
@@ -207,10 +208,14 @@ mod py {
     }
 
     /// `apply_action_np(state_bytes, action)` -> new flat state as bytes.
+    /// Routed through the gated real-NLHE street closure (`closure::maybe_close_called_street`,
+    /// POKERBOT_CLOSE_CALLED_STREET; default OFF => identity => byte-identical) so the Python-facing
+    /// native step plays the SAME game as the trainer/serve traversals under one env var.
     #[pyfunction]
     fn apply_action<'py>(py: Python<'py>, state: &[u8], action: usize) -> Bound<'py, PyBytes> {
         let s = flat::from_flat(&bytes_to_flat(state));
-        let out = flat::to_flat(&core::apply_action(&s, action));
+        let child = crate::closure::maybe_close_called_street(core::apply_action(&s, action));
+        let out = flat::to_flat(&child);
         PyBytes::new(py, &flat_to_bytes(&out))
     }
 
