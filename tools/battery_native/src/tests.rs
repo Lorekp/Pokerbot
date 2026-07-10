@@ -2330,3 +2330,223 @@ mod settle_showdown_leaf {
         assert!(sum.abs() < 1e-9);
     }
 }
+
+// ---------------------------------------------------------------------------
+// OPT-1 x SETTLE_SHOWDOWN_LEAF JOIN (merge 2026-07-10). The river chance-leaf shortcut
+// (subgame.rs leaf_value) must return the SETTLED showdown value under the gate — these tests pin
+// (a) the exact substitution OPT-1 makes: `uniform_leaf_value` under gate ON at a river chance
+// leaf == the `showdown_leaf_return` mean-fold, BIT-identical (so the shortcut's direct settle +
+// replicated fold reproduces the generic path's value exactly), and (b) at the solve level: a
+// K=2000 river-root solve is deterministic under both gate settings, gate OFF stays the shipped
+// behavior, and gate ON moves the answer (non-zero settled leaf mass reaches the regrets — the
+// bug's signature was 100% zero river leaf mass, which made ON == OFF).
+//
+// #[ignore]: these flip the PROCESS-GLOBAL gate, which the parallel default suite shares (the
+// other settle tests deliberately use the explicit-flag twin). Run in isolation:
+//   cargo test --release --lib opt1_settle_join -- --ignored --test-threads=1
+// ---------------------------------------------------------------------------
+mod opt1_settle_join {
+    use super::*;
+    use crate::playout::{self, Blueprint, PlayoutConfig};
+    use crate::subgame::{self, SubgameConfig};
+    use std::collections::HashMap;
+
+    fn deck_shuffled(seed: u64) -> [i32; 52] {
+        let mut d = [0i32; 52];
+        for (i, v) in d.iter_mut().enumerate() {
+            *v = i as i32;
+        }
+        let mut s = seed;
+        for i in (1..52usize).rev() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let j = ((s >> 33) % (i as u64 + 1)) as usize;
+            d.swap(i, j);
+        }
+        d
+    }
+
+    fn root_6max(seed: u64) -> EnvState {
+        let stacks = [100 * CHIP_UNIT; NUM_PLAYERS];
+        let occ = [true; NUM_PLAYERS];
+        init_hand(0, &stacks, &occ, 0, &deck_shuffled(seed), [7u32, 42u32])
+    }
+
+    /// Check/call-drive until the hand stands at the requested river node class:
+    /// `chance=true`  -> the RIVER CHANCE LEAF (river betting closed, pending_deal, street==RIVER;
+    ///                   exactly the OPT-1 class `is_chance_node && street == STREET_RIVER`);
+    /// `chance=false` -> the first RIVER ACTION node (river card dealt, an actor to move).
+    fn drive_to_river(mut env: EnvState, chance: bool) -> EnvState {
+        for _ in 0..200 {
+            assert!(!env.done, "check/call drive must not settle before the river");
+            if is_chance_node(&env) {
+                if chance && env.street == STREET_RIVER {
+                    return env;
+                }
+                env = sample_chance(&env);
+                continue;
+            }
+            if !chance && env.street == STREET_RIVER {
+                return env;
+            }
+            let seat = env.action_seat;
+            assert!(seat >= 0, "no actor before the requested river node");
+            let mask = legal_action_mask(&env, seat);
+            let a = if mask[CHECK] {
+                CHECK
+            } else if mask[CALL] {
+                CALL
+            } else {
+                (0..NUM_ACTIONS).find(|&x| mask[x]).unwrap()
+            };
+            env = apply_action(&env, a);
+        }
+        panic!("drive never reached the requested river node");
+    }
+
+    fn pcfg() -> PlayoutConfig {
+        PlayoutConfig {
+            allowed_pre: [true; NUM_ACTIONS],
+            allowed_post: [true; NUM_ACTIONS],
+            bias_mult: 5.0,
+            bias_floor: 0.0,
+            max_depth: 24,
+            num_buckets: 200,
+            emd: None,
+        }
+    }
+
+    fn scfg(iters: i32, leaf_worlds: i32) -> SubgameConfig {
+        SubgameConfig {
+            max_iterations: iters,
+            max_depth: 8,
+            blueprint_mix: 0.0,
+            rollout_samples: 2,
+            resample_board: true,
+            linear_averaging: true,
+            repair_deck: false,
+            two_sided: false,
+            decouple_sampler: false,
+            range_aware: false,
+            range_uniform_floor: 0.25,
+            range_reach_full: false,
+            ensemble_streams: 1,
+            leaf_cache_worlds: leaf_worlds,
+            avg_skip_frac: 0.0,
+            leaf_biased_continuations: false,
+            leaf_bias_mult: 5.0,
+            serve_final_iterate: false,
+            root_unmask: 0,
+        }
+    }
+
+    /// (a) THE SUBSTITUTION: at the OPT-1 leaf class, gate ON `uniform_leaf_value` ==
+    /// fold(showdown_leaf_return) over rollout_samples identical terms — bit-for-bit, for every
+    /// hero, both resample settings, several rollout counts. Gate OFF stays exactly 0.0.
+    #[test]
+    #[ignore = "flips the process-global settle gate; run in isolation (see mod header)"]
+    fn uniform_leaf_value_gate_on_equals_showdown_settle_fold() {
+        let env = drive_to_river(root_6max(0xB0A3D), true);
+        assert!(is_chance_node(&env) && env.street == STREET_RIVER && !env.done);
+        assert!(
+            is_unsettled_showdown(&sample_chance(&env)),
+            "advance lands in the bug class"
+        );
+        let bp: Blueprint = HashMap::new();
+        let pc = pcfg();
+
+        set_settle_showdown_leaf(false);
+        for hero in 0..NUM_PLAYERS {
+            assert_eq!(
+                playout::uniform_leaf_value(&env, hero, &bp, &pc, 0xDEAD ^ hero as u64, 2, true),
+                0.0,
+                "gate OFF must keep the shipped 0.0 river-leaf value"
+            );
+        }
+
+        set_settle_showdown_leaf(true);
+        let mut any_nonzero = false;
+        for &rs in &[1i32, 2, 3, 5] {
+            for &resample in &[false, true] {
+                let mut sum = 0.0f64;
+                for hero in 0..NUM_PLAYERS {
+                    let got = playout::uniform_leaf_value(
+                        &env,
+                        hero,
+                        &bp,
+                        &pc,
+                        0xABCD ^ ((rs as u64) << 8) ^ hero as u64,
+                        rs,
+                        resample,
+                    );
+                    let sv = showdown_leaf_return(&env, hero);
+                    let mut total = 0.0f64;
+                    for _ in 0..rs {
+                        total += sv;
+                    }
+                    let want = total / rs as f64;
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "gate ON leaf value must be the settled fold, bit-exact \
+                         (hero {hero}, rs {rs}, resample {resample}: got {got}, want {want})"
+                    );
+                    if got != 0.0 {
+                        any_nonzero = true;
+                    }
+                    sum += got;
+                }
+                assert!(sum.abs() < 1e-9, "settled river leaf must be zero-sum");
+            }
+        }
+        assert!(
+            any_nonzero,
+            "settled river leaf mass must be non-zero (the bug was 100% zero)"
+        );
+        set_settle_showdown_leaf(false);
+    }
+
+    /// (b) SOLVE LEVEL, K=2000: gate OFF deterministic; gate ON deterministic, valid, and
+    /// DIFFERENT from gate OFF (settled leaf mass reached the regrets through the OPT-1 shortcut).
+    /// Runs with the deploy coupling leaf_cache_worlds=4 (settled leaves are hole-dependent).
+    #[test]
+    #[ignore = "flips the process-global settle gate; run in isolation (see mod header)"]
+    fn river_root_solve_k2000_gate_on_moves_the_answer() {
+        let env = drive_to_river(root_6max(0x5EED2), false);
+        assert_eq!(env.street, STREET_RIVER);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = HashMap::new();
+        let pc = pcfg();
+        let sc = scfg(2000, 4);
+
+        set_settle_showdown_leaf(false);
+        let off1 = subgame::solve::<NUM_PLAYERS>(&env, hero, &bp, &pc, &sc, 0xC0FFEE);
+        let off2 = subgame::solve::<NUM_PLAYERS>(&env, hero, &bp, &pc, &sc, 0xC0FFEE);
+        assert_eq!(off1, off2, "gate OFF solve must be deterministic");
+
+        set_settle_showdown_leaf(true);
+        let on1 = subgame::solve::<NUM_PLAYERS>(&env, hero, &bp, &pc, &sc, 0xC0FFEE);
+        let on2 = subgame::solve::<NUM_PLAYERS>(&env, hero, &bp, &pc, &sc, 0xC0FFEE);
+        assert_eq!(on1, on2, "gate ON solve must be deterministic");
+        set_settle_showdown_leaf(false);
+
+        let legal = legal_action_mask(&env, hero as i32);
+        for probs in [&off1, &on1] {
+            let mut s = 0.0;
+            for a in 0..NUM_ACTIONS {
+                assert!(probs[a] >= -1e-12);
+                if !legal[a] {
+                    assert!(probs[a].abs() < 1e-9, "mass on illegal action {a}");
+                }
+                s += probs[a];
+            }
+            assert!((s - 1.0).abs() < 1e-6, "root probs must sum to 1, got {s}");
+        }
+        let max_diff = (0..NUM_ACTIONS)
+            .map(|a| (on1[a] - off1[a]).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_diff > 1e-6,
+            "gate ON must move the river solve (settled leaf mass); max root-prob diff {max_diff}"
+        );
+    }
+}
