@@ -148,10 +148,34 @@ def _configure_env(args) -> None:
     else:  # summary — no history key extension
         os.environ.pop("POKERBOT_PREFLOP_HIST_KEY", None)
         os.environ.pop("POKERBOT_FULLHIST_KEY", None)
+    # Presum postflop key (POKERBOT_PRESUM_KEY, composes with fullhist — jax_weva_encode.py:62, read
+    # AT IMPORT). Explicit set/pop like the arm-3 twins above: a presum-trained snapshot (e.g.
+    # bpv4_presum_1) served WITHOUT this flag misses ~100% of postflop keys (fullhist-exact keys the
+    # presum table never wrote) and the whole postflop field silently degrades to uniform — the exact
+    # skew that made the first Stage-0' rerun unreproducible (the original §37 shards inherited the
+    # flag from their launcher shell; nothing in the CLI recorded it).
+    if getattr(args, "presum", False):
+        os.environ["POKERBOT_PRESUM_KEY"] = "1"
+    else:
+        os.environ.pop("POKERBOT_PRESUM_KEY", None)
 
 
 class AbortHand(Exception):
     """UTG/HJ/CO did not fold -> the folded-to-BTN node was not reached; deal discarded."""
+
+
+class SettleNow(Exception):
+    """v5.1 Stage-0' idealized-realization re-serve (blueprint_v5_pluribus_grade_plan.md §11.4): raised
+    by the ``--postflop-field idealized`` wrapper at the FIRST turn/river decision whose blueprint
+    fingerprint MISSES (uniform-legal fallback). The hand is then settled at that state by
+    ``equity_allin_settle`` (side-pot-correct check-down equity, mean-preserving) instead of continuing
+    under uniform noise — replacing the node's VALUE realization while holding upstream reach (and the
+    CRN pairing) byte-identical. Carries the state at the decision point (the sampled action is
+    discarded UNAPPLIED, so ``state`` is exactly the pre-action node)."""
+
+    def __init__(self, state):
+        super().__init__()
+        self.state = state
 
 
 class _IndexedSnap:
@@ -507,12 +531,49 @@ def _rollout_main(args) -> int:
                     return pol(state)
                 return wrapped
             policies = {s: _postflop_fixed(s, pol) for s, pol in policies.items()}
+        # v5.1 Stage-0' idealized-realization re-serve (plan §11.4; spec: bpv4_pluribus_grade_design.md
+        # VERDICT "$0 discriminator"). EVERY seat plays the trained blueprint postflop, but the FIRST
+        # turn/river decision whose fingerprint MISSES (the ~83%/~91% uniform-fallback locus,
+        # lbr.py make_blueprint_policy) settles the hand THERE by check-down equity — an upper bound on
+        # what ANY realization fix (river abstraction / coverage / leaf values) could recover, with
+        # reach frequency held fixed (upstream play byte-identical to --postflop-field blueprint; the
+        # miss action is discarded unapplied). Flop misses keep the legacy uniform fallback (§37: flop
+        # contribution is stable; the localized deficit is turn+river). Miss detection = the
+        # _BP_COVERAGE per-street miss counters (the ONLY signal — a miss returns a valid uniform-legal
+        # dist; adapter fallback_count never increments; env.street ints: 2=turn, 3=river).
+        if args.postflop_field == "idealized":
+            from pokerbot.eval import lbr as _lbr
+
+            def _tr_misses() -> int:
+                cov = _lbr._BP_COVERAGE
+                return cov.get(2, (0, 0))[1] + cov.get(3, (0, 0))[1]
+
+            def _postflop_idealized(pol):
+                def wrapped(state):
+                    if len(state.board) >= 4:  # turn (4) / river (5) decisions only
+                        before = _tr_misses()
+                        a = pol(state)
+                        if _tr_misses() > before:
+                            raise SettleNow(state)
+                        return a
+                    return pol(state)
+                return wrapped
+            policies = {s: _postflop_idealized(pol) for s, pol in policies.items()}
         settle = lambda s, nb: equity_allin_settle(  # noqa: E731
             s, nb, n_runouts=args.runouts, rng=random.Random(settle_seed))
         try:
             final, deltas = play_hand(policies, state=state, allin_settle=settle)
         except AbortHand:
             return None
+        except SettleNow as e:
+            # Same settle RNG construction as the all-in hook (CRN: fixed per candidate deal h, arm-
+            # independent). deltas has the resolve_showdown shape {seat: net_bb}; the rest of the
+            # record path (delta, resp extraction, end_street tag) works on the mid-hand state
+            # unchanged — end_street tags 4/5 so ev_by_street attributes the settled EV to turn/river.
+            final = e.state
+            deltas = settle(e.state, None)
+            idealized_settles[str(len(final.board))] = (
+                idealized_settles.get(str(len(final.board)), 0) + 1)
         if not st["hero_acted"]:  # e.g. everyone folded to BTN is guaranteed reached; safety only
             return None
         # villain first responses AFTER hero's node action (preflop only)
@@ -538,8 +599,14 @@ def _rollout_main(args) -> int:
         }
 
     # --- deal loop: h indexes candidate deals; keep the first --deals REACHED ones ---------------
+    if args.postflop_field == "idealized" and node_target == "bb_defend":
+        raise SystemExit("--postflop-field idealized supports --node-target btn_open only")
+    idealized_settles: dict[str, int] = {}  # board-len ('4'=turn,'5'=river) -> settles fired
     _play = play_arm_bb if node_target == "bb_defend" else play_arm
     out = {arm: [] for arm in arm_set}
+    # Per-deal end-street tag (0=preflop, 3=flop, 4=turn, 5=river) paired 1:1 with out[arm], so the
+    # merge step can attribute each arm's EV to the street its OWN line ended on (open-vs-limp localizer).
+    street_out = {arm: [] for arm in arm_set}
     if node_target == "bb_defend":
         meta = {"btn_open": {}, "pot_before_bb": {}, "to_call_bb": {},
                 "end_street": {arm: {} for arm in arm_set}}
@@ -572,6 +639,7 @@ def _rollout_main(args) -> int:
         for arm in arm_set:
             r = recs[arm]
             out[arm].append(r["delta"])
+            street_out[arm].append(int(r["end_street"]))
             if node_target != "bb_defend":
                 for side in ("sb", "bb"):
                     if r[side]:
@@ -610,7 +678,8 @@ def _rollout_main(args) -> int:
         "postflop_field": args.postflop_field,
         "adapter_fallback_rate": fb / max(1, dc),
         "bp_coverage": bp_cov,
-        "deltas_bb": out, "meta": meta,
+        "idealized_settles": idealized_settles,
+        "deltas_bb": out, "street_tags_bb": street_out, "meta": meta,
         "wall_s": round(time.time() - t0, 1),
     }
     with open(args.out, "w", encoding="utf-8") as f:
@@ -772,6 +841,48 @@ def _merge_main(args) -> int:
                     "se_bb100": float(diff.std(ddof=1) / math.sqrt(n) * 100),
                     "t": float(diff.mean() / (diff.std(ddof=1) / math.sqrt(n)) if diff.std(ddof=1) > 0 else 0.0),
                 }
+        # --- per-street EV attribution (the open-vs-limp deficit localizer) --------------------------
+        # contrib_s(arm) = mean over ALL n deals of delta * 1[arm's line ended on street s], so
+        # sum_s contrib_s(arm) == EV(arm) exactly. The gap EV(open)-EV(limp) then decomposes additively
+        # as sum_s [contrib_s(open) - contrib_s(limp)]. This is an UNCONDITIONAL partition by the street
+        # each arm's OWN line ended on -- deliberately NOT a same-deal conditional diff (which would be
+        # selection-biased: opens fold villains out preflop more often, so conditioning on both arms
+        # reaching river silently drops the very deals where the open's fold-equity lives). Comparing the
+        # checkcall vs blueprint fields per street then tells us whether the deficit is postflop-play
+        # (coverage/realization -> presum lever) or preflop (equilibrium/jam -> preflop-menu lever).
+        ev_by_street = None
+        gap_by_street = None
+        if nt != "bb_defend" and all("street_tags_bb" in x for x in ss):
+            STREETS = [(0, "preflop"), (3, "flop"), (4, "turn"), (5, "river")]
+            stags = {arm: np.concatenate([np.asarray(x["street_tags_bb"][arm]) for x in ss])
+                     for arm in arm_set}
+            ev_by_street = {}
+            for arm in arm_set:
+                d = deltas[arm]
+                tg = stags[arm]
+                row = {}
+                for sn, lab in STREETS:
+                    mask = tg == sn
+                    ns = int(mask.sum())
+                    if ns:
+                        ds = d[mask]
+                        row[lab] = {
+                            "n": ns, "frac": ns / n,
+                            "cond_ev_bb100": float(ds.mean() * 100),
+                            "cond_se_bb100": float(ds.std(ddof=1) / math.sqrt(ns) * 100) if ns > 1 else 0.0,
+                            "contrib_bb100": float(ds.sum() / n * 100),
+                        }
+                    else:
+                        row[lab] = {"n": 0, "frac": 0.0, "cond_ev_bb100": 0.0,
+                                    "cond_se_bb100": 0.0, "contrib_bb100": 0.0}
+                ev_by_street[arm] = row
+            gap_by_street = {}
+            for arm in ("own", "open325", "open400", "jam"):
+                gap_by_street[f"{arm}_minus_limp"] = {
+                    lab: float(ev_by_street[arm][lab]["contrib_bb100"]
+                               - ev_by_street["limp"][lab]["contrib_bb100"])
+                    for _sn, lab in STREETS
+                }
         if nt == "bb_defend":
             meta = {"btn_open": {}, "pot_before_bb": {}, "to_call_bb": {},
                     "end_street": {a: {} for a in arm_set}}
@@ -816,8 +927,17 @@ def _merge_main(args) -> int:
                               "fallback_rates": [x["adapter_fallback_rate"] for x in ss],
                               "bp_coverage": bp_coverage,
                               "postflop_miss_rate": pf_m / max(1, pf_h + pf_m)}
+        if ev_by_street is not None:
+            out["hands"][hand]["ev_by_street"] = ev_by_street
+            out["hands"][hand]["open_minus_limp_by_street"] = gap_by_street
         _plog(f"merge {hand}: n={n}  " + "  ".join(
             f"{a}={stats[a]['ev_bb100']:+.1f}±{stats[a]['se_bb100']:.1f}" for a in arm_set))
+        if ev_by_street is not None:
+            for arm in ("open325", "open400", "jam"):
+                g = gap_by_street[f"{arm}_minus_limp"]
+                _plog(f"merge {hand}: ({arm}-limp) by street  "
+                      + "  ".join(f"{lab}={g[lab]:+.1f}" for lab in ("preflop", "flop", "turn", "river"))
+                      + f"  [sum={sum(g.values()):+.1f} bb/100]")
         if nt == "bb_defend":
             p = paired["defend_minus_fold"]
             _plog(f"merge {hand}: defend-fold = {p['delta_bb100']:+.1f}±{p['se_bb100']:.1f} bb/100 "
@@ -845,6 +965,11 @@ def main() -> int:
     r.add_argument("--key-mode", choices=("prefhist", "fullhist", "summary"), default="prefhist")
     r.add_argument("--postflop-mode", choices=("emd", "fast"), default="emd")
     r.add_argument("--num-buckets", type=int, default=160)
+    r.add_argument("--presum", action="store_true",
+                   help="serve under the presum postflop key (POKERBOT_PRESUM_KEY=1, composes with "
+                        "--key-mode fullhist) — REQUIRED for presum-trained snapshots (bpv4_presum_1): "
+                        "without it every postflop lookup misses (fullhist-exact keys) and the field "
+                        "silently degrades to uniform. Default off = byte-identical legacy.")
     r.add_argument("--mrr", action="store_true",
                    help="serve under the M-RR thinned postflop menus (POKERBOT_MRR=1, the trainer's "
                         "abstracted_legal_mrr keep-lists mirrored in lbr.make_blueprint_policy) — "
@@ -868,14 +993,19 @@ def main() -> int:
                         "comma-separated bet-bucket ids e.g. '1,4'. Turn/river re-raises always stay "
                         "the legacy {4} thin. Default None = legacy M-RR flop thin {4}, "
                         "byte-identical. Only meaningful with --mrr.")
-    r.add_argument("--postflop-field", choices=("blueprint", "checkcall"), default="blueprint",
+    r.add_argument("--postflop-field", choices=("blueprint", "checkcall", "idealized"),
+                   default="blueprint",
                    help="postflop continuation field for the EV rollout. 'blueprint' (default) = the "
                         "legacy frozen-blueprint field (byte-identical behavior; coverage-gated by "
                         "--max-postflop-miss). 'checkcall' = the v3 G5 instrument: EVERY seat plays "
                         "a SYMMETRIC fixed check/call policy postflop, so the EV(open)-EV(limp) "
                         "contrast measures the TRAINED preflop response economics under pure equity "
                         "realization and stays well-defined at any postflop coverage (the fix for "
-                        "the Stage-0 G5 coverage-BLOCK; amendment doc section 5).")
+                        "the Stage-0 G5 coverage-BLOCK; amendment doc section 5). 'idealized' = the "
+                        "v5.1 Stage-0' re-serve discriminator: blueprint postflop everywhere, but the "
+                        "FIRST turn/river fingerprint MISS settles the hand there by check-down "
+                        "equity (reach held fixed) — the upper bound on what any realization fix "
+                        "could recover (plan §11.4; btn_open only).")
     r.add_argument("--snapshot-index", default=None,
                    help="dir built by bpv4_nlcfr_index.py — mmap-backed snapshot lookup instead of the "
                         "full in-RAM load (REQUIRED for the 55 GB cloud fullhist blobs). Default None "
