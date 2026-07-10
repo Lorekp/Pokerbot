@@ -49,7 +49,7 @@ def _load(path: str) -> dict:
 
 
 def _arm_env(base, *, mode, num_buckets, emd_frozen, workers, river_ochs="",
-             preflop_hist_key=False) -> dict:
+             preflop_hist_key=False, fullhist_key=False, presum_key=False, mrr=False) -> dict:
     """Serve env for one arm (set by the parent for the subprocess; baked at the child's pokerbot import)."""
     env = dict(base)
     env["POKERBOT_BETTING_ABSTRACTION"] = "1"
@@ -77,6 +77,26 @@ def _arm_env(base, *, mode, num_buckets, emd_frozen, workers, river_ochs="",
         env["POKERBOT_PREFLOP_HIST_KEY"] = "1"
     else:
         env.pop("POKERBOT_PREFLOP_HIST_KEY", None)  # arm env is fully determined by the arm's args
+    # blueprint-v4 fullhist / presum / M-RR key-space flags. Each arm carries its OWN training key space:
+    # a presum arm keys POSTFLOP on the preflop pot-type SUMMARY (fullhist PREFLOP), so it CANNOT share a
+    # process with the non-presum EMD-K160 incumbent (one env baked per import). That is exactly what the
+    # subprocess-per-arm design buys: each arm's child gets its own key-space env here. Presum only ever
+    # refines the fullhist A-segment, so a presum arm MUST also set fullhist_key (guarded two-sided by
+    # lbr.check_blueprint_serve_env). M-RR must mirror training or the served postflop raise menu is wider
+    # than the trained table -> serve-miss -> uniform (arm ranks falsely low). Explicit set/pop keeps the
+    # arm env hermetic (no leak of the parent's flags into an arm that did not train with them).
+    if fullhist_key:
+        env["POKERBOT_FULLHIST_KEY"] = "1"
+    else:
+        env.pop("POKERBOT_FULLHIST_KEY", None)
+    if presum_key:
+        env["POKERBOT_PRESUM_KEY"] = "1"
+    else:
+        env.pop("POKERBOT_PRESUM_KEY", None)
+    if mrr:
+        env["POKERBOT_MRR"] = "1"
+    else:
+        env.pop("POKERBOT_MRR", None)
     return env
 
 
@@ -105,12 +125,14 @@ def _arm_main(args) -> int:
 
 
 def _run_arm(blueprint, *, mode, num_buckets, emd_frozen, decks, seed, workers, label,
-             river_ochs="", preflop_hist_key=False) -> dict:
+             river_ochs="", preflop_hist_key=False, fullhist_key=False, presum_key=False,
+             mrr=False) -> dict:
     out = tempfile.mktemp(suffix=f"_{label}.json")
     cmd = [sys.executable, os.path.abspath(__file__), "--arm", "--blueprint", blueprint,
            "--decks", str(decks), "--seed", str(seed), "--out", out, "--label", label]
     env = _arm_env(os.environ, mode=mode, num_buckets=num_buckets, emd_frozen=emd_frozen,
-                   workers=workers, river_ochs=river_ochs, preflop_hist_key=preflop_hist_key)
+                   workers=workers, river_ochs=river_ochs, preflop_hist_key=preflop_hist_key,
+                   fullhist_key=fullhist_key, presum_key=presum_key, mrr=mrr)
     print(f"[xrank] launching arm {label} ({mode}/K{num_buckets}) ...", flush=True)
     r = subprocess.run(cmd, env=env, capture_output=True, text=True)
     for line in r.stdout.splitlines():
@@ -145,6 +167,16 @@ def main() -> int:
                     help="arm A trained with POKERBOT_PREFLOP_HIST_KEY=1 (blueprint-v3)")
     ap.add_argument("--b-preflop-hist-key", action="store_true",
                     help="arm B trained with POKERBOT_PREFLOP_HIST_KEY=1 (blueprint-v3, e.g. bp3_prefhist_1)")
+    # blueprint-v4 key-space flags (per arm): a presum arm needs --X-fullhist-key --X-presum-key (presum
+    # refines the fullhist A-segment) and, if trained with M-RR thinning, --X-mrr so the served postflop
+    # raise menu matches its table. These let a presum arm be compared to the non-presum EMD-K160 incumbent
+    # (each in its own subprocess env).
+    ap.add_argument("--a-fullhist-key", action="store_true", help="arm A trained with POKERBOT_FULLHIST_KEY=1 (blueprint-v4)")
+    ap.add_argument("--b-fullhist-key", action="store_true", help="arm B trained with POKERBOT_FULLHIST_KEY=1 (blueprint-v4)")
+    ap.add_argument("--a-presum-key", action="store_true", help="arm A trained with POKERBOT_PRESUM_KEY=1 (implies --a-fullhist-key)")
+    ap.add_argument("--b-presum-key", action="store_true", help="arm B trained with POKERBOT_PRESUM_KEY=1 (implies --b-fullhist-key)")
+    ap.add_argument("--a-mrr", action="store_true", help="arm A trained with POKERBOT_MRR=1 (M-RR postflop raise thinning)")
+    ap.add_argument("--b-mrr", action="store_true", help="arm B trained with POKERBOT_MRR=1 (M-RR postflop raise thinning)")
     ap.add_argument("--label-a", default="A"); ap.add_argument("--label-b", default="B")
     ap.add_argument("--out-json", default=None)
     args = ap.parse_args()
@@ -157,10 +189,14 @@ def main() -> int:
           flush=True)
     da = _run_arm(args.a, mode=args.a_mode, num_buckets=args.a_num_buckets, emd_frozen=args.a_emd_frozen,
                   decks=args.decks, seed=args.seed, workers=args.workers, label=args.label_a,
-                  river_ochs=args.a_river_ochs, preflop_hist_key=args.a_preflop_hist_key)
+                  river_ochs=args.a_river_ochs, preflop_hist_key=args.a_preflop_hist_key,
+                  fullhist_key=args.a_fullhist_key or args.a_presum_key, presum_key=args.a_presum_key,
+                  mrr=args.a_mrr)
     db = _run_arm(args.b, mode=args.b_mode, num_buckets=args.b_num_buckets, emd_frozen=args.b_emd_frozen,
                   decks=args.decks, seed=args.seed, workers=args.workers, label=args.label_b,
-                  river_ochs=args.b_river_ochs, preflop_hist_key=args.b_preflop_hist_key)
+                  river_ochs=args.b_river_ochs, preflop_hist_key=args.b_preflop_hist_key,
+                  fullhist_key=args.b_fullhist_key or args.b_presum_key, presum_key=args.b_presum_key,
+                  mrr=args.b_mrr)
 
     # both arms used the SAME roster (default_pool_roster is deterministic) -> pair by archetype.
     if list(da["per"]) != list(db["per"]):

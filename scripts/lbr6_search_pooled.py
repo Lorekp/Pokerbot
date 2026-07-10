@@ -48,6 +48,14 @@ def main() -> None:
     ap.add_argument("--blueprint-snapshot",
                     default=r"checkpoints/bp6max_dcfrvr_iter200.pkl")
     ap.add_argument("--out", default="runs/lbr6_search_pooled.json")
+    ap.add_argument("--raw", action="store_true",
+                    help="serve the RAW blueprint (no search) through the SAME estimator/pooling -- the "
+                         "matched no-search baseline for the served-with-search numbers (iters ignored).")
+    ap.add_argument("--two-sided", action="store_true",
+                    help="match the DEPLOYED serve: two-sided subgame solve (POKERBOT_LIVE_TWO_SIDED=1). "
+                         "One-sided (the default) is the 'highly exploitable over-aggression' config.")
+    ap.add_argument("--rnr-restrict", action="store_true",
+                    help="match the DEPLOYED serve: RNR-restricted solver-internal BR (POKERBOT_RNR_SOLVER=1).")
     args = ap.parse_args()
 
     import pickle
@@ -72,7 +80,9 @@ def main() -> None:
         trip = []
         for seed in range(args.seeds):
             # New search policy per seed (its own deterministic RNG); converged iter10 (blend inert).
-            act = make_search_policy_fn(snap, leaf_select="uniform", seed=seed, iterations=args.iters)
+            # --raw: serve the bare blueprint model through the identical estimator (matched baseline).
+            act = model if args.raw else make_search_policy_fn(
+                snap, leaf_select="uniform", seed=seed, iterations=args.iters)
             cfg = lbr6.LBR6Config(hands=args.hands, seed=seed, n_seats=args.n_seats,
                                   track_ranges=True, paired=False, value_only_raises=True)
             cfg.bet_candidates = _MENUS[menu]
