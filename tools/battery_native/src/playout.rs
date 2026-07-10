@@ -424,25 +424,40 @@ pub fn reshuffle_undealt<const N: usize>(env: &mut EnvStateN<N>, rng: &mut Rng) 
             }
         }
     }
+    let mut nb = 0usize;
     for i in 0..crate::core::MAX_BOARD {
         let c = env.board[i];
         if c >= 0 {
             known[c as usize] = true;
+            nb += 1;
         }
     }
-    let mut unseen: Vec<i32> = (0..52).filter(|&c| !known[c as usize]).collect();
-    // Fisher-Yates shuffle.
-    let n = unseen.len();
-    if n > 1 {
-        for i in (1..n).rev() {
-            let j = rng.next_below((i + 1) as u64) as usize;
-            unseen.swap(i, j);
+    // OPT-8 (2026-07-10): only the next (MAX_BOARD - n_board) deck slots can EVER be consumed —
+    // the deck's sole readers are the board deals (`deal_n_cards` / `run_out`; holes are dealt at
+    // hand init only). Drawing an ordered k-card sample without replacement (partial front
+    // Fisher-Yates) is distribution-identical to the legacy full shuffle + take-first-k, at k
+    // draws instead of ~45 (k = 0 on a full board: no draws, deck untouched — the tail is dead).
+    // Stack buffer replaces the per-call Vec. rng draw PATTERN differs from the legacy full
+    // shuffle (statistical equivalence; the callers' reshuffle rngs are all derived/decoupled
+    // streams, so no other draw shifts).
+    let k = crate::core::MAX_BOARD - nb;
+    if k == 0 {
+        return;
+    }
+    let mut unseen = [0i32; 52];
+    let mut n = 0usize;
+    for c in 0..52i32 {
+        if !known[c as usize] {
+            unseen[n] = c;
+            n += 1;
         }
     }
     let ptr = env.deck_ptr as usize;
     let cap = if ptr <= 52 { 52 - ptr } else { 0 };
-    let take = unseen.len().min(cap);
+    let take = k.min(n).min(cap);
     for i in 0..take {
+        let j = i + rng.next_below((n - i) as u64) as usize;
+        unseen.swap(i, j);
         env.deck[ptr + i] = unseen[i];
     }
 }
