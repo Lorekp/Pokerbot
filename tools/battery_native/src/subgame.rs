@@ -28,6 +28,8 @@
 
 use std::collections::HashMap;
 
+use rustc_hash::FxHashMap;
+
 use crate::core::{
     self, EnvStateN, ALL_IN, BB_CHIPS, BET_BUCKET_START, FOLD, NUM_ACTIONS, SB_CHIPS, SEAT_ALLIN,
     SEAT_FOLDED, SEAT_LIVE,
@@ -49,6 +51,172 @@ macro_rules! prof_count {
         #[cfg(feature = "prof")]
         crate::prof::count($i);
     };
+}
+
+// --------------------------------------------------------------------------------------------------
+// OPT-2 (2026-07-10) — INCREMENTAL 128-BIT INFOSET/LEAF DIGEST KEYS (GTO solve path only).
+//
+// The legacy `infoset_key`/`leaf_key` build a length-prefixed Vec<i64> PER NODE (heap alloc +
+// O(hist_len) writes) and hash it 2-3x through SipHash per map op — the dominant traversal cost
+// (~55-75% of solve_total in the baseline profile). Within one solve, every interior node shares the
+// root's board/street (chance nodes are leaves) and differs only by (appended subgame actions, actor,
+// spr_bucket, pot). So the CFR recursion carries a small running digest (`NodeDig`, two independent
+// 64-bit lanes over the (seat, action) history — plus two action-only lanes for the leaf key) updated
+// in O(1) per applied action, and the tables are keyed by the finalized 128-bit digest (FxHashMap).
+//
+// EQUIVALENCE, not byte-layout identity: a digest key IDENTIFIES the same infoset partition as the
+// legacy Vec key up to 128-bit hash collisions (~n^2/2^128, vanishing at n~1e5 infosets/solve). The
+// solve's VALUES are bit-identical: traversal order, rng draw sequence, regret arithmetic and the
+// leaf-eval SEEDS are unchanged (the legacy Vec leaf key is still built on cache-miss evals — a cold
+// path — so `leaf_seed` keeps its exact FNV stream). History-append digests mirror `apply_action`'s
+// MAX_HISTORY drop (appends beyond 64 entries do not change the key), preserving the legacy
+// saturation aliasing exactly. The EXPLOIT path (cfv_exploit/TablesExploit) keeps the legacy Vec
+// keys untouched (firewall: zero implementation drift on the certified exploit solve).
+// --------------------------------------------------------------------------------------------------
+
+/// splitmix64 finalizer — full-avalanche 64-bit mix.
+#[inline(always)]
+fn fmix64(mut z: u64) -> u64 {
+    z ^= z >> 30;
+    z = z.wrapping_mul(0xBF58476D1CE4E5B9);
+    z ^= z >> 27;
+    z = z.wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+#[inline(always)]
+fn fold1(h: u64, x: u64) -> u64 {
+    fmix64(h ^ x.wrapping_mul(0x9E3779B97F4A7C15))
+}
+
+#[inline(always)]
+fn fold2(h: u64, x: u64) -> u64 {
+    fmix64(h ^ x.wrapping_mul(0xC2B2AE3D27D4EB4F))
+}
+
+/// Running per-node digest lanes: `f*` fold the (seat, action) history (infoset keys), `a*` fold the
+/// action-only history (leaf keys). Board/street are absorbed at the root (fixed within a solve —
+/// interior chance nodes are leaves by construction).
+#[derive(Clone, Copy)]
+pub(crate) struct NodeDig {
+    f1: u64,
+    f2: u64,
+    a1: u64,
+    a2: u64,
+}
+
+#[inline(always)]
+fn pair_code(seat: i32, action: i32) -> u64 {
+    ((seat as u64) << 8) | ((action as u64) & 0xff) | 0x1_0000
+}
+
+/// Digest lanes for a solve-root state: absorb street + revealed board, then the recorded history.
+pub(crate) fn root_dig<const N: usize>(s: &EnvStateN<N>) -> NodeDig {
+    let mut f1 = 0x243F6A8885A308D3u64;
+    let mut f2 = 0x452821E638D01377u64;
+    f1 = fold1(f1, s.street as u64 + 1);
+    f2 = fold2(f2, s.street as u64 + 1);
+    for &c in s.board.iter() {
+        if c >= 0 {
+            f1 = fold1(f1, (c + 1) as u64);
+            f2 = fold2(f2, (c + 1) as u64);
+        }
+    }
+    let mut a1 = f1;
+    let mut a2 = f2;
+    let hl = s.hist_len.clamp(0, core::MAX_HISTORY as i32) as usize;
+    for i in 0..hl {
+        let pr = pair_code(s.hist_seat[i], s.hist_action[i]);
+        f1 = fold1(f1, pr);
+        f2 = fold2(f2, pr);
+        let acx = (s.hist_action[i] + 1) as u64;
+        a1 = fold1(a1, acx);
+        a2 = fold2(a2, acx);
+    }
+    NodeDig { f1, f2, a1, a2 }
+}
+
+/// O(1) child digest for `apply_action(env, action)` by `seat`. Mirrors `apply_action`'s history
+/// drop: an action applied at hist_len >= MAX_HISTORY is NOT recorded, so it must not change the key
+/// (preserving the legacy saturation aliasing byte-for-byte).
+#[inline(always)]
+fn child_dig(d: &NodeDig, parent_hist_len: i32, seat: usize, action: usize) -> NodeDig {
+    if parent_hist_len as usize >= core::MAX_HISTORY {
+        return *d;
+    }
+    let pr = pair_code(seat as i32, action as i32);
+    let acx = (action + 1) as u64;
+    NodeDig {
+        f1: fold1(d.f1, pr),
+        f2: fold2(d.f2, pr),
+        a1: fold1(d.a1, acx),
+        a2: fold2(d.a2, acx),
+    }
+}
+
+/// Finalized 128-bit INFOSET key for (node digest, actor, spr_bucket, hist_len) — the digest twin of
+/// `infoset_key(env, seat)` (street/board live in the lanes; hist entries in the fold; seat/spr/len
+/// mixed here).
+#[inline(always)]
+pub(crate) fn iset_dig<const N: usize>(d: &NodeDig, env: &EnvStateN<N>, seat: usize) -> u128 {
+    let spr = spr_bucket(env) as u64;
+    let hl = env.hist_len.max(0) as u64;
+    let d1 = fmix64(
+        d.f1 ^ (seat as u64).wrapping_mul(0xD6E8FEB86659FD93)
+            ^ spr.wrapping_mul(0xA5A3564FD3C4B4F9)
+            ^ hl.wrapping_mul(0x9E3779B97F4A7C15),
+    );
+    let d2 = fmix64(
+        d.f2 ^ (seat as u64).wrapping_mul(0x8CB92BA72F3D8DD7)
+            ^ spr.wrapping_mul(0x94D049BB133111EB)
+            ^ hl.wrapping_mul(0xBF58476D1CE4E5B9),
+    );
+    ((d1 as u128) << 64) | d2 as u128
+}
+
+/// Finalized 128-bit LEAF key — the digest twin of `leaf_key(env)` (+ traverser under two_sided):
+/// action-only lanes + pot*2 + hist_len (+ traverser+1, 0 = one-sided).
+#[inline(always)]
+fn leaf_dig<const N: usize>(d: &NodeDig, env: &EnvStateN<N>, trav: Option<usize>) -> u128 {
+    let mut pot = env.pot_dead as f64;
+    for i in 0..N {
+        pot += env.committed_street[i] as f64;
+    }
+    let p2 = (pot * 2.0) as i64 as u64;
+    let hl = env.hist_len.max(0) as u64;
+    let tv = trav.map(|h| h as u64 + 1).unwrap_or(0);
+    let d1 = fmix64(
+        d.a1 ^ p2.wrapping_mul(0xD6E8FEB86659FD93)
+            ^ hl.wrapping_mul(0x9E3779B97F4A7C15)
+            ^ tv.wrapping_mul(0xA5A3564FD3C4B4F9),
+    );
+    let d2 = fmix64(
+        d.a2 ^ p2.wrapping_mul(0x8CB92BA72F3D8DD7)
+            ^ hl.wrapping_mul(0xBF58476D1CE4E5B9)
+            ^ tv.wrapping_mul(0x94D049BB133111EB),
+    );
+    ((d1 as u128) << 64) | d2 as u128
+}
+
+/// Domain-separating xor for the R2 continuation-CHOICE keys (the digest twin of appending
+/// CONT_CHOICE_MARKER to an infoset key): a fixed-constant xor is a bijection, so choice keys are
+/// exactly as collision-free as the underlying infoset digests.
+#[inline(always)]
+fn cont_dig(iset: u128) -> u128 {
+    iset ^ 0xC047_C401_5AFE_D00D_9E37_79B9_7F4A_7C15u128
+}
+
+/// Digest twin of the R2 profile-extended leaf cache key (leaf key + CONT_PROFILE_MARKER + choices).
+#[inline(always)]
+fn prof_dig<const N: usize>(leaf: u128, choices: &[i32; N]) -> u128 {
+    let mut d1 = (leaf >> 64) as u64 ^ 0xC047_9203_5AFE_D00Du64;
+    let mut d2 = leaf as u64 ^ 0x9203_C047_D00D_5AFEu64;
+    for s in 0..N {
+        let x = (choices[s] + 2) as u64;
+        d1 = fold1(d1, x);
+        d2 = fold2(d2, x);
+    }
+    ((d1 as u128) << 64) | d2 as u128
 }
 
 /// Precomputed PURE frozen-deviation table (built in Python by `exploit_table.build_frozen_table`):
@@ -236,14 +404,16 @@ struct Ctx<'a> {
 }
 
 /// Mutable per-solve tables (regrets + strategy sums keyed by infoset, leaf-value cache keyed by
-/// public leaf state).
+/// public leaf state). OPT-2: keyed by the 128-bit incremental digests (see `NodeDig`) in FxHashMaps
+/// — no per-node key allocation, O(1) hashing. The EXPLOIT path keeps its own legacy-keyed
+/// `TablesExploit` (firewall).
 struct Tables {
-    regrets: HashMap<Vec<i64>, [f64; NUM_ACTIONS]>,
-    strat_sum: HashMap<Vec<i64>, [f64; NUM_ACTIONS]>,
+    regrets: FxHashMap<u128, [f64; NUM_ACTIONS]>,
+    strat_sum: FxHashMap<u128, [f64; NUM_ACTIONS]>,
     /// Leaf value cache: `(sum, n)` running mean over the first `leaf_cache_worlds` VISITING hole-worlds
     /// (n frozen at that cap). With leaf_cache_worlds=1 (default) this is exactly the legacy first-touch
     /// single-value cache: `(v, 1)` inserted on the miss, `sum / 1` (== v bit-for-bit) on every hit.
-    leaf: HashMap<Vec<i64>, (f64, i32)>,
+    leaf: FxHashMap<u128, (f64, i32)>,
 }
 
 // --------------------------------------------------------------------------------------------------
@@ -2012,17 +2182,14 @@ fn biased_profile_value<const N: usize>(
     choices: &[i32; N],
     ctx: &Ctx,
     tab: &mut Tables,
+    nd: &NodeDig,
 ) -> f64 {
-    let mut key = leaf_key(env);
-    if ctx.two_sided {
-        key.push(hero as i64);
-    }
-    key.push(CONT_PROFILE_MARKER);
-    for s in 0..N {
-        key.push(choices[s] as i64);
-    }
+    // OPT-2: the cache is keyed by the profile-extended leaf DIGEST; the legacy Vec key is rebuilt
+    // ONLY on an eval (cache-miss path) to derive the exact legacy `leaf_seed` (bit-identical rng).
+    let trav = if ctx.two_sided { Some(hero) } else { None };
+    let dkey = prof_dig(leaf_dig(nd, env, trav), choices);
     let m = ctx.leaf_worlds;
-    let (sum0, n0) = match tab.leaf.get(&key) {
+    let (sum0, n0) = match tab.leaf.get(&dkey) {
         Some(&(s, n)) => {
             if n >= m {
                 return s / n as f64;
@@ -2031,6 +2198,14 @@ fn biased_profile_value<const N: usize>(
         }
         None => (0.0, 0),
     };
+    let mut key = leaf_key(env);
+    if ctx.two_sided {
+        key.push(hero as i64);
+    }
+    key.push(CONT_PROFILE_MARKER);
+    for s in 0..N {
+        key.push(choices[s] as i64);
+    }
     let base = leaf_seed(&key, ctx.public_seed);
     let seed = base ^ (n0 as u64).wrapping_mul(LEAF_WORLD_SEED_ODD);
     let v = playout::biased_leaf_value(
@@ -2046,7 +2221,7 @@ fn biased_profile_value<const N: usize>(
     );
     let sum = if n0 == 0 { v } else { sum0 + v };
     let n = n0 + 1;
-    tab.leaf.insert(key, (sum, n));
+    tab.leaf.insert(dkey, (sum, n));
     sum / n as f64
 }
 
@@ -2071,28 +2246,33 @@ fn leaf_value_biased<const N: usize>(
     ctx: &Ctx,
     tab: &mut Tables,
     t: i32,
+    nd: &NodeDig,
 ) -> f64 {
+    // OPT-2: choice-infoset REGRET/STRAT rows are keyed by the domain-separated infoset digest; the
+    // legacy Vec `cont_choice_key` is still built for the pure-function `cont_choice_u` draw, so the
+    // sampled continuations (and thus all values) are bit-identical to the legacy binary.
     let mut choices: [i32; N] = [-1; N];
     for s in 0..N {
         if s == hero || env.seat_status[s] != SEAT_LIVE {
             continue;
         }
+        let ckd = cont_dig(iset_dig(nd, env, s));
         let ck = cont_choice_key(env, s);
-        let regs = *tab.regrets.get(&ck).unwrap_or(&ZEROS);
+        let regs = *tab.regrets.get(&ckd).unwrap_or(&ZEROS);
         choices[s] = sample_cont_choice(&regs, &ck, t, ctx.public_seed) as i32;
     }
     if env.seat_status[hero] != SEAT_LIVE {
-        return biased_profile_value(env, hero, &choices, ctx, tab);
+        return biased_profile_value(env, hero, &choices, ctx, tab, nd);
     }
     // Traverser's choice node: branch all 4 continuations (hero's own continuation biases hero's own
     // playout actions too — both hero and opponents choose, per Pluribus).
-    let ck = cont_choice_key(env, hero);
-    let regs = *tab.regrets.get(&ck).unwrap_or(&ZEROS);
+    let ckd = cont_dig(iset_dig(nd, env, hero));
+    let regs = *tab.regrets.get(&ckd).unwrap_or(&ZEROS);
     let strat = regret_match(&regs, &CONT_LEGAL);
     let mut cv = [0.0f64; NUM_ACTIONS];
     for c in 0..playout::NUM_CONTINUATIONS {
         choices[hero] = c as i32;
-        cv[c] = biased_profile_value(env, hero, &choices, ctx, tab);
+        cv[c] = biased_profile_value(env, hero, &choices, ctx, tab, nd);
     }
     let mut ev = 0.0;
     for c in 0..playout::NUM_CONTINUATIONS {
@@ -2102,7 +2282,7 @@ fn leaf_value_biased<const N: usize>(
     for c in 0..playout::NUM_CONTINUATIONS {
         newr[c] = (newr[c] + cv[c] - ev).max(0.0);
     }
-    tab.regrets.insert(ck.clone(), newr);
+    tab.regrets.insert(ckd, newr);
     // Strategy-sum accumulation: identical gating/weighting to the action nodes (delayed averaging +
     // CFR+ linear weight), so the choice node is a first-class citizen of the served average.
     if t >= ctx.avg_skip {
@@ -2111,7 +2291,7 @@ fn leaf_value_biased<const N: usize>(
         } else {
             1.0
         };
-        let ss = tab.strat_sum.entry(ck).or_insert([0.0; NUM_ACTIONS]);
+        let ss = tab.strat_sum.entry(ckd).or_insert([0.0; NUM_ACTIONS]);
         for c in 0..playout::NUM_CONTINUATIONS {
             ss[c] += w * strat[c];
         }
@@ -2125,6 +2305,7 @@ fn leaf_value<const N: usize>(
     ctx: &Ctx,
     tab: &mut Tables,
     t: i32,
+    nd: &NodeDig,
 ) -> f64 {
     if env.done {
         return env.rewards[hero] as f64 / CHIP_UNIT;
@@ -2132,7 +2313,7 @@ fn leaf_value<const N: usize>(
     // R2 — Pluribus biased continuation leaves (gated, default OFF => the legacy uniform leaf below
     // runs byte-identically; `t` is only read on the biased path).
     if ctx.leaf_biased {
-        return leaf_value_biased(env, hero, ctx, tab, t);
+        return leaf_value_biased(env, hero, ctx, tab, t, nd);
     }
     // PERF (2026-07-10, VALUE-IDENTICAL): a RIVER chance-node leaf (river betting closed,
     // pending_deal set) is a DETERMINISTIC playout — `core::sample_chance` advances the street past
@@ -2152,10 +2333,10 @@ fn leaf_value<const N: usize>(
     // TWO-SIDED: the leaf continuation value is computed FROM the traverser's perspective (`hero` here is
     // the current traverser), so the cache MUST be keyed per-traverser or one traverser's value poisons
     // another's (mirrors pluribus_search.py:619-620 `key = (key, int(hero))`). One-sided => seat-agnostic.
-    let mut key = leaf_key(env);
-    if ctx.two_sided {
-        key.push(hero as i64);
-    }
+    // OPT-2: keyed by the leaf DIGEST; the legacy Vec key is rebuilt only on the eval (miss) path to
+    // derive the exact legacy `leaf_seed` (bit-identical rng stream).
+    let trav = if ctx.two_sided { Some(hero) } else { None };
+    let dkey = leaf_dig(nd, env, trav);
     prof_count!(crate::prof::C_LEAF_HIT); // counts every non-terminal uniform-leaf visit (hits = this - miss)
     // BUG-1 FIX: the cache entry is a RUNNING MEAN (sum, n) over the first `leaf_worlds` VISITING
     // hole-worlds. The env at each visit carries THAT iteration's sampled opponent holes, so while
@@ -2163,7 +2344,7 @@ fn leaf_value<const N: usize>(
     // CRN/pure-function contract holds) and the mean integrates M independent hole-worlds instead of
     // freezing the first-touch draw. n >= M => frozen mean (M=1 default == legacy first-touch freeze).
     let m = ctx.leaf_worlds;
-    let (sum0, n0) = match tab.leaf.get(&key) {
+    let (sum0, n0) = match tab.leaf.get(&dkey) {
         Some(&(s, n)) => {
             if n >= m {
                 return s / n as f64;
@@ -2174,6 +2355,10 @@ fn leaf_value<const N: usize>(
     };
     prof_count!(crate::prof::C_LEAF_MISS);
     prof_scope!(crate::prof::P_LEAF_PLAYOUT);
+    let mut key = leaf_key(env);
+    if ctx.two_sided {
+        key.push(hero as i64);
+    }
     let base = leaf_seed(&key, ctx.public_seed);
     let seed = base ^ (n0 as u64).wrapping_mul(LEAF_WORLD_SEED_ODD); // n0=0 => base exactly (legacy)
     let v = playout::uniform_leaf_value(
@@ -2189,10 +2374,11 @@ fn leaf_value<const N: usize>(
     // M=1 default path returns/caches EXACTLY the legacy first-touch value.
     let sum = if n0 == 0 { v } else { sum0 + v };
     let n = n0 + 1;
-    tab.leaf.insert(key, (sum, n));
+    tab.leaf.insert(dkey, (sum, n));
     sum / n as f64
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cfv<const N: usize>(
     env: &EnvStateN<N>,
     hero: usize,
@@ -2201,19 +2387,20 @@ fn cfv<const N: usize>(
     tab: &mut Tables,
     rng: &mut Rng,
     t: i32,
+    nd: &NodeDig,
 ) -> f64 {
     if env.done {
         return env.rewards[hero] as f64 / CHIP_UNIT;
     }
     if core::is_chance_node(env) {
-        return leaf_value(env, hero, ctx, tab, t);
+        return leaf_value(env, hero, ctx, tab, t, nd);
     }
     if depth >= ctx.scfg.max_depth {
-        return leaf_value(env, hero, ctx, tab, t);
+        return leaf_value(env, hero, ctx, tab, t, nd);
     }
     let actor_i = env.action_seat;
     if actor_i < 0 {
-        return leaf_value(env, hero, ctx, tab, t);
+        return leaf_value(env, hero, ctx, tab, t, nd);
     }
     let actor = actor_i as usize;
     let mut legal = abstracted_legal(env, actor, ctx.pcfg);
@@ -2234,7 +2421,7 @@ fn cfv<const N: usize>(
     if !any_legal(&legal) {
         return env.rewards[hero] as f64 / CHIP_UNIT;
     }
-    let key = infoset_key(env, actor);
+    let key = iset_dig(nd, env, actor);
 
     if actor != hero {
         prof_count!(crate::prof::C_NODE_OPP);
@@ -2250,7 +2437,8 @@ fn cfv<const N: usize>(
         let u = rng.next_f64();
         let a = sample_action(&strat, &legal, u);
         let child = core::apply_action(env, a);
-        return cfv(&child, hero, depth + 1, ctx, tab, rng, t);
+        let cd = child_dig(nd, env.hist_len, actor, a);
+        return cfv(&child, hero, depth + 1, ctx, tab, rng, t, &cd);
     }
 
     // hero node: branch all (abstracted-)legal actions, CFR+ regret update.
@@ -2261,7 +2449,8 @@ fn cfv<const N: usize>(
     for a in 0..NUM_ACTIONS {
         if legal[a] {
             let child = core::apply_action(env, a);
-            av[a] = cfv(&child, hero, depth + 1, ctx, tab, rng, t);
+            let cd = child_dig(nd, env.hist_len, actor, a);
+            av[a] = cfv(&child, hero, depth + 1, ctx, tab, rng, t, &cd);
         }
     }
     let mut ev = 0.0;
@@ -2274,7 +2463,7 @@ fn cfv<const N: usize>(
             newr[a] = (newr[a] + av[a] - ev).max(0.0);
         }
     }
-    tab.regrets.insert(key.clone(), newr);
+    tab.regrets.insert(key, newr);
     // BUG-5 (partial) — DELAYED AVERAGING: the SERVED average excludes iterations t < avg_skip
     // (floor(avg_skip_frac * K), 0 = legacy). Regret updates above are NEVER skipped.
     if t >= ctx.avg_skip {
@@ -2307,16 +2496,17 @@ fn solve_stream<const N: usize>(
     root: &EnvStateN<N>,
     hero: usize,
     ctx: &Ctx,
-    root_key: &[i64],
+    root_nd: &NodeDig,
+    root_key: u128,
     traversers: &[usize],
     rtab: Option<&RangeTable>,
     stream_seed: u64,
 ) -> ([f64; NUM_ACTIONS], [f64; NUM_ACTIONS], bool) {
     let scfg = ctx.scfg;
     let mut tab = Tables {
-        regrets: HashMap::new(),
-        strat_sum: HashMap::new(),
-        leaf: HashMap::new(),
+        regrets: FxHashMap::default(),
+        strat_sum: FxHashMap::default(),
+        leaf: FxHashMap::default(),
     };
     let mut rng = Rng::seed_from_u64(stream_seed);
     // Q2 DECOUPLE: the opponent-hole deal draws from its OWN deterministic sub-stream (derived from this
@@ -2343,12 +2533,12 @@ fn solve_stream<const N: usize>(
             playout::reshuffle_undealt(&mut world, &mut drng);
         }
         let traverser = traversers[(t as usize) % traversers.len()];
-        cfv(&world, traverser, 0, ctx, &mut tab, &mut rng, t);
+        cfv(&world, traverser, 0, ctx, &mut tab, &mut rng, t, root_nd);
     }
     // Return the ROOT rows raw (unnormalized) so the ensemble can SUM strat_sum across streams.
-    let ss = tab.strat_sum.get(root_key).copied().unwrap_or(ZEROS);
+    let ss = tab.strat_sum.get(&root_key).copied().unwrap_or(ZEROS);
     let has_avg = ss.iter().sum::<f64>() > 1e-12;
-    let rr = tab.regrets.get(root_key).copied().unwrap_or(ZEROS);
+    let rr = tab.regrets.get(&root_key).copied().unwrap_or(ZEROS);
     (ss, rr, has_avg)
 }
 
@@ -2382,7 +2572,12 @@ pub(crate) fn solve_rows<const N: usize>(
         // STAGE-1 — root-only un-mask (0 default => byte-identical; GTO path only).
         root_unmask: scfg.root_unmask,
     };
-    let root_key = infoset_key(root, hero);
+    // OPT-2: the root digest lanes are a pure function of the root's public board/street/history —
+    // invariant across worlds AND ensemble streams — so they are built once here. The extraction key
+    // is the root infoset digest (the digest twin of the legacy `infoset_key(root, hero)`; the root
+    // state's spr/hist_len are world-invariant, so this is valid for every world).
+    let root_nd = root_dig(root);
+    let root_key = iset_dig(&root_nd, root, hero);
     // TWO-SIDED traverser list: cycle over the LIVE seats (SEAT_LIVE) at the solve root; hero is always
     // included so its served average still builds (mirrors pluribus_search.py:858-865). OFF => [hero], so
     // the traverser is always hero and the loop is byte-identical to today.
@@ -2407,7 +2602,7 @@ pub(crate) fn solve_rows<const N: usize>(
     let n_streams = scfg.ensemble_streams.max(1) as usize;
     let (sum_ss, sum_rr, any_avg): ([f64; NUM_ACTIONS], [f64; NUM_ACTIONS], bool) = if n_streams <= 1 {
         let (ss, rr, has) = solve_stream(
-            root, hero, &ctx, &root_key, &traversers, rtab.as_ref(), public_seed,
+            root, hero, &ctx, &root_nd, root_key, &traversers, rtab.as_ref(), public_seed,
         );
         (ss, rr, has)
     } else {
@@ -2419,7 +2614,7 @@ pub(crate) fn solve_rows<const N: usize>(
             .into_par_iter()
             .map(|idx| {
                 let seed = public_seed ^ (idx as u64).wrapping_mul(ENSEMBLE_SEED_ODD);
-                solve_stream(root, hero, &ctx, &root_key, &traversers, rtab.as_ref(), seed)
+                solve_stream(root, hero, &ctx, &root_nd, root_key, &traversers, rtab.as_ref(), seed)
             })
             .reduce(
                 || (ZEROS, ZEROS, false),
