@@ -94,6 +94,33 @@ def is_enabled() -> bool:
     return bool(_AVAILABLE and _ENABLED)
 
 
+def set_settle_showdown_leaf(on: bool) -> bool:
+    """Flip the SETTLE_SHOWDOWN_LEAF gate in BOTH engines (Python np_engine + the native extension,
+    when loaded) so a runtime A/B can never split-brain the two. The gate (env
+    POKERBOT_SETTLE_SHOWDOWN_LEAF, default OFF = byte-identical shipped behavior) settles
+    checked-down / river-all-in showdown leaves — which the engine leaves at street=STREET_TERMINAL,
+    done=False, rewards=[0]*N — with the trainer's terminal_return semantics (compute_returns,
+    side-pot-correct) in the serve-search / LBR playout consumers. Returns True iff the native gate
+    was also set (False = pure-Python only; fine when the native path is not in use). COUPLING: run
+    with ``leaf_cache_worlds > 1`` — settled leaf values are hole-dependent, and the M=1 public-keyed
+    leaf cache would freeze the first-visit world (the audit's EV-loss tails)."""
+    from pokerbot.engine.np_engine import set_settle_showdown_leaf as _set_py
+
+    _set_py(on)
+    if _EXT is not None and hasattr(_EXT, "settle_showdown_leaf_set"):
+        _EXT.settle_showdown_leaf_set(bool(on))
+        return True
+    return False
+
+
+def settle_showdown_leaf_enabled() -> bool:
+    """Python-engine gate state (the native gate is kept in lockstep by set_settle_showdown_leaf;
+    both default from the same POKERBOT_SETTLE_SHOWDOWN_LEAF env var)."""
+    from pokerbot.engine.np_engine import settle_showdown_leaf_enabled as _get_py
+
+    return _get_py()
+
+
 def _try_load():
     global _EXT
     if os.environ.get("POKERBOT_NO_NATIVE_BATTERY"):

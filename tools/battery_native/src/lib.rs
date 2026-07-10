@@ -378,6 +378,11 @@ mod py {
             // (design doc §35; default-off byte-identical to the fullhist key space). Stale .pyds
             // without this cap must not serve a presum checkpoint.
             "presum_key".to_string(),
+            // showdown-leaf-zero fix: core.rs carries the env-gated
+            // (POKERBOT_SETTLE_SHOWDOWN_LEAF=1, default-off byte-identical) settle of
+            // street-terminal done=false showdown leaves in the serve/LBR playout paths (trainer
+            // terminal_return semantics). A/B harnesses fail closed on binaries without this cap.
+            "settle_showdown_leaf".to_string(),
         ]
     }
 
@@ -1999,6 +2004,40 @@ mod py {
         rayon::current_num_threads()
     }
 
+    /// SETTLE_SHOWDOWN_LEAF gate (env POKERBOT_SETTLE_SHOWDOWN_LEAF, default OFF = shipped
+    /// byte-identical behavior): settle street-terminal done=false showdown leaves in the serve/LBR
+    /// playout paths with the trainer's terminal_return semantics instead of the stale rewards=0.
+    /// Runtime override for gated A/Bs; keep in lockstep with the Python-engine gate
+    /// (`np_engine.set_settle_showdown_leaf` — use `native_solver.set_settle_showdown_leaf` to set
+    /// both).
+    #[pyfunction]
+    fn settle_showdown_leaf_set(on: bool) {
+        crate::core::set_settle_showdown_leaf(on);
+    }
+
+    #[pyfunction]
+    fn settle_showdown_leaf_enabled() -> bool {
+        crate::core::settle_showdown_leaf_enabled()
+    }
+
+    /// Enable/disable the playout terminal-class counters (audit instrumentation, default OFF).
+    #[pyfunction]
+    fn leaf_settle_stats_set(on: bool) {
+        crate::playout::leaf_settle_stats_set(on);
+    }
+
+    /// (n_done, n_unsettled_showdown, n_other, abs_bb_done, abs_bb_unsettled) since last reset.
+    /// Counters only advance while `leaf_settle_stats_set(true)` is active.
+    #[pyfunction]
+    fn leaf_settle_stats() -> (u64, u64, u64, f64, f64) {
+        crate::playout::leaf_settle_stats()
+    }
+
+    #[pyfunction]
+    fn leaf_settle_stats_reset() {
+        crate::playout::leaf_settle_stats_reset();
+    }
+
     #[pymodule]
     fn battery_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(apply_action, m)?)?;
@@ -2010,6 +2049,11 @@ mod py {
         m.add_function(wrap_pyfunction!(compute_returns, m)?)?;
         m.add_function(wrap_pyfunction!(engine_dims, m)?)?;
         m.add_function(wrap_pyfunction!(rayon_num_threads, m)?)?;
+        m.add_function(wrap_pyfunction!(settle_showdown_leaf_set, m)?)?;
+        m.add_function(wrap_pyfunction!(settle_showdown_leaf_enabled, m)?)?;
+        m.add_function(wrap_pyfunction!(leaf_settle_stats_set, m)?)?;
+        m.add_function(wrap_pyfunction!(leaf_settle_stats, m)?)?;
+        m.add_function(wrap_pyfunction!(leaf_settle_stats_reset, m)?)?;
         m.add_function(wrap_pyfunction!(fingerprint_fast, m)?)?;
         m.add_function(wrap_pyfunction!(fingerprint_fast_depth, m)?)?;
         m.add_function(wrap_pyfunction!(fingerprint_fast_emd, m)?)?;

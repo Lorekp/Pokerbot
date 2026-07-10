@@ -60,6 +60,7 @@ from pokerbot.engine.np_engine import (  # noqa: E402
     apply_action_np,
     evaluate_seven,
     is_chance_node_np,
+    leaf_terminal_reward_np,
     legal_action_mask_np,
     sample_chance_np,
     to_numpy_state,
@@ -767,6 +768,14 @@ def lbr_exploitability(policy_fn, cfg: LBRConfig | None = None) -> LBRResult:
 
         if bool(env.done):
             results[h] = float(env.rewards[lbr_seat]) / CHIP_UNIT
+        else:
+            # SETTLE_SHOWDOWN_LEAF gate (default OFF = legacy verbatim, results[h] stays 0): a
+            # checked-down / river-all-in showdown ends at street=STREET_TERMINAL with done=False
+            # and STALE rewards=[0] (the engine settles only inside apply_action_np), so with the
+            # gate OFF this hand scores 0 for the LBR — the showdown-leaf-zero bug. Gate ON settles
+            # via compute_returns_np (trainer terminal_return semantics); depth-capped mid-hand
+            # exits remain 0 under both settings.
+            results[h] = leaf_terminal_reward_np(env, lbr_seat) / CHIP_UNIT
 
     ev = float(results.mean())
     stderr = float(results.std(ddof=1) / np.sqrt(cfg.hands)) if cfg.hands > 1 else 0.0

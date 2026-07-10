@@ -15,6 +15,7 @@ Constants/semantics are mirrored verbatim from ``jax_engine.py``, ``side_pots_ja
 
 from __future__ import annotations
 
+import os
 import threading
 
 import numpy as np
@@ -404,6 +405,78 @@ def compute_returns_np(
             prev_level = np.int32(level)
 
     return (winnings + excess - committed_total).astype(np.int32)
+
+
+# ---------------------------------------------------------------------------
+# SETTLE_SHOWDOWN_LEAF gate (env POKERBOT_SETTLE_SHOWDOWN_LEAF, default OFF).
+#
+# THE BUG (serve/LBR only; the native trainer fixed its own copy 2026-06-29, trainer.rs FIX 1): the
+# engine NEVER settles a showdown reached by street-advance. ``sample_chance_np`` past RIVER leaves
+# street=STREET_TERMINAL with done=False and STALE rewards=[0]*N — settle happens only inside
+# ``apply_action_np`` (fold terminals + the pre-river all-in run-out; a RIVER all-in+call closes the
+# street with pending_deal=True and lands in the same unsettled class). Every consumer that reads
+# ``env.rewards[hero]`` at such a state (pluribus_rollout._playout/_dag_runout, lbr6._play_hand /
+# _rollout_value / _board_ev_settle, lbr.py, and the native playout.rs / lbr.rs twins) values the
+# ENTIRE checked-down / river-all-in showdown mass at 0.0.
+#
+# ``settle_showdown_value_np`` is the exact Python mirror of the trainer's ``terminal_return``:
+# n_showdown = seats still LIVE|ALLIN, settled via the bit-identical ``compute_returns_np``
+# (side-pot-correct; the board is complete — the only route into this class is the river
+# street-close -> ``sample_chance_np`` advance). The native gate (battery_native, core.rs) reads
+# the SAME env var at first use, so the two engines default in lockstep; for runtime toggling use
+# ``pokerbot.search.native_solver.set_settle_showdown_leaf`` (sets both). Default OFF =
+# byte-identical shipped behavior. Do NOT flip the default without the promotion battery
+# (CRN-paired engine_ab_h2h + river EV-loss re-run; memory: search-leaf-showdown-zero-bug).
+# COUPLING: settled leaf values are HOLE-DEPENDENT — deploy together with leaf_cache_worlds>1 so
+# the public-keyed leaf cache integrates M sampled showdown worlds instead of freezing the first.
+# ---------------------------------------------------------------------------
+_SETTLE_SHOWDOWN_LEAF = os.environ.get("POKERBOT_SETTLE_SHOWDOWN_LEAF", "0") not in (
+    "0", "", "false", "False",
+)
+
+
+def settle_showdown_leaf_enabled() -> bool:
+    return bool(_SETTLE_SHOWDOWN_LEAF)
+
+
+def set_settle_showdown_leaf(on: bool) -> None:
+    """Runtime toggle for the Python-engine gate ONLY. Prefer
+    ``pokerbot.search.native_solver.set_settle_showdown_leaf`` which also flips the native gate."""
+    global _SETTLE_SHOWDOWN_LEAF
+    _SETTLE_SHOWDOWN_LEAF = bool(on)
+
+
+def is_unsettled_showdown_np(state: EnvState) -> bool:
+    """True iff ``state`` is in the unsettled-showdown terminal class: the board ran out (street
+    advanced past RIVER) but ``apply_action_np`` never settled it (done=False, rewards stale-0)."""
+    return (not bool(state.done)) and int(state.street) >= int(STREET_TERMINAL)
+
+
+def settle_showdown_value_np(state: EnvState, seat: int) -> float:
+    """Exact terminal return for ``seat`` (in chips, int-exact float) at an unsettled street-terminal
+    showdown. Mirror of the native trainer's ``terminal_return`` (FIX 1): showdown size = seats still
+    LIVE|ALLIN, settled by the bit-identical ``compute_returns_np`` (side-pot-correct)."""
+    st = np.asarray(state.seat_status)
+    n_show = int(((st == SEAT_LIVE) | (st == SEAT_ALLIN)).sum())
+    rets = compute_returns_np(
+        holes=np.asarray(state.holes),
+        board=np.asarray(state.board),
+        seat_status=st,
+        committed_total=np.asarray(state.committed_total),
+        button=int(state.button),
+        n_showdown=n_show,
+    )
+    return float(rets[int(seat)])
+
+
+def leaf_terminal_reward_np(state: EnvState, seat: int) -> float:
+    """The gate-aware terminal read for playout/LBR consumers, in CHIPS (callers divide by
+    CHIP_UNIT). Gate OFF (default): ``rewards[seat]`` verbatim — byte-identical shipped behavior
+    (stale 0 at unsettled showdowns). Gate ON: the real showdown settle for the unsettled class;
+    engine-settled terminals and depth-capped mid-hand states are untouched under both settings."""
+    if _SETTLE_SHOWDOWN_LEAF and is_unsettled_showdown_np(state):
+        return settle_showdown_value_np(state, seat)
+    return float(state.rewards[int(seat)])
 
 
 # ---------------------------------------------------------------------------

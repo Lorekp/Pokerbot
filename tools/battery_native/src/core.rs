@@ -483,6 +483,79 @@ pub fn compute_returns<const N: usize>(
 }
 
 // ---------------------------------------------------------------------------
+// SETTLE_SHOWDOWN_LEAF gate (env POKERBOT_SETTLE_SHOWDOWN_LEAF, default OFF).
+//
+// THE BUG (serve/LBR only; the trainer fixed its own copy 2026-06-29, trainer.rs FIX 1): the engine
+// NEVER settles a showdown reached by street-advance. `sample_chance` past RIVER leaves
+// street=STREET_TERMINAL with done=false and STALE rewards=[0;N] — settle happens only inside
+// `apply_action` (fold terminals + the pre-river all-in run-out; a RIVER all-in+call closes the
+// street with pending_deal=true and lands in the same unsettled class). Every serve/LBR consumer
+// that reads `env.rewards[hero]` at such a state (playout.rs playout/playout_fixed, lbr.rs
+// play_hand/board_ev_settle, and the Python twins) values the ENTIRE checked-down / river-all-in
+// showdown mass at 0.0.
+//
+// `showdown_leaf_return` is the exact serve-side mirror of `trainer::terminal_return`: n_show =
+// seats still LIVE|ALLIN, settled via the bit-identical `compute_returns` (the trainer routes the
+// same arithmetic through the chip-identical phe fast path). The gate is read ONCE from the env at
+// first use (so the pure-native LBR path and the PyO3 path see the same default) and can be
+// overridden at runtime (`set_settle_showdown_leaf`, exposed to Python) for gated A/Bs. Default
+// OFF = byte-identical shipped behavior. Do NOT flip the default without the promotion battery
+// (CRN-paired engine_ab_h2h + river EV-loss re-run; see memory search-leaf-showdown-zero-bug).
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
+
+/// -1 = uninitialized (read env on first query), 0 = OFF, 1 = ON.
+static SETTLE_SHOWDOWN_LEAF: AtomicI32 = AtomicI32::new(-1);
+
+pub fn settle_showdown_leaf_enabled() -> bool {
+    match SETTLE_SHOWDOWN_LEAF.load(AtomicOrdering::Relaxed) {
+        1 => true,
+        0 => false,
+        _ => {
+            let on = match std::env::var("POKERBOT_SETTLE_SHOWDOWN_LEAF") {
+                Ok(v) => !(v.is_empty() || v == "0" || v == "false" || v == "False"),
+                Err(_) => false,
+            };
+            SETTLE_SHOWDOWN_LEAF.store(on as i32, AtomicOrdering::Relaxed);
+            on
+        }
+    }
+}
+
+pub fn set_settle_showdown_leaf(on: bool) {
+    SETTLE_SHOWDOWN_LEAF.store(on as i32, AtomicOrdering::Relaxed);
+}
+
+/// True iff `env` is in the unsettled-showdown terminal class: the board ran out (street advanced
+/// past RIVER) but `apply_action` never settled it (done=false, rewards stale-0).
+#[inline]
+pub fn is_unsettled_showdown<const N: usize>(env: &EnvStateN<N>) -> bool {
+    !env.done && env.street >= STREET_TERMINAL
+}
+
+/// Exact terminal return for `hero` (in bb) at an unsettled street-terminal showdown. Mirror of
+/// `trainer::terminal_return` (FIX 1): showdown size = seats still LIVE|ALLIN, settled by the
+/// bit-identical `compute_returns` (side-pot-correct; board is complete — the only route into this
+/// class is the river street-close -> `sample_chance` advance, so 5 board cards are dealt).
+pub fn showdown_leaf_return<const N: usize>(env: &EnvStateN<N>, hero: usize) -> f64 {
+    let n_show = env
+        .seat_status
+        .iter()
+        .filter(|&&s| s == SEAT_LIVE || s == SEAT_ALLIN)
+        .count() as i32;
+    let rets = compute_returns(
+        &env.holes,
+        &env.board,
+        &env.seat_status,
+        &env.committed_total,
+        env.button,
+        n_show,
+    );
+    rets[hero] as f64 / CHIP_UNIT as f64
+}
+
+// ---------------------------------------------------------------------------
 // Seat helpers
 // ---------------------------------------------------------------------------
 

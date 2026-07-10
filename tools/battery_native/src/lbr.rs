@@ -760,11 +760,11 @@ fn sample_policy_action<P: LbrPolicy>(
 fn board_ev_settle(s: &EnvState, lbr_seat: usize, samples: i32, rng: &mut Rng) -> f64 {
     let ptr = s.deck_ptr as usize;
     if ptr >= 52 {
-        return s.rewards[lbr_seat] as f64 / CHIP_UNIT;
+        return settled_terminal_value(s, lbr_seat);
     }
     let mut tail: Vec<i32> = s.deck[ptr..52].to_vec();
     if tail.is_empty() {
-        return s.rewards[lbr_seat] as f64 / CHIP_UNIT;
+        return settled_terminal_value(s, lbr_seat);
     }
     let mut total = 0.0f64;
     for _ in 0..samples {
@@ -787,9 +787,24 @@ fn board_ev_settle(s: &EnvState, lbr_seat: usize, samples: i32, rng: &mut Rng) -
             }
             guard += 1;
         }
-        total += e.rewards[lbr_seat] as f64 / CHIP_UNIT;
+        total += settled_terminal_value(&e, lbr_seat);
     }
     total / samples as f64
+}
+
+/// Terminal read for the LBR consumers, honoring the SETTLE_SHOWDOWN_LEAF gate (default OFF =
+/// byte-identical `rewards[seat]` read). The engine settles only inside `apply_action` (fold
+/// terminals + pre-river all-in run-outs), so a checked-down or river-all-in showdown ends at
+/// street>=STREET_TERMINAL with done=false and STALE rewards=[0] — with the gate OFF the LBR
+/// values that entire class at 0, biasing the exploitability bound (see core.rs gate docs /
+/// trainer.rs FIX 1). Gate ON settles it via `core::showdown_leaf_return` (the trainer's
+/// terminal_return semantics, side-pot-correct).
+#[inline]
+fn settled_terminal_value(e: &EnvState, seat: usize) -> f64 {
+    if core::is_unsettled_showdown(e) && core::settle_showdown_leaf_enabled() {
+        return core::showdown_leaf_return(e, seat);
+    }
+    e.rewards[seat] as f64 / CHIP_UNIT
 }
 
 #[inline]
@@ -853,8 +868,12 @@ fn play_hand<P: LbrPolicy>(
     }
     if env.done {
         env.rewards[lbr_seat] as f64 / CHIP_UNIT
+    } else if core::is_unsettled_showdown(&env) && core::settle_showdown_leaf_enabled() {
+        // Checked-down / river-all-in showdown: the `seat_i < 0` break lands here with stale
+        // rewards=[0]. Settle with the trainer's terminal_return semantics (gate ON only).
+        core::showdown_leaf_return(&env, lbr_seat)
     } else {
-        0.0
+        0.0 // depth-capped mid-hand (unchanged)
     }
 }
 

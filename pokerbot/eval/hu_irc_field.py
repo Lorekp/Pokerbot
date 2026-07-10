@@ -61,6 +61,7 @@ from pokerbot.engine.np_engine import (  # noqa: E402
     NUM_ACTIONS,
     apply_action_np,
     is_chance_node_np,
+    leaf_terminal_reward_np,
     legal_action_mask_np,
     sample_chance_np,
 )
@@ -262,6 +263,13 @@ def _play_hu_deck(hero_policy, villain_policy, *, deck_key, hero_seat: int, butt
             env = sample_chance_np(env)
             continue
         seat = int(env.action_seat)
+        if seat < 0:
+            # street=STREET_TERMINAL, done=False (checked-down / river-all-in showdown): the engine
+            # never settles this class (showdown-leaf-zero bug). The legacy loop queried
+            # policy(env, -1) here (warning + CHECK fallback) until the depth cap and returned 0.0;
+            # break instead and let the gate-aware terminal read below score it (value-identical 0.0
+            # with the gate OFF; the real settle with POKERBOT_SETTLE_SHOWDOWN_LEAF=1).
+            break
         policy = hero_policy if seat == hero_seat else villain_policy
         probs = policy(env, seat)
         legal = np.flatnonzero(probs > 0)
@@ -277,7 +285,9 @@ def _play_hu_deck(hero_policy, villain_policy, *, deck_key, hero_seat: int, butt
 
     if bool(env.done):
         return float(env.rewards[hero_seat]) / CHIP_UNIT
-    return 0.0
+    # Gate-aware terminal read (SETTLE_SHOWDOWN_LEAF, default OFF = 0.0 exactly as before): settles
+    # the unsettled-showdown class with trainer terminal_return semantics when the gate is ON.
+    return leaf_terminal_reward_np(env, hero_seat) / CHIP_UNIT
 
 
 def hu_vs_irc_rotated(hero_policy, cfg: HUFieldConfig | None = None) -> HUFieldResult:

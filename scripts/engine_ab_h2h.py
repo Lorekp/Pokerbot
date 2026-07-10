@@ -160,6 +160,14 @@ _DEPLOYED_BASELINE = {
     "single_table_iter_floor": None,
     # single-table budget ms (None = disabled)
     "single_table_budget_ms": None,
+    # SETTLE_SHOWDOWN_LEAF (showdown-leaf-zero fix, memory: search-leaf-showdown-zero-bug): when
+    # True, THIS ARM's search values checked-down / river-all-in showdown LEAVES with the real
+    # settle (trainer terminal_return semantics) instead of the engine's stale rewards=0 — the
+    # process-global gate (Python + native) is flipped around each of this arm's policy calls so
+    # two arms with different settings can share one process. False = deployed legacy zero-leaf
+    # behavior, byte-identical (the policy fn is returned UNWRAPPED). COUPLING: run the ON arm with
+    # leaf_cache_worlds > 1 (settled leaves are hole-dependent; M=1 freezes the first-visit world).
+    "settle_showdown_leaf": False,
 }
 
 _VALID_KNOBS = set(_DEPLOYED_BASELINE.keys())
@@ -188,9 +196,38 @@ def _resolve(spec: dict, key: str):
     return spec.get(key, _DEPLOYED_BASELINE[key])
 
 
+def _wrap_settle_gate(pf):
+    """Wrap a policy fn so the SETTLE_SHOWDOWN_LEAF gate (Python np_engine + native, kept in
+    lockstep by native_solver.set_settle_showdown_leaf) is ON for exactly this arm's policy calls
+    and restored afterwards. Only applied when the arm's spec sets settle_showdown_leaf=True, so
+    legacy specs return the policy fn UNWRAPPED (byte-identical; exact-zero gate untouched)."""
+    from pokerbot.search import native_solver as _nsg
+
+    def pf_gated(env, seat, _pf=pf):
+        prev = _nsg.settle_showdown_leaf_enabled()
+        _nsg.set_settle_showdown_leaf(True)
+        try:
+            return _pf(env, seat)
+        finally:
+            _nsg.set_settle_showdown_leaf(prev)
+
+    return pf_gated
+
+
 def _build_policy(spec: dict, snap, base_seed: int, repo_root: str):
     """Build a search policy function from a knob spec overriding the deployed baseline."""
     from pokerbot.eval.solver_exploitability import make_search_policy_fn
+
+    _settle_leaf = bool(_resolve(spec, "settle_showdown_leaf"))
+    if _settle_leaf:
+        # Fail closed on a stale native binary that would silently ignore the gate.
+        from pokerbot.search import native_solver as _nsc
+        if _nsc._EXT is not None:
+            caps = set(_nsc._EXT.native_caps()) if hasattr(_nsc._EXT, "native_caps") else set()
+            assert "settle_showdown_leaf" in caps, (
+                "settle_showdown_leaf arm requires a battery_native pyd built with the "
+                "SETTLE_SHOWDOWN_LEAF gate (core.rs); the loaded binary lacks the cap"
+            )
 
     # S3(a) search-off comparator arm: serve the RAW blueprint root policy with NO subgame solve.
     # Reuse the exact policy object that make_search_policy_fn itself falls back to
@@ -201,7 +238,10 @@ def _build_policy(spec: dict, snap, base_seed: int, repo_root: str):
     # search knob absent => resolves True => this branch is skipped => byte-identical to prior behavior.
     if not bool(_resolve(spec, "search")):
         from pokerbot.eval.solver_exploitability import make_blueprint_policy_fn
-        return make_blueprint_policy_fn(snap)
+        pf_raw = make_blueprint_policy_fn(snap)
+        # A raw-blueprint arm never runs leaf playouts, but wrap anyway so the knob's semantics
+        # ("gate ON during this arm's calls") hold uniformly whatever the policy internals.
+        return _wrap_settle_gate(pf_raw) if _settle_leaf else pf_raw
 
     iterations = int(_resolve(spec, "iterations"))
     time_budget_ms = int(_resolve(spec, "time_budget_ms"))
@@ -275,7 +315,7 @@ def _build_policy(spec: dict, snap, base_seed: int, repo_root: str):
     sv.config.leaf.gadget_iters = int(_resolve(spec, "leaf_gadget_iters"))
     sv.config.leaf.max_playout_depth = int(_resolve(spec, "leaf_max_playout_depth"))
 
-    return pf
+    return _wrap_settle_gate(pf) if _settle_leaf else pf
 
 
 def _ev_settle(prev_env, action, settle_rng, settle_samples, apply_action_np,
@@ -344,6 +384,10 @@ def main():
                         help="Output JSON path")
     parser.add_argument("--repo-root", default=os.getcwd(),
                         help="Repo root (for blueprint auto-detect; default=cwd)")
+    parser.add_argument("--legacy-zero-showdown", action="store_true",
+                        help="Restore the pre-fix harness money read that scored every showdown "
+                             "reached THROUGH river betting as 0 for both arms (continuity "
+                             "comparisons against historical h2h numbers only)")
     args = parser.parse_args()
 
     spec_a = _parse_spec(args.arm_a, "arm-a")
@@ -367,8 +411,9 @@ def main():
     # --- Imports (kept inside main so sys.path tricks work if needed) ---
     from pokerbot.engine.jax_engine import init_hand
     from pokerbot.engine.np_engine import (
-        apply_action_np, current_player_np, is_chance_node_np, is_terminal_np,
-        legal_action_mask_np, sample_chance_np, to_numpy_state,
+        SEAT_ALLIN, SEAT_LIVE, apply_action_np, compute_returns_np, current_player_np,
+        is_chance_node_np, is_terminal_np, is_unsettled_showdown_np, legal_action_mask_np,
+        sample_chance_np, to_numpy_state,
     )
     from pokerbot.search.pluribus_search import set_native_subgame
     from pokerbot.search import native_solver as _ns
@@ -493,6 +538,26 @@ def main():
                     prev_env, prev_action, settle_rng, settle_samples,
                     apply_action_np, is_terminal_np, is_chance_node_np, sample_chance_np,
                 )
+            elif is_unsettled_showdown_np(env) and not args.legacy_zero_showdown:
+                # HARNESS MONEY FIX (showdown-leaf-zero bug, memory: search-leaf-showdown-zero-bug):
+                # a hand that reaches showdown THROUGH river betting (checked down, river bet-call,
+                # river all-in+call) ends at street=STREET_TERMINAL with done=False and STALE
+                # rewards=[0]*6 — the engine settles only inside apply_action_np (folds + pre-river
+                # all-in run-outs), and the _ev_settle branch above only fires when the last action
+                # revealed new board cards. The legacy read below therefore scored EVERY such
+                # showdown 0 for BOTH arms, blinding the instrument to exactly the river-showdown
+                # value a strategy change moves. Settle it for real: trainer terminal_return
+                # semantics (n_show = LIVE|ALLIN contenders, bit-identical compute_returns_np,
+                # side-pot-correct). Arm-independent + deterministic (pure function of the terminal
+                # env), so the exact-zero self-gate is preserved. --legacy-zero-showdown restores
+                # the old money read for continuity comparisons against historical h2h numbers.
+                st = np.asarray(env.seat_status)
+                n_show = int(((st == SEAT_LIVE) | (st == SEAT_ALLIN)).sum())
+                rew = np.asarray(compute_returns_np(
+                    holes=np.asarray(env.holes), board=np.asarray(env.board),
+                    seat_status=st, committed_total=np.asarray(env.committed_total),
+                    button=int(env.button), n_showdown=n_show,
+                ), dtype=np.float64)
             else:
                 rew = np.asarray(env.rewards, dtype=np.float64)
 
@@ -594,6 +659,10 @@ def main():
         "wall_s": wall_s,
         "git_rev": git_rev,
         "verdict": verdict,
+        # Harness money read: True = river-reached showdowns settled for real (the showdown-leaf-
+        # zero harness fix); False = legacy zeros (--legacy-zero-showdown). Numbers produced under
+        # different money reads are NOT comparable.
+        "showdown_money_settled": not bool(args.legacy_zero_showdown),
     }
     json.dump(result, open(out_path, "w"), indent=1)
     print(f"\nwrote {out_path}", flush=True)

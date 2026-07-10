@@ -87,6 +87,7 @@ from pokerbot.engine.np_engine import (  # noqa: E402
     SEAT_LIVE,
     apply_action_np,
     is_chance_node_np,
+    leaf_terminal_reward_np,
     legal_action_mask_np,
     sample_chance_np,
     to_numpy_state,
@@ -300,7 +301,7 @@ def _board_ev_settle(env, lbr_seat: int, rng: np.random.Generator, samples: int)
     base_deck = env.deck.copy()
     tail = base_deck[ptr:].copy()
     if tail.shape[0] == 0:
-        return float(env.rewards[lbr_seat]) / CHIP_UNIT
+        return leaf_terminal_reward_np(env, lbr_seat) / CHIP_UNIT
     total = 0.0
     for _ in range(samples):
         rng.shuffle(tail)
@@ -314,7 +315,11 @@ def _board_ev_settle(env, lbr_seat: int, rng: np.random.Generator, samples: int)
             else:
                 break
             guard += 1
-        total += float(e.rewards[lbr_seat]) / CHIP_UNIT
+        # SETTLE_SHOWDOWN_LEAF (default OFF = legacy verbatim): a river all-in+call run-out ends at
+        # street=STREET_TERMINAL with done=False and STALE rewards=[0]*N (the engine settles only
+        # inside apply_action_np), so with the gate OFF every runout here scores 0 for the LBR —
+        # the showdown-leaf-zero bug. Gate ON settles via compute_returns_np (trainer semantics).
+        total += leaf_terminal_reward_np(e, lbr_seat) / CHIP_UNIT
     return total / samples
 
 
@@ -421,7 +426,10 @@ def _rollout_value(env, lbr_seat: int, policy_fn, cfg: LBR6Config, rng: np.rando
             else _sample_policy_action(env, seat, policy_fn, rng)
         env = apply_action_np(env, a)
         depth += 1
-    return float(env.rewards[lbr_seat]) / CHIP_UNIT
+    # Gate-aware terminal read (SETTLE_SHOWDOWN_LEAF, default OFF = legacy verbatim): a rollout that
+    # checks/calls down to showdown exits at street=STREET_TERMINAL, done=False, stale rewards=0 —
+    # gate ON settles it (trainer terminal_return semantics) instead of scoring the showdown 0.
+    return leaf_terminal_reward_np(env, lbr_seat) / CHIP_UNIT
 
 
 # --------------------------------------------------------------------------- #
@@ -650,7 +658,15 @@ def _play_hand(env, lbr_seat: int, br_active: bool, policy_fn, cfg: LBR6Config,
             observe_fn(env, seat, a)   # PRE-action env -> the adapting opponents ingest this decision
         env = apply_action_np(env, a)
         depth += 1
-    reward = float(env.rewards[lbr_seat]) / CHIP_UNIT if bool(env.done) else 0.0
+    # Gate-aware terminal read (SETTLE_SHOWDOWN_LEAF, default OFF = legacy verbatim): the ``seat<0``
+    # break lands here for every checked-down / river-all-in showdown (street=STREET_TERMINAL,
+    # done=False, stale rewards=0). With the gate OFF that whole class scores 0 for the LBR seat,
+    # biasing the measured bound; ON settles it via compute_returns_np (trainer terminal_return
+    # semantics). Depth-capped mid-hand exits stay 0 under both settings.
+    if bool(env.done):
+        reward = float(env.rewards[lbr_seat]) / CHIP_UNIT
+    else:
+        reward = leaf_terminal_reward_np(env, lbr_seat) / CHIP_UNIT
     if hand_sink is not None:
         hand_sink({"reward": reward, "last_call_street": last_call_street,
                    "end_street": int(np.asarray(env.street)), "folded": lbr_folded,

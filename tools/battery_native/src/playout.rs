@@ -14,11 +14,111 @@
 //! integer (statistical equivalence, NOT a replay of numpy's PCG64).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::core::{self, EnvStateN, BET_BUCKET_START, CALL, CHECK, FOLD, NUM_ACTIONS};
 use crate::emd::FrozenEMDLookup;
 use crate::fingerprint::{fingerprint_fast, fingerprint_fast_depth_emd, CHIP_UNIT};
+
+// ---------------------------------------------------------------------------
+// SETTLE_SHOWDOWN_LEAF consumer (gate lives in core.rs; env POKERBOT_SETTLE_SHOWDOWN_LEAF,
+// default OFF = byte-identical shipped behavior).
+//
+// The engine NEVER settles a showdown reached by street-advance: `sample_chance` past RIVER leaves
+// street=STREET_TERMINAL with done=false and STALE rewards=[0;N] (settle happens only inside
+// `apply_action` — fold terminals + pre-river all-in run-outs; the river all-in+call lands in the
+// same unsettled class). The trainer detects this and calls its own `terminal_return`
+// (trainer.rs FIX 1, commit 7cc9298), but `playout`/`playout_fixed` below break on
+// `action_seat < 0` and return `rewards[hero] == 0` — every check/call-to-showdown leaf (and every
+// river all-in+call leaf) contributes 0 EV to the depth-limited search (measured: 100% of river-
+// subgame leaf mass, 79-98% turn, 4-14% flop).
+//
+// Gate ON: value such leaves with the REAL showdown returns (`core::showdown_leaf_return`, the
+// exact mirror of `trainer::terminal_return`). The counters instrument how often each playout
+// terminal class is reached and how much |bb| mass the unsettled class carries, so reach frequency
+// and the A/B are measured by the same build. Stats collection is itself gated
+// (`leaf_settle_stats_set`, default OFF) so the rayon-parallel hot paths don't contend on the
+// shared atomics outside audit runs; the settle decision needs no counter.
+//
+// COUPLING NOTE (world-freeze): a settled leaf value is HOLE-DEPENDENT (it is the showdown). The
+// subgame leaf cache keys on the PUBLIC leaf, so with leaf_cache_worlds=1 the cached value freezes
+// the first-visit hole-world -> heavy EV-loss tails (measured in the audit A/B). Deploy the gate
+// together with leaf_cache_worlds>1 (subgame.rs / pluribus_search.py running-mean over M visiting
+// worlds) so the cached leaf integrates M sampled showdown worlds.
+// ---------------------------------------------------------------------------
+static LEAF_STATS_ON: AtomicBool = AtomicBool::new(false);
+static LEAF_N_DONE: AtomicU64 = AtomicU64::new(0); // env.done: engine-settled (fold / pre-river all-in)
+static LEAF_N_UNSETTLED_SHOWDOWN: AtomicU64 = AtomicU64::new(0); // street>=TERMINAL, done=false (the bug class)
+static LEAF_N_OTHER: AtomicU64 = AtomicU64::new(0); // depth-capped mid-hand (rewards also stale-0)
+static LEAF_ABS_MILLIBB_DONE: AtomicU64 = AtomicU64::new(0); // sum |v_bb|*1000 over settled leaves
+static LEAF_ABS_MILLIBB_UNSETTLED: AtomicU64 = AtomicU64::new(0); // sum |settled-would-be v_bb|*1000 over unsettled leaves
+
+/// Terminal value of a finished playout. Shipped behavior (gate OFF): `env.rewards[hero]/CHIP_UNIT`
+/// (stale 0 at street-terminal showdowns). Gate ON: real `core::showdown_leaf_return` at the
+/// unsettled-showdown class. Depth-capped mid-hand exits keep the stale value under both settings.
+fn playout_terminal_value<const N: usize>(env: &EnvStateN<N>, hero: usize) -> f64 {
+    playout_terminal_value_gated(env, hero, core::settle_showdown_leaf_enabled())
+}
+
+/// Explicit-flag twin of `playout_terminal_value` (the global gate resolved by the caller); lets
+/// tests exercise both settings without racing the process-global gate across parallel test threads.
+pub(crate) fn playout_terminal_value_gated<const N: usize>(
+    env: &EnvStateN<N>,
+    hero: usize,
+    settle_on: bool,
+) -> f64 {
+    let stale = env.rewards[hero] as f64 / CHIP_UNIT;
+    let stats = LEAF_STATS_ON.load(Ordering::Relaxed);
+    if env.done {
+        if stats {
+            LEAF_N_DONE.fetch_add(1, Ordering::Relaxed);
+            LEAF_ABS_MILLIBB_DONE.fetch_add((stale.abs() * 1000.0) as u64, Ordering::Relaxed);
+        }
+        return stale;
+    }
+    if core::is_unsettled_showdown(env) {
+        // Board is complete (the only route here is the river street-close -> sample_chance
+        // advance), so the settle sees 5 board cards. Mirror of trainer FIX 1.
+        if stats {
+            let real = core::showdown_leaf_return(env, hero);
+            LEAF_N_UNSETTLED_SHOWDOWN.fetch_add(1, Ordering::Relaxed);
+            LEAF_ABS_MILLIBB_UNSETTLED.fetch_add((real.abs() * 1000.0) as u64, Ordering::Relaxed);
+        }
+        if settle_on {
+            return core::showdown_leaf_return(env, hero);
+        }
+        return stale; // shipped behavior: 0 for hero at every such leaf
+    }
+    if stats {
+        LEAF_N_OTHER.fetch_add(1, Ordering::Relaxed);
+    }
+    stale
+}
+
+/// Enable/disable the playout terminal-class counters (audit instrumentation; default OFF).
+pub fn leaf_settle_stats_set(on: bool) {
+    LEAF_STATS_ON.store(on, Ordering::Relaxed);
+}
+
+pub fn leaf_settle_stats_reset() {
+    LEAF_N_DONE.store(0, Ordering::Relaxed);
+    LEAF_N_UNSETTLED_SHOWDOWN.store(0, Ordering::Relaxed);
+    LEAF_N_OTHER.store(0, Ordering::Relaxed);
+    LEAF_ABS_MILLIBB_DONE.store(0, Ordering::Relaxed);
+    LEAF_ABS_MILLIBB_UNSETTLED.store(0, Ordering::Relaxed);
+}
+
+/// (n_done, n_unsettled_showdown, n_other, abs_bb_done, abs_bb_unsettled)
+pub fn leaf_settle_stats() -> (u64, u64, u64, f64, f64) {
+    (
+        LEAF_N_DONE.load(Ordering::Relaxed),
+        LEAF_N_UNSETTLED_SHOWDOWN.load(Ordering::Relaxed),
+        LEAF_N_OTHER.load(Ordering::Relaxed),
+        LEAF_ABS_MILLIBB_DONE.load(Ordering::Relaxed) as f64 / 1000.0,
+        LEAF_ABS_MILLIBB_UNSETTLED.load(Ordering::Relaxed) as f64 / 1000.0,
+    )
+}
 
 pub const NUM_CONTINUATIONS: usize = 4;
 
@@ -442,7 +542,7 @@ pub fn playout_fixed<const N: usize>(
         env = core::apply_action(&env, a);
         depth += 1;
     }
-    env.rewards[hero] as f64 / CHIP_UNIT
+    playout_terminal_value(&env, hero)
 }
 
 /// Native uniform-mode `_playout`. choices[seat] is the fixed continuation index for that seat
@@ -481,5 +581,5 @@ pub fn playout<const N: usize>(
         env = core::apply_action(&env, a);
         depth += 1;
     }
-    env.rewards[hero] as f64 / CHIP_UNIT
+    playout_terminal_value(&env, hero)
 }

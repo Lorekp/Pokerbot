@@ -2092,3 +2092,241 @@ mod stage2a_amount_faithful {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// SETTLE_SHOWDOWN_LEAF (showdown-leaf-zero bug fix, env POKERBOT_SETTLE_SHOWDOWN_LEAF, default OFF).
+//
+// THE BUG CLASS: a showdown reached by street-advance (`sample_chance` past RIVER — every
+// checked-down hand and every river all-in+call) ends at street=STREET_TERMINAL with done=false and
+// STALE rewards=[0;N]; the serve/LBR playout consumers read rewards[hero] there and value the whole
+// class at 0. The trainer settles the same class via `terminal_return` (trainer.rs FIX 1). These
+// tests pin (a) the bug class exists exactly as diagnosed, (b) gate OFF is byte-identical (stale 0),
+// (c) gate ON settles with the trainer's semantics (compute_returns, n_show = LIVE|ALLIN), zero-sum
+// and side-pot-consistent. Tests use the explicit-flag twin `playout_terminal_value_gated` so the
+// process-global gate is never flipped (cargo tests share it across parallel threads).
+// ---------------------------------------------------------------------------
+mod settle_showdown_leaf {
+    use super::*;
+
+    /// Deterministic shuffled deck (an identity deck deals quad-5s ON BOARD -> a 6-way chop, which
+    /// would make the "settle is nonzero" assertions vacuous). Tiny LCG Fisher-Yates, seed-stable.
+    fn deck_shuffled(seed: u64) -> [i32; 52] {
+        let mut d = [0i32; 52];
+        for (i, v) in d.iter_mut().enumerate() {
+            *v = i as i32;
+        }
+        let mut s = seed;
+        for i in (1..52usize).rev() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let j = ((s >> 33) % (i as u64 + 1)) as usize;
+            d.swap(i, j);
+        }
+        d
+    }
+
+    fn root_6max(stack_bb: i32) -> EnvState {
+        let stacks = [stack_bb * CHIP_UNIT; NUM_PLAYERS];
+        let occ = [true; NUM_PLAYERS];
+        init_hand(0, &stacks, &occ, 0, &deck_shuffled(0xB0A3D), [7u32, 42u32])
+    }
+
+    /// Drive with check-preferred (else call, else first legal) until no actor remains.
+    fn drive_checkdown(mut env: EnvState) -> EnvState {
+        for _ in 0..200 {
+            if env.done {
+                return env;
+            }
+            if is_chance_node(&env) {
+                env = sample_chance(&env);
+                continue;
+            }
+            if env.action_seat < 0 {
+                return env;
+            }
+            let mask = legal_action_mask(&env, env.action_seat);
+            let a = if mask[CHECK] {
+                CHECK
+            } else if mask[CALL] {
+                CALL
+            } else {
+                (0..NUM_ACTIONS).find(|&x| mask[x]).unwrap()
+            };
+            env = apply_action(&env, a);
+        }
+        env
+    }
+
+    #[test]
+    fn checked_down_showdown_is_unsettled_and_gate_off_returns_stale_zero() {
+        let env = drive_checkdown(root_6max(100));
+        // (a) the diagnosed bug class: street past RIVER, done=false, rewards all stale-0.
+        assert!(!env.done, "checked-down hand must NOT be engine-settled");
+        assert!(env.street >= STREET_TERMINAL, "board must have run out");
+        assert!(is_unsettled_showdown(&env));
+        assert!(
+            env.rewards.iter().all(|&r| r == 0),
+            "rewards must be the stale zeros: {:?}",
+            env.rewards
+        );
+        // (b) gate OFF (shipped behavior): every hero reads 0 — despite blinds in the pot.
+        for hero in 0..NUM_PLAYERS {
+            assert_eq!(
+                crate::playout::playout_terminal_value_gated(&env, hero, false),
+                0.0,
+                "gate OFF must preserve the shipped stale-0 read"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_on_settles_checked_down_showdown_with_trainer_semantics() {
+        let env = drive_checkdown(root_6max(100));
+        assert!(is_unsettled_showdown(&env));
+        let n_show = env
+            .seat_status
+            .iter()
+            .filter(|&&s| s == SEAT_LIVE || s == SEAT_ALLIN)
+            .count() as i32;
+        assert!(n_show >= 2, "checked-down hand keeps >=2 contenders");
+        let rets = compute_returns(
+            &env.holes,
+            &env.board,
+            &env.seat_status,
+            &env.committed_total,
+            env.button,
+            n_show,
+        );
+        // Zero-sum + somebody wins the blinds (pot is never empty: SB+BB posted).
+        assert_eq!(rets.iter().sum::<i32>(), 0, "settle must be zero-sum");
+        assert!(
+            rets.iter().any(|&r| r != 0),
+            "blinds are in the pot; a settle of all-zeros is the bug, not a showdown"
+        );
+        let mut settled_sum = 0.0;
+        for hero in 0..NUM_PLAYERS {
+            let v = crate::playout::playout_terminal_value_gated(&env, hero, true);
+            // (c) exact trainer terminal_return semantics: compute_returns[hero] / CHIP_UNIT.
+            assert_eq!(
+                v,
+                rets[hero] as f64 / CHIP_UNIT as f64,
+                "gate ON must equal compute_returns (trainer terminal_return mirror), seat {hero}"
+            );
+            assert_eq!(v, showdown_leaf_return(&env, hero));
+            settled_sum += v;
+        }
+        assert!(settled_sum.abs() < 1e-9, "settled bb values must be zero-sum");
+    }
+
+    #[test]
+    fn engine_settled_and_midhand_states_are_untouched_by_the_gate() {
+        // Fold-to-one terminal: engine settles in apply_action; both gate settings read rewards.
+        let mut env = root_6max(100);
+        for _ in 0..NUM_PLAYERS {
+            if env.done {
+                break;
+            }
+            let mask = legal_action_mask(&env, env.action_seat);
+            let a = if mask[FOLD] { FOLD } else { CHECK };
+            env = apply_action(&env, a);
+        }
+        assert!(env.done, "fold-around must be engine-settled");
+        for hero in 0..NUM_PLAYERS {
+            let want = env.rewards[hero] as f64 / CHIP_UNIT as f64;
+            assert_eq!(crate::playout::playout_terminal_value_gated(&env, hero, false), want);
+            assert_eq!(crate::playout::playout_terminal_value_gated(&env, hero, true), want);
+        }
+        // Mid-hand (depth-capped) state: street < TERMINAL, not done — stale read under BOTH
+        // settings (the gate must not invent a value for an unfinished betting round).
+        let mid = root_6max(100);
+        assert!(!mid.done && mid.street < STREET_TERMINAL);
+        for hero in 0..NUM_PLAYERS {
+            assert_eq!(crate::playout::playout_terminal_value_gated(&mid, hero, false), 0.0);
+            assert_eq!(crate::playout::playout_terminal_value_gated(&mid, hero, true), 0.0);
+        }
+    }
+
+    #[test]
+    fn river_allin_call_lands_in_the_unsettled_class_and_settles_sidepot_correct() {
+        // Uneven stacks so the settle exercises the capped-contribution (side-pot) arithmetic.
+        // The short stack sits at seat 3 (NOT the first river actor, seat 1): the jammer must be a
+        // covering stack so every caller's CALL is itself an all-in and the street closes via
+        // n_can_act==0 (the engine's round-close convention returns action to the aggressor for a
+        // no-op check; an ALLIN aggressor is skipped by first_live_after, so a river jam with LIVE
+        // callers left behind never closes — the callers must go all-in for the terminal to form).
+        let stacks = [
+            100 * CHIP_UNIT,
+            100 * CHIP_UNIT,
+            100 * CHIP_UNIT,
+            60 * CHIP_UNIT,
+            100 * CHIP_UNIT,
+            100 * CHIP_UNIT,
+        ];
+        let occ = [true; NUM_PLAYERS];
+        let mut env = init_hand(0, &stacks, &occ, 0, &deck_shuffled(0x5EED), [11u32, 5u32]);
+        // Check/call to the river, then first actor jams, everyone still live calls.
+        let mut jammed = false;
+        for _ in 0..200 {
+            if env.done {
+                break;
+            }
+            if is_chance_node(&env) {
+                env = sample_chance(&env);
+                continue;
+            }
+            if env.action_seat < 0 {
+                break;
+            }
+            let mask = legal_action_mask(&env, env.action_seat);
+            let a = if env.street == STREET_RIVER && !jammed && mask[ALL_IN] {
+                jammed = true;
+                ALL_IN
+            } else if env.street == STREET_RIVER && jammed && mask[CALL] {
+                CALL
+            } else if mask[CHECK] {
+                CHECK
+            } else if mask[CALL] {
+                CALL
+            } else {
+                (0..NUM_ACTIONS).find(|&x| mask[x]).unwrap()
+            };
+            env = apply_action(&env, a);
+        }
+        // River all-in + calls: close_street's run_out is gated street<RIVER, so this terminal is
+        // reached via sample_chance -> STREET_TERMINAL with done=false (the same unsettled class).
+        assert!(jammed, "the river jam must have happened");
+        assert!(is_unsettled_showdown(&env), "river all-in+call must land unsettled");
+        assert!(env.rewards.iter().all(|&r| r == 0));
+        let n_show = env
+            .seat_status
+            .iter()
+            .filter(|&&s| s == SEAT_LIVE || s == SEAT_ALLIN)
+            .count() as i32;
+        assert!(n_show >= 2);
+        let rets = compute_returns(
+            &env.holes,
+            &env.board,
+            &env.seat_status,
+            &env.committed_total,
+            env.button,
+            n_show,
+        );
+        assert_eq!(rets.iter().sum::<i32>(), 0);
+        // The short stack's exposure is capped at its own commitment (side-pot correctness).
+        assert!(
+            rets[3] >= -env.committed_total[3],
+            "short stack cannot lose more than it committed"
+        );
+        assert!(
+            env.committed_total[3] < env.committed_total[1],
+            "seat 3 must actually be the capped short stack"
+        );
+        let mut sum = 0.0;
+        for hero in 0..NUM_PLAYERS {
+            let v = crate::playout::playout_terminal_value_gated(&env, hero, true);
+            assert_eq!(v, rets[hero] as f64 / CHIP_UNIT as f64);
+            assert_eq!(crate::playout::playout_terminal_value_gated(&env, hero, false), 0.0);
+            sum += v;
+        }
+        assert!(sum.abs() < 1e-9);
+    }
+}

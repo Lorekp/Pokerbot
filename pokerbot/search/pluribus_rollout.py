@@ -31,6 +31,10 @@ from dataclasses import dataclass
 import numpy as np
 
 from pokerbot.engine.jax_engine import CHIP_UNIT
+# SETTLE_SHOWDOWN_LEAF gate (env POKERBOT_SETTLE_SHOWDOWN_LEAF, default OFF = byte-identical):
+# gate-aware terminal read that settles checked-down / river-all-in showdowns the engine leaves at
+# street=STREET_TERMINAL, done=False, rewards=[0]*N (see np_engine gate docs / trainer.rs FIX 1).
+from pokerbot.engine.np_engine import leaf_terminal_reward_np
 # Hot-path engine primitives via the native dispatch layer: it forwards to the bit-identical Rust
 # core when enabled (battery --native), else to the pure-Python np_engine (byte-identical fallback).
 from pokerbot.search.native_solver import (
@@ -235,7 +239,12 @@ def _playout(
         a = _sample_action(row, mask, float(rng.random()))
         env = apply_action_np(env, a)
         depth += 1
-    return float(env.rewards[hero]) / CHIP_UNIT
+    # Gate-aware terminal read (POKERBOT_SETTLE_SHOWDOWN_LEAF, default OFF = the legacy
+    # ``env.rewards[hero]`` verbatim): a checked-down / river-all-in showdown exits this loop at
+    # street=STREET_TERMINAL with done=False and STALE rewards=[0]*N — with the gate OFF every such
+    # leaf contributes 0 EV (the showdown-leaf-zero bug); ON settles it via compute_returns_np
+    # (the trainer's terminal_return semantics). Mirrors playout.rs::playout_terminal_value.
+    return leaf_terminal_reward_np(env, hero) / CHIP_UNIT
 
 
 class _DrawStream:
@@ -270,7 +279,8 @@ def _dag_runout(env, hero: int, adapter, M: np.ndarray, stream: _DrawStream,
     every cell that ended there."""
     while True:
         if depth >= max_depth or bool(env.done):
-            v = float(env.rewards[hero]) / CHIP_UNIT
+            # Gate-aware terminal read (identical to _playout's exit; default OFF = legacy verbatim).
+            v = leaf_terminal_reward_np(env, hero) / CHIP_UNIT
             for (i, j) in cells:
                 M[i, j] += v
             return
@@ -279,7 +289,9 @@ def _dag_runout(env, hero: int, adapter, M: np.ndarray, stream: _DrawStream,
             continue
         seat = int(env.action_seat)
         if seat < 0:
-            v = float(env.rewards[hero]) / CHIP_UNIT
+            # street>=STREET_TERMINAL, done=False lands here (checked-down / river-all-in showdown):
+            # gate ON settles it instead of adding the stale 0 (the showdown-leaf-zero bug).
+            v = leaf_terminal_reward_np(env, hero) / CHIP_UNIT
             for (i, j) in cells:
                 M[i, j] += v
             return
