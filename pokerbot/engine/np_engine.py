@@ -15,6 +15,7 @@ Constants/semantics are mirrored verbatim from ``jax_engine.py``, ``side_pots_ja
 
 from __future__ import annotations
 
+import os
 import threading
 
 import numpy as np
@@ -705,7 +706,52 @@ def _action_amount(state: EnvState, seat, action: int) -> int:
     return 0
 
 
+def _close_called_street_enabled() -> bool:
+    """POKERBOT_CLOSE_CALLED_STREET=1 (default OFF => apply_action_np is byte-identical).
+
+    Gated REAL-NLHE street closure — Python mirror of ``battery_native::closure`` (single shared
+    semantics across trainer/subgame/playout/live/LBR/PyO3 binding and this engine, so ONE env var
+    flips the whole stack coherently).  The shared ``_street_complete`` requires ``back_to_aggressor``
+    but is evaluated BEFORE the actor seat advances, so it can never be satisfied on the closing CALL
+    itself: every called bet/raise deals the AGGRESSOR an extra decision node with re-open rights
+    (raise your own called bet) — a rules variant real NLHE does not play (verified vs
+    third_party/pypokerengine; see artifacts_wt/_close_called_street/).  Read PER CALL (cheap) so a
+    test process can flip the gate; the Rust side caches per process (OnceLock) — the configuration
+    unit is still "set the env var before launch".
+    """
+    return os.environ.get("POKERBOT_CLOSE_CALLED_STREET", "") == "1"
+
+
+def _maybe_close_called_street(state: EnvState) -> EnvState:
+    """Inject the closing CHECK iff ``state`` is the extra aggressor-reopen node (gate ON only).
+
+    Predicate is exact (mirrors ``closure::close_called_street``): mid-street, action back at
+    ``last_aggressor`` with nothing to call happens only after every other live seat called or folded
+    (any re-raise replaces ``last_aggressor``); ``sample_chance`` resets ``last_aggressor``/``acted``
+    each street and blinds are not aggression, so the legal BB-option node (``no_aggressor`` path) is
+    never touched.  The injected CHECK closes the street -> chance node, so the inner
+    ``apply_action_np`` recursion terminates at depth 1 (predicate false on its output).
+    """
+    if not _close_called_street_enabled():
+        return state
+    a = int(state.action_seat)
+    if (
+        not bool(state.done)
+        and not bool(state.pending_deal)
+        and int(state.street) < STREET_TERMINAL
+        and a >= 0
+        and a == int(state.last_aggressor)
+        and int(state.current_bet) == int(state.committed_street[a])
+    ):
+        return apply_action_np(state, CHECK)
+    return state
+
+
 def apply_action_np(state: EnvState, action: int) -> EnvState:
+    return _maybe_close_called_street(_apply_action_np_impl(state, action))
+
+
+def _apply_action_np_impl(state: EnvState, action: int) -> EnvState:
     action = int(action)
     n = state.seat_status.shape[0]  # seat count
     seat = int(state.action_seat)

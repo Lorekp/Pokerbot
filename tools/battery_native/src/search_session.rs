@@ -481,7 +481,8 @@ fn cfv<const N: usize>(
         }
         let u = rng.next_f64();
         let a = sample_action(&strat, &legal, u);
-        let child = core::apply_action(env, a);
+        // Gated real-NLHE street closure (POKERBOT_CLOSE_CALLED_STREET; default OFF => identity).
+        let child = crate::closure::maybe_close_called_street(core::apply_action(env, a));
         return cfv(&child, hero, depth + 1, max_depth, ctx, leaf_cont_weights, tab, rng, t);
     }
 
@@ -492,7 +493,7 @@ fn cfv<const N: usize>(
     let mut av = [0.0f64; NUM_ACTIONS];
     for a in 0..NUM_ACTIONS {
         if legal[a] {
-            let child = core::apply_action(env, a);
+            let child = crate::closure::maybe_close_called_street(core::apply_action(env, a));
             av[a] = cfv(&child, hero, depth + 1, max_depth, ctx, leaf_cont_weights, tab, rng, t);
         }
     }
