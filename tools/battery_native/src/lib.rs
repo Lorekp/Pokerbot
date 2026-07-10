@@ -29,7 +29,80 @@ pub mod trainer;
 #[cfg(test)]
 mod tests;
 
-#[cfg(feature = "python")]
+// PERF-BENCH instrumentation (feature `prof`, default OFF => nothing compiled). Coarse per-phase
+// rdtsc accumulators + event counters around the subgame-solve hot path; single-writer (the bench
+// is single-threaded per solve) so Relaxed atomics are exact there.
+#[cfg(feature = "prof")]
+pub mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub const P_SOLVE: usize = 0;
+    pub const P_RTAB: usize = 1;
+    pub const P_DEAL: usize = 2;
+    pub const P_REPAIR: usize = 3;
+    pub const P_LEAF_PLAYOUT: usize = 4;
+    pub const P_FP_KEY: usize = 5;
+    pub const NP: usize = 6;
+    pub const PHASE_NAMES: [&str; NP] =
+        ["solve_total", "rtab_build", "deal_holes", "repair_deck", "leaf_playout", "fp_key"];
+    pub static TSC: [AtomicU64; NP] = [const { AtomicU64::new(0) }; NP];
+
+    pub const C_NODE_HERO: usize = 0;
+    pub const C_NODE_OPP: usize = 1;
+    pub const C_LEAF_HIT: usize = 2;
+    pub const C_LEAF_MISS: usize = 3;
+    pub const C_PLAYOUT_STEP: usize = 4;
+    pub const C_BP_GET: usize = 5;
+    pub const NC: usize = 6;
+    pub const COUNT_NAMES: [&str; NC] =
+        ["node_hero", "node_opp", "leaf_hit", "leaf_miss", "playout_step", "bp_get"];
+    pub static CNT: [AtomicU64; NC] = [const { AtomicU64::new(0) }; NC];
+
+    #[inline(always)]
+    pub fn tsc() -> u64 {
+        unsafe { std::arch::x86_64::_rdtsc() }
+    }
+
+    pub struct Scope {
+        i: usize,
+        t0: u64,
+    }
+    impl Scope {
+        #[inline(always)]
+        pub fn new(i: usize) -> Self {
+            Scope { i, t0: tsc() }
+        }
+    }
+    impl Drop for Scope {
+        #[inline(always)]
+        fn drop(&mut self) {
+            TSC[self.i].fetch_add(tsc().wrapping_sub(self.t0), Relaxed);
+        }
+    }
+
+    #[inline(always)]
+    pub fn count(i: usize) {
+        CNT[i].fetch_add(1, Relaxed);
+    }
+
+    /// Dump all accumulators as `name=value` pairs and reset them.
+    pub fn dump_and_reset() -> String {
+        let mut s = String::new();
+        for i in 0..NP {
+            let v = TSC[i].swap(0, Relaxed);
+            s.push_str(&format!("{}={} ", PHASE_NAMES[i], v));
+        }
+        for i in 0..NC {
+            let v = CNT[i].swap(0, Relaxed);
+            s.push_str(&format!("{}={} ", COUNT_NAMES[i], v));
+        }
+        s
+    }
+}
+
+// NOTE (perf-bench, 2026-07-10): formerly `#[cfg(feature = "python")]` — ungated so the pure-native
+// bench harness (`examples/bench_subgame.rs`) can unmarshal the exported corpus states without pyo3.
+// Pure data conversion, no python dependency; the python-feature FFI surface is unchanged.
 pub mod flat {
     use crate::core::{EnvState, MAX_BOARD, MAX_HISTORY, NUM_PLAYERS};
 

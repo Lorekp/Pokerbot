@@ -37,6 +37,20 @@ use crate::playout::{self, Blueprint, PlayoutConfig, Rng};
 
 const ZEROS: [f64; NUM_ACTIONS] = [0.0; NUM_ACTIONS];
 
+// PERF-BENCH (feature `prof`, default OFF => macros expand to nothing; zero shipped-binary impact).
+macro_rules! prof_scope {
+    ($i:expr) => {
+        #[cfg(feature = "prof")]
+        let _prof_scope = crate::prof::Scope::new($i);
+    };
+}
+macro_rules! prof_count {
+    ($i:expr) => {
+        #[cfg(feature = "prof")]
+        crate::prof::count($i);
+    };
+}
+
 /// Precomputed PURE frozen-deviation table (built in Python by `exploit_table.build_frozen_table`):
 /// `(actor:u8, ctx_id:u16, legal_bits:u16) -> frozen[f64;11]`. Native NEVER computes the exploit math
 /// (context_read / posterior / cap_eff) — it only LOOKS UP this output (data-not-code firewall) and
@@ -799,6 +813,7 @@ fn deal_opponent_holes<const N: usize>(
     scfg: &SubgameConfig,
     rtab: Option<&RangeTable>,
 ) {
+    prof_scope!(crate::prof::P_DEAL);
     let mut known = [false; 52];
     for k in 0..2 {
         let c = env.holes[hero][k];
@@ -1805,6 +1820,7 @@ pub(crate) fn build_rtab<const N: usize>(
     if !(scfg.range_aware || scfg.range_reach_full) {
         return None;
     }
+    prof_scope!(crate::prof::P_RTAB);
     let known = hero_board_known(root, hero);
     if scfg.range_reach_full {
         if let Some(rt) = build_range_table_reach(root, hero, &known, bp, pcfg) {
@@ -2125,6 +2141,7 @@ fn leaf_value<const N: usize>(
     if ctx.two_sided {
         key.push(hero as i64);
     }
+    prof_count!(crate::prof::C_LEAF_HIT); // counts every non-terminal uniform-leaf visit (hits = this - miss)
     // BUG-1 FIX: the cache entry is a RUNNING MEAN (sum, n) over the first `leaf_worlds` VISITING
     // hole-worlds. The env at each visit carries THAT iteration's sampled opponent holes, so while
     // n < M every hit re-evaluates under the CURRENT world (deterministic per-(leaf, n) seed => the
@@ -2140,6 +2157,8 @@ fn leaf_value<const N: usize>(
         }
         None => (0.0, 0),
     };
+    prof_count!(crate::prof::C_LEAF_MISS);
+    prof_scope!(crate::prof::P_LEAF_PLAYOUT);
     let base = leaf_seed(&key, ctx.public_seed);
     let seed = base ^ (n0 as u64).wrapping_mul(LEAF_WORLD_SEED_ODD); // n0=0 => base exactly (legacy)
     let v = playout::uniform_leaf_value(
@@ -2203,6 +2222,7 @@ fn cfv<const N: usize>(
     let key = infoset_key(env, actor);
 
     if actor != hero {
+        prof_count!(crate::prof::C_NODE_OPP);
         let regrets = *tab.regrets.get(&key).unwrap_or(&ZEROS);
         // TWO-SIDED (GTO): the non-traverser samples from ITS OWN learned regret-match (uniform on first
         // touch), and its regrets update on the iterations where IT is the traverser -> a subgame
@@ -2219,6 +2239,7 @@ fn cfv<const N: usize>(
     }
 
     // hero node: branch all (abstracted-)legal actions, CFR+ regret update.
+    prof_count!(crate::prof::C_NODE_HERO);
     let regrets = *tab.regrets.get(&key).unwrap_or(&ZEROS);
     let strat = regret_match(&regrets, &legal);
     let mut av = [0.0f64; NUM_ACTIONS];
@@ -2298,6 +2319,7 @@ fn solve_stream<const N: usize>(
             deal_opponent_holes(&mut world, hero, hrng, scfg, rtab);
         }
         if scfg.repair_deck {
+            prof_scope!(crate::prof::P_REPAIR);
             // Rebuild the undealt deck tail AFTER the deal (seed + known set both depend on the sampled
             // holes). A SEPARATE Rng stream (deterministic per-world seed) so the solve's iteration `rng`
             // is unperturbed and worlds stay CRN-stable across processes/arms.
@@ -2327,6 +2349,7 @@ pub(crate) fn solve_rows<const N: usize>(
     scfg: &SubgameConfig,
     public_seed: u64,
 ) -> ([f64; NUM_ACTIONS], [f64; NUM_ACTIONS], bool) {
+    prof_scope!(crate::prof::P_SOLVE);
     let ctx = Ctx {
         bp,
         pcfg,

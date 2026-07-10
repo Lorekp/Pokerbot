@@ -157,6 +157,10 @@ impl PlayoutConfig {
     /// native subgame/rollout path routes through here so the abstraction is decided in ONE place.
     #[inline]
     pub fn fp_key<const N: usize>(&self, s: &EnvStateN<N>, seat: usize) -> [u8; 16] {
+        #[cfg(feature = "prof")]
+        let _prof_scope = crate::prof::Scope::new(crate::prof::P_FP_KEY);
+        #[cfg(feature = "prof")]
+        crate::prof::count(crate::prof::C_BP_GET);
         match &self.emd {
             None => fingerprint_fast(s, seat, self.num_buckets),
             Some(k) => fingerprint_fast_depth_emd(
@@ -567,6 +571,8 @@ pub fn playout<const N: usize>(
             break;
         }
         let seat = seat_i as usize;
+        #[cfg(feature = "prof")]
+        crate::prof::count(crate::prof::C_PLAYOUT_STEP);
         let full = core::legal_action_mask(&env, seat_i);
         let abst = abstracted_mask(&full, env.street, cfg);
         let bp_row = blueprint_policy(&env, seat, &abst, bp, cfg);

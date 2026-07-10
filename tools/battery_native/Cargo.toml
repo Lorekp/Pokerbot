@@ -73,6 +73,10 @@ hogwild = []
 # drift), regret_zero (skip the cum_regret probe), showdown_const (skip the terminal showdown eval). Driven by
 # scripts/ab_stub_probe.py. NEVER ship the ab_stub cdylib to serve (it lives in the *_profile twins only).
 ab_stub = []
+# PERF-BENCH instrumentation (2026-07-10, perf worktree): coarse per-phase rdtsc accumulators around
+# the subgame-solve hot path (world sampling / traversal / leaf playout / map+key ops). Default OFF =>
+# zero code compiled into the shipped binary. Dumped by `examples/bench_subgame.rs` when built with it.
+prof = []
 
 [profile.release]
 opt-level = 3
