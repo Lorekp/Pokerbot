@@ -2624,7 +2624,57 @@ fn leaf_value<const N: usize>(
     // derived seeds), so the solve output is bit-identical. GTO path only — solve_exploit's
     // leaf_value_x is deliberately left untouched (firewall).
     if core::is_chance_node(env) && env.street == core::STREET_RIVER {
-        return 0.0;
+        if !core::settle_showdown_leaf_enabled() {
+            // Shipped semantics (gate OFF): every rollout of every visiting world returns EXACTLY
+            // 0.0 — bit-identical, cache-skip unobservable (see the block comment above).
+            return 0.0;
+        }
+        // LEAF-SETTLE JOIN (2026-07-10, POKERBOT_SETTLE_SHOWDOWN_LEAF=1): under the gate the
+        // playout no longer returns 0.0 at this leaf — it advances past RIVER (n_new=0: holes,
+        // board, seat_status, committed_total all UNCHANGED) and settles via
+        // `core::showdown_leaf_return` (playout.rs::playout_terminal_value). That value is
+        // DETERMINISTIC per visiting world (no card can be dealt, no action taken, no rng
+        // consumed), so the shortcut computes it directly at the CURRENT env — but it must keep
+        // the EXACT generic-path semantics below, which are hole-dependent under the gate:
+        //   * the (sum, n) running-mean leaf cache over the first `leaf_worlds` visiting worlds
+        //     (BUG-1 fix; a settled leaf is the showdown, so world-freeze matters — see the
+        //     playout.rs COUPLING NOTE), keyed per-traverser when two_sided;
+        //   * `uniform_leaf_value`'s mean fold over `rollout_samples` IDENTICAL terms (summed
+        //     then divided, reproducing its exact f64 rounding).
+        // Net effect: bit-identical to the un-optimized gate-ON path, still skipping the
+        // rollout_samples x (2 state copies + reshuffle + 2 rng seedings) per visit. The derived
+        // leaf_seed is dead under the gate (the settle reads no rng), so skipping it is exact.
+        // max_depth < 1 (never used in practice) would keep the playout from advancing the
+        // chance node at all — fall through to the generic path for exactness there.
+        if ctx.pcfg.max_depth >= 1 {
+            let trav = if ctx.two_sided { Some(hero) } else { None };
+            let dkey = leaf_dig(nd, env, trav);
+            prof_count!(crate::prof::C_LEAF_HIT);
+            let m = ctx.leaf_worlds;
+            let (sum0, n0) = match tab.leaf.get(&dkey) {
+                Some(&(s, n)) => {
+                    if n >= m {
+                        return s / n as f64;
+                    }
+                    (s, n)
+                }
+                None => (0.0, 0),
+            };
+            prof_count!(crate::prof::C_LEAF_MISS);
+            let sv = core::showdown_leaf_return(env, hero);
+            // Reproduce uniform_leaf_value's fold bit-for-bit: rollout_samples identical terms
+            // summed into an f64 accumulator, then divided.
+            let rs = ctx.scfg.rollout_samples;
+            let mut total = 0.0f64;
+            for _ in 0..rs {
+                total += sv;
+            }
+            let v = total / rs as f64;
+            let sum = if n0 == 0 { v } else { sum0 + v };
+            let n = n0 + 1;
+            tab.leaf.insert(dkey, (sum, n));
+            return sum / n as f64;
+        }
     }
     // TWO-SIDED: the leaf continuation value is computed FROM the traverser's perspective (`hero` here is
     // the current traverser), so the cache MUST be keyed per-traverser or one traverser's value poisons
