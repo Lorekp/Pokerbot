@@ -81,6 +81,12 @@ _DEPLOYED_BASELINE = {
     "iterations": 2000,
     # wall-clock budget per decision (ms); only active when iterations==0
     "time_budget_ms": 2000,
+    # subgame search master switch: True = solve the depth-limited Pluribus subgame at each decision
+    # (DEPLOYED default, byte-identical to prior behavior); False = serve the RAW blueprint root policy
+    # with NO subgame solve at all — the S3(a) "search-off" comparator arm (matched no-search baseline).
+    # When absent from a spec this resolves True, so nothing changes. Two identical specs (both True OR
+    # both False) still produce every per-deck diff exactly 0.0 (the raw policy is deterministic).
+    "search": True,
     # blueprint preflop: False = serve preflop from blueprint (DEPLOYED default)
     "search_preflop": False,
     # leaf continuation strategy: "gadget" (primary) | "uniform" (bootstrap)
@@ -185,6 +191,17 @@ def _resolve(spec: dict, key: str):
 def _build_policy(spec: dict, snap, base_seed: int, repo_root: str):
     """Build a search policy function from a knob spec overriding the deployed baseline."""
     from pokerbot.eval.solver_exploitability import make_search_policy_fn
+
+    # S3(a) search-off comparator arm: serve the RAW blueprint root policy with NO subgame solve.
+    # Reuse the exact policy object that make_search_policy_fn itself falls back to
+    # (make_blueprint_policy_fn -> eval.lbr.make_blueprint_policy) so the raw arm IS the search anchor,
+    # no surgery. The returned policy is a deterministic prob-vector fn, identical in shape/contract to
+    # the search policy, so it flows through act()/the salt-based sampler unchanged and preserves the
+    # exact-zero self-gate: {"search": false} vs {"search": false} => every per-deck diff 0.0.
+    # search knob absent => resolves True => this branch is skipped => byte-identical to prior behavior.
+    if not bool(_resolve(spec, "search")):
+        from pokerbot.eval.solver_exploitability import make_blueprint_policy_fn
+        return make_blueprint_policy_fn(snap)
 
     iterations = int(_resolve(spec, "iterations"))
     time_budget_ms = int(_resolve(spec, "time_budget_ms"))
