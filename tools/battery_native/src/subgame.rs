@@ -2134,6 +2134,21 @@ fn leaf_value<const N: usize>(
     if ctx.leaf_biased {
         return leaf_value_biased(env, hero, ctx, tab, t);
     }
+    // PERF (2026-07-10, VALUE-IDENTICAL): a RIVER chance-node leaf (river betting closed,
+    // pending_deal set) is a DETERMINISTIC playout — `core::sample_chance` advances the street past
+    // RIVER with n_new=0 and actor=-1, the playout loop breaks immediately, and returns the
+    // non-terminal state's rewards[hero], which `apply_action` zeroed. No action-rng is consumed and
+    // no board card can be dealt (the resample-board reshuffle fills deck slots that are never
+    // read), so every rollout of every visiting world returns EXACTLY 0.0 — the engines' certified
+    // shared "unsettled showdown" semantics (see optlog.md; correctness audit spawned separately).
+    // Return it directly instead of paying rollout_samples x (2 state copies + reshuffle + 2 rng
+    // seedings) per visit plus a leaf-cache entry per leaf. The cache skip is unobservable (entries
+    // are solve-internal) and the shared traversal `rng` was never touched by leaf evals (they use
+    // derived seeds), so the solve output is bit-identical. GTO path only — solve_exploit's
+    // leaf_value_x is deliberately left untouched (firewall).
+    if core::is_chance_node(env) && env.street == core::STREET_RIVER {
+        return 0.0;
+    }
     // TWO-SIDED: the leaf continuation value is computed FROM the traverser's perspective (`hero` here is
     // the current traverser), so the cache MUST be keyed per-traverser or one traverser's value poisons
     // another's (mirrors pluribus_search.py:619-620 `key = (key, int(hero))`). One-sided => seat-agnostic.
