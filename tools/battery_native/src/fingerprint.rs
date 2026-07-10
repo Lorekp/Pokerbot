@@ -866,19 +866,6 @@ pub fn fingerprint_from_bucket<const N: usize>(
     out
 }
 
-/// EMD-mode fingerprint for the SERVE fast paths (subgame / rollout / LBR / fingerprint export) —
-/// the serve twin of the trainer's `fingerprint_fast_depth_memo_emd` (trainer.rs), which keyed the
-/// promoted EMD-K160 blueprint and is therefore the ground truth for what the blueprint rows were
-/// written under. Byte-parity target: `jax_weva_fast.fingerprint_fast` with
-/// `POKERBOT_POSTFLOP_MODE=emd` (`jax_weva_encode.compute_postflop_bucket`):
-///   * flop/turn (3-4 board cards): bucket = the FROZEN lookup id -> the postflop `b"B"` key;
-///   * frozen MISS (river always — it is not in the blob — or an off-blob flop/turn spot):
-///       - `miss_made_hand=true`  (POKERBOT_EMD_FROZEN_MIRROR_FALLBACK=1 / silent fallback /
-///         fail-on-miss OFF — the deployed serve regime): made-hand bucket, exactly what the
-///         trainer keyed the river with (the "mirror rule");
-///       - `miss_made_hand=false` (fail-on-miss, no mirror): Python returns bucket=-1, so the
-///         digest takes the preflop `b"w"` branch — replicated via `fingerprint_from_bucket(-1)`.
-///   * preflop / invalid holes: identical to the made-hand path (the branches coincide).
 // OPT-6 (2026-07-10, perf worktree) — SERVE-PATH DIGEST MEMO. The subgame/playout blueprint
 // lookups (`PlayoutConfig::fp_key`) paid one blake2b16 compression per call (~60% of the flop-leaf
 // fp_key cost). The message->digest map is a PURE cache (a hit returns exactly what a miss
@@ -941,6 +928,19 @@ pub fn fingerprint_fast_servememo<const N: usize>(
     })
 }
 
+/// EMD-mode fingerprint for the SERVE fast paths (subgame / rollout / LBR / fingerprint export) —
+/// the serve twin of the trainer's `fingerprint_fast_depth_memo_emd` (trainer.rs), which keyed the
+/// promoted EMD-K160 blueprint and is therefore the ground truth for what the blueprint rows were
+/// written under. Byte-parity target: `jax_weva_fast.fingerprint_fast` with
+/// `POKERBOT_POSTFLOP_MODE=emd` (`jax_weva_encode.compute_postflop_bucket`):
+///   * flop/turn (3-4 board cards): bucket = the FROZEN lookup id -> the postflop `b"B"` key;
+///   * frozen MISS (river always — it is not in the blob — or an off-blob flop/turn spot):
+///       - `miss_made_hand=true`  (POKERBOT_EMD_FROZEN_MIRROR_FALLBACK=1 / silent fallback /
+///         fail-on-miss OFF — the deployed serve regime): made-hand bucket, exactly what the
+///         trainer keyed the river with (the "mirror rule");
+///       - `miss_made_hand=false` (fail-on-miss, no mirror): Python returns bucket=-1, so the
+///         digest takes the preflop `b"w"` branch — replicated via `fingerprint_from_bucket(-1)`.
+///   * preflop / invalid holes: identical to the made-hand path (the branches coincide).
 pub fn fingerprint_fast_depth_emd<const N: usize>(
     s: &EnvStateN<N>,
     seat: usize,

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::core::{self, EnvStateN, BET_BUCKET_START, CALL, CHECK, FOLD, NUM_ACTIONS};
 use crate::emd::FrozenEMDLookup;
-use crate::fingerprint::{fingerprint_fast, fingerprint_fast_depth_emd, CHIP_UNIT};
+use crate::fingerprint::CHIP_UNIT;
 
 // ---------------------------------------------------------------------------
 // SETTLE_SHOWDOWN_LEAF consumer (gate lives in core.rs; env POKERBOT_SETTLE_SHOWDOWN_LEAF,
