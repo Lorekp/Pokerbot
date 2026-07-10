@@ -543,7 +543,7 @@ pub fn playout_fixed<const N: usize>(
         let row = bias_continuation_mult(&bp_row, group, &abst, cfg, bias_mult);
         let u = rng.next_f64();
         let a = sample_action(&row, &full, u);
-        env = core::apply_action(&env, a);
+        env = crate::subgame::subgame_apply(&env, a);
         depth += 1;
     }
     playout_terminal_value(&env, hero)
@@ -584,7 +584,8 @@ pub fn playout<const N: usize>(
         let row = bias_continuation(&bp_row, group, &abst, cfg);
         let u = rng.next_f64();
         let a = sample_action(&row, &full, u);
-        env = core::apply_action(&env, a);
+        // OPT-3: perfect-hash settle (chip-identical, certified) on the playout's terminal applies.
+        env = crate::subgame::subgame_apply(&env, a);
         depth += 1;
     }
     playout_terminal_value(&env, hero)

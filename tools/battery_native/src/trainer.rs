@@ -2023,7 +2023,7 @@ fn player_showdown_score_phe(holes: &[i32; 2], board: &[i32; MAX_BOARD]) -> i32 
 /// helpers) — is reused unchanged, so the chip-identity surface is exactly the one swapped scorer.
 /// Returns the per-seat net chip delta (sums to zero), byte-equal to `core::compute_returns`.
 #[cfg(feature = "phe_showdown")]
-fn compute_returns_phe<const N: usize>(
+pub(crate) fn compute_returns_phe<const N: usize>(
     holes: &[[i32; 2]; N],
     board: &[i32; MAX_BOARD],
     seat_status: &[i8; N],

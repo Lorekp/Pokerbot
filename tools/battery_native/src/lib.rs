@@ -42,9 +42,14 @@ pub mod prof {
     pub const P_REPAIR: usize = 3;
     pub const P_LEAF_PLAYOUT: usize = 4;
     pub const P_FP_KEY: usize = 5;
-    pub const NP: usize = 6;
-    pub const PHASE_NAMES: [&str; NP] =
-        ["solve_total", "rtab_build", "deal_holes", "repair_deck", "leaf_playout", "fp_key"];
+    pub const P_APPLY: usize = 6;
+    pub const P_LEGAL: usize = 7;
+    pub const P_MAPS: usize = 8;
+    pub const NP: usize = 9;
+    pub const PHASE_NAMES: [&str; NP] = [
+        "solve_total", "rtab_build", "deal_holes", "repair_deck", "leaf_playout", "fp_key",
+        "apply_action", "legal_mask", "map_ops",
+    ];
     pub static TSC: [AtomicU64; NP] = [const { AtomicU64::new(0) }; NP];
 
     pub const C_NODE_HERO: usize = 0;

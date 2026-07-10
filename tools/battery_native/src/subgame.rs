@@ -74,6 +74,25 @@ macro_rules! prof_count {
 // keys untouched (firewall: zero implementation drift on the certified exploit solve).
 // --------------------------------------------------------------------------------------------------
 
+/// OPT-3 (2026-07-10) — route the GTO subgame's in-tree `apply_action` through the perfect-hash
+/// settle (`trainer::compute_returns_phe`, feature phe_showdown+phe_site1, default ON). The settle
+/// is CHIP-IDENTICAL to `core::compute_returns` (existing gate:
+/// `apply_action_with_phe_matches_scalar_byte_for_byte`), so outputs are byte-unchanged — this is
+/// the same certified per-terminal speed lever the trainer ships with, now applied to the search's
+/// all-in run-out terminals (the profile showed apply_action = 35-70% of solve on settle-heavy
+/// states). Feature OFF => exactly `core::apply_action` (the scalar A/B baseline). The exploit
+/// path's cfv_exploit keeps `core::apply_action` untouched (firewall).
+#[cfg(all(feature = "phe_showdown", feature = "phe_site1"))]
+#[inline(always)]
+pub(crate) fn subgame_apply<const N: usize>(env: &EnvStateN<N>, action: usize) -> EnvStateN<N> {
+    core::apply_action_with(env, action, crate::trainer::compute_returns_phe::<N>)
+}
+#[cfg(not(all(feature = "phe_showdown", feature = "phe_site1")))]
+#[inline(always)]
+pub(crate) fn subgame_apply<const N: usize>(env: &EnvStateN<N>, action: usize) -> EnvStateN<N> {
+    core::apply_action(env, action)
+}
+
 /// splitmix64 finalizer — full-avalanche 64-bit mix.
 #[inline(always)]
 fn fmix64(mut z: u64) -> u64 {
@@ -2403,7 +2422,14 @@ fn cfv<const N: usize>(
         return leaf_value(env, hero, ctx, tab, t, nd);
     }
     let actor = actor_i as usize;
+    #[cfg(feature = "prof")]
+    let _t_legal = crate::prof::tsc();
     let mut legal = abstracted_legal(env, actor, ctx.pcfg);
+    #[cfg(feature = "prof")]
+    crate::prof::TSC[crate::prof::P_LEGAL].fetch_add(
+        crate::prof::tsc().wrapping_sub(_t_legal),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // STAGE-1 ROOT UN-MASK (root_unmask, artifacts/offtree_resolve_design.md §3/§8): at the ROOT
     // node ONLY (depth == 0 — the root actor is always the hero seat), OR the un-mask bits into the
     // abstracted keep-list, ANDed with FULL engine legality so an engine-illegal action can never
@@ -2436,7 +2462,14 @@ fn cfv<const N: usize>(
         };
         let u = rng.next_f64();
         let a = sample_action(&strat, &legal, u);
-        let child = core::apply_action(env, a);
+        #[cfg(feature = "prof")]
+        let _t_ap = crate::prof::tsc();
+        let child = subgame_apply(env, a);
+        #[cfg(feature = "prof")]
+        crate::prof::TSC[crate::prof::P_APPLY].fetch_add(
+            crate::prof::tsc().wrapping_sub(_t_ap),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let cd = child_dig(nd, env.hist_len, actor, a);
         return cfv(&child, hero, depth + 1, ctx, tab, rng, t, &cd);
     }
@@ -2448,7 +2481,14 @@ fn cfv<const N: usize>(
     let mut av = [0.0f64; NUM_ACTIONS];
     for a in 0..NUM_ACTIONS {
         if legal[a] {
-            let child = core::apply_action(env, a);
+            #[cfg(feature = "prof")]
+            let _t_ap = crate::prof::tsc();
+            let child = subgame_apply(env, a);
+            #[cfg(feature = "prof")]
+            crate::prof::TSC[crate::prof::P_APPLY].fetch_add(
+                crate::prof::tsc().wrapping_sub(_t_ap),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let cd = child_dig(nd, env.hist_len, actor, a);
             av[a] = cfv(&child, hero, depth + 1, ctx, tab, rng, t, &cd);
         }
