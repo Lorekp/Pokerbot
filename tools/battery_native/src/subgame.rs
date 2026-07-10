@@ -422,13 +422,27 @@ struct Ctx<'a> {
     root_unmask: u32,
 }
 
+/// One infoset's mutable state: cumulative CFR+ regrets + the (linear-)averaged strategy sum.
+/// OPT-5: merged into ONE row so a hero-node update is a single map probe (entry) instead of the
+/// legacy regrets.insert + strat_sum.entry pair, and an opponent read touches one map. Arithmetic
+/// and update order are unchanged (bit-identical outputs).
+#[derive(Clone, Copy)]
+struct IsetRow {
+    reg: [f64; NUM_ACTIONS],
+    ss: [f64; NUM_ACTIONS],
+}
+
+const ROW_ZERO: IsetRow = IsetRow {
+    reg: [0.0; NUM_ACTIONS],
+    ss: [0.0; NUM_ACTIONS],
+};
+
 /// Mutable per-solve tables (regrets + strategy sums keyed by infoset, leaf-value cache keyed by
 /// public leaf state). OPT-2: keyed by the 128-bit incremental digests (see `NodeDig`) in FxHashMaps
 /// — no per-node key allocation, O(1) hashing. The EXPLOIT path keeps its own legacy-keyed
 /// `TablesExploit` (firewall).
 struct Tables {
-    regrets: FxHashMap<u128, [f64; NUM_ACTIONS]>,
-    strat_sum: FxHashMap<u128, [f64; NUM_ACTIONS]>,
+    rows: FxHashMap<u128, IsetRow>,
     /// Leaf value cache: `(sum, n)` running mean over the first `leaf_cache_worlds` VISITING hole-worlds
     /// (n frozen at that cap). With leaf_cache_worlds=1 (default) this is exactly the legacy first-touch
     /// single-value cache: `(v, 1)` inserted on the miss, `sum / 1` (== v bit-for-bit) on every hit.
@@ -2469,7 +2483,7 @@ fn leaf_value_biased<const N: usize>(
         }
         let ckd = cont_dig(iset_dig(nd, env, s));
         let ck = cont_choice_key(env, s);
-        let regs = *tab.regrets.get(&ckd).unwrap_or(&ZEROS);
+        let regs = tab.rows.get(&ckd).map(|r| r.reg).unwrap_or(ZEROS);
         choices[s] = sample_cont_choice(&regs, &ck, t, ctx.public_seed) as i32;
     }
     if env.seat_status[hero] != SEAT_LIVE {
@@ -2478,7 +2492,7 @@ fn leaf_value_biased<const N: usize>(
     // Traverser's choice node: branch all 4 continuations (hero's own continuation biases hero's own
     // playout actions too — both hero and opponents choose, per Pluribus).
     let ckd = cont_dig(iset_dig(nd, env, hero));
-    let regs = *tab.regrets.get(&ckd).unwrap_or(&ZEROS);
+    let regs = tab.rows.get(&ckd).map(|r| r.reg).unwrap_or(ZEROS);
     let strat = regret_match(&regs, &CONT_LEGAL);
     let mut cv = [0.0f64; NUM_ACTIONS];
     for c in 0..playout::NUM_CONTINUATIONS {
@@ -2493,7 +2507,8 @@ fn leaf_value_biased<const N: usize>(
     for c in 0..playout::NUM_CONTINUATIONS {
         newr[c] = (newr[c] + cv[c] - ev).max(0.0);
     }
-    tab.regrets.insert(ckd, newr);
+    let row = tab.rows.entry(ckd).or_insert(ROW_ZERO);
+    row.reg = newr;
     // Strategy-sum accumulation: identical gating/weighting to the action nodes (delayed averaging +
     // CFR+ linear weight), so the choice node is a first-class citizen of the served average.
     if t >= ctx.avg_skip {
@@ -2502,9 +2517,8 @@ fn leaf_value_biased<const N: usize>(
         } else {
             1.0
         };
-        let ss = tab.strat_sum.entry(ckd).or_insert([0.0; NUM_ACTIONS]);
         for c in 0..playout::NUM_CONTINUATIONS {
-            ss[c] += w * strat[c];
+            row.ss[c] += w * strat[c];
         }
     }
     ev
@@ -2643,7 +2657,7 @@ fn cfv<const N: usize>(
 
     if actor != hero {
         prof_count!(crate::prof::C_NODE_OPP);
-        let regrets = *tab.regrets.get(&key).unwrap_or(&ZEROS);
+        let regrets = tab.rows.get(&key).map(|r| r.reg).unwrap_or(ZEROS);
         // TWO-SIDED (GTO): the non-traverser samples from ITS OWN learned regret-match (uniform on first
         // touch), and its regrets update on the iterations where IT is the traverser -> a subgame
         // equilibrium (mirrors pluribus_search.py:722-723). ONE-SIDED: fixed blueprint-mixed prior.
@@ -2668,7 +2682,7 @@ fn cfv<const N: usize>(
 
     // hero node: branch all (abstracted-)legal actions, CFR+ regret update.
     prof_count!(crate::prof::C_NODE_HERO);
-    let regrets = *tab.regrets.get(&key).unwrap_or(&ZEROS);
+    let regrets = tab.rows.get(&key).map(|r| r.reg).unwrap_or(ZEROS);
     let strat = regret_match(&regrets, &legal);
     let mut av = [0.0f64; NUM_ACTIONS];
     for a in 0..NUM_ACTIONS {
@@ -2695,7 +2709,8 @@ fn cfv<const N: usize>(
             newr[a] = (newr[a] + av[a] - ev).max(0.0);
         }
     }
-    tab.regrets.insert(key, newr);
+    let row = tab.rows.entry(key).or_insert(ROW_ZERO);
+    row.reg = newr;
     // BUG-5 (partial) — DELAYED AVERAGING: the SERVED average excludes iterations t < avg_skip
     // (floor(avg_skip_frac * K), 0 = legacy). Regret updates above are NEVER skipped.
     if t >= ctx.avg_skip {
@@ -2705,9 +2720,8 @@ fn cfv<const N: usize>(
         } else {
             1.0
         };
-        let ss = tab.strat_sum.entry(key).or_insert([0.0; NUM_ACTIONS]);
         for a in 0..NUM_ACTIONS {
-            ss[a] += w * strat[a];
+            row.ss[a] += w * strat[a];
         }
     }
     ev
@@ -2737,8 +2751,7 @@ fn solve_stream<const N: usize>(
 ) -> ([f64; NUM_ACTIONS], [f64; NUM_ACTIONS], bool) {
     let scfg = ctx.scfg;
     let mut tab = Tables {
-        regrets: FxHashMap::default(),
-        strat_sum: FxHashMap::default(),
+        rows: FxHashMap::default(),
         leaf: FxHashMap::default(),
     };
     let mut rng = Rng::seed_from_u64(stream_seed);
@@ -2769,10 +2782,10 @@ fn solve_stream<const N: usize>(
         cfv(&world, traverser, 0, ctx, &mut tab, &mut rng, t, root_nd);
     }
     // Return the ROOT rows raw (unnormalized) so the ensemble can SUM strat_sum across streams.
-    let ss = tab.strat_sum.get(&root_key).copied().unwrap_or(ZEROS);
+    let root_row = tab.rows.get(&root_key).copied().unwrap_or(ROW_ZERO);
+    let ss = root_row.ss;
     let has_avg = ss.iter().sum::<f64>() > 1e-12;
-    let rr = tab.regrets.get(&root_key).copied().unwrap_or(ZEROS);
-    (ss, rr, has_avg)
+    (ss, root_row.reg, has_avg)
 }
 
 /// The full CFR solve MINUS the extraction: the ensemble-merged ROOT rows
