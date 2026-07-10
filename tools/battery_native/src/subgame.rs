@@ -2603,6 +2603,43 @@ fn leaf_value<const N: usize>(
     sum / n as f64
 }
 
+/// OPT-7 (2026-07-10, BIT-IDENTICAL) — inline fold-terminal value. When the acting seat folds with
+/// exactly TWO contesting seats (SEAT_LIVE/SEAT_ALLIN), `apply_action` would mark the folder,
+/// find n_live==1 => terminal, and settle via the `n_showdown <= 1` fold-win branch of
+/// `compute_returns`: every seat -committed_total, the single remaining eligible seat +total. The
+/// traverser's component of that settle is computed here directly — skipping the ~1.3KB child state
+/// copy + betting bookkeeping for the single scalar the recursion consumes. Returns None unless the
+/// fold is immediately terminal (multiway folds continue the hand — and under the engine's
+/// unsettled-showdown semantics a folded hero's DOWNSTREAM value is path-dependent, so no shortcut
+/// is valid there). Mirrors compute_returns' fold_win branch exactly (winner = first eligible seat
+/// after the fold), so the value is bit-identical to the applied child's rewards[hero] / CHIP_UNIT.
+#[inline]
+fn fold_terminal_value<const N: usize>(env: &EnvStateN<N>, hero: usize) -> Option<f64> {
+    if live_count_rs(&env.seat_status) != 2 {
+        return None;
+    }
+    let folder = env.action_seat;
+    debug_assert!(folder >= 0);
+    // Winner = first eligible (non-folded, non-empty) seat once the folder is excluded — exactly
+    // core::eligible_to_win on the post-fold status (the folder becomes SEAT_FOLDED).
+    let mut status = env.seat_status;
+    status[folder as usize] = SEAT_FOLDED;
+    let elig = core::eligible_to_win(&status);
+    let mut winner = 0usize;
+    for i in 0..N {
+        if elig[i] {
+            winner = i;
+            break;
+        }
+    }
+    let total: i32 = env.committed_total.iter().sum();
+    let mut r = -env.committed_total[hero];
+    if winner == hero {
+        r += total;
+    }
+    Some(r as f64 / CHIP_UNIT)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cfv<const N: usize>(
     env: &EnvStateN<N>,
@@ -2668,6 +2705,12 @@ fn cfv<const N: usize>(
         };
         let u = rng.next_f64();
         let a = sample_action(&strat, &legal, u);
+        // OPT-7: immediately-terminal fold => the settle's hero component, no child state build.
+        if a == FOLD {
+            if let Some(v) = fold_terminal_value(env, hero) {
+                return v;
+            }
+        }
         #[cfg(feature = "prof")]
         let _t_ap = crate::prof::tsc();
         let child = subgame_apply(env, a);
@@ -2687,6 +2730,13 @@ fn cfv<const N: usize>(
     let mut av = [0.0f64; NUM_ACTIONS];
     for a in 0..NUM_ACTIONS {
         if legal[a] {
+            // OPT-7: immediately-terminal fold => the settle's hero component, no child state build.
+            if a == FOLD {
+                if let Some(v) = fold_terminal_value(env, hero) {
+                    av[a] = v;
+                    continue;
+                }
+            }
             #[cfg(feature = "prof")]
             let _t_ap = crate::prof::tsc();
             let child = subgame_apply(env, a);
@@ -2751,8 +2801,10 @@ fn solve_stream<const N: usize>(
 ) -> ([f64; NUM_ACTIONS], [f64; NUM_ACTIONS], bool) {
     let scfg = ctx.scfg;
     let mut tab = Tables {
-        rows: FxHashMap::default(),
-        leaf: FxHashMap::default(),
+        // Pre-reserve past the early doubling churn (rehash copies showed up on the big river
+        // solves); ~3 MB up front, reclaimed at solve end.
+        rows: FxHashMap::with_capacity_and_hasher(1 << 14, Default::default()),
+        leaf: FxHashMap::with_capacity_and_hasher(1 << 13, Default::default()),
     };
     let mut rng = Rng::seed_from_u64(stream_seed);
     // Q2 DECOUPLE: the opponent-hole deal draws from its OWN deterministic sub-stream (derived from this
