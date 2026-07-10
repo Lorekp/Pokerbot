@@ -161,9 +161,10 @@ impl PlayoutConfig {
         let _prof_scope = crate::prof::Scope::new(crate::prof::P_FP_KEY);
         #[cfg(feature = "prof")]
         crate::prof::count(crate::prof::C_BP_GET);
+        // OPT-6: memoized digest twins (byte-identical; thread-local pure message->digest cache).
         match &self.emd {
-            None => fingerprint_fast(s, seat, self.num_buckets),
-            Some(k) => fingerprint_fast_depth_emd(
+            None => crate::fingerprint::fingerprint_fast_servememo(s, seat, self.num_buckets),
+            Some(k) => crate::fingerprint::fingerprint_fast_depth_emd_servememo(
                 s,
                 seat,
                 self.num_buckets,

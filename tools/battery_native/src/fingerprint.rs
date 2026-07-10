@@ -879,6 +879,68 @@ pub fn fingerprint_from_bucket<const N: usize>(
 ///       - `miss_made_hand=false` (fail-on-miss, no mirror): Python returns bucket=-1, so the
 ///         digest takes the preflop `b"w"` branch — replicated via `fingerprint_from_bucket(-1)`.
 ///   * preflop / invalid holes: identical to the made-hand path (the branches coincide).
+// OPT-6 (2026-07-10, perf worktree) — SERVE-PATH DIGEST MEMO. The subgame/playout blueprint
+// lookups (`PlayoutConfig::fp_key`) paid one blake2b16 compression per call (~60% of the flop-leaf
+// fp_key cost). The message->digest map is a PURE cache (a hit returns exactly what a miss
+// recomputes — the established `FpMemo` contract the trainer ships with), so routing the serve fast
+// paths through the existing *_memo twins with a thread-local memo is byte-identical. Capped like
+// the trainer's memo (clear-on-cap bounds a long-lived serve process); rayon ensemble streams each
+// get their own thread-local (pure cache => no cross-thread coherence needed).
+thread_local! {
+    static SERVE_FP_MEMO: std::cell::RefCell<FpMemo> = std::cell::RefCell::new(FpMemo::default());
+}
+const SERVE_FP_MEMO_CAP: usize = 1 << 21;
+
+/// Memoized twin of `fingerprint_fast_depth_emd` for the serve hot path (byte-identical digests).
+pub fn fingerprint_fast_depth_emd_servememo<const N: usize>(
+    s: &EnvStateN<N>,
+    seat: usize,
+    num_buckets: i32,
+    depth_edges: &[f64],
+    lookup: &crate::emd::FrozenEMDLookup,
+    miss_made_hand: bool,
+) -> [u8; 16] {
+    SERVE_FP_MEMO.with(|m| {
+        let memo = &mut *m.borrow_mut();
+        if memo.len() > SERVE_FP_MEMO_CAP {
+            memo.clear();
+        }
+        let h0 = s.holes[seat][0];
+        let h1 = s.holes[seat][1];
+        let nb = s.board.iter().filter(|&&c| c >= 0).count();
+        if nb >= 3 && h0 >= 0 && h1 >= 0 {
+            if nb <= 4 {
+                if let Some(bucket) =
+                    crate::emd::frozen_bucket_memoed(lookup, &s.holes[seat], &s.board)
+                {
+                    return fingerprint_fast_depth_postflop_bucket_memo(s, seat, bucket, memo);
+                }
+            }
+            // Frozen miss: river (never in the blob) or a true flop/turn blob miss.
+            if miss_made_hand {
+                return fingerprint_fast_depth_memo(s, seat, num_buckets, depth_edges, memo);
+            }
+            return fingerprint_from_bucket(s, seat, -1, depth_edges);
+        }
+        fingerprint_fast_depth_memo(s, seat, num_buckets, depth_edges, memo)
+    })
+}
+
+/// Memoized twin of `fingerprint_fast` (made-hand serve keying) — byte-identical digests.
+pub fn fingerprint_fast_servememo<const N: usize>(
+    s: &EnvStateN<N>,
+    seat: usize,
+    num_buckets: i32,
+) -> [u8; 16] {
+    SERVE_FP_MEMO.with(|m| {
+        let memo = &mut *m.borrow_mut();
+        if memo.len() > SERVE_FP_MEMO_CAP {
+            memo.clear();
+        }
+        fingerprint_fast_depth_memo(s, seat, num_buckets, &[], memo)
+    })
+}
+
 pub fn fingerprint_fast_depth_emd<const N: usize>(
     s: &EnvStateN<N>,
     seat: usize,
