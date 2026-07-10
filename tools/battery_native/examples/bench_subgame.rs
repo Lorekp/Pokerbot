@@ -207,7 +207,7 @@ fn main() {
             } else {
                 probs
                     .iter()
-                    .map(|x| format!("{x:.6}"))
+                    .map(|x| format!("{x:.17e}"))
                     .collect::<Vec<_>>()
                     .join(",")
             };
