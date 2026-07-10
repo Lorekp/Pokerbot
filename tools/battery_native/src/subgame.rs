@@ -85,7 +85,78 @@ macro_rules! prof_count {
 #[cfg(all(feature = "phe_showdown", feature = "phe_site1"))]
 #[inline(always)]
 pub(crate) fn subgame_apply<const N: usize>(env: &EnvStateN<N>, action: usize) -> EnvStateN<N> {
-    core::apply_action_with(env, action, crate::trainer::compute_returns_phe::<N>)
+    core::apply_action_with(env, action, settle_checked::<N>)
+}
+
+/// The PHE settle with a DEGENERATE-WORLD guard. Under `repair_deck=false` (legacy/test configs)
+/// the solver's per-world envs can carry a STALE deck: opponent holes are re-dealt independently of
+/// the deck tail, so an in-tree all-in run-out can put a card on the board that duplicates a hole
+/// card (the documented stale-deck bug repair_deck exists to fix). The scalar `compute_returns`
+/// tolerates such garbage inputs (defined-but-meaningless scores — the certified legacy behavior);
+/// the perfect-hash evaluator PANICS on them (5-of-a-rank quinary). This wrapper routes showdown
+/// settles with a full, duplicate-free, in-range (board + eligible holes) card set through the
+/// certified chip-identical `compute_returns_phe`, and EVERYTHING else through the scalar
+/// `core::compute_returns` — bit-identical to the legacy settle in all cases (valid worlds:
+/// PHE == scalar by the chip-identity gate; degenerate worlds: exactly the scalar path).
+#[cfg(all(feature = "phe_showdown", feature = "phe_site1"))]
+fn settle_checked<const N: usize>(
+    holes: &[[i32; 2]; N],
+    board: &[i32; core::MAX_BOARD],
+    seat_status: &[i8; N],
+    committed_total: &[i32; N],
+    button: i32,
+    n_showdown: i32,
+) -> [i32; N] {
+    if n_showdown > 1 {
+        let mut mask: u64 = 0;
+        let mut ok = true;
+        'validate: {
+            for i in 0..core::MAX_BOARD {
+                let c = board[i];
+                if !(0..52).contains(&c) {
+                    ok = false;
+                    break 'validate;
+                }
+                let b = 1u64 << c;
+                if mask & b != 0 {
+                    ok = false;
+                    break 'validate;
+                }
+                mask |= b;
+            }
+            let elig = core::eligible_to_win(seat_status);
+            for s in 0..N {
+                if !elig[s] {
+                    continue;
+                }
+                for k in 0..2 {
+                    let c = holes[s][k];
+                    if !(0..52).contains(&c) {
+                        ok = false;
+                        break 'validate;
+                    }
+                    let b = 1u64 << c;
+                    if mask & b != 0 {
+                        ok = false;
+                        break 'validate;
+                    }
+                    mask |= b;
+                }
+            }
+        }
+        if ok {
+            return crate::trainer::compute_returns_phe(
+                holes,
+                board,
+                seat_status,
+                committed_total,
+                button,
+                n_showdown,
+            );
+        }
+    }
+    // Fold-win (n_showdown <= 1, no eval) or a degenerate world: the scalar legacy settle.
+    core::compute_returns(holes, board, seat_status, committed_total, button, n_showdown)
 }
 #[cfg(not(all(feature = "phe_showdown", feature = "phe_site1")))]
 #[inline(always)]
