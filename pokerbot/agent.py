@@ -96,11 +96,6 @@ class HybridAgent:
         # Exploit magnitude (set_exploit_strength): scales the mixer alpha. 1.0 ⇒ full overlay (legacy
         # behavior); 0.0 ⇒ pure GTO base; in-between is the skill-tier exploitation dial (see ADAPT).
         self._exploit_strength = 1.0
-        # Optional table-toughness router (pokerbot.opponent.base_router): per-decision, per-villain it
-        # may swap the GTO base to the CFR blueprint and damp exploit when the modeled villain reads as
-        # a near-equilibrium reg (protect vs strong), while keeping the SFT base + full exploit vs weak
-        # fields (the value focus). None ⇒ the validated SFT vehicle, byte-unchanged.
-        self._base_router = None
 
         if use_transformer:
             self.transformer = OpponentTransformer(OpponentTransformerConfig()).to(self.device)
@@ -179,13 +174,6 @@ class HybridAgent:
         skill-tier ladder maps ADAPT[tier].exploit_strength here (advanced soft … superhuman full)."""
         self._exploit_strength = float(max(0.0, min(1.0, strength)))
 
-    def set_base_router(self, router) -> None:
-        """Attach a ``pokerbot.opponent.base_router.BaseRouter`` (or ``None`` to detach). When set, each
-        decision the router inspects the modeled villain's profile and may (a) damp exploit_strength and
-        (b) swap the GTO base to the CFR blueprint — protecting against confirmed regs while leaving the
-        SFT base + full exploit vs weak fields (the value focus). None ⇒ the validated SFT vehicle."""
-        self._base_router = router
-
     def observe_decision(self, state: GameState, actor_seat: int) -> None:
         self._trajectory.on_decision(state, actor_seat)
 
@@ -252,17 +240,8 @@ class HybridAgent:
         position = torch.from_numpy(enc["policy_position"]).unsqueeze(0).to(self.device)
         legal = torch.from_numpy(_legal_mask(state, seat)).unsqueeze(0).to(self.device)
 
-        # Table-toughness routing (task (b)): on a confirmed-reg villain, damp exploit and fall back to
-        # the blueprint base (protect vs strong); on weak/unknown villains keep the SFT base + full
-        # exploit (the value focus). Only active when a router is attached AND exploitation is on — the
-        # clean A/B OFF arm stays the pure SFT GTO base regardless of toughness.
         eff_strength = self._exploit_strength
         base_override = None
-        if self._base_router is not None and self._exploit_enabled:
-            decision = self._base_router.decide(opponent_profile)
-            eff_strength *= decision.exploit_scale
-            if decision.use_blueprint:
-                base_override = self._base_router.base_probs(state, seat)
 
         tf_out = self._transformer_outputs(state, hero_seat)
         probs = self.hybrid.get_probs(
