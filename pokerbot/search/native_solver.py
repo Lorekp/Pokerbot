@@ -396,12 +396,34 @@ def _native_fingerprint_matches_serve_abstraction() -> bool:
             return False
         if "preflop_hist_key" not in caps:
             return False
-    # River-OCHS serve regime (POKERBOT_RIVER_OCHS): the native SERVE fast paths have no river-OCHS
-    # keying (only trainer.rs does), so a river lookup through them would take the made-hand mirror
-    # branch and HIT wrong-semantics river rows (same bucket-id space). Fail closed to the Python
-    # path (river-OCHS-correct) until fingerprint.rs::fingerprint_fast_depth_emd learns the table.
+    # River-OCHS serve regime (POKERBOT_RIVER_OCHS): fingerprint.rs::fingerprint_fast_depth_emd now
+    # carries the OCHS-first river branch (serve_river_ochs, 2026-07-11 port of the trainer's
+    # keying) — capability-gated: a STALE .pyd without it would take the made-hand mirror branch and
+    # HIT wrong-semantics river rows (same bucket-id space). Fail closed unless the binary reports
+    # "river_ochs_serve".
     if os.environ.get("POKERBOT_RIVER_OCHS"):
-        return False
+        if _EXT is None:
+            return False
+        try:
+            caps = set(_EXT.native_caps())
+        except Exception:  # noqa: BLE001
+            return False
+        if "river_ochs_serve" not in caps:
+            return False
+    # Off-menu action translation (POKERBOT_ACTION_TRANSLATE=1, serve-coverage fix 2026-07-11): the
+    # Python key path translates off-trained-menu history tokens before key construction
+    # (action_translate.py); a STALE .pyd without translate.rs would key UNTRANSLATED histories — a
+    # silent Python/native KEY SKEW inside one serve process. Fail closed unless the binary reports
+    # "action_translate".
+    if os.environ.get("POKERBOT_ACTION_TRANSLATE", "") == "1":
+        if _EXT is None:
+            return False
+        try:
+            caps = set(_EXT.native_caps())
+        except Exception:  # noqa: BLE001
+            return False
+        if "action_translate" not in caps:
+            return False
     if os.environ.get("POKERBOT_POSTFLOP_MODE", "fast").lower() != "emd":
         return True
     if os.environ.get("POKERBOT_NATIVE_ALLOW_EMD_MISKEY", "0").lower() in ("1", "true", "yes", "on"):

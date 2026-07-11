@@ -440,7 +440,30 @@ fn effective_depth_bb<const N: usize>(s: &EnvStateN<N>) -> f64 {
 /// Depth-aware fingerprint (`POKERBOT_DEPTH_BUCKETS=1`). When `depth_edges` is non-empty, the PREFLOP
 /// key gains `b"D" + depth_bucket(1 byte)` between weva_id and the betting_state -- byte-identical to
 /// `NLHEEncodeBundle._digest` with `_DEPTH_BUCKETS`. Pass `&[]` for the non-depth blueprint (unchanged).
+///
+/// SERVE entry point: consults the off-menu action-translation gate (`POKERBOT_ACTION_TRANSLATE=1`,
+/// crate::translate) BEFORE key construction — default OFF is byte-identical (one latched bool
+/// check). The trainer's keying (trainer.rs `fingerprint_fast_depth_memo*` -> the `_memo` twins
+/// below) never routes through here, so training is untouched by the gate.
 pub fn fingerprint_fast_depth<const N: usize>(
+    s: &EnvStateN<N>,
+    seat: usize,
+    num_buckets: i32,
+    depth_edges: &[f64],
+) -> [u8; 16] {
+    let translated;
+    let s = if crate::translate::enabled() {
+        translated = crate::translate::translate_state_for_key(s);
+        &translated
+    } else {
+        s
+    };
+    fingerprint_fast_depth_raw(s, seat, num_buckets, depth_edges)
+}
+
+/// The pre-translation `fingerprint_fast_depth` body (state taken AS-IS — used internally by the
+/// EMD serve path after it has already applied translation once).
+fn fingerprint_fast_depth_raw<const N: usize>(
     s: &EnvStateN<N>,
     seat: usize,
     num_buckets: i32,
@@ -887,10 +910,32 @@ pub fn fingerprint_fast_depth_emd<const N: usize>(
     lookup: &crate::emd::FrozenEMDLookup,
     miss_made_hand: bool,
 ) -> [u8; 16] {
+    // SERVE entry point: off-menu action translation (POKERBOT_ACTION_TRANSLATE=1) BEFORE key
+    // construction; default OFF is byte-identical. Applied ONCE here — the inner calls below use
+    // the `_raw` twin so a translated state is never re-translated.
+    let translated;
+    let s = if crate::translate::enabled() {
+        translated = crate::translate::translate_state_for_key(s);
+        &translated
+    } else {
+        s
+    };
     let h0 = s.holes[seat][0];
     let h1 = s.holes[seat][1];
     let nb = s.board.iter().filter(|&&c| c >= 0).count();
     if nb >= 3 && h0 >= 0 && h1 >= 0 {
+        // River-OCHS serve keying (mirrors trainer.rs::fingerprint_fast_depth_memo_emd_impl —
+        // OCHS checked FIRST so an active-table river never falls through to the made-hand
+        // mirror). Rows trained under POKERBOT_RIVER_OCHS are hit with the exact trainer keying.
+        if nb == 5 {
+            if let Some(table) = serve_river_ochs() {
+                if let Some(bucket) =
+                    crate::river_ochs::river_ochs_bucket_memoed(table, &s.holes[seat], &s.board)
+                {
+                    return fingerprint_fast_depth_postflop_bucket(s, seat, bucket);
+                }
+            }
+        }
         if nb <= 4 {
             if let Some(bucket) = crate::emd::frozen_bucket_memoed(lookup, &s.holes[seat], &s.board)
             {
@@ -899,11 +944,37 @@ pub fn fingerprint_fast_depth_emd<const N: usize>(
         }
         // Frozen miss: river (never in the blob) or a true flop/turn blob miss.
         if miss_made_hand {
-            return fingerprint_fast_depth(s, seat, num_buckets, depth_edges);
+            return fingerprint_fast_depth_raw(s, seat, num_buckets, depth_edges);
         }
         return fingerprint_from_bucket(s, seat, -1, depth_edges);
     }
-    fingerprint_fast_depth(s, seat, num_buckets, depth_edges)
+    fingerprint_fast_depth_raw(s, seat, num_buckets, depth_edges)
+}
+
+/// SERVE-side river-OCHS table (blueprint-v2 river keying). Latched ONCE per process from
+/// `POKERBOT_RIVER_OCHS` (the same env var the Python serve twin keys the river with), matching the
+/// OnceLock convention of every other keying gate — the configuration unit is "set the env before
+/// launch". `None` (unset) is byte-identical to the shipped made-hand-mirror river.
+///
+/// FAIL-CLOSED: if the env var is set but the table cannot be loaded, PANIC. Falling through to the
+/// made-hand mirror would silently HIT wrong-semantics river rows (OCHS and made-hand share the
+/// postflop bucket-id space) — a misconfigured serve process must die, not serve garbage.
+pub fn serve_river_ochs() -> Option<&'static crate::river_ochs::RiverOchs> {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Option<crate::river_ochs::RiverOchs>> = OnceLock::new();
+    TABLE
+        .get_or_init(|| match std::env::var("POKERBOT_RIVER_OCHS") {
+            Ok(p) if !p.is_empty() => match crate::river_ochs::RiverOchs::load_path(&p) {
+                Ok(t) => Some(t),
+                Err(e) => panic!(
+                    "POKERBOT_RIVER_OCHS is set ({p}) but the table failed to load: {e} — \
+                     refusing the made-hand fall-through (shared bucket-id space => \
+                     wrong-semantics river rows)"
+                ),
+            },
+            _ => None,
+        })
+        .as_ref()
 }
 
 /// Digest a stack-assembled message with the FP memo (R3: slice-probed — the memo key type

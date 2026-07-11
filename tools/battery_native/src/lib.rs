@@ -26,6 +26,7 @@ pub mod playout;
 pub mod river_ochs;
 pub mod subgame;
 pub mod trainer;
+pub mod translate;
 
 #[cfg(test)]
 mod tests;
@@ -383,6 +384,15 @@ mod py {
             // (design doc §35; default-off byte-identical to the fullhist key space). Stale .pyds
             // without this cap must not serve a presum checkpoint.
             "presum_key".to_string(),
+            // blueprint-v2 river keying at SERVE: fingerprint.rs consults POKERBOT_RIVER_OCHS
+            // (fail-closed) in the EMD fast path, mirroring the trainer's OCHS-first river branch.
+            // Stale .pyds without this cap must not native-serve a river-OCHS checkpoint (they
+            // would silently HIT wrong-semantics made-hand river rows).
+            "river_ochs_serve".to_string(),
+            // serve-coverage fix (2026-07-11): fingerprint.rs serve entry points consult the
+            // env-gated (POKERBOT_ACTION_TRANSLATE=1) pseudo-harmonic off-menu action translation
+            // (translate.rs; default-off byte-identical).
+            "action_translate".to_string(),
         ]
     }
 
