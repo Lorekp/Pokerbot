@@ -164,6 +164,10 @@ tar -xzf /tmp/code.tar.gz -C /opt/pokerbot
 cd /opt/pokerbot
 python3 -m pip install --disable-pip-version-check --no-input --break-system-packages boto3 numpy "jax[cpu]" phevaluator \
   || python3 -m pip install --disable-pip-version-check --no-input boto3 numpy "jax[cpu]" phevaluator || fail pip
+# CPU torch: pokerbot.search.state_bridge -> pbs_tracker -> sequence_encoder imports torch
+# (cert2 failure; same fallback the eval-suite launcher ships)
+python3 -m pip install --disable-pip-version-check --no-input --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu \
+  || python3 -m pip install --disable-pip-version-check --no-input torch --index-url https://download.pytorch.org/whl/cpu || fail torch
 
 mkdir -p data/abstraction checkpoints
 aws s3 cp s3://{BUCKET}/{PREFIX}/data/emd_frozen_flop_turn_160_r400.emdfrzn data/abstraction/ --region {REGION} || fail blob1
