@@ -9,8 +9,9 @@ fallback chain, dead-man-cost-cap user-data stub) but renders a CERT bootstrap:
   3. convert the FULL 148.5M-row strat table -> arrays_v1 f32 serve pkl (nlcfr_stream_filter);
   4. GATES (abort-on-fail => marker + poweroff): fullhist+presum+closure key parity,
      EMD+river-OCHS native serve parity, worker exact-zero, knob-effectiveness nonzero;
-  5. BATTERY: CRN-paired engine_ab_h2h NEW-vs-INCUMBENT (both arms Track-2 search K=2000,
-     two-sided, settle-showdown-leaf ON, closure ON), 2 seeds x 4000 decks, deck-sharded;
+  5. BATTERY: CRN-paired engine_ab_h2h NEW-vs-INCUMBENT, both arms RAW BLUEPRINT
+     (search:false — isolates the BLUEPRINT delta; search additivity is Track-2-certified
+     separately), settle-showdown-leaf ON, closure ON, 2 seeds x 4000 decks, deck-sharded;
   6. POOL: pool_absolute_one_arm per arm (own process env = own serve regime), CRN deck seeds;
   7. results synced to S3 every 120 s (heartbeat) + RESULT_DONE marker; poweroff on completion.
 
@@ -58,6 +59,7 @@ _CODE_INCLUDE = [
     "scripts/pool_absolute_one_arm.py",
     "scripts/track2_s3c_pool.py",
     "scripts/nlcfr_stream_filter.py",
+    "scripts/cert_verdict_merge.py",
     "scripts/probe_fullhist_key_parity.py",
     "scripts/probe_native_emd_parity.py",
     "scripts/f32_regret_strategy_delta.py",
@@ -125,8 +127,7 @@ def _upload_data(s3) -> None:
         print(f"  uploaded {name} ({p.stat().st_size/1e6:.1f} MB)", flush=True)
 
 
-def _render_bootstrap(*, run_id: str, decks_per_seed: int, seeds: str, pool_decks: int,
-                      search_iters: int) -> str:
+def _render_bootstrap(*, run_id: str, decks_per_seed: int, seeds: str, pool_decks: int) -> str:
     res = f"s3://{BUCKET}/{PREFIX}/{run_id}/results"
     newenv = ("POKERBOT_FULLHIST_KEY=1 POKERBOT_PRESUM_KEY=1 POKERBOT_MRR=1 "
               "POKERBOT_CLOSE_CALLED_STREET=1 POKERBOT_PRE_KEEP=2,3,4,5,6 "
@@ -139,21 +140,27 @@ def _render_bootstrap(*, run_id: str, decks_per_seed: int, seeds: str, pool_deck
         "POKERBOT_RIVER_OCHS": "/opt/pokerbot/data/abstraction/river_ochs_160.rochs",
     })
     incenv_json = json.dumps({"POKERBOT_CLOSE_CALLED_STREET": "1"})
+    # RAW arms: search:false serves the blueprint root policy directly (no subgame solve) —
+    # the cert isolates the BLUEPRINT object; both arms still settle showdown money (harness
+    # money fix default-ON) and play under closure (parent env).
     arm_new = json.dumps({"worker_env": json.loads(newenv_json), "settle_showdown_leaf": True,
-                          "iterations": search_iters,
+                          "search": False,
                           "blueprint_path": "/opt/pokerbot/checkpoints/bp_new_full.pkl"})
     arm_inc = json.dumps({"worker_env": json.loads(incenv_json), "settle_showdown_leaf": True,
-                          "iterations": search_iters})
+                          "search": False})
     return f"""#!/bin/bash
 set -uxo pipefail
 export HOME="${{HOME:-/root}}"
 export DEBIAN_FRONTEND=noninteractive AWS_DEFAULT_REGION={REGION}
 OUT=/opt/pokerbot/cert_out; mkdir -p $OUT /opt/pokerbot
 fail() {{ echo "$1" > $OUT/FAILED.txt; aws s3 sync $OUT {res}/ --region {REGION} || true; sync; poweroff; exit 1; }}
+stage() {{ echo "$(date -u +%s) $1" >> $OUT/stage.txt; }}
+stage boot
 
 # heartbeat + result sync loop (background, entire run)
 ( while true; do date -u +%s > $OUT/heartbeat.txt; aws s3 sync $OUT {res}/ --region {REGION} --quiet || true; sleep 120; done ) &
 
+stage deps
 apt-get update -qq && apt-get install -y -qq python3-pip python3-dev build-essential curl unzip || fail deps
 curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/aws.zip && unzip -q /tmp/aws.zip -d /tmp && /tmp/aws/install --update && hash -r
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
@@ -180,6 +187,7 @@ echo "25c860d2f35a08fcb38499d436d29547233b771e5a6b4fc057da8a72d7d53d44  data/abs
 # NO target-cpu override: the native_solver startup self-check requires BIT-IDENTICAL
 # Rust-vs-Python f32 bet-amount arithmetic; x86-64-v3 FMA contraction broke it on cert1
 # (locally-validated builds use the default target). Baseline codegen is plenty for serve.
+stage build
 cd tools/battery_native && cargo build --release --features python 2>&1 | tail -3 || fail build
 cp target/release/libbattery_native.so /opt/pokerbot/battery_native.so
 mkdir -p target/release && cp target/release/libbattery_native.so target/release/battery_native.so || true
@@ -194,13 +202,16 @@ print('available', ns.available(), 'selfcheck', ns._SELFCHECK_OK, flush=True)
 sys.exit(0 if ns.available() else 1)" 2>&1 | tee $OUT/selfcheck_diag.log || fail selfcheck
 
 # blueprint download + FULL-table conversion (arrays_v1 f32)
+stage nlcfr_download
 aws s3 cp {NLCFR_S3} /opt/pokerbot/iter_050000.nlcfr --region {REGION} || fail nlcfr
+stage convert
 python3 scripts/nlcfr_stream_filter.py /opt/pokerbot/iter_050000.nlcfr checkpoints/bp_new_full.pkl \\
   --mass 1.0 --max-rows 200000000 --arrays 2>&1 | tee $OUT/convert.log || fail convert
 rm -f /opt/pokerbot/iter_050000.nlcfr
 
 export PYTHONPATH=/opt/pokerbot
 # ---------------- GATES (abort-on-fail) ----------------
+stage gates
 {newenv} python3 scripts/probe_fullhist_key_parity.py --fullhist 1 --presum 1 \\
   --min-states 1024 --min-postflop 1024 --out $OUT/gate_parity_fullhist.json 2>&1 | tail -3 | tee $OUT/gate_parity_fullhist.log || fail gate_parity_fullhist
 {newenv} python3 scripts/probe_native_emd_parity.py --min-postflop 600 --min-per-street 80 \\
@@ -210,7 +221,11 @@ POKERBOT_CLOSE_CALLED_STREET=1 python3 scripts/engine_ab_h2h.py \\
   --decks 6 --seed 4242 --label box_zero_gate --out $OUT/gate_zero.json 2>&1 | tail -6 | tee $OUT/gate_zero.log
 python3 - <<'PY' || fail gate_zero
 import json; d=json.load(open('/opt/pokerbot/cert_out/gate_zero.json'))
-assert abs(d["a_minus_b_per_deck"]) < 1e-9 and abs(d["ci95"]) < 1e-9, d["a_minus_b_per_deck"]
+# cert4 postmortem: ci95 is a LIST [lo, hi] — abs(list) raised TypeError and spuriously failed
+# a PERFECT-zero gate. Check mean + both CI bounds + every per-deck net element-wise.
+assert abs(d["a_minus_b_per_deck"]) < 1e-9, d["a_minus_b_per_deck"]
+assert all(abs(x) < 1e-9 for x in d["ci95"]), d["ci95"]
+assert all(abs(x) < 1e-9 for x in d["per_deck_nets"]), d["per_deck_nets"]
 PY
 POKERBOT_CLOSE_CALLED_STREET=1 python3 scripts/engine_ab_h2h.py \\
   --arm-a '{arm_new}' --arm-b '{arm_inc}' \\
@@ -223,10 +238,13 @@ PY
 
 # ---------------- BATTERY: NEW vs INCUMBENT, sharded ----------------
 MEMGB=$(awk '/MemTotal/ {{printf "%d", $2/1048576}}' /proc/meminfo)
-SHARDS=1; [ "$MEMGB" -gt 400 ] && SHARDS=3; [ "$MEMGB" -gt 200 ] && [ "$MEMGB" -le 400 ] && SHARDS=2
+# RAW arms: each shard = parent + 2 workers; the NEW-arm worker holds the 8.91GB arrays pkl
+# (~20-30GB resident). Shard counts sized so worst-case worker RSS stays < half of RAM.
+SHARDS=2; [ "$MEMGB" -gt 400 ] && SHARDS=6; [ "$MEMGB" -gt 200 ] && [ "$MEMGB" -le 400 ] && SHARDS=3
 DPS=$(( {decks_per_seed} / SHARDS ))
 echo "MEMGB=$MEMGB SHARDS=$SHARDS decks/shard=$DPS" | tee $OUT/plan.txt
 for SEED in {seeds}; do
+  stage battery_seed$SEED
   pids=()
   for SH in $(seq 0 $((SHARDS-1))); do
     POKERBOT_CLOSE_CALLED_STREET=1 python3 scripts/engine_ab_h2h.py \\
@@ -240,17 +258,23 @@ for SEED in {seeds}; do
 done
 
 # ---------------- POOL: absolute vs roster, one process per arm-env ----------------
+stage pool
 {newenv} python3 scripts/pool_absolute_one_arm.py \\
-  --blueprint checkpoints/bp_new_full.pkl --spec '{{"settle_showdown_leaf": true, "iterations": {search_iters}}}' \\
-  --decks {pool_decks} --seed 0 --label pool_new --out $OUT/pool_new.json > $OUT/pool_new.log 2>&1 &
+  --blueprint checkpoints/bp_new_full.pkl --spec '{{"search": false, "settle_showdown_leaf": true}}' \\
+  --decks {pool_decks} --seed 0 --workers 4 --label pool_new --out $OUT/pool_new.json > $OUT/pool_new.log 2>&1 &
 PNEW=$!
 POKERBOT_CLOSE_CALLED_STREET=1 python3 scripts/pool_absolute_one_arm.py \\
-  --blueprint checkpoints/serve_blueprint_6max.pkl --spec '{{"settle_showdown_leaf": true, "iterations": {search_iters}}}' \\
-  --decks {pool_decks} --seed 0 --label pool_inc --out $OUT/pool_inc.json > $OUT/pool_inc.log 2>&1 &
+  --blueprint checkpoints/serve_blueprint_6max.pkl --spec '{{"search": false, "settle_showdown_leaf": true}}' \\
+  --decks {pool_decks} --seed 0 --workers 4 --label pool_inc --out $OUT/pool_inc.json > $OUT/pool_inc.log 2>&1 &
 PINC=$!
 wait $PNEW || echo "pool_new rc!=0" >> $OUT/battery_warnings.txt
 wait $PINC || echo "pool_inc rc!=0" >> $OUT/battery_warnings.txt
 
+stage verdict
+python3 scripts/cert_verdict_merge.py --out-dir $OUT --run-id {run_id} 2>&1 | tee $OUT/verdict_merge.log \\
+  || echo "verdict merge rc!=0" >> $OUT/battery_warnings.txt
+
+stage done
 date -u +"%Y-%m-%dT%H:%M:%SZ" > $OUT/RESULT_DONE.txt
 aws s3 sync $OUT {res}/ --region {REGION}
 sync
@@ -264,7 +288,6 @@ def main() -> None:
     ap.add_argument("--decks-per-seed", type=int, default=4000)
     ap.add_argument("--seeds", default="101 202")
     ap.add_argument("--pool-decks", type=int, default=600)
-    ap.add_argument("--search-iters", type=int, default=2000)
     ap.add_argument("--wall-hours", type=float, default=12.0)
     ap.add_argument("--instance-types", default="r8i.32xlarge,r6i.32xlarge,c6i.32xlarge")
     ap.add_argument("--on-demand", action="store_true")
@@ -279,8 +302,7 @@ def main() -> None:
     _upload_code(s3)
 
     bootstrap = _render_bootstrap(run_id=args.run_id, decks_per_seed=args.decks_per_seed,
-                                  seeds=args.seeds, pool_decks=args.pool_decks,
-                                  search_iters=args.search_iters)
+                                  seeds=args.seeds, pool_decks=args.pool_decks)
     bkey = f"{PREFIX}/{args.run_id}/code/bootstrap.sh"
     s3.put_object(Bucket=BUCKET, Key=bkey, Body=bootstrap.encode())
     print(f"uploaded bootstrap ({len(bootstrap)} bytes) -> s3://{BUCKET}/{bkey}", flush=True)
