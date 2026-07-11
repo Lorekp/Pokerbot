@@ -162,8 +162,8 @@ export PATH="$HOME/.cargo/bin:$PATH"
 aws s3 cp s3://{BUCKET}/{PREFIX}/code/cert_code.tar.gz /tmp/code.tar.gz --region {REGION} || fail codefetch
 tar -xzf /tmp/code.tar.gz -C /opt/pokerbot
 cd /opt/pokerbot
-python3 -m pip install --disable-pip-version-check --no-input --break-system-packages boto3 numpy "jax[cpu]" phevaluator \
-  || python3 -m pip install --disable-pip-version-check --no-input boto3 numpy "jax[cpu]" phevaluator || fail pip
+python3 -m pip install --disable-pip-version-check --no-input --break-system-packages boto3 numpy "jax[cpu]" phevaluator flax optax \
+  || python3 -m pip install --disable-pip-version-check --no-input boto3 numpy "jax[cpu]" phevaluator flax optax || fail pip
 # CPU torch: pokerbot.search.state_bridge -> pbs_tracker -> sequence_encoder imports torch
 # (cert2 failure; same fallback the eval-suite launcher ships)
 python3 -m pip install --disable-pip-version-check --no-input --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu \
