@@ -127,7 +127,8 @@ def _upload_data(s3) -> None:
         print(f"  uploaded {name} ({p.stat().st_size/1e6:.1f} MB)", flush=True)
 
 
-def _render_bootstrap(*, run_id: str, decks_per_seed: int, seeds: str, pool_decks: int) -> str:
+def _render_bootstrap(*, run_id: str, decks_per_seed: int, seeds: str, pool_decks: int,
+                      pool_only: bool = False) -> str:
     res = f"s3://{BUCKET}/{PREFIX}/{run_id}/results"
     newenv = ("POKERBOT_FULLHIST_KEY=1 POKERBOT_PRESUM_KEY=1 POKERBOT_MRR=1 "
               "POKERBOT_CLOSE_CALLED_STREET=1 POKERBOT_PRE_KEEP=2,3,4,5,6 "
@@ -148,7 +149,7 @@ def _render_bootstrap(*, run_id: str, decks_per_seed: int, seeds: str, pool_deck
                           "blueprint_path": "/opt/pokerbot/checkpoints/bp_new_full.pkl"})
     arm_inc = json.dumps({"worker_env": json.loads(incenv_json), "settle_showdown_leaf": True,
                           "search": False})
-    return f"""#!/bin/bash
+    head = f"""#!/bin/bash
 set -uxo pipefail
 export HOME="${{HOME:-/root}}"
 export DEBIAN_FRONTEND=noninteractive AWS_DEFAULT_REGION={REGION}
@@ -169,8 +170,8 @@ export PATH="$HOME/.cargo/bin:$PATH"
 aws s3 cp s3://{BUCKET}/{PREFIX}/code/cert_code.tar.gz /tmp/code.tar.gz --region {REGION} || fail codefetch
 tar -xzf /tmp/code.tar.gz -C /opt/pokerbot
 cd /opt/pokerbot
-python3 -m pip install --disable-pip-version-check --no-input --break-system-packages boto3 numpy "jax[cpu]" phevaluator flax optax \
-  || python3 -m pip install --disable-pip-version-check --no-input boto3 numpy "jax[cpu]" phevaluator flax optax || fail pip
+python3 -m pip install --disable-pip-version-check --no-input --break-system-packages boto3 numpy "jax[cpu]" phevaluator flax optax cloudpickle \
+  || python3 -m pip install --disable-pip-version-check --no-input boto3 numpy "jax[cpu]" phevaluator flax optax cloudpickle || fail pip
 # CPU torch: pokerbot.search.state_bridge -> pbs_tracker -> sequence_encoder imports torch
 # (cert2 failure; same fallback the eval-suite launcher ships)
 python3 -m pip install --disable-pip-version-check --no-input --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu \
@@ -210,7 +211,8 @@ python3 scripts/nlcfr_stream_filter.py /opt/pokerbot/iter_050000.nlcfr checkpoin
 rm -f /opt/pokerbot/iter_050000.nlcfr
 
 export PYTHONPATH=/opt/pokerbot
-# ---------------- GATES (abort-on-fail) ----------------
+"""
+    mid = "" if pool_only else f"""# ---------------- GATES (abort-on-fail) ----------------
 stage gates
 {newenv} python3 scripts/probe_fullhist_key_parity.py --fullhist 1 --presum 1 \\
   --min-states 1024 --min-postflop 1024 --out $OUT/gate_parity_fullhist.json 2>&1 | tail -3 | tee $OUT/gate_parity_fullhist.log || fail gate_parity_fullhist
@@ -256,8 +258,8 @@ for SEED in {seeds}; do
   done
   for p in "${{pids[@]}}"; do wait $p || echo "shard rc!=0 (seed $SEED)" >> $OUT/battery_warnings.txt; done
 done
-
-# ---------------- POOL: absolute vs roster, one process per arm-env ----------------
+"""
+    tail = f"""# ---------------- POOL: absolute vs roster, one process per arm-env ----------------
 stage pool
 {newenv} python3 scripts/pool_absolute_one_arm.py \\
   --blueprint checkpoints/bp_new_full.pkl --spec '{{"search": false, "settle_showdown_leaf": true}}' \\
@@ -280,6 +282,7 @@ aws s3 sync $OUT {res}/ --region {REGION}
 sync
 poweroff
 """
+    return head + mid + tail
 
 
 def main() -> None:
@@ -288,6 +291,9 @@ def main() -> None:
     ap.add_argument("--decks-per-seed", type=int, default=4000)
     ap.add_argument("--seeds", default="101 202")
     ap.add_argument("--pool-decks", type=int, default=600)
+    ap.add_argument("--pool-only", action="store_true",
+                    help="skip gates+battery; run ONLY the pool absolutes (e.g. after a battery-"
+                         "complete run whose pool leg failed)")
     ap.add_argument("--wall-hours", type=float, default=12.0)
     ap.add_argument("--instance-types", default="r8i.32xlarge,r6i.32xlarge,c6i.32xlarge")
     ap.add_argument("--on-demand", action="store_true")
@@ -302,7 +308,8 @@ def main() -> None:
     _upload_code(s3)
 
     bootstrap = _render_bootstrap(run_id=args.run_id, decks_per_seed=args.decks_per_seed,
-                                  seeds=args.seeds, pool_decks=args.pool_decks)
+                                  seeds=args.seeds, pool_decks=args.pool_decks,
+                                  pool_only=args.pool_only)
     bkey = f"{PREFIX}/{args.run_id}/code/bootstrap.sh"
     s3.put_object(Bucket=BUCKET, Key=bkey, Body=bootstrap.encode())
     print(f"uploaded bootstrap ({len(bootstrap)} bytes) -> s3://{BUCKET}/{bkey}", flush=True)
