@@ -117,6 +117,13 @@ def _write(args, spec, roster, per_arch, comb, t0, *, final):
         "wall_s": time.perf_counter() - t0,
         "final": final,
     }
+    # Cert6 lookup-miss instrument: per-street blueprint coverage (POKERBOT_BP_COVERAGE=1 opt-in;
+    # {} when disabled). Counts masked-to-zero rows as misses -- the honest serve-quality surface.
+    try:
+        from pokerbot.eval.lbr import bp_coverage_report
+        result["bp_coverage"] = bp_coverage_report()
+    except Exception:  # noqa: BLE001
+        result["bp_coverage"] = {}
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=1)

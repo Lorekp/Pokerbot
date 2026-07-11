@@ -224,12 +224,55 @@ def _wrap_settle_gate(pf):
     return pf_gated
 
 
+class SortedSnapshotDir:
+    """FULL-table blueprint serve object (cert6, serve-coverage fix): the nlcfr_key_index.py
+    ``--with-rows`` output dir — lexicographically sorted S16 keys + aligned f32 rows, both
+    memory-mapped; ``get`` = binary search. Duck-types the only access every serve consumer uses
+    (``snapshot.get(key)``; see lbr.make_blueprint_policy) with ~0 RSS, so the 241M-row snap_avg
+    merged table serves WITHOUT the 25M-row-cap pkl truncation (the RC-2 preflop-mass killer).
+    Twin of scripts/serve_miss_probe.py::SortedSnapshot (kept separate: importing serve_miss_probe
+    applies NEW-arm env setdefaults that would poison an incumbent-arm process)."""
+
+    def __init__(self, dirpath: str):
+        import numpy as _np
+        self._np = _np
+        self.keys = _np.memmap(os.path.join(dirpath, "keys_sorted.bin"), dtype="S16", mode="r")
+        rows_path = os.path.join(dirpath, "rows_sorted.f32.bin")
+        if not os.path.exists(rows_path):
+            raise FileNotFoundError(
+                f"{dirpath}: rows_sorted.f32.bin missing — build the index with "
+                "nlcfr_key_index.py --with-rows (a keys-only index cannot serve values)")
+        self.rows = _np.memmap(rows_path, dtype=_np.float32, mode="r").reshape(-1, 11)
+        assert self.rows.shape[0] == self.keys.shape[0]
+
+    def __len__(self) -> int:
+        return int(self.keys.shape[0])
+
+    # numpy 'S16' semantics: trailing NULs ignored; keep comparisons numpy-vs-numpy (both sides
+    # NUL-stripped) — see serve_miss_probe.SortedSnapshot for the false-MISS footgun this avoids.
+    def get(self, key, default=None):
+        kk = self._np.asarray(key, dtype="S16")
+        i = int(self._np.searchsorted(self.keys, kk))
+        if i < self.keys.shape[0] and self.keys[i] == kk:
+            return self.rows[i]
+        return default
+
+    def __contains__(self, key) -> bool:
+        return self.get(key) is not None
+
+
 def load_snapshot(path: str):
     """Load a serve blueprint snapshot: legacy dict pkl ({key16: row} or {"strat_sum": dict})
     OR the nlcfr_stream_filter --arrays format ({"strat_sum": {"keys": bytes, "vals": f32[n,11],
-    "format": "arrays_v1"}}), which is rebuilt into the plain dict every consumer expects."""
+    "format": "arrays_v1"}}), which is rebuilt into the plain dict every consumer expects, OR a
+    DIRECTORY -> the nlcfr_key_index.py --with-rows mmap index (SortedSnapshotDir, full table)."""
     import pickle as _pkl
 
+    if os.path.isdir(path):
+        snap = SortedSnapshotDir(path)
+        print(f"[load_snapshot] mmap index dir: {len(snap):,} rows (full table, no row cap)",
+              flush=True)
+        return snap
     raw = _pkl.load(open(path, "rb"))
     snap = raw["strat_sum"] if isinstance(raw, dict) and "strat_sum" in raw else raw
     if isinstance(snap, dict) and snap.get("format") == "arrays_v1":

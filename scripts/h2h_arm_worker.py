@@ -120,7 +120,33 @@ def main() -> int:
                 _CountingSnap.misses += 1
             return c
 
-    snap = _CountingSnap(snap)
+    class _CountingWrap:
+        """Counting facade for NON-dict serve objects (engine_ab_h2h.SortedSnapshotDir — the cert6
+        full-table mmap index). Same class-level counters as _CountingSnap; delegates get/len."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def get(self, k, default=None):
+            v = self._inner.get(k, default)
+            if v is None and default is None:
+                _CountingSnap.misses += 1
+            else:
+                _CountingSnap.hits += 1
+            return v
+
+        def __contains__(self, k):
+            c = k in self._inner
+            if c:
+                _CountingSnap.hits += 1
+            else:
+                _CountingSnap.misses += 1
+            return c
+
+        def __len__(self):
+            return len(self._inner)
+
+    snap = _CountingSnap(snap) if isinstance(snap, dict) else _CountingWrap(snap)
 
     from pokerbot.search import native_solver as _ns  # noqa: E402
     from pokerbot.search.pluribus_search import set_native_subgame  # noqa: E402
@@ -162,6 +188,15 @@ def main() -> int:
           f"hits={_CountingSnap.hits} misses={_CountingSnap.misses} "
           f"miss_rate={_CountingSnap.misses / max(1, _CountingSnap.hits + _CountingSnap.misses):.4f}",
           flush=True)
+    # Per-street coverage (opt-in POKERBOT_BP_COVERAGE=1 in this arm's worker_env): the lbr
+    # instrument counts a masked-to-zero row as a miss too — the honest serve-quality surface.
+    try:
+        from pokerbot.eval.lbr import bp_coverage_report  # noqa: E402
+        rep = bp_coverage_report()
+        if rep:
+            print(f"[arm_worker] bp_coverage per-street: {json.dumps(rep)}", flush=True)
+    except Exception:  # noqa: BLE001
+        pass
     return 0
 
 
