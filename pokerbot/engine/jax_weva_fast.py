@@ -336,7 +336,16 @@ def _presum_n_preflop_boundary(state: EnvState | Any) -> int:
         assert int(r.action_seat) == int(hist_seat[i]), (
             f"presum n_preflop replay diverged: engine action_seat {int(r.action_seat)} != recorded "
             f"hist_seat {int(hist_seat[i])} at i={i}")
-        r = _np.apply_action_np(r, action)
+        # RAW (non-closure) step, matching fingerprint.rs::n_preflop_boundary which replays through
+        # the frozen ``core::apply_action``. Under POKERBOT_CLOSE_CALLED_STREET=1 the closure-injected
+        # closing CHECK is ALREADY RECORDED in ``hist_action`` (closure.rs records it like any action),
+        # so replaying the recorded bytes through the raw step reproduces the exact transitions and
+        # classifies that injected CHECK as PREFLOP (boundary = i_check + 1) — the semantics the Rust
+        # trainer keyed the checkpoint with. Replaying through the closure-wrapped ``apply_action_np``
+        # would close the street INSIDE the call step and put the recorded CHECK byte in the postflop
+        # segment (off-by-one vs train keys on every called preflop raise; caught by
+        # probe_fullhist_key_parity --presum with CLOSE_CALLED_STREET=1).
+        r = _np._apply_action_np_impl(r, action)
         if int(r.street) >= STREET_FLOP or bool(r.pending_deal):
             return i + 1
     return hist_len

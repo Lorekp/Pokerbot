@@ -356,9 +356,17 @@ def main() -> int:
             a_pick = _pick_action(rng, legal)
             if 3 <= a_pick <= 10:
                 street_raises += 1
-            if street == 0:
-                true_n_preflop += 1  # this action was taken FROM a preflop state
+            was_preflop = street == 0
             env = apply_action_np(env, a_pick)
+            if was_preflop and (int(np.asarray(env.street)) >= 1 or bool(env.pending_deal)):
+                # GROUND TRUTH = hist_len snapshot at the FIRST street boundary: every recorded entry
+                # so far (INCLUDING a POKERBOT_CLOSE_CALLED_STREET closure-injected closing CHECK,
+                # which closure.rs/np_engine record in hist like any action) originated preflop.
+                # This matches fingerprint.rs::n_preflop_boundary, which replays the recorded bytes
+                # through the raw core step — the semantics the trainer keyed the checkpoint with.
+                # (The old per-applied-action counter missed the injected CHECK: off-by-one under
+                # closure-ON on every called preflop raise.)
+                true_n_preflop = min(int(np.asarray(env.hist_len)), 64)
             depth += 1
         if hands % 500 == 0:
             print(f"[progress] hands={hands} states={total} cov={cov} "
