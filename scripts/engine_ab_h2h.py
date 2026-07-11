@@ -224,6 +224,27 @@ def _wrap_settle_gate(pf):
     return pf_gated
 
 
+def load_snapshot(path: str):
+    """Load a serve blueprint snapshot: legacy dict pkl ({key16: row} or {"strat_sum": dict})
+    OR the nlcfr_stream_filter --arrays format ({"strat_sum": {"keys": bytes, "vals": f32[n,11],
+    "format": "arrays_v1"}}), which is rebuilt into the plain dict every consumer expects."""
+    import pickle as _pkl
+
+    raw = _pkl.load(open(path, "rb"))
+    snap = raw["strat_sum"] if isinstance(raw, dict) and "strat_sum" in raw else raw
+    if isinstance(snap, dict) and snap.get("format") == "arrays_v1":
+        keys = snap["keys"]
+        vals = snap["vals"]
+        n = vals.shape[0]
+        print(f"[load_snapshot] arrays_v1: rebuilding dict for {n:,} rows...", flush=True)
+        mv = memoryview(keys)
+        out = {}
+        for i in range(n):
+            out[bytes(mv[i * 16:(i + 1) * 16])] = vals[i]
+        return out
+    return snap
+
+
 _WORKER_PROCS = []
 
 
@@ -254,7 +275,21 @@ def _spawn_worker_policy(label: str, spec: dict, bp_path: str, base_seed: int, r
     if len(_WORKER_PROCS) == 1:
         @atexit.register
         def _kill_workers():
+            # Graceful first (lets the worker print its blueprint-miss stats), then hard kill.
             for pr in _WORKER_PROCS:
+                try:
+                    if pr.poll() is None:
+                        pr.stdin.write(struct.pack("<I", len(pickle.dumps(("quit", None)))))
+                        pr.stdin.write(pickle.dumps(("quit", None)))
+                        pr.stdin.flush()
+                except Exception:  # noqa: BLE001
+                    pass
+            for pr in _WORKER_PROCS:
+                try:
+                    if pr.poll() is None:
+                        pr.wait(timeout=15)
+                except Exception:  # noqa: BLE001
+                    pass
                 try:
                     if pr.poll() is None:
                         pr.kill()
@@ -513,8 +548,7 @@ def main():
 
     # Load blueprints (may be the same file; load separately so arm-b can use a different checkpoint).
     def _load_snap(path):
-        raw = pickle.load(open(path, "rb"))
-        return raw["strat_sum"] if isinstance(raw, dict) and "strat_sum" in raw else raw
+        return load_snapshot(path)
 
     we_a = _resolve(spec_a, "worker_env")
     we_b = _resolve(spec_b, "worker_env")

@@ -83,8 +83,7 @@ def main() -> int:
             "POKERBOT_RIVER_OCHS", "POKERBOT_POSTFLOP_MODE", "POKERBOT_POSTFLOP_EMD_FROZEN",
             "POKERBOT_EMD_FROZEN_MIRROR_FALLBACK", "POKERBOT_SETTLE_SHOWDOWN_LEAF")), flush=True)
 
-    raw = pickle.load(open(args.blueprint, "rb"))
-    snap = raw["strat_sum"] if isinstance(raw, dict) and "strat_sum" in raw else raw
+    snap = h2h.load_snapshot(args.blueprint)
     print(f"[arm_worker] blueprint rows={len(snap)}", flush=True)
 
     # Blueprint lookup MISS instrument (Python-side lookups only — the hero-preflop surface when
