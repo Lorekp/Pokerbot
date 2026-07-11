@@ -378,8 +378,50 @@ def step_state(state: EnvState, action: Array) -> EnvState:
     return apply_action(state, action)
 
 
+def _close_called_street_enabled() -> bool:
+    """POKERBOT_CLOSE_CALLED_STREET=1 (default OFF => apply_action is the identical jitted impl).
+
+    Gated REAL-NLHE street closure -- JAX mirror of ``battery_native::closure`` /
+    ``np_engine._maybe_close_called_street`` (one env var flips the whole stack coherently; see
+    np_engine for the semantics + verification pointers).  Read at TRACE time inside jitted callers
+    (``step_state``/``batched_step``) and per call here, so set the env var BEFORE the first engine
+    use of the process (same contract as the other POKERBOT_* engine flags).
+    """
+    return os.environ.get("POKERBOT_CLOSE_CALLED_STREET", "") == "1"
+
+
 @jax.jit
+def _maybe_close_called_street(state: EnvState) -> EnvState:
+    """Inject the closing CHECK iff ``state`` is the extra aggressor-reopen node.
+
+    Exact predicate (mirrors ``closure::close_called_street``): mid-street, action back at
+    ``last_aggressor`` with nothing to call -- the node real NLHE never deals (a called bet/raise
+    closes the round).  The BB-option node of a limped pot has ``last_aggressor == -1`` and is never
+    touched.  The injected CHECK closes the street, so ``_apply_action_impl``'s output can never
+    satisfy the predicate again (no recursion needed -- a single conditional step suffices).
+    """
+    a = state.action_seat
+    safe_a = jnp.maximum(a, 0)
+    pred = (
+        (~state.done)
+        & (~state.pending_deal)
+        & (state.street < STREET_TERMINAL)
+        & (a >= 0)
+        & (a == state.last_aggressor)
+        & (state.current_bet == state.committed_street[safe_a])
+    )
+    return jax.lax.cond(pred, lambda s: _apply_action_impl(s, jnp.int32(CHECK)), lambda s: s, state)
+
+
 def apply_action(state: EnvState, action: Array) -> EnvState:
+    child = _apply_action_impl(state, action)
+    if _close_called_street_enabled():
+        child = _maybe_close_called_street(child)
+    return child
+
+
+@jax.jit
+def _apply_action_impl(state: EnvState, action: Array) -> EnvState:
     n = state.seat_status.shape[0]  # seat count (static under jit)
     seat = state.action_seat
     amount = _action_amount(state, seat, action)

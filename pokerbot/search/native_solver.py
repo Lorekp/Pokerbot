@@ -423,12 +423,19 @@ def _native_fingerprint_matches_serve_abstraction() -> bool:
             return False
         if "preflop_hist_key" not in caps:
             return False
-    # River-OCHS serve regime (POKERBOT_RIVER_OCHS): the native SERVE fast paths have no river-OCHS
-    # keying (only trainer.rs does), so a river lookup through them would take the made-hand mirror
-    # branch and HIT wrong-semantics river rows (same bucket-id space). Fail closed to the Python
-    # path (river-OCHS-correct) until fingerprint.rs::fingerprint_fast_depth_emd learns the table.
+    # River-OCHS serve regime (POKERBOT_RIVER_OCHS): the native fast paths key the river with the
+    # trainer's OCHS bucket ONLY on binaries that advertise the "river_ochs_serve" cap
+    # (fingerprint.rs::serve_river_ochs, env-latched, checked before the made-hand mirror; the
+    # binary panics fail-closed if the table cannot load). Stale .pyds without the cap would take
+    # the made-hand mirror branch and HIT wrong-semantics river rows (same bucket-id space), so
+    # they keep failing closed to the Python path (river-OCHS-correct).
     if os.environ.get("POKERBOT_RIVER_OCHS"):
-        return False
+        try:
+            caps = set(_EXT.native_caps())
+        except Exception:  # noqa: BLE001
+            return False
+        if "river_ochs_serve" not in caps:
+            return False
     if os.environ.get("POKERBOT_POSTFLOP_MODE", "fast").lower() != "emd":
         return True
     if os.environ.get("POKERBOT_NATIVE_ALLOW_EMD_MISKEY", "0").lower() in ("1", "true", "yes", "on"):

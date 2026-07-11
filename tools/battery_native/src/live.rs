@@ -841,7 +841,8 @@ pub mod py {
             let strat = opponent_strategy(env, actor, &legal, &regrets, &subgame_ctx(ctx), &key);
             let u = rng.next_f64();
             let a = sample_action(&strat, &legal, u);
-            let child = core::apply_action(env, a);
+            // Gated real-NLHE street closure (POKERBOT_CLOSE_CALLED_STREET; default OFF => identity).
+            let child = crate::closure::maybe_close_called_street(core::apply_action(env, a));
             return cfv_iter(&child, hero, depth + 1, max_depth, ctx, tab, rng, t);
         }
 
@@ -851,7 +852,7 @@ pub mod py {
         let mut av = [0.0f64; NUM_ACTIONS];
         for a in 0..NUM_ACTIONS {
             if legal[a] {
-                let child = core::apply_action(env, a);
+                let child = crate::closure::maybe_close_called_street(core::apply_action(env, a));
                 av[a] = cfv_iter(&child, hero, depth + 1, max_depth, ctx, tab, rng, t);
             }
         }

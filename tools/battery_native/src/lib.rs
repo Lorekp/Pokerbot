@@ -9,6 +9,7 @@
 //! is native.
 
 pub mod cfr_table;
+pub mod closure;
 pub mod core;
 pub mod emd;
 pub mod fingerprint;
@@ -285,10 +286,14 @@ mod py {
     }
 
     /// `apply_action_np(state_bytes, action)` -> new flat state as bytes.
+    /// Routed through the gated real-NLHE street closure (`closure::maybe_close_called_street`,
+    /// POKERBOT_CLOSE_CALLED_STREET; default OFF => identity => byte-identical) so the Python-facing
+    /// native step plays the SAME game as the trainer/serve traversals under one env var.
     #[pyfunction]
     fn apply_action<'py>(py: Python<'py>, state: &[u8], action: usize) -> Bound<'py, PyBytes> {
         let s = flat::from_flat(&bytes_to_flat(state));
-        let out = flat::to_flat(&core::apply_action(&s, action));
+        let child = crate::closure::maybe_close_called_street(core::apply_action(&s, action));
+        let out = flat::to_flat(&child);
         PyBytes::new(py, &flat_to_bytes(&out))
     }
 
@@ -461,6 +466,13 @@ mod py {
             // street-terminal done=false showdown leaves in the serve/LBR playout paths (trainer
             // terminal_return semantics). A/B harnesses fail closed on binaries without this cap.
             "settle_showdown_leaf".to_string(),
+            // River-OCHS SERVE keying: fingerprint.rs::serve_river_ochs latches the
+            // POKERBOT_RIVER_OCHS table once per process and the EMD serve fingerprints key the
+            // river with the trainer's OCHS bucket (checked FIRST, never the made-hand mirror;
+            // fail-closed panic on a set-but-unloadable table). native_solver.py opens the native
+            // fast paths under POKERBOT_RIVER_OCHS only when this cap is present — stale .pyds
+            // keep failing closed to the Python path.
+            "river_ochs_serve".to_string(),
         ]
     }
 

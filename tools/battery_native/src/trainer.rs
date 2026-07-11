@@ -2161,6 +2161,20 @@ fn showdown_returns<const N: usize>(
     }
 }
 
+/// GATED REAL-NLHE STREET CLOSURE (POKERBOT_CLOSE_CALLED_STREET=1, default OFF => byte-identical;
+/// promoted 2026-07-10 from the a6d46bba root-cause audit). The shared engine's `street_complete`
+/// requires `back_to_aggressor` — action must RETURN to the last aggressor — so every called bet/raise
+/// deals the AGGRESSOR an extra decision node with re-open rights (check to close, or raise AGAIN), on
+/// every street. Real NLHE closes the round on the last call. The asymmetry lands exactly on open/bet
+/// lines (a called equal-stack JAM closes itself via `n_can_act == 0`; LIMPED pots close via
+/// `no_aggressor`), so under unconverged uniform play the extra nodes systematically burn the
+/// aggressor's EV — the mechanism behind the degenerate EP premium-jam preflop (audit probe: UTG AA
+/// jam 0.66 -> 0.16 ON@120k, -12% infosets, +20-35% speed). Each `trainer_apply` variant below routes
+/// through the SHARED `closure::maybe_close_called_street` (single impl for trainer + subgame/playout/
+/// search_session/live/LBR + the PyO3 binding + the np/jax Python mirrors, so ONE env var flips train
+/// AND serve coherently; see closure.rs for the exact-predicate argument + why the injected CHECK is
+/// byte-safe under scalar `core::apply_action`).
+///
 /// Trainer-local `apply_action`: the SHARED, byte-identical betting state machine via
 /// `core::apply_action_with`, with the IN-APPLY terminal settle (SITE 1) routed through the perfect-hash
 /// `compute_returns_phe` (feature `phe_showdown`, default ON) instead of the scalar 21-combo
@@ -2175,18 +2189,22 @@ fn showdown_returns<const N: usize>(
 #[cfg(all(feature = "phe_showdown", feature = "phe_site1"))]
 #[inline]
 fn trainer_apply<const N: usize>(env: &EnvStateN<N>, action: usize) -> EnvStateN<N> {
-    core::apply_action_with(env, action, compute_returns_phe::<N>)
+    crate::closure::maybe_close_called_street(core::apply_action_with(
+        env,
+        action,
+        compute_returns_phe::<N>,
+    ))
 }
 // Site-1 scalar (site-2 phe stays on) = the pre-site-1 baseline; the A/B arm + a kill-switch.
 #[cfg(all(feature = "phe_showdown", not(feature = "phe_site1")))]
 #[inline]
 fn trainer_apply<const N: usize>(env: &EnvStateN<N>, action: usize) -> EnvStateN<N> {
-    core::apply_action(env, action)
+    crate::closure::maybe_close_called_street(core::apply_action(env, action))
 }
 #[cfg(not(feature = "phe_showdown"))]
 #[inline]
 fn trainer_apply<const N: usize>(env: &EnvStateN<N>, action: usize) -> EnvStateN<N> {
-    core::apply_action(env, action)
+    crate::closure::maybe_close_called_street(core::apply_action(env, action))
 }
 
 /// Exact terminal return for `hero` (in bb) at a settled state. Counts the seats still eligible for the
@@ -5985,6 +6003,180 @@ mod tests {
             any_nonzero,
             "FIX 1: showdown leaf returned 0 for every seat (the EV=0 bug)"
         );
+    }
+
+    /// PREFLOP RFI SHAPE PROBE for the gated street-closure A/B (#[ignore] — run explicitly, twice):
+    ///
+    ///   POKERBOT_SHAPE_ITERS=3000 cargo test --release shape_probe_rfi -- --ignored --nocapture
+    ///   POKERBOT_CLOSE_CALLED_STREET=1 POKERBOT_SHAPE_ITERS=3000 cargo test --release ... (the ON arm)
+    ///
+    /// Trains a fresh table for ITERS iterations (same seed/config both arms; the ONLY difference is the
+    /// aggressor-reopen closure gate), then reads the row-normalized average strategy at every first-in
+    /// (RFI) preflop node — 169 hand classes x {UTG,HJ,CO,BTN,SB}, button=0, lossless preflop keys —
+    /// and prints per-position fold/limp/open/jam mass (combo-weighted) plus the premium rows. This is
+    /// the same shape yardstick as scripts/preflop_strategy_audit.py (open premiums / limp~0 / jam~0),
+    /// read natively so the A/B needs no pyd build.
+    #[test]
+    #[ignore]
+    fn shape_probe_rfi() {
+        const N: usize = NUM_PLAYERS;
+        fn env_u64(k: &str, d: u64) -> u64 {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        }
+        let iters = env_u64("POKERBOT_SHAPE_ITERS", 2000);
+        let ndeals = env_u64("POKERBOT_SHAPE_NDEALS", 64) as usize;
+        let mut cfg = test_cfg(ndeals);
+        // POKERBOT_SHAPE_SEED: base-seed override so a multi-seed A/B yields CI-bearing shape numbers
+        // (default = test_cfg's 0xC0FFEE, the seed of the audit's 60k/120k probes).
+        cfg.base_seed = env_u64("POKERBOT_SHAPE_SEED", cfg.base_seed);
+        // Optional checkpoint (POKERBOT_SHAPE_CKPT=path): resume if the file exists, save on exit —
+        // lets a long run be split into <1h chunks (the background-task wall cap) and yields the
+        // shape TREND at each chunk boundary. `iters` is the TOTAL target (already-done iters count).
+        let ckpt = std::env::var("POKERBOT_SHAPE_CKPT").ok();
+        let mut tab = match &ckpt {
+            Some(p) if std::path::Path::new(p).exists() => {
+                let bytes = std::fs::read(p).expect("read ckpt");
+                let t = deserialize_parallel(&bytes).expect("bad ckpt");
+                println!("resumed ckpt {p}: iters_done={} rows={}", t.iters_done, t.total_strat_len());
+                t
+            }
+            _ => NlheTables::default(),
+        };
+        let t0 = std::time::Instant::now();
+        println!(
+            "shape_probe_rfi: iters={iters} ndeals={ndeals} close_called_street={}",
+            crate::closure::enabled()
+        );
+        let mut done = tab.iters_done;
+        while done < iters {
+            tab.train_iteration(&cfg);
+            done += 1;
+            if done % 500 == 0 || done == iters {
+                println!("  iter {done}/{iters} el={:.0}s", t0.elapsed().as_secs_f64());
+            }
+        }
+        if let Some(p) = &ckpt {
+            let n = serialize_to_file(&tab, p).expect("save ckpt");
+            println!("saved ckpt {p}: {n} bytes at iters_done={}", tab.iters_done);
+        }
+        let snap = snapshot(&tab);
+        println!("snapshot rows: {}", snap.len());
+
+        // RFI nodes with button=0: acting order 3(UTG) 4(HJ) 5(CO) 0(BTN) 1(SB).
+        let positions: [(usize, &str, usize); 5] =
+            [(3, "UTG", 0), (4, "HJ", 1), (5, "CO", 2), (0, "BTN", 3), (1, "SB", 4)];
+        const RANKS: &[u8] = b"23456789TJQKA";
+        let specials = ["AA", "KK", "QQ", "AKs", "AKo", "72o"];
+        for (seat, pname, nfolds) in positions {
+            let (mut wf, mut wl, mut wo, mut wj, mut wtot) = (0.0f64, 0.0, 0.0, 0.0, 0.0);
+            let mut covered = 0u32;
+            let mut total = 0u32;
+            let mut special_rows: Vec<String> = Vec::new();
+            for hi in 0..13usize {
+                for lo in 0..=hi {
+                    for suited in [true, false] {
+                        if hi == lo && suited {
+                            continue; // pairs are offsuit-only
+                        }
+                        let r1 = hi as i32 + 2;
+                        let r2 = lo as i32 + 2;
+                        let (s1, s2) = if suited { (0, 0) } else { (0, 1) };
+                        let c1 = (r1 - 2) * 4 + s1;
+                        let c2 = (r2 - 2) * 4 + s2;
+                        // Identity deck with the class's two cards rigged into this seat's hole slots.
+                        let mut deck: [i32; 52] = [0; 52];
+                        for (i, c) in deck.iter_mut().enumerate() {
+                            *c = i as i32;
+                        }
+                        for (k, target) in [c1, c2].iter().enumerate() {
+                            let pos = deck.iter().position(|&c| c == *target).unwrap();
+                            deck.swap(pos, 2 * seat + k);
+                        }
+                        let stacks = [START_STACK_CHIPS; N];
+                        let occ = [true; N];
+                        let mut env =
+                            core::init_hand_n::<N>(0, &stacks, &occ, ANTE_CHIPS, &deck, [0, 0]);
+                        for _ in 0..nfolds {
+                            env = core::apply_action(&env, core::FOLD);
+                        }
+                        assert_eq!(env.action_seat as usize, seat, "RFI actor mismatch");
+                        let legal = abstracted_legal(&env, seat, &cfg);
+                        let mut memo: FpMemo = FpMemo::default();
+                        let key = fingerprint_fast_depth_memo_emd(
+                            &env,
+                            seat,
+                            cfg.num_buckets,
+                            &cfg.depth_edges,
+                            cfg.emd_frozen.as_deref(),
+                            cfg.river_ochs.as_deref(),
+                            &mut memo,
+                        );
+                        total += 1;
+                        let w = if hi == lo {
+                            6.0
+                        } else if suited {
+                            4.0
+                        } else {
+                            12.0
+                        };
+                        let row = match snap.get(&key) {
+                            Some(r) => {
+                                covered += 1;
+                                regret_match_like_renorm(r, &legal)
+                            }
+                            None => continue, // uncovered: excluded from the shape mass
+                        };
+                        let open: f64 =
+                            (core::BET_BUCKET_START..core::ALL_IN).map(|a| row[a]).sum();
+                        wf += w * row[core::FOLD];
+                        wl += w * row[core::CALL];
+                        wo += w * open;
+                        wj += w * row[core::ALL_IN];
+                        wtot += w;
+                        let label = if hi == lo {
+                            format!("{}{}", RANKS[hi] as char, RANKS[lo] as char)
+                        } else {
+                            format!(
+                                "{}{}{}",
+                                RANKS[hi] as char,
+                                RANKS[lo] as char,
+                                if suited { "s" } else { "o" }
+                            )
+                        };
+                        if specials.contains(&label.as_str()) {
+                            // Also read the CUM REGRET row (start-of-final-iteration table): the
+                            // trainer's own measurement of each action's value vs its current mix.
+                            // Under CFR+ the floor keeps entries >= 0; a locked-out action shows ~0
+                            // while the preferred actions carry large positive regret.
+                            let rrow =
+                                widen_r(tab.shards[shard_of(&key)].cum_regret.get(&key).unwrap_or(&ZEROS_R));
+                            let ropen: f64 =
+                                (core::BET_BUCKET_START..core::ALL_IN).map(|a| rrow[a]).sum();
+                            special_rows.push(format!(
+                                "    {label:4} fold={:.2} limp={:.2} open={:.2} jam={:.2}  R[fold={:.0} limp={:.0} open={:.0} jam={:.0}]",
+                                row[core::FOLD], row[core::CALL], open, row[core::ALL_IN],
+                                rrow[core::FOLD], rrow[core::CALL], ropen, rrow[core::ALL_IN]
+                            ));
+                        }
+                    }
+                }
+            }
+            if wtot > 0.0 {
+                println!(
+                    "{pname:4} covered {covered}/{total}: fold={:.1}% limp={:.1}% open={:.1}% jam={:.1}%",
+                    100.0 * wf / wtot,
+                    100.0 * wl / wtot,
+                    100.0 * wo / wtot,
+                    100.0 * wj / wtot
+                );
+            } else {
+                println!("{pname:4} covered 0/{total}");
+            }
+            for s in special_rows {
+                println!("{s}");
+            }
+        }
+        println!("total wall: {:.0}s", t0.elapsed().as_secs_f64());
     }
 
     /// LEVER 2 gate: the trainer-local phe `showdown_returns` must produce CHIP-IDENTICAL output to

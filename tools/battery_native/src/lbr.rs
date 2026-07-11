@@ -685,7 +685,9 @@ fn lbr_action_analytic<P: LbrPolicy>(
         if a >= NUM_ACTIONS || !mask[a] {
             continue;
         }
-        let env_r = core::apply_action(s, a);
+        // Gated real-NLHE street closure (POKERBOT_CLOSE_CALLED_STREET; default OFF => identity).
+        // A raise never triggers the closure predicate, so this is belt-and-braces consistency.
+        let env_r = crate::closure::maybe_close_called_street(core::apply_action(s, a));
         let invest = env_r.committed_total[lbr_seat] as f64 - ct[lbr_seat];
         let bp_to_act =
             !env_r.done && !core::is_chance_node(&env_r) && env_r.action_seat != lbr_seat as i32;
@@ -854,7 +856,9 @@ fn play_hand<P: LbrPolicy>(
         let seat = seat_i as usize;
         if seat == lbr_seat {
             let a = lbr_action_analytic(&env, lbr_seat, &beliefs, policy, cfg, rng);
-            env = core::apply_action(&env, a);
+            // Gated real-NLHE street closure (POKERBOT_CLOSE_CALLED_STREET; default OFF => identity):
+            // a closure-trained blueprint must be probed on the closed game it was trained on.
+            env = crate::closure::maybe_close_called_street(core::apply_action(&env, a));
         } else {
             let a = sample_policy_action(&env, seat, policy, rng);
             if has_beliefs {
@@ -862,7 +866,7 @@ fn play_hand<P: LbrPolicy>(
                     b.bayes_update(&env, seat, a, policy, cfg.range_cap, rng);
                 }
             }
-            env = core::apply_action(&env, a);
+            env = crate::closure::maybe_close_called_street(core::apply_action(&env, a));
         }
         depth += 1;
     }
