@@ -168,6 +168,16 @@ _DEPLOYED_BASELINE = {
     # behavior, byte-identical (the policy fn is returned UNWRAPPED). COUPLING: run the ON arm with
     # leaf_cache_worlds > 1 (settled leaves are hole-dependent; M=1 freezes the first-visit world).
     "settle_showdown_leaf": False,
+    # ISOLATED-ARM WORKER (per-arm keying env): when a dict, this arm's policy runs in its OWN
+    # subprocess (scripts/h2h_arm_worker.py) whose environment = parent env + these overrides,
+    # applied BEFORE the child python starts — so import-latched / OnceLock-latched POKERBOT_*
+    # keying gates (FULLHIST/PRESUM/RIVER_OCHS/PRE_KEEP/...) configure INDEPENDENTLY per arm.
+    # This is the only way two arms with different TRAIN keying (e.g. a fullhist+presum+river-OCHS
+    # blueprint vs the deployed summary-keyed blueprint) can share one CRN-paired money loop.
+    # The RPC contract is pf(env, seat) -> prob row - identical to the in-process contract - so
+    # act()/salt sampling and the exact-zero self-gate are untouched (two identical worker arms
+    # still produce every per-deck diff exactly 0.0). None = in-process (byte-identical default).
+    "worker_env": None,
 }
 
 _VALID_KNOBS = set(_DEPLOYED_BASELINE.keys())
@@ -212,6 +222,80 @@ def _wrap_settle_gate(pf):
             _nsg.set_settle_showdown_leaf(prev)
 
     return pf_gated
+
+
+_WORKER_PROCS = []
+
+
+def _spawn_worker_policy(label: str, spec: dict, bp_path: str, base_seed: int, repo_root: str):
+    """Isolated-arm policy: spawn h2h_arm_worker.py with the arm's own keying env (see the
+    worker_env knob doc). Length-prefixed pickle frames over the child's stdio; the child dups its
+    fd1 away so library prints can never corrupt the frame stream."""
+    import atexit
+    import pickle
+    import struct
+
+    env_over = dict(_resolve(spec, "worker_env") or {})
+    child_env = dict(os.environ)
+    for k, v in env_over.items():
+        child_env[str(k)] = str(v)
+    wspec = {k: v for k, v in spec.items() if k != "worker_env"}
+    cmd = [
+        sys.executable,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "h2h_arm_worker.py"),
+        "--spec", json.dumps(wspec),
+        "--blueprint", bp_path,
+        "--seed", str(base_seed),
+        "--repo-root", repo_root,
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=child_env,
+                            cwd=repo_root)
+    _WORKER_PROCS.append(proc)
+    if len(_WORKER_PROCS) == 1:
+        @atexit.register
+        def _kill_workers():
+            for pr in _WORKER_PROCS:
+                try:
+                    if pr.poll() is None:
+                        pr.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _send(obj):
+        b = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+        proc.stdin.write(struct.pack("<I", len(b)))
+        proc.stdin.write(b)
+        proc.stdin.flush()
+
+    def _recv():
+        hdr = proc.stdout.read(4)
+        if len(hdr) < 4:
+            raise RuntimeError(f"arm-{label} worker died (rc={proc.poll()})")
+        n = struct.unpack("<I", hdr)[0]
+        buf = b""
+        while len(buf) < n:
+            chunk = proc.stdout.read(n - len(buf))
+            if not chunk:
+                raise RuntimeError(f"arm-{label} worker died mid-frame (rc={proc.poll()})")
+            buf += chunk
+        return pickle.loads(buf)
+
+    _send(("hello", None))
+    ready = _recv()
+    if ready[0] != "ready":
+        raise RuntimeError(f"arm-{label} worker failed to initialize: {ready!r}")
+    print(f"  arm-{label} ISOLATED worker ready: pid={proc.pid} env_over={sorted(env_over)} "
+          f"caps={ready[1]}", flush=True)
+
+    def pf(env, seat):
+        _send(("act", (env, int(seat))))
+        kind, payload = _recv()
+        if kind != "row":
+            raise RuntimeError(f"arm-{label} worker error: {payload}")
+        return payload
+
+    pf._worker_proc = proc  # type: ignore[attr-defined]
+    return pf
 
 
 def _build_policy(spec: dict, snap, base_seed: int, repo_root: str):
@@ -432,21 +516,28 @@ def main():
         raw = pickle.load(open(path, "rb"))
         return raw["strat_sum"] if isinstance(raw, dict) and "strat_sum" in raw else raw
 
-    print(f"Loading blueprint A: {bp_path_a}", flush=True)
-    snap_a = _load_snap(bp_path_a)
-    if bp_path_b == bp_path_a:
-        snap_b = snap_a
-    else:
-        print(f"Loading blueprint B: {bp_path_b}", flush=True)
-        snap_b = _load_snap(bp_path_b)
+    we_a = _resolve(spec_a, "worker_env")
+    we_b = _resolve(spec_b, "worker_env")
+    snap_a = snap_b = None
+    if we_a is None:
+        print(f"Loading blueprint A: {bp_path_a}", flush=True)
+        snap_a = _load_snap(bp_path_a)
+    if we_b is None:
+        if we_a is None and bp_path_b == bp_path_a:
+            snap_b = snap_a
+        else:
+            print(f"Loading blueprint B: {bp_path_b}", flush=True)
+            snap_b = _load_snap(bp_path_b)
 
     occ = jax.numpy.array([True] * 6)
 
     # Build policies.
     print(f"\nBuilding arm A policy (spec={spec_a or '{}'})...", flush=True)
-    pf_a = _build_policy(spec_a, snap_a, base_seed, repo_root)
+    pf_a = (_spawn_worker_policy("A", spec_a, bp_path_a, base_seed, repo_root)
+            if we_a is not None else _build_policy(spec_a, snap_a, base_seed, repo_root))
     print(f"Building arm B policy (spec={spec_b or '{}'})...", flush=True)
-    pf_b = _build_policy(spec_b, snap_b, base_seed, repo_root)
+    pf_b = (_spawn_worker_policy("B", spec_b, bp_path_b, base_seed, repo_root)
+            if we_b is not None else _build_policy(spec_b, snap_b, base_seed, repo_root))
 
     # Resolved config summary.
     def _summary(spec):
