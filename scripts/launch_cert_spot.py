@@ -48,6 +48,12 @@ REGION = "eu-central-1"
 PROFILE = "pokerbot-labelgen-worker"
 NLCFR_S3 = ("s3://video-processing-6789/pokerbot/prod6000/native_cfr/"
             "bpv4_pluribus_finemenu_1/checkpoints/iter_050000.nlcfr")
+# cert6 (corrected serve): the run trained with POKERBOT_SNAPSHOT_AVG=1 — postflop average lives
+# in the NLSNAP01 snapshots; the servable table is snap_avg(ckpt, snaps), NEVER the raw ckpt.
+SNAPS_S3 = [
+    ("s3://video-processing-6789/pokerbot/prod6000/native_cfr/bpv4_pluribus_finemenu_1/"
+     f"snapshots/snap_{i:06d}.nlsnap") for i in (10000, 20000, 30000, 40000, 50000)
+]
 
 _EXCLUDE_DIRS = ("__pycache__", ".git", "target", "artifacts", "runs")
 
@@ -59,6 +65,8 @@ _CODE_INCLUDE = [
     "scripts/pool_absolute_one_arm.py",
     "scripts/track2_s3c_pool.py",
     "scripts/nlcfr_stream_filter.py",
+    "scripts/nlcfr_key_index.py",
+    "scripts/serve_miss_probe.py",
     "scripts/cert_verdict_merge.py",
     "scripts/probe_fullhist_key_parity.py",
     "scripts/probe_native_emd_parity.py",
@@ -130,23 +138,33 @@ def _upload_data(s3) -> None:
 def _render_bootstrap(*, run_id: str, decks_per_seed: int, seeds: str, pool_decks: int,
                       pool_only: bool = False) -> str:
     res = f"s3://{BUCKET}/{PREFIX}/{run_id}/results"
+    snap_urls = " ".join(SNAPS_S3)
+    # cert6 serve env (NEW arm): the trained gates + ACTION_TRANSLATE (off-menu pseudo-harmonic
+    # translation, serve-coverage fix) + POSTFLOP_SB_FIRST (trainer-order postflop in the eval
+    # GameState engine — arm-independent, set BOTH arms) + BP_COVERAGE (per-street miss instrument).
     newenv = ("POKERBOT_FULLHIST_KEY=1 POKERBOT_PRESUM_KEY=1 POKERBOT_MRR=1 "
               "POKERBOT_CLOSE_CALLED_STREET=1 POKERBOT_PRE_KEEP=2,3,4,5,6 "
-              "POKERBOT_PRE_RR_KEEP=4,5,6 "
+              "POKERBOT_PRE_RR_KEEP=4,5,6 POKERBOT_ACTION_TRANSLATE=1 "
+              "POKERBOT_POSTFLOP_SB_FIRST=1 POKERBOT_BP_COVERAGE=1 "
               "POKERBOT_RIVER_OCHS=/opt/pokerbot/data/abstraction/river_ochs_160.rochs")
     newenv_json = json.dumps({
         "POKERBOT_FULLHIST_KEY": "1", "POKERBOT_PRESUM_KEY": "1", "POKERBOT_MRR": "1",
         "POKERBOT_CLOSE_CALLED_STREET": "1", "POKERBOT_PRE_KEEP": "2,3,4,5,6",
-        "POKERBOT_PRE_RR_KEEP": "4,5,6",
+        "POKERBOT_PRE_RR_KEEP": "4,5,6", "POKERBOT_ACTION_TRANSLATE": "1",
+        "POKERBOT_POSTFLOP_SB_FIRST": "1", "POKERBOT_BP_COVERAGE": "1",
         "POKERBOT_RIVER_OCHS": "/opt/pokerbot/data/abstraction/river_ochs_160.rochs",
     })
-    incenv_json = json.dumps({"POKERBOT_CLOSE_CALLED_STREET": "1"})
+    # Incumbent arm: its standard default-key serve — NO translation, NO fullhist keys; closure +
+    # SB-first (engine-wide street order, arm-independent) + the miss instrument only.
+    incenv_json = json.dumps({"POKERBOT_CLOSE_CALLED_STREET": "1",
+                              "POKERBOT_POSTFLOP_SB_FIRST": "1", "POKERBOT_BP_COVERAGE": "1"})
     # RAW arms: search:false serves the blueprint root policy directly (no subgame solve) —
     # the cert isolates the BLUEPRINT object; both arms still settle showdown money (harness
-    # money fix default-ON) and play under closure (parent env).
+    # money fix default-ON) and play under closure (parent env). The NEW arm serves the FULL
+    # snap_avg-merged table via the mmap index dir (SortedSnapshotDir — no 25M row cap).
     arm_new = json.dumps({"worker_env": json.loads(newenv_json), "settle_showdown_leaf": True,
                           "search": False,
-                          "blueprint_path": "/opt/pokerbot/checkpoints/bp_new_full.pkl"})
+                          "blueprint_path": "/opt/pokerbot/checkpoints/idx_new_full"})
     arm_inc = json.dumps({"worker_env": json.loads(incenv_json), "settle_showdown_leaf": True,
                           "search": False})
     head = f"""#!/bin/bash
@@ -189,12 +207,17 @@ echo "25c860d2f35a08fcb38499d436d29547233b771e5a6b4fc057da8a72d7d53d44  data/abs
 # Rust-vs-Python f32 bet-amount arithmetic; x86-64-v3 FMA contraction broke it on cert1
 # (locally-validated builds use the default target). Baseline codegen is plenty for serve.
 stage build
-cd tools/battery_native && cargo build --release --features python 2>&1 | tail -3 || fail build
+# snap_avg FIRST (no python feature): the offline NLSNAP01 snapshot averager (mandatory for a
+# SNAPSHOT_AVG-trained run — the raw ckpt is postflop-EMPTY; cert5 postmortem). Building it AFTER
+# the python-feature lib would REBUILD libbattery_native.so WITHOUT PyInit (feature sets don't
+# unify across invocations) and the natimport gate would fail on a featureless cdylib.
+cd tools/battery_native && cargo build --release --example snap_avg 2>&1 | tail -2 || fail build_snapavg
+cargo build --release --features python 2>&1 | tail -3 || fail build
 cp target/release/libbattery_native.so /opt/pokerbot/battery_native.so
 mkdir -p target/release && cp target/release/libbattery_native.so target/release/battery_native.so || true
 cd /opt/pokerbot
 python3 -c "import battery_native; print('caps', sorted(battery_native.native_caps()))" || fail natimport
-python3 -c "import battery_native,sys; sys.exit(0 if {{'river_ochs_serve','settle_showdown_leaf','presum_key','full_hist_key'}} <= set(battery_native.native_caps()) else 1)" || fail natcaps
+python3 -c "import battery_native,sys; sys.exit(0 if {{'river_ochs_serve','settle_showdown_leaf','presum_key','full_hist_key','action_translate'}} <= set(battery_native.native_caps()) else 1)" || fail natcaps
 # explicit native_solver self-check with verbose diagnostics (the cert1 failure surface)
 POKERBOT_SELFCHECK_VERBOSE=1 python3 -c "
 from pokerbot.search import native_solver as ns
@@ -202,15 +225,42 @@ import sys
 print('available', ns.available(), 'selfcheck', ns._SELFCHECK_OK, flush=True)
 sys.exit(0 if ns.available() else 1)" 2>&1 | tee $OUT/selfcheck_diag.log || fail selfcheck
 
-# blueprint download + FULL-table conversion (arrays_v1 f32)
+# ---------------- SERVE OBJECT (cert6 mandatory order) ----------------
+# 1) ckpt + ALL NLSNAP01 snapshots; 2) snap_avg merge (NEVER filter/serve the raw ckpt — it is
+# postflop-EMPTY under SNAPSHOT_AVG); 3) full-table mmap index (no row cap); 4) self-play
+# serve-miss gate BEFORE any money run.
 stage nlcfr_download
 aws s3 cp {NLCFR_S3} /opt/pokerbot/iter_050000.nlcfr --region {REGION} || fail nlcfr
-stage convert
-python3 scripts/nlcfr_stream_filter.py /opt/pokerbot/iter_050000.nlcfr checkpoints/bp_new_full.pkl \\
-  --mass 1.0 --max-rows 200000000 --arrays 2>&1 | tee $OUT/convert.log || fail convert
-rm -f /opt/pokerbot/iter_050000.nlcfr
+SNAPS=""
+for SURL in {snap_urls}; do
+  SBASE=$(basename $SURL)
+  aws s3 cp $SURL /opt/pokerbot/$SBASE --region {REGION} || fail snapdl
+  SNAPS="$SNAPS /opt/pokerbot/$SBASE"
+done
+stage snap_merge
+tools/battery_native/target/release/examples/snap_avg /opt/pokerbot/merged_50k.nlcfr \\
+  /opt/pokerbot/iter_050000.nlcfr $SNAPS 2>&1 | tee $OUT/snap_merge.log || fail snap_merge
+rm -f /opt/pokerbot/iter_050000.nlcfr /opt/pokerbot/snap_*.nlsnap
+stage index
+python3 scripts/nlcfr_key_index.py /opt/pokerbot/merged_50k.nlcfr checkpoints/idx_new_full \\
+  --with-rows 2>&1 | tee $OUT/index.log || fail index
+rm -f /opt/pokerbot/merged_50k.nlcfr
+cp checkpoints/idx_new_full/meta.json $OUT/serve_index_meta.json || true
 
 export PYTHONPATH=/opt/pokerbot
+
+# ---------------- SERVE-MISS GATE (BEFORE MONEY) ----------------
+stage serve_gate
+{newenv} python3 scripts/serve_miss_probe.py --blueprint checkpoints/idx_new_full \\
+  --full-index checkpoints/idx_new_full --mode selfplay --hands 2000 --seed 11 \\
+  --miss-log $OUT/serve_gate_miss.jsonl --out $OUT/serve_gate_selfplay.json 2>&1 | tail -8 | tee $OUT/serve_gate.log
+python3 - <<'PY' || fail serve_gate
+import json
+d = json.load(open('/opt/pokerbot/cert_out/serve_gate_selfplay.json'))
+mr = d["total"]["miss_rate"]
+print(f"serve gate: self-play miss_rate={{mr:.4f}} (threshold 0.005)")
+assert mr < 0.005, f"SERVE-MISS GATE FAIL: {{mr:.4f}} >= 0.5% -- NOT spending on the money cert"
+PY
 """
     mid = "" if pool_only else f"""# ---------------- GATES (abort-on-fail) ----------------
 stage gates
@@ -218,7 +268,10 @@ stage gates
   --min-states 1024 --min-postflop 1024 --out $OUT/gate_parity_fullhist.json 2>&1 | tail -3 | tee $OUT/gate_parity_fullhist.log || fail gate_parity_fullhist
 {newenv} python3 scripts/probe_native_emd_parity.py --min-postflop 600 --min-per-street 80 \\
   --out $OUT/gate_parity_emd_ochs.json 2>&1 | tail -4 | tee $OUT/gate_parity_emd_ochs.log || fail gate_parity_emd_ochs
-POKERBOT_CLOSE_CALLED_STREET=1 python3 scripts/engine_ab_h2h.py \\
+# cert6: rust<->python off-menu translation parity (the serve-fix gate; 0 mismatches required)
+{newenv} python3 scripts/probe_fullhist_key_parity.py --fullhist 1 --presum 1 --translate 1 \\
+  --out $OUT/gate_parity_translate.json 2>&1 | tail -3 | tee $OUT/gate_parity_translate.log || fail gate_parity_translate
+POKERBOT_CLOSE_CALLED_STREET=1 POKERBOT_POSTFLOP_SB_FIRST=1 python3 scripts/engine_ab_h2h.py \\
   --arm-a '{arm_new}' --arm-b '{arm_new}' \\
   --decks 6 --seed 4242 --label box_zero_gate --out $OUT/gate_zero.json 2>&1 | tail -6 | tee $OUT/gate_zero.log
 python3 - <<'PY' || fail gate_zero
@@ -229,7 +282,7 @@ assert abs(d["a_minus_b_per_deck"]) < 1e-9, d["a_minus_b_per_deck"]
 assert all(abs(x) < 1e-9 for x in d["ci95"]), d["ci95"]
 assert all(abs(x) < 1e-9 for x in d["per_deck_nets"]), d["per_deck_nets"]
 PY
-POKERBOT_CLOSE_CALLED_STREET=1 python3 scripts/engine_ab_h2h.py \\
+POKERBOT_CLOSE_CALLED_STREET=1 POKERBOT_POSTFLOP_SB_FIRST=1 python3 scripts/engine_ab_h2h.py \\
   --arm-a '{arm_new}' --arm-b '{arm_inc}' \\
   --decks 40 --seed 4242 --label box_knob_screen --out $OUT/gate_screen.json 2>&1 | tail -6 | tee $OUT/gate_screen.log
 python3 - <<'PY' || fail gate_screen
@@ -240,8 +293,8 @@ PY
 
 # ---------------- BATTERY: NEW vs INCUMBENT, sharded ----------------
 MEMGB=$(awk '/MemTotal/ {{printf "%d", $2/1048576}}' /proc/meminfo)
-# RAW arms: each shard = parent + 2 workers; the NEW-arm worker holds the 8.91GB arrays pkl
-# (~20-30GB resident). Shard counts sized so worst-case worker RSS stays < half of RAM.
+# RAW arms: each shard = parent + 2 workers. cert6: the NEW arm serves the mmap index (~0 RSS),
+# so RAM stops binding -- keep the cert5-proven shard counts (page-cache reuse across shards).
 SHARDS=2; [ "$MEMGB" -gt 400 ] && SHARDS=6; [ "$MEMGB" -gt 200 ] && [ "$MEMGB" -le 400 ] && SHARDS=3
 DPS=$(( {decks_per_seed} / SHARDS ))
 echo "MEMGB=$MEMGB SHARDS=$SHARDS decks/shard=$DPS" | tee $OUT/plan.txt
@@ -249,7 +302,7 @@ for SEED in {seeds}; do
   stage battery_seed$SEED
   pids=()
   for SH in $(seq 0 $((SHARDS-1))); do
-    POKERBOT_CLOSE_CALLED_STREET=1 python3 scripts/engine_ab_h2h.py \\
+    POKERBOT_CLOSE_CALLED_STREET=1 POKERBOT_POSTFLOP_SB_FIRST=1 python3 scripts/engine_ab_h2h.py \\
       --arm-a '{arm_new}' --arm-b '{arm_inc}' \\
       --decks $DPS --deck-start $SH --deck-stride $SHARDS --seed $SEED \\
       --label cert_new_vs_inc_s${{SEED}}_sh${{SH}} \\
@@ -262,10 +315,10 @@ done
     tail = f"""# ---------------- POOL: absolute vs roster, one process per arm-env ----------------
 stage pool
 {newenv} python3 scripts/pool_absolute_one_arm.py \\
-  --blueprint checkpoints/bp_new_full.pkl --spec '{{"search": false, "settle_showdown_leaf": true}}' \\
+  --blueprint checkpoints/idx_new_full --spec '{{"search": false, "settle_showdown_leaf": true}}' \\
   --decks {pool_decks} --seed 0 --workers 1 --label pool_new --out $OUT/pool_new.json > $OUT/pool_new.log 2>&1 &
 PNEW=$!
-POKERBOT_CLOSE_CALLED_STREET=1 python3 scripts/pool_absolute_one_arm.py \\
+POKERBOT_CLOSE_CALLED_STREET=1 POKERBOT_POSTFLOP_SB_FIRST=1 POKERBOT_BP_COVERAGE=1 python3 scripts/pool_absolute_one_arm.py \\
   --blueprint checkpoints/serve_blueprint_6max.pkl --spec '{{"search": false, "settle_showdown_leaf": true}}' \\
   --decks {pool_decks} --seed 0 --workers 1 --label pool_inc --out $OUT/pool_inc.json > $OUT/pool_inc.log 2>&1 &
 PINC=$!
@@ -275,6 +328,7 @@ wait $PINC || echo "pool_inc rc!=0" >> $OUT/battery_warnings.txt
 stage verdict
 python3 scripts/cert_verdict_merge.py --out-dir $OUT --run-id {run_id} 2>&1 | tee $OUT/verdict_merge.log \\
   || echo "verdict merge rc!=0" >> $OUT/battery_warnings.txt
+cp $OUT/VERDICT.json $OUT/VERDICT_FINAL.json || true
 
 stage done
 date -u +"%Y-%m-%dT%H:%M:%SZ" > $OUT/RESULT_DONE.txt
