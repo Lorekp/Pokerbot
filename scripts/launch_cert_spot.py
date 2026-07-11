@@ -263,11 +263,11 @@ done
 stage pool
 {newenv} python3 scripts/pool_absolute_one_arm.py \\
   --blueprint checkpoints/bp_new_full.pkl --spec '{{"search": false, "settle_showdown_leaf": true}}' \\
-  --decks {pool_decks} --seed 0 --workers 4 --label pool_new --out $OUT/pool_new.json > $OUT/pool_new.log 2>&1 &
+  --decks {pool_decks} --seed 0 --workers 1 --label pool_new --out $OUT/pool_new.json > $OUT/pool_new.log 2>&1 &
 PNEW=$!
 POKERBOT_CLOSE_CALLED_STREET=1 python3 scripts/pool_absolute_one_arm.py \\
   --blueprint checkpoints/serve_blueprint_6max.pkl --spec '{{"search": false, "settle_showdown_leaf": true}}' \\
-  --decks {pool_decks} --seed 0 --workers 4 --label pool_inc --out $OUT/pool_inc.json > $OUT/pool_inc.log 2>&1 &
+  --decks {pool_decks} --seed 0 --workers 1 --label pool_inc --out $OUT/pool_inc.json > $OUT/pool_inc.log 2>&1 &
 PINC=$!
 wait $PNEW || echo "pool_new rc!=0" >> $OUT/battery_warnings.txt
 wait $PINC || echo "pool_inc rc!=0" >> $OUT/battery_warnings.txt
