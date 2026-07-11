@@ -57,6 +57,11 @@ _ap.add_argument("--presum", type=int, choices=(0, 1), default=0,
                  help="1 = POKERBOT_PRESUM_KEY=1 (arm-4 postflop preflop-summary key; requires "
                       "--fullhist 1). The POSTFLOP A-segment becomes street + 4 summary bytes + "
                       "exact postflop bytes; preflop is unchanged fullhist. 0 = plain fullhist.")
+_ap.add_argument("--translate", type=int, choices=(0, 1), default=0,
+                 help="1 = POKERBOT_ACTION_TRANSLATE=1 (serve-coverage off-menu pseudo-harmonic "
+                      "translation; requires --fullhist 1). The independent ref layout cannot "
+                      "reproduce the replay-translation, so this mode gates py==nat byte-parity "
+                      "plus a floor of actually-TRANSLATED states. 0 = no translation (3-way).")
 _ap.add_argument("--min-states", type=int, default=512)
 _ap.add_argument("--min-postflop", type=int, default=512)
 _ap.add_argument("--max-hands", type=int, default=12000)
@@ -77,6 +82,15 @@ for _k, _v in {
     os.environ.setdefault(_k, _v)
 if ARGS.presum == 1 and ARGS.fullhist != 1:
     _ap.error("--presum 1 requires --fullhist 1 (presum refines the fullhist A-segment)")
+if ARGS.translate == 1 and ARGS.fullhist != 1:
+    _ap.error("--translate 1 requires --fullhist 1 (translation exists for history-baked keys)")
+if ARGS.translate == 1:
+    os.environ["POKERBOT_ACTION_TRANSLATE"] = "1"
+    # Exercise the M-RR postflop thinning too (the deployed fullhist regimes train with it), so the
+    # walk's free-menu bets are off the trained menu on every street.
+    os.environ.setdefault("POKERBOT_MRR", "1")
+else:
+    os.environ.pop("POKERBOT_ACTION_TRANSLATE", None)
 if ARGS.fullhist == 1:
     os.environ["POKERBOT_FULLHIST_KEY"] = "1"
 else:
@@ -265,11 +279,20 @@ def main() -> int:
         print(f"FATAL: battery_native binary predates the presum-key port (caps={sorted(caps)}); "
               "rebuild --features python and reinstall the .pyd", flush=True)
         return 2
+    translate_on = ARGS.translate == 1
+    if translate_on and "action_translate" not in caps:
+        print(f"FATAL: battery_native binary predates the action-translate port (caps={sorted(caps)}); "
+              "rebuild --features python and reinstall the .pyd", flush=True)
+        return 2
     print(f"fullhist={ARGS.fullhist} presum={ARGS.presum} num_buckets={ARGS.num_buckets} "
           f"native_caps={sorted(caps)}", flush=True)
 
+    if translate_on:
+        from pokerbot.engine.action_translate import translate_state_for_key as _py_translate
+
     rng = random.Random(ARGS.seed)
     total = 0
+    translated = 0
     fails = 0
     mismatches = []
     cov = {"preflop": 0, "flop": 0, "turn": 0, "river": 0,
@@ -345,7 +368,16 @@ def main() -> int:
                 cov["hist_len_10plus"] += 1
             if hl >= 16:
                 cov["hist_len_16plus"] += 1
-            if not (py_key == nat_key == ref_key):
+            if translate_on:
+                # The independent ref cannot replay-translate; the gate here is Rust==Python
+                # byte-parity of the TRANSLATED key + a floor of actually-translated states.
+                t_env = _py_translate(env)
+                if t_env is not env:
+                    translated += 1
+                key_ok = py_key == nat_key
+            else:
+                key_ok = py_key == nat_key == ref_key
+            if not key_ok:
                 fails += 1
                 if len(mismatches) < 20:
                     mismatches.append({
@@ -373,11 +405,15 @@ def main() -> int:
                   f"elapsed={time.time()-t0:.0f}s", flush=True)
 
     ok = fails == 0 and covered()
-    print(f"\n=== FULL-HIST KEY PARITY (fullhist={ARGS.fullhist} presum={ARGS.presum}) ===")
-    print(f"hands={hands} states={total} mismatches={fails}")
+    if translate_on and translated < 100:
+        ok = False  # the walk must actually exercise translation, not just pass vacuously
+    print(f"\n=== FULL-HIST KEY PARITY (fullhist={ARGS.fullhist} presum={ARGS.presum} "
+          f"translate={ARGS.translate}) ===")
+    print(f"hands={hands} states={total} mismatches={fails} translated={translated}")
     print(f"coverage: {cov}")
     print(f"PARITY GATE: {'PASS' if ok else 'FAIL'}", flush=True)
-    result = {"fullhist": ARGS.fullhist, "presum": ARGS.presum, "hands": hands, "states": total,
+    result = {"fullhist": ARGS.fullhist, "presum": ARGS.presum, "translate": ARGS.translate,
+              "translated_states": translated, "hands": hands, "states": total,
               "mismatches": fails, "coverage": cov, "covered": covered(), "pass": bool(ok),
               "mismatch_samples": mismatches, "seed": ARGS.seed,
               "num_buckets": ARGS.num_buckets}

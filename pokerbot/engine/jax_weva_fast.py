@@ -332,10 +332,16 @@ def _presum_n_preflop_boundary(state: EnvState | Any) -> int:
         action = int(hist_action[i])
         if not (0 <= action < NUM_ACTIONS):
             return hist_len
-        # (Debug parity: the engine picks action_seat; it must equal the recorded hist_seat[i].)
-        assert int(r.action_seat) == int(hist_seat[i]), (
-            f"presum n_preflop replay diverged: engine action_seat {int(r.action_seat)} != recorded "
-            f"hist_seat {int(hist_seat[i])} at i={i}")
+        # RUST-RELEASE PARITY (2026-07-11 serve-coverage fix): fingerprint.rs::n_preflop_boundary
+        # guards the recorded-seat match with a debug_assert only — RELEASE builds replay the
+        # recorded ACTION bytes regardless of the recorded seats and return a boundary. This twin
+        # used a hard `assert` (Python always evaluates it), so any live/pool-bridged history whose
+        # actor order diverges from the trainer engine (state_bridge histories carry no
+        # closure-injected CHECK; engine/game.py's legacy play_hand order is postflop-BB-first)
+        # RAISED here — crashing ~1/3 of pool postflop fingerprints into the callers' random-legal
+        # fallback, a python-vs-native BEHAVIORAL skew. Match the Rust release semantics: ignore the
+        # recorded seat (it is not hashed; only the action bytes are).
+        _ = hist_seat  # recorded seats intentionally unused (Rust release parity; see above)
         # RAW (non-closure) step, matching fingerprint.rs::n_preflop_boundary which replays through
         # the frozen ``core::apply_action``. Under POKERBOT_CLOSE_CALLED_STREET=1 the closure-injected
         # closing CHECK is ALREADY RECORDED in ``hist_action`` (closure.rs records it like any action),
@@ -703,6 +709,15 @@ def fingerprint_fast(state: EnvState | Any, seat: int, *, weva_table: np.ndarray
 
     if not _BETTING_ABSTRACTION:
         return encode_nlhe_bundle_fast(state, seat, weva_table=weva_table).fingerprint()
+
+    # SERVE entry point: off-menu action translation (POKERBOT_ACTION_TRANSLATE=1) BEFORE key
+    # construction — the pseudo-harmonic remap of off-trained-menu history tokens so fullhist/presum
+    # keys land in trained key space (twin of the fingerprint.rs serve hook; default OFF is
+    # byte-identical, one latched module-bool check).
+    from pokerbot.engine.action_translate import _ENABLED as _TRANSLATE_ON
+    if _TRANSLATE_ON:
+        from pokerbot.engine.action_translate import translate_state_for_key
+        state = translate_state_for_key(state)
 
     holes = np.asarray(state.holes)
     board = np.asarray(state.board)

@@ -440,7 +440,30 @@ fn effective_depth_bb<const N: usize>(s: &EnvStateN<N>) -> f64 {
 /// Depth-aware fingerprint (`POKERBOT_DEPTH_BUCKETS=1`). When `depth_edges` is non-empty, the PREFLOP
 /// key gains `b"D" + depth_bucket(1 byte)` between weva_id and the betting_state -- byte-identical to
 /// `NLHEEncodeBundle._digest` with `_DEPTH_BUCKETS`. Pass `&[]` for the non-depth blueprint (unchanged).
+///
+/// SERVE entry point: consults the off-menu action-translation gate (`POKERBOT_ACTION_TRANSLATE=1`,
+/// crate::translate) BEFORE key construction — default OFF is byte-identical (one latched bool
+/// check). The trainer's keying (trainer.rs `fingerprint_fast_depth_memo*` -> the `_memo` twins
+/// below) never routes through here, so training is untouched by the gate.
 pub fn fingerprint_fast_depth<const N: usize>(
+    s: &EnvStateN<N>,
+    seat: usize,
+    num_buckets: i32,
+    depth_edges: &[f64],
+) -> [u8; 16] {
+    let translated;
+    let s = if crate::translate::enabled() {
+        translated = crate::translate::translate_state_for_key(s);
+        &translated
+    } else {
+        s
+    };
+    fingerprint_fast_depth_raw(s, seat, num_buckets, depth_edges)
+}
+
+/// The pre-translation `fingerprint_fast_depth` body (state taken AS-IS — used internally by the
+/// EMD serve path after it has already applied translation once).
+fn fingerprint_fast_depth_raw<const N: usize>(
     s: &EnvStateN<N>,
     seat: usize,
     num_buckets: i32,
@@ -913,6 +936,16 @@ pub fn fingerprint_fast_depth_emd_servememo<const N: usize>(
     lookup: &crate::emd::FrozenEMDLookup,
     miss_made_hand: bool,
 ) -> [u8; 16] {
+    // SERVE entry point: off-menu action translation (POKERBOT_ACTION_TRANSLATE=1) BEFORE key
+    // construction (same gate as the non-memo `fingerprint_fast_depth_emd` twin); default OFF is
+    // byte-identical. Applied ONCE — every inner call below keys the translated state directly.
+    let translated;
+    let s = if crate::translate::enabled() {
+        translated = crate::translate::translate_state_for_key(s);
+        &translated
+    } else {
+        s
+    };
     SERVE_FP_MEMO.with(|m| {
         let memo = &mut *m.borrow_mut();
         if memo.len() > SERVE_FP_MEMO_CAP {
@@ -959,6 +992,14 @@ pub fn fingerprint_fast_servememo<const N: usize>(
     seat: usize,
     num_buckets: i32,
 ) -> [u8; 16] {
+    // Serve entry point: same translation gate as `fingerprint_fast_depth` (default OFF identical).
+    let translated;
+    let s = if crate::translate::enabled() {
+        translated = crate::translate::translate_state_for_key(s);
+        &translated
+    } else {
+        s
+    };
     SERVE_FP_MEMO.with(|m| {
         let memo = &mut *m.borrow_mut();
         if memo.len() > SERVE_FP_MEMO_CAP {
@@ -989,11 +1030,23 @@ pub fn fingerprint_fast_depth_emd<const N: usize>(
     lookup: &crate::emd::FrozenEMDLookup,
     miss_made_hand: bool,
 ) -> [u8; 16] {
+    // SERVE entry point: off-menu action translation (POKERBOT_ACTION_TRANSLATE=1) BEFORE key
+    // construction; default OFF is byte-identical. Applied ONCE here — the inner calls below use
+    // the `_raw` twin so a translated state is never re-translated.
+    let translated;
+    let s = if crate::translate::enabled() {
+        translated = crate::translate::translate_state_for_key(s);
+        &translated
+    } else {
+        s
+    };
     let h0 = s.holes[seat][0];
     let h1 = s.holes[seat][1];
     let nb = s.board.iter().filter(|&&c| c >= 0).count();
     if nb >= 3 && h0 >= 0 && h1 >= 0 {
-        // River-OCHS serve keying (mirrors trainer.rs — OCHS checked FIRST; see the servememo twin).
+        // River-OCHS serve keying (mirrors trainer.rs::fingerprint_fast_depth_memo_emd_impl —
+        // OCHS checked FIRST so an active-table river never falls through to the made-hand
+        // mirror). Rows trained under POKERBOT_RIVER_OCHS are hit with the exact trainer keying.
         if nb == 5 {
             if let Some(table) = serve_river_ochs() {
                 if let Some(bucket) =
@@ -1011,11 +1064,11 @@ pub fn fingerprint_fast_depth_emd<const N: usize>(
         }
         // Frozen miss: river (never in the blob) or a true flop/turn blob miss.
         if miss_made_hand {
-            return fingerprint_fast_depth(s, seat, num_buckets, depth_edges);
+            return fingerprint_fast_depth_raw(s, seat, num_buckets, depth_edges);
         }
         return fingerprint_from_bucket(s, seat, -1, depth_edges);
     }
-    fingerprint_fast_depth(s, seat, num_buckets, depth_edges)
+    fingerprint_fast_depth_raw(s, seat, num_buckets, depth_edges)
 }
 
 /// Digest a stack-assembled message with the FP memo (R3: slice-probed — the memo key type

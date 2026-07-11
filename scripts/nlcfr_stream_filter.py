@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 """STREAMING NLCFR001 -> serve-pkl converter with a row-mass filter (bounded RAM).
 
+*** SNAPSHOT_AVG WARNING (2026-07-11 serve-coverage root cause) ***
+A checkpoint trained with POKERBOT_SNAPSHOT_AVG=1 (babysitter -V3SnapshotAvg — e.g.
+bpv4_pluribus_finemenu_1) accumulates strat_sum at PREFLOP nodes ONLY; its postflop average lives
+in the NLSNAP01 snapshots. Filtering such a checkpoint DIRECTLY produces a POSTFLOP-EMPTY serve
+table: every postflop lookup misses and serves uniform (measured 100% flop/turn/river miss — the
+2026-07-10 strength-cert killer). ALWAYS merge first:
+    tools/battery_native snap_avg.exe merged.nlcfr <final_ckpt.nlcfr> <snap_*.nlsnap ...>
+then filter/index the MERGED blob, and gate the result with scripts/serve_miss_probe.py
+(self-play postflop miss must be <1%, not ~100%). Also mind the row cap: the 25M default kept
+only 90.9% of preflop mass on the 50k finemenu run (~9% direct self-play miss) — prefer the
+mmap-index serve object (scripts/nlcfr_key_index.py --with-rows, SortedSnapshot) or a cap that
+reaches the --mass target.
+
 Purpose: a fullhist+presum blueprint checkpoint has ~150M strat rows (~28 GB f64 on disk) — far
 beyond any practical serve table (the dict->PyDict->HashMap serve path would need >80 GB RSS).
 The practical SHIP OBJECT is the mass-filtered f32 snapshot this script emits: rows are kept by

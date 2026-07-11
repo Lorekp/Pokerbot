@@ -26,6 +26,7 @@ pub mod playout;
 pub mod river_ochs;
 pub mod subgame;
 pub mod trainer;
+pub mod translate;
 
 #[cfg(test)]
 mod tests;
@@ -473,6 +474,10 @@ mod py {
             // fast paths under POKERBOT_RIVER_OCHS only when this cap is present — stale .pyds
             // keep failing closed to the Python path.
             "river_ochs_serve".to_string(),
+            // serve-coverage fix (2026-07-11): fingerprint.rs serve entry points consult the
+            // env-gated (POKERBOT_ACTION_TRANSLATE=1) pseudo-harmonic off-menu action translation
+            // (translate.rs; default-off byte-identical).
+            "action_translate".to_string(),
         ]
     }
 

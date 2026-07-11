@@ -423,18 +423,33 @@ def _native_fingerprint_matches_serve_abstraction() -> bool:
             return False
         if "preflop_hist_key" not in caps:
             return False
-    # River-OCHS serve regime (POKERBOT_RIVER_OCHS): the native fast paths key the river with the
-    # trainer's OCHS bucket ONLY on binaries that advertise the "river_ochs_serve" cap
-    # (fingerprint.rs::serve_river_ochs, env-latched, checked before the made-hand mirror; the
-    # binary panics fail-closed if the table cannot load). Stale .pyds without the cap would take
-    # the made-hand mirror branch and HIT wrong-semantics river rows (same bucket-id space), so
-    # they keep failing closed to the Python path (river-OCHS-correct).
+    # River-OCHS serve regime (POKERBOT_RIVER_OCHS): fingerprint.rs::fingerprint_fast_depth_emd now
+    # carries the OCHS-first river branch (serve_river_ochs, 2026-07-11 port of the trainer's
+    # keying) — capability-gated: a STALE .pyd without it would take the made-hand mirror branch and
+    # HIT wrong-semantics river rows (same bucket-id space). Fail closed unless the binary reports
+    # "river_ochs_serve".
     if os.environ.get("POKERBOT_RIVER_OCHS"):
+        if _EXT is None:
+            return False
         try:
             caps = set(_EXT.native_caps())
         except Exception:  # noqa: BLE001
             return False
         if "river_ochs_serve" not in caps:
+            return False
+    # Off-menu action translation (POKERBOT_ACTION_TRANSLATE=1, serve-coverage fix 2026-07-11): the
+    # Python key path translates off-trained-menu history tokens before key construction
+    # (action_translate.py); a STALE .pyd without translate.rs would key UNTRANSLATED histories — a
+    # silent Python/native KEY SKEW inside one serve process. Fail closed unless the binary reports
+    # "action_translate".
+    if os.environ.get("POKERBOT_ACTION_TRANSLATE", "") == "1":
+        if _EXT is None:
+            return False
+        try:
+            caps = set(_EXT.native_caps())
+        except Exception:  # noqa: BLE001
+            return False
+        if "action_translate" not in caps:
             return False
     if os.environ.get("POKERBOT_POSTFLOP_MODE", "fast").lower() != "emd":
         return True

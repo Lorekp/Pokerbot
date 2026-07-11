@@ -122,6 +122,13 @@ def is_enabled() -> bool:
     # is only for the separate tools/fingerprint_native crate.)
     if os.environ.get("POKERBOT_PREFLOP_HIST_KEY", "") == "1":
         return False
+    # HARD OVERRIDE (serve-coverage fix 2026-07-11): THIS crate has no off-menu action translation
+    # (POKERBOT_ACTION_TRANSLATE); serving through it with the gate on would key UNTRANSLATED
+    # histories -> the exact off-menu misses the gate exists to remove. Fail closed to the Python
+    # oracle (whose fingerprint_fast applies the translation hook). tools/battery_native DOES carry
+    # the native translation (translate.rs, cap "action_translate").
+    if os.environ.get("POKERBOT_ACTION_TRANSLATE", "") == "1":
+        return False
     if os.environ.get("POKERBOT_POSTFLOP_MODE", "fast").lower() == "emd":
         mod = load_native()
         try:

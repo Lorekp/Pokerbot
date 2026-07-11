@@ -415,6 +415,15 @@ class GameState:
         return copy.deepcopy(self)
 
 
+def _postflop_sb_first_enabled() -> bool:
+    """POKERBOT_POSTFLOP_SB_FIRST=1 (default OFF => play_hand keeps the legacy BB-first postflop
+    order, byte-identical). Read PER CALL (cheap) so a test process can flip the gate — the same
+    convention as np_engine's ``_close_called_street_enabled`` mirror."""
+    import os
+
+    return os.environ.get("POKERBOT_POSTFLOP_SB_FIRST", "") == "1"
+
+
 def play_hand(
     policies: dict[int, callable],
     state: GameState | None = None,
@@ -484,12 +493,25 @@ def play_hand(
                     Action(ActionType.FOLD),
                 )
         n_board_seen = len(state.board)
+        prev_street = state.street
         state.apply_action(action)
         if chance_sink is not None and len(state.board) > n_board_seen:
             chance_sink(state, n_board_seen)
         if state.is_terminal():
             break
-        state.advance_to_next_actor()
+        # POSTFLOP FIRST-ACTOR FIX (env-gated POKERBOT_POSTFLOP_SB_FIRST=1, default OFF =>
+        # byte-identical legacy). BUG (2026-07-11 serve-coverage root-cause): when apply_action
+        # closes a street, its _advance_street already seats the street's FIRST actor
+        # (_first_postflop_actor == first live seat after the button == the SB, real NLHE); the
+        # unconditional advance_to_next_actor here then SKIPPED that seat, so this engine has
+        # always played postflop streets one live seat late (BB-first) — diverging from real NLHE,
+        # from the trainer core engine (SB-first), and from live tables. Histories recorded here
+        # are therefore not replayable in the trainer's game (fullhist/presum serve keys and the
+        # POKERBOT_ACTION_TRANSLATE replay both fail-open on them). Gated OFF by default because
+        # every historical eval baseline was measured under the legacy order; fullhist serve
+        # measurement / the blueprint re-cert set it ON.
+        if state.street == prev_street or not _postflop_sb_first_enabled():
+            state.advance_to_next_actor()
     else:
         raise RuntimeError("Hand exceeded maximum action count")
 
