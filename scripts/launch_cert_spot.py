@@ -162,7 +162,8 @@ export PATH="$HOME/.cargo/bin:$PATH"
 aws s3 cp s3://{BUCKET}/{PREFIX}/code/cert_code.tar.gz /tmp/code.tar.gz --region {REGION} || fail codefetch
 tar -xzf /tmp/code.tar.gz -C /opt/pokerbot
 cd /opt/pokerbot
-python3 -m pip install --disable-pip-version-check --no-input --break-system-packages boto3 numpy "jax[cpu]" phevaluator || fail pip
+python3 -m pip install --disable-pip-version-check --no-input --break-system-packages boto3 numpy "jax[cpu]" phevaluator \
+  || python3 -m pip install --disable-pip-version-check --no-input boto3 numpy "jax[cpu]" phevaluator || fail pip
 
 mkdir -p data/abstraction checkpoints
 aws s3 cp s3://{BUCKET}/{PREFIX}/data/emd_frozen_flop_turn_160_r400.emdfrzn data/abstraction/ --region {REGION} || fail blob1
@@ -172,12 +173,21 @@ echo "344ab2fd328f4b360fd2c11a09c1f6fd2c45a56e62f75d6bc1a502c71612cb74  data/abs
 echo "25c860d2f35a08fcb38499d436d29547233b771e5a6b4fc057da8a72d7d53d44  data/abstraction/river_ochs_160.rochs" | sha256sum -c - || fail blob2sha
 
 # native build (default release profile — minutes, not the trainer's lto=fat hour)
-cd tools/battery_native && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --features python 2>&1 | tail -3 || fail build
+# NO target-cpu override: the native_solver startup self-check requires BIT-IDENTICAL
+# Rust-vs-Python f32 bet-amount arithmetic; x86-64-v3 FMA contraction broke it on cert1
+# (locally-validated builds use the default target). Baseline codegen is plenty for serve.
+cd tools/battery_native && cargo build --release --features python 2>&1 | tail -3 || fail build
 cp target/release/libbattery_native.so /opt/pokerbot/battery_native.so
 mkdir -p target/release && cp target/release/libbattery_native.so target/release/battery_native.so || true
 cd /opt/pokerbot
 python3 -c "import battery_native; print('caps', sorted(battery_native.native_caps()))" || fail natimport
 python3 -c "import battery_native,sys; sys.exit(0 if {{'river_ochs_serve','settle_showdown_leaf','presum_key','full_hist_key'}} <= set(battery_native.native_caps()) else 1)" || fail natcaps
+# explicit native_solver self-check with verbose diagnostics (the cert1 failure surface)
+POKERBOT_SELFCHECK_VERBOSE=1 python3 -c "
+from pokerbot.search import native_solver as ns
+import sys
+print('available', ns.available(), 'selfcheck', ns._SELFCHECK_OK, flush=True)
+sys.exit(0 if ns.available() else 1)" 2>&1 | tee $OUT/selfcheck_diag.log || fail selfcheck
 
 # blueprint download + FULL-table conversion (arrays_v1 f32)
 aws s3 cp {NLCFR_S3} /opt/pokerbot/iter_050000.nlcfr --region {REGION} || fail nlcfr

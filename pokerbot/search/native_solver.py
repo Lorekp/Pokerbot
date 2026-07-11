@@ -771,6 +771,14 @@ def _selfcheck(n_hands: int = 40) -> bool:
     Returns True iff native == pure-Python on every transition + every legal mask + chance deal +
     terminal reward. Run once at import (cheap) so a miscompiled / stale extension silently falls back
     instead of corrupting a battery run."""
+    _verbose = os.environ.get("POKERBOT_SELFCHECK_VERBOSE", "") == "1"
+
+    def _diag(msg):
+        if _verbose:
+            import traceback
+            print(f"[native_selfcheck] {msg}", flush=True)
+            traceback.print_exc()
+
     try:
         import random as _random
 
@@ -778,11 +786,16 @@ def _selfcheck(n_hands: int = 40) -> bool:
         from pokerbot.engine.np_engine import to_numpy_state
         from pokerbot.search.state_bridge import build_subgame_root  # noqa: F401
     except Exception:  # noqa: BLE001
+        _diag("head import failed")
         return False
 
     def _eq_state(a: EnvState, b: EnvState) -> bool:
         for f in a._fields:
             if not np.array_equal(np.asarray(getattr(a, f)), np.asarray(getattr(b, f))):
+                if _verbose:
+                    print(f"[native_selfcheck] STATE MISMATCH field={f} "
+                          f"native={np.asarray(getattr(a, f)).tolist()} "
+                          f"python={np.asarray(getattr(b, f)).tolist()}", flush=True)
                 return False
         return True
 
@@ -794,11 +807,13 @@ def _selfcheck(n_hands: int = 40) -> bool:
             from pokerbot.search.state_bridge import build_subgame_root
             from pokerbot.search.pbs_tracker import PBSTracker  # noqa: F401
         except Exception:  # noqa: BLE001
+            _diag("bridge import failed")
             return False
         # Simplest robust seed: construct an EnvState by stepping the JAX init through to_numpy_state.
         try:
             from pokerbot.engine.jax_engine import init_hand
         except Exception:  # noqa: BLE001
+            _diag("jax_engine import failed")
             return False
         import jax  # noqa: F401  (only used by init_hand; battery env already has jax)
         key = jax.random.PRNGKey(rng.randint(0, 10**9))
@@ -819,6 +834,9 @@ def _selfcheck(n_hands: int = 40) -> bool:
             m_n = legal_action_mask_np(env, seat)
             m_p = _legal_mask_py(env, seat)
             if not np.array_equal(m_n, m_p):
+                if _verbose:
+                    print(f"[native_selfcheck] MASK MISMATCH seat={seat} "
+                          f"native={m_n.tolist()} python={m_p.tolist()}", flush=True)
                 return False
             legal = np.flatnonzero(m_p)
             if legal.size == 0:

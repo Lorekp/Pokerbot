@@ -95,8 +95,10 @@ def main() -> int:
         _ck = load_checkpoint(ckpt)
         snap = {k: avg_strategy(row) for k, row in _ck["strat"].items()}
     else:
-        raw = pickle.load(open(ckpt, "rb"))
-        snap = raw["strat_sum"] if isinstance(raw, dict) and "strat_sum" in raw else raw
+        # Format-aware loader (legacy dict pkl OR nlcfr_stream_filter arrays_v1).
+        sys.path.insert(0, os.path.join(REPO, "scripts"))
+        from engine_ab_h2h import load_snapshot
+        snap = load_snapshot(ckpt)
     # The deployed serve stack (engine_ab_h2h `{}` baseline). At preflop nodes solve() returns
     # _root_blueprint without search, so iterations/native knobs are inert here — but we go through
     # the same wrapper to audit what is actually SERVED.
