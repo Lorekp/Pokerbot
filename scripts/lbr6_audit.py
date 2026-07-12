@@ -29,6 +29,17 @@ from pokerbot.eval.lbr import (always_fold_policy, make_blueprint_policy, make_n
 
 
 def _load_snapshot(path):
+    # cert7: a DIRECTORY is the nlcfr_key_index.py --with-rows mmap index (SortedSnapshotDir, the
+    # full snap_avg-merged serve table). make_blueprint_policy touches the snapshot only via
+    # snapshot.get(key) (lbr.py), which SortedSnapshotDir duck-types -- so the pure-python LBR6
+    # serves the full index directly (no 25M row cap, no pkl materialization). Default (a file)
+    # path is byte-identical to the prior behavior.
+    import os as _os
+    if _os.path.isdir(path):
+        import sys as _sys
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        from engine_ab_h2h import load_snapshot as _load_dir
+        return _load_dir(path)
     with open(path, "rb") as f:
         snap_full = pickle.load(f)
     return (snap_full["strat_sum"]

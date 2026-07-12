@@ -36,8 +36,16 @@ def main() -> None:
                     default=r"checkpoints/bp6max_dcfrvr_iter200.pkl")
     args = ap.parse_args()
 
-    with open(args.blueprint_snapshot, "rb") as f:
-        snap = pickle.load(f)
+    import os as _os
+    if _os.path.isdir(args.blueprint_snapshot):
+        # cert7: mmap index directory (SortedSnapshotDir) -- served via .get(); no pkl materialize.
+        import sys as _sys
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        from engine_ab_h2h import load_snapshot as _load_dir
+        snap = _load_dir(args.blueprint_snapshot)
+    else:
+        with open(args.blueprint_snapshot, "rb") as f:
+            snap = pickle.load(f)
     # Serve-env guard: a flag skew (e.g. forgetting POKERBOT_PREFLOP_LOSSLESS=1 for a lossless snapshot)
     # silently misses every key and would make the gate read a uniform-fallback policy. Cross-check the
     # snapshot's abstraction stamp BEFORE attributing anything.

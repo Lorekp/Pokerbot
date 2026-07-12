@@ -102,8 +102,17 @@ def main() -> int:
     # The deployed serve stack (engine_ab_h2h `{}` baseline). At preflop nodes solve() returns
     # _root_blueprint without search, so iterations/native knobs are inert here — but we go through
     # the same wrapper to audit what is actually SERVED.
-    pf = make_search_policy_fn(snap, leaf_select="uniform", seed=0, iterations=2000,
-                               time_budget_ms=2000, search_preflop=False)
+    # cert7: env-gated preflop-search toggle (default OFF = byte-identical to prior behavior). With
+    # AUDIT_PF_SEARCH_PREFLOP=1 the preflop nodes are SEARCH-RESOLVED (depth-limited subgame solve at
+    # K=AUDIT_PF_ITERS), so this same node walk dumps the search-resolved preflop shape for the
+    # with-vs-without-search comparison (does search neutralize the residual BTN-AA-limp?).
+    _pf_search = os.environ.get("AUDIT_PF_SEARCH_PREFLOP", "0") == "1"
+    _pf_iters = int(os.environ.get("AUDIT_PF_ITERS", "2000"))
+    pf = make_search_policy_fn(snap, leaf_select="uniform", seed=0, iterations=_pf_iters,
+                               time_budget_ms=2000, search_preflop=_pf_search)
+    if _pf_search:
+        # native subgame is what makes K=2000 preflop resolves tractable
+        os.environ.setdefault("POKERBOT_NATIVE_SUBGAME", "1")
 
     occ = jax.numpy.array([True] * 6)
 
