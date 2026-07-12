@@ -64,6 +64,18 @@ from pokerbot.tournament.satellite import (
     seat_locked,
     should_fold_for_seat,
 )
+from pokerbot.tournament.serve_payouts import (
+    ResolvedPayouts,
+    resolve_from_prize_list,
+    resolve_payouts,
+    try_resolve,
+)
+from pokerbot.tournament.live_adapter import (
+    deep_icm_live_override,
+    field_icm_live_override,
+    pko_call_override,
+    satellite_fold_override,
+)
 from pokerbot.tournament.structure import (
     BlindLevel,
     ante_for_bb,
@@ -89,6 +101,11 @@ __all__ = [
     "satellite_payouts", "seat_locked", "should_fold_for_seat",
     # overlay / deal toggle
     "icm_action_value", "icm_tilt", "chip_ev_action_value",
+    # live payout resolution
+    "ResolvedPayouts", "resolve_payouts", "resolve_from_prize_list", "try_resolve",
+    # live override gates (thin adapters over the certified math)
+    "deep_icm_live_override", "pko_call_override", "field_icm_live_override",
+    "satellite_fold_override",
     # calibration anchor
     "always_fold_exploitability", "sixmax_anchor", "sevenmax_tournament_anchor",
 ]
