@@ -285,8 +285,8 @@ export PATH="$HOME/.cargo/bin:$PATH"
 aws s3 cp s3://@@BUCKET@@/@@PREFIX@@/cert7/code/cert7_code.tar.gz /tmp/code.tar.gz --region @@REGION@@ || fail codefetch
 tar -xzf /tmp/code.tar.gz -C /opt/pokerbot
 cd /opt/pokerbot
-python3 -m pip install --disable-pip-version-check --no-input --break-system-packages boto3 numpy "jax[cpu]" phevaluator flax optax cloudpickle \
-  || python3 -m pip install --disable-pip-version-check --no-input boto3 numpy "jax[cpu]" phevaluator flax optax cloudpickle || fail pip
+python3 -m pip install --disable-pip-version-check --no-input --break-system-packages boto3 numpy pandas "jax[cpu]" phevaluator flax optax cloudpickle \
+  || python3 -m pip install --disable-pip-version-check --no-input boto3 numpy pandas "jax[cpu]" phevaluator flax optax cloudpickle || fail pip
 python3 -m pip install --disable-pip-version-check --no-input --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu \
   || python3 -m pip install --disable-pip-version-check --no-input torch --index-url https://download.pytorch.org/whl/cpu || fail torch
 

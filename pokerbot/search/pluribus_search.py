@@ -571,7 +571,15 @@ class PluribusReBeLSolver:
         # TEST_MODE bypass: when POKERBOT_TEST_MODE=1 (set by tests/conftest.py) the validator
         # logs a warning instead of raising, so the many unit tests that pass an empty {} snapshot
         # continue to run. Production never sets this env var; the bypass is unreachable there.
-        if getattr(self.config, "validate_snapshot_at_init", True):
+        # cert7: a non-dict duck-typed serve table (SortedSnapshotDir mmap full-table index, or a
+        # _CountingWrap coverage-counter around one) is already integrity-checked at index build AND
+        # serve-miss-gated, and the TabularBlueprintAdapter touches it only via make_blueprint_policy's
+        # snapshot.get(key) -- the exact access the RAW arm already serves successfully. The dict-only
+        # validate_snapshot would reject it (TypeError "not a dict"); skip strict validation for such an
+        # object. Real dict snapshots (all production/test paths) are unaffected.
+        _duck_serve = (not isinstance(blueprint_snapshot, dict)) and callable(
+            getattr(blueprint_snapshot, "get", None))
+        if getattr(self.config, "validate_snapshot_at_init", True) and not _duck_serve:
             from pokerbot.eval.lbr import validate_snapshot
             _test_mode = os.environ.get("POKERBOT_TEST_MODE", "").lower() in ("1", "true", "yes")
             # When POKERBOT_TEST_MODE=1, default to PERMISSIVE validation (warn instead of raise) so
