@@ -123,7 +123,153 @@ pub fn leaf_settle_stats() -> (u64, u64, u64, f64, f64) {
 pub const NUM_CONTINUATIONS: usize = 4;
 
 /// Blueprint snapshot: fingerprint(16 bytes) -> strat row over the 11 actions.
-pub type Blueprint = HashMap<[u8; 16], [f64; NUM_ACTIONS]>;
+///
+/// TIER-1 SERVE FLIP (2026-07-12): the certified tier-1 126k serve object is a 538,848,758-row
+/// FULL table — far beyond Python-dict marshaling range — served as the nlcfr_key_index.py
+/// `--with-rows` SORTED MMAP INDEX (`keys_sorted.bin`: n*16 B lexicographically sorted digests;
+/// `rows_sorted.f32.bin`: n*11 f32 LE, row-aligned with the keys). `Index` memory-maps both files
+/// and binary-searches per lookup (~30 probes, ~1 µs page-cache-warm) — the Rust twin of the
+/// Python serve object (pokerbot/eval/snapshot_dir.SortedSnapshotDir), so the native subgame CFR
+/// reads the SAME table the Python serve path reads (f32 rows upcast to f64, exactly like numpy).
+/// `Dict` is the historical HashMap; every existing constructor still builds it, byte-identical.
+pub enum Blueprint {
+    Dict(HashMap<[u8; 16], [f64; NUM_ACTIONS]>),
+    Index(std::sync::Arc<SortedIndex>),
+}
+
+impl Clone for Blueprint {
+    fn clone(&self) -> Self {
+        match self {
+            // Historical semantics: a full HashMap copy (the pre-flip type was a bare HashMap).
+            Blueprint::Dict(m) => Blueprint::Dict(m.clone()),
+            // The mmap index is immutable + Arc-shared: clone = refcount bump (cheap by design).
+            Blueprint::Index(ix) => Blueprint::Index(std::sync::Arc::clone(ix)),
+        }
+    }
+}
+
+/// Memory-mapped sorted key/row store (see `Blueprint::Index`). Send+Sync (read-only mmaps), so
+/// `Arc<Blueprint>` sharing across rayon workers keeps working.
+pub struct SortedIndex {
+    keys: memmap2::Mmap,
+    rows: memmap2::Mmap,
+    n: usize,
+}
+
+impl SortedIndex {
+    pub fn open(dir: &str) -> std::io::Result<Self> {
+        let kp = std::path::Path::new(dir).join("keys_sorted.bin");
+        let rp = std::path::Path::new(dir).join("rows_sorted.f32.bin");
+        let kf = std::fs::File::open(&kp)?;
+        let rf = std::fs::File::open(&rp)?;
+        let keys = unsafe { memmap2::Mmap::map(&kf)? };
+        let rows = unsafe { memmap2::Mmap::map(&rf)? };
+        if keys.len() % 16 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: size {} not a multiple of 16", kp.display(), keys.len()),
+            ));
+        }
+        let n = keys.len() / 16;
+        if rows.len() != n * NUM_ACTIONS * 4 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: rows size {} != n({}) * {}", rp.display(), rows.len(), n,
+                        NUM_ACTIONS * 4),
+            ));
+        }
+        Ok(SortedIndex { keys, rows, n })
+    }
+
+    #[inline]
+    fn key_at(&self, i: usize) -> &[u8] {
+        &self.keys[i * 16..i * 16 + 16]
+    }
+
+    /// Binary search over the sorted raw 16-byte keys. Raw memcmp order == numpy 'S16' sort order
+    /// for fixed-width 16-byte data (NUL is the smallest byte and S16 pads with NULs), so the
+    /// Python-side searchsorted and this search agree on every key.
+    pub fn get(&self, key: &[u8; 16]) -> Option<[f64; NUM_ACTIONS]> {
+        let (mut lo, mut hi) = (0usize, self.n);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.key_at(mid).cmp(&key[..]) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let off = mid * NUM_ACTIONS * 4;
+                    let mut row = [0.0f64; NUM_ACTIONS];
+                    for (a, slot) in row.iter_mut().enumerate() {
+                        let b = off + a * 4;
+                        *slot = f32::from_le_bytes([
+                            self.rows[b], self.rows[b + 1], self.rows[b + 2], self.rows[b + 3],
+                        ]) as f64;
+                    }
+                    return Some(row);
+                }
+            }
+        }
+        None
+    }
+
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.n
+    }
+}
+
+impl Blueprint {
+    pub fn new() -> Self {
+        Blueprint::Dict(HashMap::new())
+    }
+
+    pub fn with_capacity(n: usize) -> Self {
+        Blueprint::Dict(HashMap::with_capacity(n))
+    }
+
+    /// Open the nlcfr_key_index.py `--with-rows` output dir as an immutable mmap blueprint.
+    pub fn from_index_dir(dir: &str) -> std::io::Result<Self> {
+        Ok(Blueprint::Index(std::sync::Arc::new(SortedIndex::open(dir)?)))
+    }
+
+    /// Insert (Dict only). The mmap index is immutable by construction; every constructor that
+    /// inserts marshals a Python dict and starts from `Dict`, so this is unreachable for `Index`.
+    pub fn insert(&mut self, k: [u8; 16], v: [f64; NUM_ACTIONS]) {
+        match self {
+            Blueprint::Dict(m) => {
+                m.insert(k, v);
+            }
+            Blueprint::Index(_) => panic!("Blueprint::Index is immutable (mmap serve object)"),
+        }
+    }
+
+    /// Row lookup BY VALUE (11 f64). Dict rows are copied (88 B — same cost as the old deref +
+    /// element reads at the call sites); Index rows are decoded f32 LE -> f64.
+    #[inline]
+    pub fn get(&self, key: &[u8; 16]) -> Option<[f64; NUM_ACTIONS]> {
+        match self {
+            Blueprint::Dict(m) => m.get(key).copied(),
+            Blueprint::Index(ix) => ix.get(key),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Blueprint::Dict(m) => m.len(),
+            Blueprint::Index(ix) => ix.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for Blueprint {
+    fn default() -> Self {
+        Blueprint::new()
+    }
+}
 
 /// EMD frozen-lookup keying config for the serve fast paths. `None` on `PlayoutConfig.emd` (the
 /// default for every pre-existing caller) => the made-hand `fingerprint_fast` key, byte-identical

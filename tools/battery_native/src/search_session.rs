@@ -701,7 +701,7 @@ pub mod py {
             num_buckets: i32,
             session_seed: u64,
         ) -> PyResult<Self> {
-            let mut bp: Blueprint = HashMap::with_capacity(blueprint.len());
+            let mut bp: Blueprint = Blueprint::with_capacity(blueprint.len());
             for (k, v) in blueprint.iter() {
                 let kb: &[u8] = k.extract()?;
                 if kb.len() != 16 {

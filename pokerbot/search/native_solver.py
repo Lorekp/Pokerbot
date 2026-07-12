@@ -498,6 +498,17 @@ def native_rollout_available() -> bool:
 _PLAYOUT_ENGINE_CACHE: dict[int, object] = {}
 
 
+def _snapshot_index_dirpath(snap) -> str | None:
+    """Filesystem dir of a SortedSnapshotDir-style mmap blueprint (tier-1 serve flip), unwrapping
+    one counting/instrumentation facade level (`_inner`, the h2h worker wrapper). None for dicts
+    and unknown objects — callers fall back to the Python loop rather than guessing."""
+    for obj in (snap, getattr(snap, "_inner", None)):
+        d = getattr(obj, "dirpath", None)
+        if d:
+            return str(d)
+    return None
+
+
 def _build_playout_engine(adapter, num_buckets: int, max_playout_depth: int):
     import numpy as _np
 
@@ -505,6 +516,12 @@ def _build_playout_engine(adapter, num_buckets: int, max_playout_depth: int):
     allowed_post = adapter._allowed_post
     if allowed_pre is None or allowed_post is None:
         return None  # native path requires client_bet_sizing (the eval config)
+    if not isinstance(adapter.snapshot, dict):
+        # Tier-1 mmap index blueprint: PlayoutEngine has no index-dir constructor (only
+        # SubgameSolver does — the serving stack's solver); NEVER .items() a 538M-row mmap
+        # object (pre-flip this line CRASHED and the eval wrapper silently served the raw
+        # blueprint). Python-loop fallback.
+        return None
     bp = {
         bytes(k): [float(x) for x in _np.asarray(v, dtype=_np.float64).reshape(-1)[:11]]
         for k, v in adapter.snapshot.items()
@@ -576,6 +593,37 @@ def _build_subgame_engine(adapter, num_buckets: int, leaf_max_depth: int):
     allowed_post = adapter._allowed_post
     if allowed_pre is None or allowed_post is None:
         return None  # native path requires client_bet_sizing (the eval config)
+    if not isinstance(adapter.snapshot, dict):
+        # TIER-1 SERVE FLIP (2026-07-12): the deployed blueprint is the 538.85M-row
+        # SortedSnapshotDir mmap index — dict marshaling is impossible (pre-flip this line
+        # CRASHED with AttributeError and make_search_policy_fn's except silently served the
+        # RAW blueprint: the cert7 search-arm 200-decks-in-53s smoking gun). Build the native
+        # engine straight off the index dir; capability-gated so a stale .pyd falls back to
+        # the Python CFR loop instead of crashing or silently serving raw.
+        dirpath = _snapshot_index_dirpath(adapter.snapshot)
+        if dirpath is None or _EXT is None:
+            return None
+        try:
+            caps = set(_EXT.native_caps())
+        except Exception:  # noqa: BLE001
+            return None
+        if "subgame_index_dir" not in caps:
+            return None
+        try:
+            return _EXT.SubgameSolver.from_index_dir(
+                str(dirpath),
+                [bool(x) for x in allowed_pre],
+                [bool(x) for x in allowed_post],
+                float(adapter.bias_mult),
+                float(adapter.bias_floor),
+                int(leaf_max_depth),
+                int(num_buckets),
+                **_emd_engine_kwargs(),
+            )
+        except Exception as _e:  # noqa: BLE001 — a broken index must not crash the serve
+            print(f"[native_solver] SubgameSolver.from_index_dir({dirpath}) failed: {_e!r} — "
+                  "falling back to the Python CFR loop", flush=True)
+            return None
     bp = {
         bytes(k): [float(x) for x in _np.asarray(v, dtype=_np.float64).reshape(-1)[:11]]
         for k, v in adapter.snapshot.items()

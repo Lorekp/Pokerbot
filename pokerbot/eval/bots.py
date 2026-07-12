@@ -752,6 +752,35 @@ def _load_blueprint_snapshot():
         path, source = _LEGACY, "LEGACY TEMP fallback (STABLE pointer MISSING!)"
 
     if path not in _BLUEPRINT_SNAPSHOT_CACHE:
+        if os.path.isdir(path):
+            # TIER-1 SERVE FLIP (2026-07-12): a DIRECTORY blueprint is the SortedSnapshotDir mmap
+            # index (nlcfr_key_index.py --with-rows; tier1 126k snap_avg full table, 538.85M rows).
+            # load_blueprint_index_dir is FAIL-CLOSED: it verifies the stamped serve_config.json
+            # (env_require exact-match + strict encoder-abstraction cross-check) before serving —
+            # a config skew silently misses every node (uniform fallback), so we raise instead.
+            from pokerbot.eval.snapshot_dir import load_blueprint_index_dir
+
+            snap, info = load_blueprint_index_dir(path)
+            banner = (
+                "\n===================== BLUEPRINT SERVE =====================\n"
+                f"[BLUEPRINT] path     : {path}\n"
+                f"[BLUEPRINT] source   : {source} (SortedSnapshotDir mmap index)\n"
+                f"[BLUEPRINT] rows     : {info['n_rows']:,}   iters={info['meta'].get('iters')}\n"
+                f"[BLUEPRINT] object   : {info['serve_config'].get('object', '?')}\n"
+                f"[BLUEPRINT] certs    : {info['serve_config'].get('certs', '?')}\n"
+                "===========================================================\n"
+            )
+            print(banner, file=sys.stderr, flush=True)
+            try:
+                import logging
+
+                logging.getLogger("pokerbot.blueprint").warning(
+                    "SERVING blueprint index dir=%s source=%s rows=%s object=%s",
+                    path, source, info["n_rows"], info["serve_config"].get("object"))
+            except Exception:  # noqa: BLE001 — logging must never break the serve
+                pass
+            _BLUEPRINT_SNAPSHOT_CACHE[path] = snap
+            return _BLUEPRINT_SNAPSHOT_CACHE[path]
         with open(path, "rb") as f:
             raw = f.read()
         snap = pickle.loads(raw)

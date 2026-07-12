@@ -511,7 +511,7 @@ mod subgame_n7 {
         let env = init_hand_7(40);
         let hero = env.action_seat as usize;
         assert_eq!(hero, 3, "7-handed UTG is the first preflop actor");
-        let bp: Blueprint = HashMap::new(); // no 7-seat blueprint -> uniform fallback = chip-EV base
+        let bp: Blueprint = Blueprint::new(); // no 7-seat blueprint -> uniform fallback = chip-EV base
         let pc = pcfg();
         let sc = scfg();
         let probs = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 0xC0FFEE);
@@ -530,7 +530,7 @@ mod subgame_n7 {
         // Pure function of (public state, config, seed): same inputs -> identical root probs.
         let env = init_hand_7(25);
         let hero = env.action_seat as usize;
-        let bp: Blueprint = HashMap::new();
+        let bp: Blueprint = Blueprint::new();
         let pc = pcfg();
         let sc = scfg();
         let a = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 12345);
@@ -545,7 +545,7 @@ mod subgame_n7 {
     fn n7_subgame_q2q3_flags_off_byte_identical() {
         let env = init_hand_7(40);
         let hero = env.action_seat as usize;
-        let bp: Blueprint = HashMap::new();
+        let bp: Blueprint = Blueprint::new();
         let pc = pcfg();
         // Baseline: the legacy config (flags off). scfg() already sets decouple/range_aware false.
         let base = scfg();
@@ -574,7 +574,7 @@ mod subgame_n7 {
     fn n7_subgame_range_reach_valid_and_flat_matches_fold_now() {
         let env = init_hand_7(40);
         let hero = env.action_seat as usize;
-        let bp: Blueprint = HashMap::new(); // empty => reach factors all-miss => flat table
+        let bp: Blueprint = Blueprint::new(); // empty => reach factors all-miss => flat table
         let pc = pcfg();
         let reach = SubgameConfig { range_aware: true, range_reach_full: true, ..scfg() };
         let a = subgame::solve::<7>(&env, hero, &bp, &pc, &reach, 4242);
@@ -597,7 +597,7 @@ mod subgame_n7 {
     fn n7_subgame_decouple_valid_and_deterministic() {
         let env = init_hand_7(40);
         let hero = env.action_seat as usize;
-        let bp: Blueprint = HashMap::new();
+        let bp: Blueprint = Blueprint::new();
         let pc = pcfg();
         let sc = SubgameConfig { decouple_sampler: true, ..scfg() };
         let a = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 777);
@@ -615,7 +615,7 @@ mod subgame_n7 {
     fn n7_subgame_range_aware_valid_distribution() {
         let env = init_hand_7(40);
         let hero = env.action_seat as usize;
-        let bp: Blueprint = HashMap::new(); // empty => uniform fallback => flat continue_weight
+        let bp: Blueprint = Blueprint::new(); // empty => uniform fallback => flat continue_weight
         let pc = pcfg();
         for floor in [0.15_f64, 0.25, 0.4] {
             let sc = SubgameConfig { range_aware: true, range_uniform_floor: floor, ..scfg() };
@@ -633,7 +633,7 @@ mod subgame_n7 {
     fn n7_subgame_ensemble_one_byte_identical_and_n_deterministic() {
         let env = init_hand_7(40);
         let hero = env.action_seat as usize;
-        let bp: Blueprint = HashMap::new();
+        let bp: Blueprint = Blueprint::new();
         let pc = pcfg();
         // ensemble=1 (explicit) == legacy (scfg() default 1): byte-identical.
         let base = scfg();
@@ -658,7 +658,7 @@ mod subgame_n7 {
     fn n7_subgame_leaf_cache_worlds_default_byte_identical() {
         let env = init_hand_7(40);
         let hero = env.action_seat as usize;
-        let bp: Blueprint = HashMap::new();
+        let bp: Blueprint = Blueprint::new();
         let pc = pcfg();
         let base = scfg(); // leaf_cache_worlds: 1 (default)
         let probs_base = subgame::solve::<7>(&env, hero, &bp, &pc, &base, 0xBADC0DE);
@@ -683,7 +683,7 @@ mod subgame_n7 {
     fn n7_subgame_avg_skip_frac_default_byte_identical() {
         let env = init_hand_7(40);
         let hero = env.action_seat as usize;
-        let bp: Blueprint = HashMap::new();
+        let bp: Blueprint = Blueprint::new();
         let pc = pcfg();
         let base = scfg(); // avg_skip_frac: 0.0 (default)
         let probs_base = subgame::solve::<7>(&env, hero, &bp, &pc, &base, 0xBADC0DE);
@@ -710,7 +710,7 @@ mod subgame_n7 {
     fn n7_subgame_leaf_biased_default_byte_identical() {
         let env = init_hand_7(40);
         let hero = env.action_seat as usize;
-        let bp: Blueprint = HashMap::new();
+        let bp: Blueprint = Blueprint::new();
         let pc = pcfg();
         let base = scfg(); // leaf_biased_continuations: false (default)
         let probs_base = subgame::solve::<7>(&env, hero, &bp, &pc, &base, 0xBADC0DE);
@@ -734,7 +734,7 @@ mod subgame_n7 {
     fn n7_subgame_leaf_biased_on_deterministic_and_valid() {
         let env = init_hand_7(40);
         let hero = env.action_seat as usize;
-        let bp: Blueprint = HashMap::new();
+        let bp: Blueprint = Blueprint::new();
         let pc = pcfg();
         for mult in [5.0_f64, 10.0] {
             let sc = SubgameConfig {
@@ -767,7 +767,7 @@ mod subgame_n7 {
     fn n7_subgame_serve_final_iterate_default_byte_identical() {
         let env = init_hand_7(40);
         let hero = env.action_seat as usize;
-        let bp: Blueprint = HashMap::new();
+        let bp: Blueprint = Blueprint::new();
         let pc = pcfg();
         let base = scfg(); // serve_final_iterate: false (default)
         let probs_base = subgame::solve::<7>(&env, hero, &bp, &pc, &base, 0xBADC0DE);
@@ -789,7 +789,7 @@ mod subgame_n7 {
     fn n7_subgame_serve_final_iterate_golden_extraction() {
         let env = init_hand_7(40);
         let hero = env.action_seat as usize;
-        let bp: Blueprint = HashMap::new();
+        let bp: Blueprint = Blueprint::new();
         let pc = pcfg();
         let sc_on = SubgameConfig { serve_final_iterate: true, ..scfg() };
         let sc_off = scfg();
@@ -851,7 +851,7 @@ mod subgame_n7 {
     fn n7_subgame_root_unmask_zero_byte_identical_and_keeps_mask() {
         let env = init_hand_7(40);
         let hero = env.action_seat as usize;
-        let bp: Blueprint = HashMap::new();
+        let bp: Blueprint = Blueprint::new();
         // Restricted menu: drop bet bucket 6 (2.0x pot, action index BET_BUCKET_START+6 == 9).
         let mut pc = pcfg();
         pc.allowed_pre[BET_BUCKET_START + 6] = false;
@@ -879,7 +879,7 @@ mod subgame_n7 {
     fn n7_subgame_root_unmask_widens_root_and_ands_full_legality() {
         let env = init_hand_7(40);
         let hero = env.action_seat as usize;
-        let bp: Blueprint = HashMap::new();
+        let bp: Blueprint = Blueprint::new();
         let mut pc = pcfg();
         pc.allowed_pre[BET_BUCKET_START + 6] = false;
         pc.allowed_post[BET_BUCKET_START + 6] = false;
@@ -987,7 +987,7 @@ mod subgame_n7 {
         }
         if env.street >= STREET_FLOP && !env.done && env.action_seat >= 0 {
             let hero = env.action_seat as usize;
-            let bp: Blueprint = HashMap::new();
+            let bp: Blueprint = Blueprint::new();
             let probs = subgame::solve::<7>(&env, hero, &bp, &pcfg(), &scfg(), 99);
             assert_valid_root_probs(&env, hero, &probs);
         }
@@ -1788,7 +1788,7 @@ mod range_reach_r1 {
         let (root, st0) = scripted_limp_root();
         let hero = 2usize;
         let pc = pcfg6();
-        let mut bp: Blueprint = HashMap::new();
+        let mut bp: Blueprint = Blueprint::new();
         // Blueprint rows keyed EXACTLY like the serve path (pcfg.fp_key on the decision state with
         // the candidate combo substituted — preflop lossless keys).
         let key_for = |c0: i32, c1: i32| {
@@ -1985,7 +1985,7 @@ mod stage2a_amount_faithful {
             num_buckets: 200,
             emd: None,
         };
-        let mut bp: Blueprint = std::collections::HashMap::new();
+        let mut bp: Blueprint = Blueprint::new();
         // Pin a row at the BB 3-bet decision so the table is non-trivial.
         let st5 = pristine[5].2;
         let mut keyed = st5;
@@ -2451,7 +2451,7 @@ mod opt1_settle_join {
             is_unsettled_showdown(&sample_chance(&env)),
             "advance lands in the bug class"
         );
-        let bp: Blueprint = HashMap::new();
+        let bp: Blueprint = Blueprint::new();
         let pc = pcfg();
 
         set_settle_showdown_leaf(false);
@@ -2514,7 +2514,7 @@ mod opt1_settle_join {
         let env = drive_to_river(root_6max(0x5EED2), false);
         assert_eq!(env.street, STREET_RIVER);
         let hero = env.action_seat as usize;
-        let bp: Blueprint = HashMap::new();
+        let bp: Blueprint = Blueprint::new();
         let pc = pcfg();
         let sc = scfg(2000, 4);
 

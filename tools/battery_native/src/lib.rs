@@ -478,6 +478,12 @@ mod py {
             // env-gated (POKERBOT_ACTION_TRANSLATE=1) pseudo-harmonic off-menu action translation
             // (translate.rs; default-off byte-identical).
             "action_translate".to_string(),
+            // tier-1 serve flip (2026-07-12): SubgameSolver::from_index_dir — the native subgame
+            // CFR consumes the nlcfr_key_index.py --with-rows mmap index directly (538.85M-row
+            // full table; Python-dict marshaling impossible). native_solver.py builds the native
+            // engine for a SortedSnapshotDir blueprint only when this cap is present — stale
+            // .pyds fall back to the Python CFR loop instead of crashing/serving raw.
+            "subgame_index_dir".to_string(),
         ]
     }
 
@@ -569,7 +575,7 @@ mod py {
             emd_frozen_path: Option<String>,
             emd_miss_made_hand: bool,
         ) -> PyResult<Self> {
-            let mut bp: Blueprint = HashMap::with_capacity(blueprint.len());
+            let mut bp: Blueprint = Blueprint::with_capacity(blueprint.len());
             for (k, v) in blueprint.iter() {
                 let kb: &[u8] = k.extract()?;
                 if kb.len() != 16 {
@@ -667,7 +673,7 @@ mod py {
             emd_frozen_path: Option<String>,
             emd_miss_made_hand: bool,
         ) -> PyResult<Self> {
-            let mut bp: Blueprint = HashMap::with_capacity(blueprint.len());
+            let mut bp: Blueprint = Blueprint::with_capacity(blueprint.len());
             for (k, v) in blueprint.iter() {
                 let kb: &[u8] = k.extract()?;
                 if kb.len() != 16 {
@@ -687,6 +693,51 @@ mod py {
                 r.copy_from_slice(&row[..NUM_ACTIONS]);
                 bp.insert(key, r);
             }
+            let mut ap = [false; NUM_ACTIONS];
+            let mut po = [false; NUM_ACTIONS];
+            for a in 0..NUM_ACTIONS {
+                ap[a] = *allowed_pre.get(a).unwrap_or(&false);
+                po[a] = *allowed_post.get(a).unwrap_or(&false);
+            }
+            Ok(SubgameSolver {
+                bp,
+                cfg: PlayoutConfig {
+                    allowed_pre: ap,
+                    allowed_post: po,
+                    bias_mult,
+                    bias_floor,
+                    max_depth: leaf_max_depth,
+                    num_buckets,
+                    emd: emd_key_cfg(emd_frozen_path, emd_miss_made_hand)?,
+                },
+            })
+        }
+
+        /// TIER-1 SERVE FLIP (2026-07-12): construct from the nlcfr_key_index.py `--with-rows`
+        /// mmap index DIRECTORY (keys_sorted.bin + rows_sorted.f32.bin) instead of a marshaled
+        /// Python dict. The certified tier-1 126k serve object is 538.85M rows — dict marshaling
+        /// is impossible — so the native subgame CFR binary-searches the SAME mmap files the
+        /// Python serve object (SortedSnapshotDir) reads. Everything after construction is the
+        /// byte-identical solve path (capability: "subgame_index_dir").
+        #[staticmethod]
+        #[pyo3(signature = (index_dir, allowed_pre, allowed_post, bias_mult, bias_floor, leaf_max_depth, num_buckets, emd_frozen_path=None, emd_miss_made_hand=true))]
+        #[allow(clippy::too_many_arguments)]
+        fn from_index_dir(
+            index_dir: &str,
+            allowed_pre: Vec<bool>,
+            allowed_post: Vec<bool>,
+            bias_mult: f64,
+            bias_floor: f64,
+            leaf_max_depth: i32,
+            num_buckets: i32,
+            emd_frozen_path: Option<String>,
+            emd_miss_made_hand: bool,
+        ) -> PyResult<Self> {
+            let bp = Blueprint::from_index_dir(index_dir).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "blueprint index dir {index_dir}: {e}"
+                ))
+            })?;
             let mut ap = [false; NUM_ACTIONS];
             let mut po = [false; NUM_ACTIONS];
             for a in 0..NUM_ACTIONS {
@@ -1014,7 +1065,7 @@ mod py {
             emd_frozen_path: Option<String>,
             emd_miss_made_hand: bool,
         ) -> PyResult<Self> {
-            let mut bp: Blueprint = HashMap::with_capacity(blueprint.len());
+            let mut bp: Blueprint = Blueprint::with_capacity(blueprint.len());
             for (k, v) in blueprint.iter() {
                 let kb: &[u8] = k.extract()?;
                 if kb.len() != 16 {

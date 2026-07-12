@@ -236,6 +236,9 @@ class SortedSnapshotDir:
     def __init__(self, dirpath: str):
         import numpy as _np
         self._np = _np
+        # tier-1 serve flip: native_solver._snapshot_index_dirpath reads this to build the native
+        # SubgameSolver straight off the mmap index (no dict marshal).
+        self.dirpath = dirpath
         self.keys = _np.memmap(os.path.join(dirpath, "keys_sorted.bin"), dtype="S16", mode="r")
         rows_path = os.path.join(dirpath, "rows_sorted.f32.bin")
         if not os.path.exists(rows_path):
