@@ -323,7 +323,12 @@ SEEN_HANDS_CAP = 50_000  # idempotency ledger cap (lexicographic ≈ chronologic
 # --- cross-process store lock (finding #6) -------------------------------------------------------
 # A stale lock older than this whose holder we CANNOT verify dead (different host, or unknown pid)
 # is reclaimed anyway — a crashed process must not brick the store forever on a multi-day run.
-_LOCK_STALE_SECONDS = 1800.0   # 30 min
+_LOCK_STALE_SECONDS = 1800.0   # 30 min (legacy locks with no heartbeat capability)
+# Soak fix B (2026-07-12): v2 locks are heartbeat-capable ("hb": 1 in the payload) — the holder
+# refreshes the lock mtime from its periodic liveness tick (see lock_heartbeat), not only from the
+# throttled save (which never fired on a 6-hand session, freezing the mtime at creation). An
+# UNVERIFIABLE hb-capable lock whose mtime is this stale is therefore reclaimable within minutes.
+_LOCK_HB_STALE_SECONDS = 180.0  # 3 min
 try:
     _HOSTNAME = socket.gethostname() or "?"
 except Exception:  # noqa: BLE001
@@ -360,9 +365,61 @@ def _pid_alive(pid) -> bool:
     return True
 
 
+def _proc_create_time(pid) -> int | None:
+    """The process CREATION TIME for ``pid``, or None when unavailable.
+
+    Soak fix B (2026-07-12): pid-alone liveness is fooled by PID RECYCLING — live evidence: a
+    force-killed runner's pid was reassigned to an unrelated process within minutes, so
+    ``_pid_alive`` said "alive" and a relaunched child refused to steal a dead holder's lock.
+    A (pid, creation-time) pair identifies a process instance uniquely: alive pid + DIFFERENT
+    creation time == the real holder is dead.
+
+    Windows: kernel32 GetProcessTimes creation FILETIME as a single int (100ns ticks since 1601).
+    Linux: /proc/<pid>/stat field 22 (starttime, clock ticks since boot). Elsewhere: None (the
+    caller falls back to plain pid-alive semantics). Never raises."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            k = ctypes.WinDLL("kernel32")
+            k.OpenProcess.restype = wintypes.HANDLE
+            k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return None
+            try:
+                k.GetProcessTimes.restype = wintypes.BOOL
+                k.GetProcessTimes.argtypes = [wintypes.HANDLE] + [
+                    ctypes.POINTER(wintypes.FILETIME)] * 4
+                ct, et, kt, ut = (wintypes.FILETIME() for _ in range(4))
+                if not k.GetProcessTimes(h, ctypes.byref(ct), ctypes.byref(et),
+                                         ctypes.byref(kt), ctypes.byref(ut)):
+                    return None
+                return (int(ct.dwHighDateTime) << 32) | int(ct.dwLowDateTime)
+            finally:
+                k.CloseHandle(h)
+        except Exception:  # noqa: BLE001 — best-effort; caller degrades to pid-alive
+            return None
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read().decode("ascii", "replace")
+        # comm (field 2) may contain spaces/parens — split after the LAST ')'.
+        after = data.rsplit(")", 1)[1].split()
+        return int(after[19])  # starttime is field 22; after ')' the first is field 3
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class PlayerProfileStore:
     def __init__(self, path: str | Path = DEFAULT_PATH, *, wal: bool = True,
-                 lock: bool = True) -> None:
+                 lock: bool = True, lock_wait_s: float | None = None) -> None:
         self.path = Path(path)
         # Cross-process lock state (finding #6): two runners on ONE db_path would clobber each
         # other last-writer-wins. Acquire a pid+heartbeat lockfile at open; conflict -> clear
@@ -370,6 +427,17 @@ class PlayerProfileStore:
         # allowed. Disabled per-store via lock=False or globally via POKERBOT_PROFILE_NO_LOCK=1.
         self._lock_enabled = bool(lock) and os.environ.get("POKERBOT_PROFILE_NO_LOCK") != "1"
         self._lock_held = False
+        # Soak fix C3 (2026-07-12): how long acquisition WAITS for a LIVE foreign holder to
+        # release before failing hard. Default 0 (immediate clear error — test/tool semantics);
+        # the arena launcher sets POKERBOT_PROFILE_LOCK_WAIT_S=90 so a relaunched child rides out
+        # the force-killed predecessor's teardown window. A genuinely dead/recycled holder is
+        # stolen immediately regardless (fix B), so the wait only applies to truly-live holders.
+        if lock_wait_s is None:
+            try:
+                lock_wait_s = float(os.environ.get("POKERBOT_PROFILE_LOCK_WAIT_S", "0") or 0.0)
+            except ValueError:
+                lock_wait_s = 0.0
+        self._lock_wait_s = max(0.0, float(lock_wait_s))
         self.profiles: dict[str, OpponentStats] = {}
         self.names: dict[str, str] = {}  # key -> last seen display name
         # O4 name<->uid reconciliation: name:<name> -> canonical str(user_id), learned whenever a seat
@@ -420,17 +488,27 @@ class PlayerProfileStore:
     # -- cross-process lock (finding #6) --------------------------------------------------------
 
     def _acquire_lock(self) -> None:
-        """Take an exclusive ``<path>.lock`` (atomic O_EXCL create). On conflict: steal it when the
-        holder is US (same pid), or provably dead (same host, pid gone), or unverifiably stale
-        (different host / unknown pid, and older than _LOCK_STALE_SECONDS); otherwise RAISE a clear
-        error naming the live foreign holder. Any FS error fails OPEN (never brick a real run)."""
+        """Take an exclusive ``<path>.lock`` (atomic O_EXCL create).
+
+        Holder liveness is PID-RECYCLING-PROOF (soak fix B, 2026-07-12): the lock records the
+        holder's process CREATION TIME next to its pid, and an alive pid with a DIFFERENT creation
+        time is an unrelated process wearing a recycled pid — the real holder is dead and the lock
+        is stolen. Steal also when the holder is US (same pid), provably dead (same host, pid
+        gone), or unverifiably stale (different host / unknown pid, older than the stale window —
+        3 min for heartbeat-capable v2 locks, 30 min legacy). A LIVE same-host foreign holder is
+        never stolen: acquisition waits up to ``lock_wait_s`` for it to release (soak fix C3 — the
+        relaunch-teardown window), then RAISES a clear error naming it. Any FS error fails OPEN
+        (never brick a real run)."""
         lp = self.lock_path
         me = os.getpid()
         try:
             lp.parent.mkdir(parents=True, exist_ok=True)
         except OSError:
             return  # can't even create the dir -> fail open
-        for _ in range(3):
+        deadline = time.monotonic() + self._lock_wait_s
+        last_wait_log = 0.0
+        steal_attempts = 0
+        while True:
             try:
                 fd = os.open(str(lp), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             except FileExistsError:
@@ -441,26 +519,56 @@ class PlayerProfileStore:
                     age = time.time() - lp.stat().st_mtime
                 except OSError:
                     age = 0.0
-                dead = same_host and holder is not None and not _pid_alive(holder)
-                unverifiable_stale = age > _LOCK_STALE_SECONDS and (not same_host or holder is None)
+                alive = _pid_alive(holder) if (same_host and holder is not None) else None
+                # Fix B: alive pid + mismatched creation time == recycled pid == dead holder.
+                recycled = False
+                if alive and info.get("create_ts") is not None:
+                    cur_ct = _proc_create_time(holder)
+                    recycled = cur_ct is not None and int(cur_ct) != int(info["create_ts"])
+                dead = same_host and holder is not None and (alive is False or recycled)
+                stale_after = _LOCK_HB_STALE_SECONDS if info.get("hb") else _LOCK_STALE_SECONDS
+                unverifiable_stale = age > stale_after and (not same_host or holder is None)
                 if holder == me or dead or unverifiable_stale:
+                    steal_attempts += 1
+                    if steal_attempts > 8:
+                        return  # lost the create/steal race repeatedly -> fail open
                     try:
                         lp.unlink()
                     except OSError:
                         pass
                     continue   # retry the exclusive create
-                raise RuntimeError(
-                    f"PlayerProfileStore: {self.path} is already locked by another live process "
-                    f"(pid={holder} host={info.get('host')} since {info.get('ts')}). Two runners "
-                    f"sharing one opponent DB clobber each other (last-writer-wins). Stop the other "
-                    f"runner, delete {lp} if it is stale, or set POKERBOT_PROFILE_NO_LOCK=1."
-                )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        f"PlayerProfileStore: {self.path} is already locked by another live "
+                        f"process (pid={holder} host={info.get('host')} since {info.get('ts')}"
+                        + (f"; waited {self._lock_wait_s:.0f}s for release"
+                           if self._lock_wait_s > 0 else "")
+                        + f"). Two runners sharing one opponent DB clobber each other "
+                        f"(last-writer-wins). Stop the other runner, delete {lp} if it is stale, "
+                        f"or set POKERBOT_PROFILE_NO_LOCK=1."
+                    )
+                # Fix C3: live holder + wait budget left -> bounded, logged retry (a relaunched
+                # child rides out its force-killed predecessor's teardown; a holder that dies
+                # mid-wait is stolen on the next probe via the dead/recycled branch above).
+                now_m = time.monotonic()
+                if last_wait_log == 0.0 or now_m - last_wait_log >= 15.0:
+                    last_wait_log = now_m
+                    try:
+                        print(f"[profiles] {lp} held by live pid={holder}; waiting up to "
+                              f"{remaining:.0f}s more for release before failing hard",
+                              file=sys.stderr, flush=True)
+                    except Exception:  # noqa: BLE001
+                        pass
+                time.sleep(min(3.0, max(0.1, remaining)))
+                continue
             except OSError:
                 return  # unexpected FS error -> fail open
             else:
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        json.dump({"pid": me, "host": _HOSTNAME, "ts": int(time.time())}, f)
+                        json.dump({"pid": me, "host": _HOSTNAME, "ts": int(time.time()),
+                                   "create_ts": _proc_create_time(me), "hb": 1}, f)
                 except OSError:
                     try:
                         os.close(fd)
@@ -468,7 +576,6 @@ class PlayerProfileStore:
                         pass
                 self._lock_held = True
                 return
-        return  # lost the create race repeatedly -> fail open rather than raise spuriously
 
     @staticmethod
     def _read_lock(lp: Path) -> dict:
@@ -487,6 +594,17 @@ class PlayerProfileStore:
             os.utime(self.lock_path, None)
         except OSError:
             pass
+
+    def lock_heartbeat(self) -> None:
+        """Refresh the lock mtime WITHOUT a save (soak fix B, 2026-07-12).
+
+        The save-piggybacked heartbeat alone never fired on a low-hand session (throttle: 20
+        hands / 60s), freezing the lock mtime at creation so peers' staleness reads were
+        meaningless. Call this from a cheap periodic liveness tick (the arena runner's health
+        tick does, ~every 30s) so an hb-capable lock's mtime is an honest "holder is alive"
+        signal and staleness-based stealing works within ~3 min even with zero saves.
+        Best-effort, no-op when this store does not hold the lock."""
+        self._touch_lock()
 
     def _release_lock(self) -> None:
         if not self._lock_held:
