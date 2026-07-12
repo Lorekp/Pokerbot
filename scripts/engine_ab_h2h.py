@@ -221,6 +221,9 @@ def _wrap_settle_gate(pf):
         finally:
             _nsg.set_settle_showdown_leaf(prev)
 
+    # CERT9 proof-of-search: the wrapper must not hide the inner policy's counters.
+    if getattr(pf, "search_stats", None) is not None:
+        pf_gated.search_stats = pf.search_stats  # type: ignore[attr-defined]
     return pf_gated
 
 
@@ -375,7 +378,19 @@ def _spawn_worker_policy(label: str, spec: dict, bp_path: str, base_seed: int, r
             raise RuntimeError(f"arm-{label} worker error: {payload}")
         return payload
 
+    def _get_runtime_stats():
+        """CERT9 proof-of-search: pull the worker's counters (acts, blueprint hit/miss, native
+        caps + the search_stats summary) over the frame protocol. Any transport error surfaces as
+        an {'error': ...} payload rather than crashing the money loop mid-deck."""
+        try:
+            _send(("stats", None))
+            kind, payload = _recv()
+            return payload if kind == "stats" else {"error": repr(payload)}
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"stats fetch failed: {e!r}"}
+
     pf._worker_proc = proc  # type: ignore[attr-defined]
+    pf.get_runtime_stats = _get_runtime_stats  # type: ignore[attr-defined]
     return pf
 
 
@@ -483,6 +498,39 @@ def _build_policy(spec: dict, snap, base_seed: int, repo_root: str):
     return _wrap_settle_gate(pf) if _settle_leaf else pf
 
 
+def _collect_arm_stats(pf):
+    """CERT9 proof-of-search: runtime counters for one arm — from the isolated worker (frame RPC)
+    or the in-process policy's search_stats. None for a plain raw arm with no counters."""
+    fetch = getattr(pf, "get_runtime_stats", None)
+    if fetch is not None:
+        return fetch()
+    st = getattr(pf, "search_stats", None)
+    if st is None:
+        return None
+    from pokerbot.eval.solver_exploitability import summarize_search_stats
+    return {"search_stats": summarize_search_stats(st)}
+
+
+def _assert_search_native(label: str, statspack, *, decks_done: int) -> None:
+    """HARD proof-of-search gate (--require-search-native): the designated search arm must show
+    ZERO raw-blueprint fallbacks and 100% native-served postflop decisions. Any violation aborts
+    the shard with a non-zero rc — an INFRA_FAIL, never a money number (the cert7/cert8 lesson:
+    a search arm that silently serves raw produces a fast, plausible, WRONG money number)."""
+    ss = (statspack or {}).get("search_stats")
+    if ss is None:
+        sys.exit(f"[engine_ab_h2h] SEARCH-NATIVE GATE FAIL arm {label} (deck {decks_done}): no "
+                 "search_stats — the arm is not running the instrumented search policy at all")
+    fb = int(ss.get("decisions_fallback", 0))
+    post = int(ss.get("postflop_decisions", 0))
+    post_native = int(ss.get("postflop_search_native", 0))
+    if fb > 0 or post_native != post:
+        sys.exit(
+            f"[engine_ab_h2h] SEARCH-NATIVE GATE FAIL arm {label} (deck {decks_done}): "
+            f"decisions_fallback={fb}, postflop_search_native={post_native}/{post} "
+            f"(by_street={json.dumps(ss.get('by_street', {}))}) — search is NOT genuinely "
+            "native-serving; aborting the shard (INFRA_FAIL, not a money number)")
+
+
 def _ev_settle(prev_env, action, settle_rng, settle_samples, apply_action_np,
                is_terminal_np, is_chance_node_np, sample_chance_np):
     """All-in EV settlement: integrate equity split over `settle_samples` runouts.
@@ -553,6 +601,11 @@ def main():
                         help="Restore the pre-fix harness money read that scored every showdown "
                              "reached THROUGH river betting as 0 for both arms (continuity "
                              "comparisons against historical h2h numbers only)")
+    parser.add_argument("--require-search-native", default="",
+                        help="Comma list of arms ('a','b') that MUST be genuinely native-search-"
+                             "serving: after every deck their runtime counters are checked and the "
+                             "shard ABORTS (rc!=0, INFRA_FAIL) on any raw-blueprint fallback or any "
+                             "non-native postflop serve (CERT9 fail-closed proof-of-search)")
     args = parser.parse_args()
 
     spec_a = _parse_spec(args.arm_a, "arm-a")
@@ -656,6 +709,10 @@ def main():
     b_total = 0.0
     per_deck = []
     flopdecks = 0
+    _require_native = {t.strip().lower() for t in args.require_search_native.split(",") if t.strip()}
+    _bad = _require_native - {"a", "b"}
+    if _bad:
+        sys.exit(f"[engine_ab_h2h] --require-search-native: unknown arm(s) {sorted(_bad)}")
     t0 = time.perf_counter()
 
     out_path = args.out
@@ -775,6 +832,16 @@ def main():
             flush=True,
         )
 
+        # CERT9 proof-of-search: refresh both arms' runtime counters every deck so (a) the
+        # hard gate below fails the shard within ONE deck of the first fallback and (b) every
+        # incremental checkpoint (the artifact a spot reclaim leaves behind) already carries the
+        # counters a shard verdict needs.
+        stats_a = _collect_arm_stats(pf_a)
+        stats_b = _collect_arm_stats(pf_b)
+        for _lbl in _require_native:
+            _assert_search_native(_lbl, stats_a if _lbl == "a" else stats_b,
+                                  decks_done=len(per_deck))
+
         # Incremental checkpoint.
         _checkpoint = {
             "label": args.label,
@@ -785,9 +852,18 @@ def main():
             "b_total": b_total,
             "per_deck_nets": per_deck,
             "flopdecks": flopdecks,
+            "arm_a_runtime_stats": stats_a,
+            "arm_b_runtime_stats": stats_b,
+            "require_search_native": sorted(_require_native),
+            "wall_s_so_far": el,
         }
         try:
-            json.dump(_checkpoint, open(out_path, "w"), indent=1)
+            # Atomic write: cert shards are deadline-bound (timeout SIGTERM mid-deck is expected);
+            # a truncated checkpoint JSON would discard every completed deck of the shard.
+            _tmp = out_path + ".tmp"
+            with open(_tmp, "w") as _fh:
+                json.dump(_checkpoint, _fh, indent=1)
+            os.replace(_tmp, out_path)
         except Exception:
             pass
 
@@ -814,6 +890,11 @@ def main():
     print(f"  wall: {wall_s:.1f}s  git: {git_rev}")
     print(f"  VERDICT: {verdict}", flush=True)
 
+    # Final proof-of-search counters (CERT9): collected AFTER the last deck so the totals cover
+    # every decision the shard scored; a search-arm result without these is not a money number.
+    stats_a_final = _collect_arm_stats(pf_a)
+    stats_b_final = _collect_arm_stats(pf_b)
+
     result = {
         "label": args.label,
         "arm_a": _summary(spec_a),
@@ -830,6 +911,9 @@ def main():
         "wall_s": wall_s,
         "git_rev": git_rev,
         "verdict": verdict,
+        "arm_a_runtime_stats": stats_a_final,
+        "arm_b_runtime_stats": stats_b_final,
+        "require_search_native": sorted(_require_native),
         # Harness money read: True = river-reached showdowns settled for real (the showdown-leaf-
         # zero harness fix); False = legacy zeros (--legacy-zero-showdown). Numbers produced under
         # different money reads are NOT comparable.
