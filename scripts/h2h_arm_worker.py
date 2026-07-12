@@ -179,7 +179,21 @@ def main() -> int:
                 traceback.print_exc()
                 _send(("err", f"{type(e).__name__}: {e}"))
         elif kind == "stats":
-            _send(("stats", {"acts": n_acts}))
+            # CERT9 proof-of-search: ship the full runtime counter block back to the parent so
+            # every shard checkpoint/result JSON carries it (decisions_total, per-street served
+            # tags + wall p50/p95, fallback counters, blueprint hit/miss, native caps).
+            payload_out = {
+                "acts": n_acts,
+                "bp_hits": int(_CountingSnap.hits),
+                "bp_misses": int(_CountingSnap.misses),
+                "native_caps": caps,
+                "strict_env": os.environ.get("POKERBOT_SEARCH_STRICT", ""),
+            }
+            st = getattr(pf, "search_stats", None)
+            if st is not None:
+                from pokerbot.eval.solver_exploitability import summarize_search_stats
+                payload_out["search_stats"] = summarize_search_stats(st)
+            _send(("stats", payload_out))
         elif kind == "quit":
             break
         else:
