@@ -285,12 +285,12 @@ export PATH="$HOME/.cargo/bin:$PATH"
 aws s3 cp s3://@@BUCKET@@/@@PREFIX@@/cert7/code/cert7_code.tar.gz /tmp/code.tar.gz --region @@REGION@@ || fail codefetch
 tar -xzf /tmp/code.tar.gz -C /opt/pokerbot
 cd /opt/pokerbot
-python3 -m pip install --disable-pip-version-check --no-input --break-system-packages boto3 numpy pandas "jax[cpu]" phevaluator flax optax cloudpickle \
-  || python3 -m pip install --disable-pip-version-check --no-input boto3 numpy pandas "jax[cpu]" phevaluator flax optax cloudpickle || fail pip
+python3 -m pip install --disable-pip-version-check --no-input --break-system-packages boto3 numpy pandas pyarrow "jax[cpu]" phevaluator flax optax cloudpickle \
+  || python3 -m pip install --disable-pip-version-check --no-input boto3 numpy pandas pyarrow "jax[cpu]" phevaluator flax optax cloudpickle || fail pip
 python3 -m pip install --disable-pip-version-check --no-input --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu \
   || python3 -m pip install --disable-pip-version-check --no-input torch --index-url https://download.pytorch.org/whl/cpu || fail torch
 
-mkdir -p data/abstraction checkpoints runs
+mkdir -p data/abstraction checkpoints runs artifacts
 aws s3 cp s3://@@BUCKET@@/@@PREFIX@@/data/emd_frozen_flop_turn_160_r400.emdfrzn data/abstraction/ --region @@REGION@@ || fail blob1
 aws s3 cp s3://@@BUCKET@@/@@PREFIX@@/data/river_ochs_160.rochs data/abstraction/ --region @@REGION@@ || fail blob2
 aws s3 cp s3://@@BUCKET@@/@@PREFIX@@/data/serve_blueprint_6max.pkl checkpoints/ --region @@REGION@@ || fail incpkl
