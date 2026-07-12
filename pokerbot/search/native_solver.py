@@ -577,10 +577,38 @@ def native_uniform_leaf_value(
 # the GTO-base path (opponent_model is None, uniform belief) is native; the exploit tail stays in
 # Python (firewall). Statistically equivalent, not bit-identical (fast native RNG). Default OFF.
 # ---------------------------------------------------------------------------
-def native_subgame_available() -> bool:
-    """True iff the native extension exposes SubgameSolver (built) AND the native path is enabled."""
-    return bool(_AVAILABLE and _ENABLED and _EXT is not None and hasattr(_EXT, "SubgameSolver")
-                and _native_fingerprint_matches_serve_abstraction())
+def native_subgame_index_capable() -> bool:
+    """True iff the loaded battery_native binary REPORTS the ``subgame_index_dir`` capability
+    (SubgameSolver.from_index_dir — the tier-1 SortedSnapshotDir serve path). A binary built before
+    the tier-1 flip has SubgameSolver but NOT this cap, so every index-dir solve would silently
+    return None and drop onto the Python CFR loop; fail closed on stale .pyds."""
+    if _EXT is None:
+        return False
+    try:
+        caps = set(_EXT.native_caps())
+    except Exception:  # noqa: BLE001
+        return False
+    return "subgame_index_dir" in caps
+
+
+def native_subgame_available(snapshot=None) -> bool:
+    """True iff the native extension exposes SubgameSolver (built) AND the native path is enabled.
+
+    ``snapshot`` (optional, SERVE-INTEGRITY fix 2026-07-12): pass the blueprint snapshot object the
+    solver will actually serve. When it is a SortedSnapshotDir-style mmap INDEX (the tier-1 serving
+    stack — non-dict with a resolvable dirpath), availability ADDITIONALLY requires the loaded
+    binary's ``subgame_index_dir`` capability. Without this check a stale-but-SubgameSolver-capable
+    .pyd reports available=True at startup while EVERY per-decision solve silently falls back to the
+    starved Python loop (the exact silent-downgrade seam this audit closes). Callers that don't have
+    the snapshot at hand keep the legacy no-arg behavior."""
+    ok = bool(_AVAILABLE and _ENABLED and _EXT is not None and hasattr(_EXT, "SubgameSolver")
+              and _native_fingerprint_matches_serve_abstraction())
+    if not ok:
+        return False
+    if snapshot is not None and not isinstance(snapshot, dict):
+        if _snapshot_index_dirpath(snapshot) is not None and not native_subgame_index_capable():
+            return False
+    return True
 
 
 _SUBGAME_ENGINE_CACHE: dict[tuple, object] = {}
@@ -655,7 +683,7 @@ def warm_subgame_engine(adapter, *, num_buckets: int, max_playout_depth: int) ->
     advisor at construction time; returns True iff the engine is built and cached (the subsequent
     native_subgame_solve calls hit the cache). False => unavailable/unsupported (callers fall back
     exactly as native_subgame_solve would)."""
-    if not native_subgame_available():
+    if not native_subgame_available(getattr(adapter, "snapshot", None)):
         return False
     ckey = (id(adapter), int(max_playout_depth), int(num_buckets))
     if _SUBGAME_ENGINE_CACHE.get(ckey) is not None:
@@ -708,7 +736,7 @@ def native_subgame_solve(
     §3/§8): bitmask of action indices to OR into the abstracted legal mask at the ROOT node only
     (full-legality ANDed; the extraction mask is widened identically). 0 (default) = no widening,
     byte-identical. GTO path only — the exploit FFI does not accept it."""
-    if not native_subgame_available():
+    if not native_subgame_available(getattr(adapter, "snapshot", None)):
         return None
     ckey = (id(adapter), int(max_playout_depth), int(num_buckets))
     eng = _SUBGAME_ENGINE_CACHE.get(ckey)
@@ -785,6 +813,9 @@ def native_subgame_solve_exploit(
     ``rnr`` is the length-6 per-actor scalar list (NaN = overwrite-with-frozen). The native side
     recomputes the context KEY + legal_bits and applies the overwrite / blend against its OWN base."""
     if not native_subgame_exploit_available():
+        return None
+    # Tier-1 index snapshots additionally need the subgame_index_dir capability (stale-.pyd guard).
+    if not native_subgame_available(getattr(adapter, "snapshot", None)):
         return None
     ckey = (id(adapter), int(max_playout_depth), int(num_buckets))
     eng = _SUBGAME_ENGINE_CACHE.get(ckey)
