@@ -15,9 +15,13 @@ Play-money / own-account evaluation use only.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import socket
+import sys
 import threading
+import time
 from pathlib import Path
 
 from pokerbot.opponent.context import (
@@ -316,10 +320,56 @@ def _folded_preflop(pre: list[dict]) -> bool:
 
 SEEN_HANDS_CAP = 50_000  # idempotency ledger cap (lexicographic ≈ chronological for live hand ids)
 
+# --- cross-process store lock (finding #6) -------------------------------------------------------
+# A stale lock older than this whose holder we CANNOT verify dead (different host, or unknown pid)
+# is reclaimed anyway — a crashed process must not brick the store forever on a multi-day run.
+_LOCK_STALE_SECONDS = 1800.0   # 30 min
+try:
+    _HOSTNAME = socket.gethostname() or "?"
+except Exception:  # noqa: BLE001
+    _HOSTNAME = "?"
+
+
+def _pid_alive(pid) -> bool:
+    """Best-effort liveness of ``pid`` on THIS host (Windows + POSIX). Uncertain => assume alive
+    (fail toward NOT stealing a possibly-live process's lock)."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            k = ctypes.windll.kernel32
+            h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return False   # no such process -> dead (fast same-host restart reclaim)
+            k.CloseHandle(h)
+            return True
+        except Exception:  # noqa: BLE001
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
+
 
 class PlayerProfileStore:
-    def __init__(self, path: str | Path = DEFAULT_PATH, *, wal: bool = True) -> None:
+    def __init__(self, path: str | Path = DEFAULT_PATH, *, wal: bool = True,
+                 lock: bool = True) -> None:
         self.path = Path(path)
+        # Cross-process lock state (finding #6): two runners on ONE db_path would clobber each
+        # other last-writer-wins. Acquire a pid+heartbeat lockfile at open; conflict -> clear
+        # error. Same-process re-open (tests, sequential restart-sim) and stale/dead holders are
+        # allowed. Disabled per-store via lock=False or globally via POKERBOT_PROFILE_NO_LOCK=1.
+        self._lock_enabled = bool(lock) and os.environ.get("POKERBOT_PROFILE_NO_LOCK") != "1"
+        self._lock_held = False
         self.profiles: dict[str, OpponentStats] = {}
         self.names: dict[str, str] = {}  # key -> last seen display name
         # O4 name<->uid reconciliation: name:<name> -> canonical str(user_id), learned whenever a seat
@@ -347,11 +397,117 @@ class PlayerProfileStore:
         self._wal_lock = threading.Lock()
         self._updates_since_save = 0
         self._last_save_ts = 0.0
+        if self._lock_enabled:
+            self._acquire_lock()
         self.load()
+        # Finding #2: last-line-of-defense flush. atexit fires on ordinary interpreter exit
+        # (normal return, sys.exit, unhandled exception, KeyboardInterrupt unwind) — the paths a
+        # taskkill from cmd_play's finally would otherwise skip. The WAL already covers kill -9;
+        # this closes the graceful-but-not-via-stop() gap. Idempotent (no-op when not dirty).
+        try:
+            atexit.register(self._atexit_flush)
+        except Exception:  # noqa: BLE001 — registration must never break construction
+            pass
 
     @property
     def wal_path(self) -> Path:
         return self.path.with_suffix(self.path.suffix + ".wal.jsonl")
+
+    @property
+    def lock_path(self) -> Path:
+        return self.path.with_suffix(self.path.suffix + ".lock")
+
+    # -- cross-process lock (finding #6) --------------------------------------------------------
+
+    def _acquire_lock(self) -> None:
+        """Take an exclusive ``<path>.lock`` (atomic O_EXCL create). On conflict: steal it when the
+        holder is US (same pid), or provably dead (same host, pid gone), or unverifiably stale
+        (different host / unknown pid, and older than _LOCK_STALE_SECONDS); otherwise RAISE a clear
+        error naming the live foreign holder. Any FS error fails OPEN (never brick a real run)."""
+        lp = self.lock_path
+        me = os.getpid()
+        try:
+            lp.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return  # can't even create the dir -> fail open
+        for _ in range(3):
+            try:
+                fd = os.open(str(lp), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                info = self._read_lock(lp)
+                holder = info.get("pid")
+                same_host = info.get("host") == _HOSTNAME
+                try:
+                    age = time.time() - lp.stat().st_mtime
+                except OSError:
+                    age = 0.0
+                dead = same_host and holder is not None and not _pid_alive(holder)
+                unverifiable_stale = age > _LOCK_STALE_SECONDS and (not same_host or holder is None)
+                if holder == me or dead or unverifiable_stale:
+                    try:
+                        lp.unlink()
+                    except OSError:
+                        pass
+                    continue   # retry the exclusive create
+                raise RuntimeError(
+                    f"PlayerProfileStore: {self.path} is already locked by another live process "
+                    f"(pid={holder} host={info.get('host')} since {info.get('ts')}). Two runners "
+                    f"sharing one opponent DB clobber each other (last-writer-wins). Stop the other "
+                    f"runner, delete {lp} if it is stale, or set POKERBOT_PROFILE_NO_LOCK=1."
+                )
+            except OSError:
+                return  # unexpected FS error -> fail open
+            else:
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        json.dump({"pid": me, "host": _HOSTNAME, "ts": int(time.time())}, f)
+                except OSError:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                self._lock_held = True
+                return
+        return  # lost the create race repeatedly -> fail open rather than raise spuriously
+
+    @staticmethod
+    def _read_lock(lp: Path) -> dict:
+        try:
+            data = json.loads(lp.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _touch_lock(self) -> None:
+        """Heartbeat the lock mtime (called from save) so a live-but-idle holder isn't seen as
+        stale by a peer. Best-effort."""
+        if not self._lock_held:
+            return
+        try:
+            os.utime(self.lock_path, None)
+        except OSError:
+            pass
+
+    def _release_lock(self) -> None:
+        if not self._lock_held:
+            return
+        self._lock_held = False
+        try:
+            if self._read_lock(self.lock_path).get("pid") == os.getpid():
+                self.lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _atexit_flush(self) -> None:
+        """Interpreter-exit backstop: final save (only if dirty AND the target dir still exists, so
+        a cleaned-up test tmp dir is never resurrected) then release the cross-process lock.
+        Best-effort + idempotent — never raises."""
+        try:
+            if self._dirty and self.path.parent.exists():
+                self.save()
+        except Exception:  # noqa: BLE001
+            pass
+        self._release_lock()
 
     def load(self) -> None:
         self._load_snapshot()
@@ -474,9 +630,8 @@ class PlayerProfileStore:
                 pass
         self._dirty = False
         self._updates_since_save = 0
-        import time
-
         self._last_save_ts = time.monotonic()
+        self._touch_lock()  # heartbeat: keep our lock fresh so a peer never sees it as stale
 
     def save_throttled(self, *, min_hands: int = 20, min_seconds: float = 60.0) -> bool:
         """Snapshot only every ``min_hands`` updates or ``min_seconds`` — the per-hand cost drops
