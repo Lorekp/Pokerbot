@@ -248,13 +248,24 @@ fn read_key_at(f: &mut fs::File, idx: usize) -> [u8; 16] {
     key
 }
 
+/// OPT-BP status of an opened Blueprint (fence sidecar loaded? row cache on?). Dict => (false, false).
+fn optbp_status(bp: &Blueprint) -> (bool, bool) {
+    match bp {
+        Blueprint::Index(ix) => (ix.fence_active(), ix.cache_active()),
+        _ => (false, false),
+    }
+}
+
 fn run_keys(index_dir: &str, n_present: usize, n_absent: usize, seed: u64) {
     let t_open = Instant::now();
     let bp = Blueprint::from_index_dir(index_dir)
         .unwrap_or_else(|e| panic!("from_index_dir({index_dir}): {e}"));
     let n = bp.len();
+    let (fence_on, cache_on) = optbp_status(&bp);
     eprintln!(
-        "[keys] opened index dir={index_dir} n_rows={n} in {:.2}s (mmap; pages fault in on demand)",
+        "[keys] opened index dir={index_dir} n_rows={n} in {:.2}s (mmap; pages fault in on demand) \
+fence={fence_on} rowcache={cache_on} (env POKERBOT_BP_FENCE/POKERBOT_BP_ROWCACHE=0 to disable; \
+with rowcache ON the WARM repeat is a cache hit, not a re-search)",
         t_open.elapsed().as_secs_f64()
     );
     let keys_path = Path::new(index_dir).join("keys_sorted.bin");
@@ -331,7 +342,8 @@ fn run_keys(index_dir: &str, n_present: usize, n_absent: usize, seed: u64) {
         "[keys] hit_rate={hit_rate:.4} cold/warm(p50)={ratio:.1}x absent_false_hits={absent_false_hits}"
     );
     println!(
-        "JSON\t{{\"mode\":\"keys\",\"index_dir\":\"{}\",\"n_rows\":{n},\"present\":{n_present},\
+        "JSON\t{{\"mode\":\"keys\",\"index_dir\":\"{}\",\"n_rows\":{n},\
+\"fence_active\":{fence_on},\"cache_active\":{cache_on},\"present\":{n_present},\
 \"hits\":{hits},\"hit_rate\":{hit_rate:.6},\
 \"cold_ns\":{{\"p50\":{cp50},\"p90\":{cp90},\"p99\":{cp99},\"max\":{cmax}}},\
 \"warm_ns\":{{\"p50\":{wp50},\"p90\":{wp90},\"p99\":{wp99},\"max\":{wmax}}},\
@@ -362,8 +374,9 @@ fn run_solve(
         .unwrap_or_else(|e| panic!("from_index_dir({index_dir}): {e}"));
     let emd_path = cfgm["emd_frozen_path"].clone();
     let lookup = emd::load_shared(&emd_path).expect("emd frozen blob");
+    let (fence_on, cache_on) = optbp_status(&bp);
     eprintln!(
-        "[solve] index n_rows={} emd={} loaded in {:.2}s",
+        "[solve] index n_rows={} emd={} loaded in {:.2}s fence={fence_on} rowcache={cache_on}",
         bp.len(),
         emd_path,
         t_open.elapsed().as_secs_f64()
@@ -447,7 +460,7 @@ Rebuild with `--features prof` for bp_lookup vs solve_total."
     #[cfg(feature = "prof")]
     let mut per_solve_json: Vec<String> = Vec::new();
     #[cfg(feature = "prof")]
-    let (mut agg_bp_get, mut agg_bp_miss) = (0u64, 0u64);
+    let (mut agg_bp_get, mut agg_bp_miss, mut agg_bp_chit) = (0u64, 0u64, 0u64);
 
     for (i, (env, hero)) in states.iter().enumerate() {
         let seed = seed_base.wrapping_add(i as u64 * 1_000_003);
@@ -486,17 +499,20 @@ Rebuild with `--features prof` for bp_lookup vs solve_total."
             let fpk_c = g("fp_key");
             let bp_get = g("bp_get");
             let bp_miss = g("bp_miss");
+            let bp_chit = g("bp_cache_hit");
             agg_bp_get += bp_get;
             agg_bp_miss += bp_miss;
+            agg_bp_chit += bp_chit;
             let f_solve = bp_c as f64 / solve_c as f64;
             let f_leaf = bp_c as f64 / leaf_c as f64;
             let to_ns = |c: u64| (c as f64 / ghz) as u64;
             eprintln!(
                 "  PROF cyc solve_total={solve_c} leaf_playout={leaf_c} fp_key={fpk_c} \
 bp_lookup={bp_c} | bp_lookup={:.1}% of solve, {:.1}% of leaf | bp_get={bp_get} bp_miss={bp_miss} \
-| bp_lookup~{}us ({} lookups, ~{}ns each)",
+bp_cache_hit={bp_chit} (distinct mmap lookups={}) | bp_lookup~{}us ({} lookups, ~{}ns each)",
                 100.0 * f_solve,
                 100.0 * f_leaf,
+                bp_get.saturating_sub(bp_chit),
                 to_ns(bp_c) / 1000,
                 bp_get,
                 if bp_get > 0 { to_ns(bp_c) / bp_get } else { 0 },
@@ -505,7 +521,7 @@ bp_lookup={bp_c} | bp_lookup={:.1}% of solve, {:.1}% of leaf | bp_get={bp_get} b
                 "{{\"i\":{i},\"street\":{},\"wall_ns\":{wall_ns},\"solve_total_cyc\":{solve_c},\
 \"leaf_playout_cyc\":{leaf_c},\"fp_key_cyc\":{fpk_c},\"bp_lookup_cyc\":{bp_c},\
 \"bp_lookup_frac_solve\":{f_solve:.4},\"bp_lookup_frac_leaf\":{f_leaf:.4},\
-\"bp_get\":{bp_get},\"bp_miss\":{bp_miss}}}",
+\"bp_get\":{bp_get},\"bp_miss\":{bp_miss},\"bp_cache_hit\":{bp_chit}}}",
                 env.street
             ));
         }
@@ -522,8 +538,10 @@ bp_lookup={bp_c} | bp_lookup={:.1}% of solve, {:.1}% of leaf | bp_get={bp_get} b
         };
         println!(
             "JSON\t{{\"mode\":\"solve\",\"index_dir\":\"{}\",\"iters\":{iters},\"n_states\":{},\
+\"fence_active\":{fence_on},\"cache_active\":{cache_on},\
 \"tsc_ghz\":{ghz:.4},\"wall_ns_p50\":{wp50},\"bp_get_total\":{agg_bp_get},\
-\"bp_miss_total\":{agg_bp_miss},\"hit_rate\":{hr:.6},\"per_solve\":[{}]}}",
+\"bp_miss_total\":{agg_bp_miss},\"bp_cache_hit_total\":{agg_bp_chit},\
+\"hit_rate\":{hr:.6},\"per_solve\":[{}]}}",
             index_dir.replace('\\', "\\\\"),
             states.len(),
             per_solve_json.join(",")
@@ -532,7 +550,7 @@ bp_lookup={bp_c} | bp_lookup={:.1}% of solve, {:.1}% of leaf | bp_get={bp_get} b
     #[cfg(not(feature = "prof"))]
     println!(
         "JSON\t{{\"mode\":\"solve\",\"index_dir\":\"{}\",\"iters\":{iters},\"n_states\":{},\
-\"wall_ns_p50\":{wp50},\"prof\":false}}",
+\"fence_active\":{fence_on},\"cache_active\":{cache_on},\"wall_ns_p50\":{wp50},\"prof\":false}}",
         index_dir.replace('\\', "\\\\"),
         states.len()
     );
