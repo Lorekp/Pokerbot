@@ -540,6 +540,34 @@ _NATIVE_WALL_CAP_PAD = 1.25
 _NATIVE_RAISE_CAP = int(os.environ.get("POKERBOT_SUBGAME_RAISE_CAP", "0") or 0)
 
 
+def _river_leaf_unfreeze_enabled() -> bool:
+    """RIVER STACK-OFF FIX (2026-07-13 table-94363 postmortem; default ON, kill with
+    POKERBOT_RIVER_LEAF_UNFREEZE=0).
+
+    THE MEASURED BUG: at a RIVER root every depth-limit leaf is a SHOWDOWN SETTLE (the
+    street-close chance node — there is no next betting round), so the leaf value is exactly
+    the CURRENT sampled opponent holes' showdown. But the leaf cache is PUBLIC-keyed and its
+    running mean FREEZES after ``leaf_cache_worlds`` (default 4) visiting hole-worlds — the
+    entire fold-vs-call comparison for a river all-in call then rests on a FROZEN 4-sample
+    equity draw instead of the range expectation. Repro (this worktree, _repro_worlds sweep,
+    K=400, uniform villain range): a call needing 49.1% equity with a 37.6%-equity hand —
+    a clearly -EV stack-off — was CALLED on 3/10 rng salts at M=4 (P(>=2 of 4 sampled hands
+    lose to hero) ~ 0.48 puts call-EV >= 0 ~ half the time) and FOLDED on 3/3 salts once the
+    mean integrates every visiting world. Live incident: hero called off 845bb (1690 chips)
+    with ace-high no-pair on 6h5s7h6c3s facing a river jam (fold mass served: 0.0).
+
+    THE FIX: at a RIVER root, raise the effective leaf-world integration cap to the solve's
+    iteration target so the public-keyed running mean never freezes — every iteration's
+    sampled world contributes and the call EV converges to the range expectation. River-root
+    leaves are settles (an evaluate-seven + side-pot split, no rollout gadget), so the extra
+    evaluations are cheap; flop/turn roots keep the certified M (their leaves are real
+    continuation-gadget rollouts). Threaded into the NATIVE solve via the existing
+    ``leaf_cache_worlds`` FFI argument (subgame.rs mirrors the running-mean semantics), so
+    the pure-Python fix covers both engines."""
+    return os.environ.get("POKERBOT_RIVER_LEAF_UNFREEZE", "1") not in (
+        "0", "", "false", "False")
+
+
 def _abstraction_masks(client_bet_sizing: bool):
     if not client_bet_sizing:
         return None, None
@@ -636,6 +664,11 @@ class PluribusReBeLSolver:
         # Leaf value cache: key -> (sum, n) running mean over the first config.leaf_cache_worlds
         # VISITING hole-worlds (BUG-1 fix; (v, 1) first-touch-frozen at the default of 1).
         self._leaf_cache: dict = {}
+        # Effective leaf-world integration cap THIS solve (set per-solve). Equals
+        # config.leaf_cache_worlds everywhere except a RIVER root, where the river stack-off fix
+        # (_river_leaf_unfreeze_enabled) raises it to the iteration target so the public-keyed
+        # showdown-settle leaves never freeze on a tiny hole-world sample.
+        self._leaf_worlds_eff = max(1, int(self.config.leaf_cache_worlds))
         self._leaf_eval_count = 0
         self._leaf_cache_hits = 0
         self._leaf_counter = 0  # per-leaf CRN offset so distinct leaves get distinct board runouts
@@ -942,7 +975,10 @@ class PluribusReBeLSolver:
         # byte-identically).
         if self._leaf_biased_active:
             return self._leaf_value_biased(env, hero, key, t)
-        m_worlds = max(1, int(self.config.leaf_cache_worlds))
+        # Per-solve effective cap (river stack-off fix): equals config.leaf_cache_worlds except at
+        # a river root, where showdown-settle leaves integrate every visiting world (never freeze).
+        m_worlds = max(1, int(getattr(self, "_leaf_worlds_eff", 0)
+                              or self.config.leaf_cache_worlds))
         hit = self._leaf_cache.get(key)
         if hit is not None:
             leaf_sum, leaf_n = hit
@@ -1075,7 +1111,9 @@ class PluribusReBeLSolver:
         4 entries per leaf visit and the 4^n blowup never materializes."""
         prof = tuple(sorted(choices.items()))
         ckey = (base_key, "cont_prof", prof)
-        m_worlds = max(1, int(self.config.leaf_cache_worlds))
+        # Same per-solve effective cap as _leaf_value (river stack-off fix; R2 gated-off default).
+        m_worlds = max(1, int(getattr(self, "_leaf_worlds_eff", 0)
+                              or self.config.leaf_cache_worlds))
         hit = self._leaf_cache.get(ckey)
         if hit is not None:
             leaf_sum, leaf_n = hit
@@ -1344,6 +1382,16 @@ class PluribusReBeLSolver:
         self._root_av_sum = None      # reset the AIVAT root-CFV accumulator (per-decision; no carryover)
         self._root_av_wsum = 0.0
         base_state = to_numpy_state(root.env)
+        # RIVER STACK-OFF FIX (2026-07-13, see _river_leaf_unfreeze_enabled): at a RIVER root every
+        # leaf is a showdown settle, so the public-keyed leaf cache must integrate EVERY visiting
+        # hole-world (cap = the iteration target) instead of freezing a 4-sample equity draw that
+        # turned an 845bb ace-high call-off into a coin flip. Flop/turn roots keep the certified
+        # config.leaf_cache_worlds (their leaves are real rollout gadgets). Threaded into the native
+        # solve below via the leaf_cache_worlds FFI arg; POKERBOT_RIVER_LEAF_UNFREEZE=0 restores the
+        # legacy frozen mean.
+        self._leaf_worlds_eff = max(1, int(cfg.leaf_cache_worlds))
+        if int(base_state.street) == 3 and _river_leaf_unfreeze_enabled():
+            self._leaf_worlds_eff = max(self._leaf_worlds_eff, int(eff_max_iters))
         # R3 mini-proof knobs (GTO path only — opponent_model must be None, mirroring the two_sided
         # gating; the exploit path's modeled opponents are frozen reads, not learners, so hand-
         # conditioning them is meaningless there). Defaults are False => both flags stay False and
@@ -1432,8 +1480,16 @@ class PluribusReBeLSolver:
 
         legal = self._legal(base_state, hero)
         if not legal.any():
+            # STATE-CORRUPTION early return (2026-07-13 audit): a live seat's legal mask is never
+            # empty for a well-formed state (legal_action_mask_np always emits at least one of
+            # FOLD/CHECK/CALL, and the abstraction keep-lists always allow them), so landing here
+            # means the assembled root is corrupt. The all-zero action_probs vector must NEVER be
+            # argmaxed raw — tag the serve explicitly (the historical ``metadata={}`` made this
+            # path invisible to every metadata-keyed guard) so the decider's degenerate-serve
+            # guard downgrades it to the blueprint root / a conservative wire-legal fallback.
             probs = np.zeros(NUM_ACTIONS, dtype=np.float32)
-            return SolveResult(action_probs=probs, ev=0.0, iterations=0, metadata={})
+            return SolveResult(action_probs=probs, ev=0.0, iterations=0,
+                               metadata={"served": "no_legal"})
 
         # TOURNAMENT SHALLOW-STACK PRIOR: a folded-to-hero / facing-one-jam SHALLOW preflop spot is an
         # exact-game push/fold node. Serve the CERTIFIED ante-aware ICM open-shove / call-vs-jam Nash
@@ -1545,8 +1601,9 @@ class PluribusReBeLSolver:
                     ensemble_streams=int(cfg.ensemble_streams),
                     # BUG-1 leaf hole-world integration (1 = legacy first-touch freeze) + BUG-5 delayed
                     # averaging (0.0 = legacy). Native mirrors the Python semantics exactly; both no-op
-                    # at the defaults.
-                    leaf_cache_worlds=int(cfg.leaf_cache_worlds),
+                    # at the defaults. _leaf_worlds_eff == cfg.leaf_cache_worlds everywhere except a
+                    # RIVER root (river stack-off fix: showdown-settle leaves never freeze).
+                    leaf_cache_worlds=int(self._leaf_worlds_eff),
                     avg_skip_frac=float(cfg.avg_skip_frac),
                     # R2 biased continuation leaves (GTO-only; this branch is gated on opponent_model
                     # is None, mirroring _leaf_biased_active). False (default) => the legacy uniform
