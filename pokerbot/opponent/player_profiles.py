@@ -337,7 +337,19 @@ except Exception:  # noqa: BLE001
 
 def _pid_alive(pid) -> bool:
     """Best-effort liveness of ``pid`` on THIS host (Windows + POSIX). Uncertain => assume alive
-    (fail toward NOT stealing a possibly-live process's lock)."""
+    (fail toward NOT stealing a possibly-live process's lock).
+
+    Soak fix D1 (2026-07-13, the 01:20 four-hour wedge): "OpenProcess succeeded" is NOT
+    liveness on Windows. A TERMINATED process whose kernel process object is still held
+    open by someone else's handle — exactly what the multiday supervisor produces, since
+    Start-Process -PassThru caches the child's native handle to read its exit code — stays
+    openable as a ZOMBIE for as long as that handle lives (hours). Live evidence: dead pid
+    53956 passed OpenProcess for ~4h while Get-Process (which enumerates only RUNNING
+    processes) showed it gone, so every relaunched child classified the dead holder as
+    alive, waited 90s and hard-failed. Liveness therefore asks the kernel whether the
+    process has EXITED: WaitForSingleObject(h, 0) — the process object is signaled iff it
+    has terminated — with GetExitCodeProcess (!= STILL_ACTIVE) as the fallback when
+    SYNCHRONIZE access is denied."""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
@@ -347,13 +359,49 @@ def _pid_alive(pid) -> bool:
     if sys.platform == "win32":
         try:
             import ctypes
+            from ctypes import wintypes
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            k = ctypes.windll.kernel32
-            h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            SYNCHRONIZE = 0x00100000
+            ERROR_ACCESS_DENIED = 5
+            WAIT_OBJECT_0 = 0x0
+            WAIT_TIMEOUT = 0x102
+            STILL_ACTIVE = 259
+            # A FRESH WinDLL instance (not ctypes.windll's shared cache) so our
+            # argtypes/restype are correct on 64-bit and never clash with other modules.
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            k.OpenProcess.restype = wintypes.HANDLE
+            k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k.WaitForSingleObject.restype = wintypes.DWORD
+            k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            k.GetExitCodeProcess.restype = wintypes.BOOL
+            k.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
+                                             ctypes.POINTER(wintypes.DWORD)]
+            k.CloseHandle.restype = wintypes.BOOL
+            k.CloseHandle.argtypes = [wintypes.HANDLE]
+            have_sync = True
+            h = k.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h and ctypes.get_last_error() == ERROR_ACCESS_DENIED:
+                have_sync = False
+                h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
             if not h:
-                return False   # no such process -> dead (fast same-host restart reclaim)
-            k.CloseHandle(h)
-            return True
+                # ACCESS_DENIED on both opens => the process EXISTS but is protected
+                # (assume alive). Anything else (ERROR_INVALID_PARAMETER) => no such
+                # process object at all -> dead (fast same-host restart reclaim).
+                return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+            try:
+                if have_sync:
+                    r = k.WaitForSingleObject(h, 0)
+                    if r == WAIT_OBJECT_0:
+                        return False   # signaled == TERMINATED (zombie handle-held object)
+                    if r == WAIT_TIMEOUT:
+                        return True    # not signaled == still running
+                    # WAIT_FAILED / unexpected -> fall through to the exit-code check
+                code = wintypes.DWORD(0)
+                if k.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return code.value == STILL_ACTIVE
+                return True  # can't even read the exit code -> assume alive
+            finally:
+                k.CloseHandle(h)
         except Exception:  # noqa: BLE001
             return True
     try:
@@ -362,6 +410,16 @@ def _pid_alive(pid) -> bool:
         return False
     except (PermissionError, OSError):
         return True
+    # POSIX flavor of the same zombie trap: an exited-but-unreaped child still answers
+    # kill(pid, 0). /proc state Z/X == terminated -> dead. Best-effort (non-Linux: no /proc).
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read().decode("ascii", "replace")
+        state = data.rsplit(")", 1)[1].split()[0]
+        if state in ("Z", "X", "x"):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
     return True
 
 
@@ -490,15 +548,28 @@ class PlayerProfileStore:
     def _acquire_lock(self) -> None:
         """Take an exclusive ``<path>.lock`` (atomic O_EXCL create).
 
-        Holder liveness is PID-RECYCLING-PROOF (soak fix B, 2026-07-12): the lock records the
-        holder's process CREATION TIME next to its pid, and an alive pid with a DIFFERENT creation
-        time is an unrelated process wearing a recycled pid — the real holder is dead and the lock
-        is stolen. Steal also when the holder is US (same pid), provably dead (same host, pid
-        gone), or unverifiably stale (different host / unknown pid, older than the stale window —
-        3 min for heartbeat-capable v2 locks, 30 min legacy). A LIVE same-host foreign holder is
-        never stolen: acquisition waits up to ``lock_wait_s`` for it to release (soak fix C3 — the
-        relaunch-teardown window), then RAISES a clear error naming it. Any FS error fails OPEN
-        (never brick a real run)."""
+        Soak fix D (2026-07-13, the 01:20 four-hour wedge — 47 relaunch deaths at +105s):
+        the holder is classified into exactly THREE states and only one may block us:
+
+          * DEAD — same host and the pid is gone, TERMINATED-but-handle-held (a zombie
+            process object kept openable by the supervisor's cached child handle; see
+            ``_pid_alive``), or RECYCLED (alive pid whose creation time mismatches the
+            lock's ``create_ts`` — soak fix B, 2026-07-12). Stolen IMMEDIATELY.
+          * VERIFIED-LIVE — same host, pid alive AND creation time MATCHES ``create_ts``.
+            The only holder that blocks: wait up to ``lock_wait_s`` for release (soak fix
+            C3 — the relaunch-teardown window), then RAISE a clear error naming it (two
+            live runners on one opponent DB is a real config error).
+          * UNVERIFIABLE — different host, unknown pid, or no identity to check (v1 lock
+            without ``create_ts`` / unreadable process times). Stolen once the lock mtime
+            exceeds the stale window (3 min hb-capable / 30 min legacy) — SAME-HOST
+            INCLUDED (the old cross-host-only gate made the staleness steal unreachable
+            for the exact lock that wedged the run) — and otherwise stolen WITH A LOUD
+            WARNING at wait-timeout instead of raising: under the strictly-serial
+            supervisor a lingering lock is always a dead predecessor, and hard-raising
+            here held the arena down for 4 hours.
+
+        Every steal of a foreign lock logs loudly. Any FS error fails OPEN (never brick a
+        real run); POKERBOT_PROFILE_NO_LOCK=1 disables locking entirely."""
         lp = self.lock_path
         me = os.getpid()
         try:
@@ -519,26 +590,67 @@ class PlayerProfileStore:
                     age = time.time() - lp.stat().st_mtime
                 except OSError:
                     age = 0.0
-                alive = _pid_alive(holder) if (same_host and holder is not None) else None
-                # Fix B: alive pid + mismatched creation time == recycled pid == dead holder.
-                recycled = False
-                if alive and info.get("create_ts") is not None:
-                    cur_ct = _proc_create_time(holder)
-                    recycled = cur_ct is not None and int(cur_ct) != int(info["create_ts"])
-                dead = same_host and holder is not None and (alive is False or recycled)
-                stale_after = _LOCK_HB_STALE_SECONDS if info.get("hb") else _LOCK_STALE_SECONDS
-                unverifiable_stale = age > stale_after and (not same_host or holder is None)
-                if holder == me or dead or unverifiable_stale:
+                # -- classify the holder: DEAD / VERIFIED-LIVE / UNVERIFIABLE ----------
+                dead = False
+                verified_live = False
+                reason = ""
+                if same_host and holder is not None:
+                    if not _pid_alive(holder):
+                        dead = True   # pid gone OR terminated zombie (fix D1)
+                        reason = f"holder pid={holder} is DEAD (no such process or exited)"
+                    else:
+                        lock_ct = info.get("create_ts")
+                        cur_ct = _proc_create_time(holder) if lock_ct is not None else None
+                        if lock_ct is not None and cur_ct is not None:
+                            if int(cur_ct) != int(lock_ct):
+                                dead = True   # recycled pid == real holder dead (fix B)
+                                reason = (f"holder pid={holder} was RECYCLED (create_ts "
+                                          f"{cur_ct} != lock {lock_ct}); real holder dead")
+                            else:
+                                verified_live = True
+                        # else: alive pid but identity UNVERIFIABLE (v1 lock / times
+                        # unreadable) -> neither dead nor verified_live
+                stale_after = (_LOCK_HB_STALE_SECONDS if info.get("hb")
+                               else _LOCK_STALE_SECONDS)
+                # Fix D2: staleness applies to ANY holder not POSITIVELY verified alive —
+                # same-host included. The old `and (not same_host or holder is None)` gate
+                # made this branch unreachable for the dead same-host lock of the wedge.
+                stale = age > stale_after and not verified_live
+                if stale and not dead:
+                    reason = (f"lock is {age:.0f}s stale (> {stale_after:.0f}s "
+                              f"{'hb' if info.get('hb') else 'legacy'} window) and holder "
+                              f"could not be verified alive")
+                remaining = deadline - time.monotonic()
+                # Fix D3: at wait-timeout, only a POSITIVELY-VERIFIED-LIVE holder may make
+                # us fail; an unverifiable one is stolen with a loud warning (a strand
+                # must never wedge the run for hours again).
+                timeout_steal = remaining <= 0 and not verified_live
+                if timeout_steal and not (dead or stale):
+                    reason = (f"waited {self._lock_wait_s:.0f}s and holder pid={holder} "
+                              f"host={info.get('host')} could NOT be positively verified "
+                              f"alive (children are strictly serial under the supervisor; "
+                              f"a lingering lock is a dead predecessor)")
+                if holder == me or dead or stale or timeout_steal:
                     steal_attempts += 1
                     if steal_attempts > 8:
                         return  # lost the create/steal race repeatedly -> fail open
+                    if holder != me:
+                        try:
+                            print(f"[profiles] WARNING: STEALING profile lock {lp}: "
+                                  f"{reason} (lock: pid={holder} host={info.get('host')} "
+                                  f"ts={info.get('ts')} create_ts={info.get('create_ts')} "
+                                  f"hb={info.get('hb')} age={age:.0f}s) — proceeding as "
+                                  f"the new holder", file=sys.stderr, flush=True)
+                        except Exception:  # noqa: BLE001
+                            pass
                     try:
                         lp.unlink()
                     except OSError:
                         pass
                     continue   # retry the exclusive create
-                remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    # verified_live only: alive pid + matching create_ts == a genuinely
+                    # live runner on this DB. That is a real config error -> clear raise.
                     raise RuntimeError(
                         f"PlayerProfileStore: {self.path} is already locked by another live "
                         f"process (pid={holder} host={info.get('host')} since {info.get('ts')}"
@@ -548,15 +660,16 @@ class PlayerProfileStore:
                         f"(last-writer-wins). Stop the other runner, delete {lp} if it is stale, "
                         f"or set POKERBOT_PROFILE_NO_LOCK=1."
                     )
-                # Fix C3: live holder + wait budget left -> bounded, logged retry (a relaunched
-                # child rides out its force-killed predecessor's teardown; a holder that dies
-                # mid-wait is stolen on the next probe via the dead/recycled branch above).
+                # Fix C3: holder (verified or not-yet-verifiable) + wait budget left ->
+                # bounded, logged retry (a relaunched child rides out its predecessor's
+                # teardown; a holder that dies mid-wait is stolen on the next probe).
                 now_m = time.monotonic()
                 if last_wait_log == 0.0 or now_m - last_wait_log >= 15.0:
                     last_wait_log = now_m
                     try:
-                        print(f"[profiles] {lp} held by live pid={holder}; waiting up to "
-                              f"{remaining:.0f}s more for release before failing hard",
+                        print(f"[profiles] {lp} held by pid={holder} "
+                              f"(verified_live={verified_live}); waiting up to "
+                              f"{remaining:.0f}s more for release",
                               file=sys.stderr, flush=True)
                     except Exception:  # noqa: BLE001
                         pass
