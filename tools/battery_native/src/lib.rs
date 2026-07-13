@@ -68,9 +68,15 @@ pub mod prof {
     // bp_miss: an index `get` (Blueprint::Index arm) returned None -> uniform fallback. Serving the
     // Index, hit-rate = (bp_get - bp_miss) / bp_get. `bp_get` still counts every key construction.
     pub const C_BP_MISS: usize = 6;
-    pub const NC: usize = 7;
-    pub const COUNT_NAMES: [&str; NC] =
-        ["node_hero", "node_opp", "leaf_hit", "leaf_miss", "playout_step", "bp_get", "bp_miss"];
+    // bp_cache_hit: an index `get` was answered by the in-process sharded row cache (OPT-BP2,
+    // playout.rs) WITHOUT touching the mmap. Distinct-key lookups per solve = bp_get - bp_cache_hit;
+    // the memoization win is bp_cache_hit / bp_get.
+    pub const C_BP_CACHE_HIT: usize = 7;
+    pub const NC: usize = 8;
+    pub const COUNT_NAMES: [&str; NC] = [
+        "node_hero", "node_opp", "leaf_hit", "leaf_miss", "playout_step", "bp_get", "bp_miss",
+        "bp_cache_hit",
+    ];
     pub static CNT: [AtomicU64; NC] = [const { AtomicU64::new(0) }; NC];
 
     #[inline(always)]

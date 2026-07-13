@@ -2550,3 +2550,401 @@ mod opt1_settle_join {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// OPT-BP (2026-07-13): blueprint mmap-index fast paths — fence sidecar (OPT-BP1) and sharded row
+// cache (OPT-BP2). Both are LOSSLESS by contract: the fence only narrows the binary-search range
+// (same match found), and the cache is pure (a hit returns exactly the f32 row bytes a miss
+// decodes; f32->f64 widening is exact). These tests gate that contract:
+//   * fence-vs-plain search parity, bit-identical rows, present + absent + page-boundary keys;
+//   * FAIL-OPEN on every sidecar corruption class (missing/truncated/bad-magic/count-mismatch/
+//     non-monotone/stale) — open never errors, lookups stay correct on the plain path;
+//   * row-cache purity incl. the clear-on-cap path (all keys forced into ONE shard past its cap);
+//   * FULL SOLVE bit-identity at fixed seed across every fence/cache gate combination, against an
+//     index built from real fp_key digests (so cache/fence hit paths are exercised in the solve).
+// ---------------------------------------------------------------------------
+mod bp_index_fence_cache {
+    use super::*;
+    use crate::playout::{self, Blueprint, PlayoutConfig, Rng, SortedIndex, FENCE_KEYS_PER_PAGE};
+    use crate::subgame::{self, SubgameConfig};
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bn_bpidx_{}_{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Deterministic unique sorted 16B keys (BTreeSet order == the index's memcmp sort order).
+    /// `fix` lets a test pin bytes (e.g. force one cache shard) before dedup/sort.
+    fn gen_keys_with(n: usize, seed: u64, fix: impl Fn(&mut [u8; 16])) -> Vec<[u8; 16]> {
+        let mut rng = Rng::seed_from_u64(seed);
+        let mut set: BTreeSet<[u8; 16]> = BTreeSet::new();
+        while set.len() < n {
+            let mut k = [0u8; 16];
+            for b in k.iter_mut() {
+                *b = rng.next_below(256) as u8;
+            }
+            fix(&mut k);
+            set.insert(k);
+        }
+        set.into_iter().collect()
+    }
+
+    fn gen_keys(n: usize, seed: u64) -> Vec<[u8; 16]> {
+        gen_keys_with(n, seed, |_| {})
+    }
+
+    /// Write keys_sorted.bin + rows_sorted.f32.bin. Row values are derived from the ROW INDEX
+    /// (not the key), so bit-identical row equality in an assert implies the searches matched the
+    /// SAME index — no accidental pass through equal rows at different positions.
+    fn write_index(dir: &Path, keys: &[[u8; 16]]) {
+        let mut kb = Vec::with_capacity(keys.len() * 16);
+        let mut rb = Vec::with_capacity(keys.len() * NUM_ACTIONS * 4);
+        for (i, k) in keys.iter().enumerate() {
+            kb.extend_from_slice(k);
+            for a in 0..NUM_ACTIONS {
+                let v = (i as f32) * 16.0 + a as f32 + 0.25;
+                rb.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        fs::write(dir.join("keys_sorted.bin"), kb).unwrap();
+        fs::write(dir.join("rows_sorted.f32.bin"), rb).unwrap();
+    }
+
+    fn assert_bits_eq(a: &Option<[f64; NUM_ACTIONS]>, b: &Option<[f64; NUM_ACTIONS]>, ctx: &str) {
+        match (a, b) {
+            (None, None) => {}
+            (Some(x), Some(y)) => {
+                for i in 0..NUM_ACTIONS {
+                    assert_eq!(
+                        x[i].to_bits(),
+                        y[i].to_bits(),
+                        "{ctx}: row f64 bits differ at action {i}"
+                    );
+                }
+            }
+            _ => panic!("{ctx}: presence mismatch ({} vs {})", a.is_some(), b.is_some()),
+        }
+    }
+
+    // ---- (a) fence-vs-plain parity: present + absent + page-boundary keys, bit-identical ----
+    #[test]
+    fn fence_parity_present_absent_bit_identical() {
+        let n = 100_000usize; // 391 fence pages incl. a partial last page
+        let keys = gen_keys(n, 0xFACE);
+        let dir = tmp_dir("parity");
+        write_index(&dir, &keys);
+        let (nk, nf) = playout::build_keys_fence(dir.to_str().unwrap(), false).unwrap();
+        assert_eq!(nk, n);
+        assert_eq!(nf, n.div_ceil(FENCE_KEYS_PER_PAGE));
+
+        let plain = SortedIndex::open_with(dir.to_str().unwrap(), false, false).unwrap();
+        let fenced = SortedIndex::open_with(dir.to_str().unwrap(), true, false).unwrap();
+        assert!(!plain.fence_active() && !plain.cache_active());
+        assert!(fenced.fence_active() && !fenced.cache_active());
+
+        // Present keys: a stride sweep + every page-boundary neighborhood the fence logic cares
+        // about (page firsts, page lasts, the partial final page, both ends of the index).
+        let mut idxs: Vec<usize> = (0..n).step_by(97).collect();
+        for b in [
+            0usize,
+            1,
+            FENCE_KEYS_PER_PAGE - 1,
+            FENCE_KEYS_PER_PAGE,
+            FENCE_KEYS_PER_PAGE + 1,
+            2 * FENCE_KEYS_PER_PAGE - 1,
+            2 * FENCE_KEYS_PER_PAGE,
+            n - 2,
+            n - 1,
+            (n / FENCE_KEYS_PER_PAGE) * FENCE_KEYS_PER_PAGE, // first key of the partial last page
+        ] {
+            idxs.push(b);
+        }
+        for &i in &idxs {
+            let k = keys[i];
+            assert_eq!(plain.search_plain(&k), Some(i), "plain search must find index {i}");
+            assert_eq!(fenced.search_fenced_loaded(&k), Some(i), "fenced search must find index {i}");
+            let a = plain.get(&k);
+            let b = fenced.get(&k);
+            assert!(a.is_some());
+            assert_bits_eq(&a, &b, &format!("present key at index {i}"));
+        }
+
+        // Absent keys: perturbed samples + the extremes (below-first / above-last).
+        let mut rng = Rng::seed_from_u64(7);
+        let mut absents: Vec<[u8; 16]> = vec![[0u8; 16], [0xFFu8; 16]];
+        for _ in 0..500 {
+            let i = rng.next_below(n as u64) as usize;
+            let mut k = keys[i];
+            let b = rng.next_below(16) as usize;
+            k[b] ^= (rng.next_below(255) as u8).wrapping_add(1);
+            absents.push(k);
+        }
+        for k in &absents {
+            if keys.binary_search(k).is_ok() {
+                continue; // perturbation landed on a real key (astronomically unlikely)
+            }
+            assert_eq!(plain.search_plain(k), None);
+            assert_eq!(fenced.search_fenced_loaded(k), None);
+            assert_bits_eq(&plain.get(k), &fenced.get(k), "absent key");
+        }
+    }
+
+    // ---- (b) FAIL-OPEN: every sidecar corruption class degrades to plain search, no panic ----
+    #[test]
+    fn fence_fail_open_on_missing_or_corrupt_sidecar() {
+        let n = 4_000usize;
+        let keys = gen_keys(n, 0xBEEF);
+        let dir = tmp_dir("failopen");
+        write_index(&dir, &keys);
+        let dstr = dir.to_str().unwrap();
+
+        // Correctness never degrades: a few present keys (exact expected row) + one absent key.
+        let probe = |ix: &SortedIndex, why: &str| {
+            for &i in &[0usize, n / 2, n - 1] {
+                let got = ix.get(&keys[i]).unwrap_or_else(|| panic!("{why}: present key lost"));
+                let want = ((i as f32) * 16.0 + 0.25) as f64;
+                assert_eq!(got[0].to_bits(), want.to_bits(), "{why}: wrong row");
+            }
+            let mut absent = keys[n / 3];
+            absent[15] ^= 0x5A;
+            if keys.binary_search(&absent).is_err() {
+                assert!(ix.get(&absent).is_none(), "{why}: absent key found");
+            }
+        };
+
+        // Missing sidecar: silent fail-open.
+        let ix = SortedIndex::open_with(dstr, true, false).unwrap();
+        assert!(!ix.fence_active(), "missing sidecar must fail open");
+        probe(&ix, "missing sidecar");
+
+        // Valid sidecar loads (positive control), then each corruption class fails open.
+        playout::build_keys_fence(dstr, false).unwrap();
+        let ix = SortedIndex::open_with(dstr, true, false).unwrap();
+        assert!(ix.fence_active(), "valid sidecar must load");
+        probe(&ix, "valid sidecar");
+        let good = fs::read(dir.join("keys_fence.bin")).unwrap();
+
+        let corruptions: Vec<(&str, Box<dyn Fn(&mut Vec<u8>)>)> = vec![
+            (
+                "truncated",
+                Box::new(|d: &mut Vec<u8>| {
+                    let keep = d.len() - 10;
+                    d.truncate(keep);
+                }),
+            ),
+            ("bad magic", Box::new(|d: &mut Vec<u8>| d[0] ^= 1)),
+            ("n_keys mismatch", Box::new(|d: &mut Vec<u8>| d[8] = d[8].wrapping_add(1))),
+            ("keys_per_page mismatch", Box::new(|d: &mut Vec<u8>| d[16] = d[16].wrapping_add(1))),
+            (
+                "non-monotone",
+                Box::new(|d: &mut Vec<u8>| {
+                    // swap fence[0] and fence[1] (header is 32 bytes)
+                    for j in 0..16 {
+                        d.swap(32 + j, 48 + j);
+                    }
+                }),
+            ),
+            ("stale entry", Box::new(|d: &mut Vec<u8>| d[32 + 15] ^= 1)), // fence[0] != keys[0]
+        ];
+        for (why, f) in corruptions {
+            let mut bad = good.clone();
+            f(&mut bad);
+            fs::write(dir.join("keys_fence.bin"), &bad).unwrap();
+            let ix = SortedIndex::open_with(dstr, true, false)
+                .unwrap_or_else(|e| panic!("{why}: open must not error ({e})"));
+            assert!(!ix.fence_active(), "{why}: corrupt sidecar must fail open");
+            probe(&ix, why);
+        }
+        fs::write(dir.join("keys_fence.bin"), &good).unwrap();
+    }
+
+    // ---- (c) row-cache purity + clear-on-cap: all keys forced into ONE shard past its cap ----
+    #[test]
+    fn rowcache_pure_and_clear_on_cap_correct() {
+        // key[8] selects the cache shard; pin it to 0 so 20k keys overflow the 16384/shard cap.
+        let n = 20_000usize;
+        let keys = gen_keys_with(n, 0xCAFE, |k| k[8] = 0);
+        let dir = tmp_dir("rowcache");
+        write_index(&dir, &keys);
+        let dstr = dir.to_str().unwrap();
+        let plain = SortedIndex::open_with(dstr, false, false).unwrap();
+        let cached = SortedIndex::open_with(dstr, false, true).unwrap();
+        assert!(cached.cache_active() && !cached.fence_active());
+
+        // Pass 1 fills shard 0 past its cap (triggers >=1 clear-on-cap); pass 2 re-reads everything
+        // (mix of fresh inserts + cache hits). Every read must be bit-identical to the uncached path.
+        for pass in 0..2 {
+            for (i, k) in keys.iter().enumerate() {
+                assert_bits_eq(&plain.get(k), &cached.get(k), &format!("pass {pass} key {i}"));
+            }
+        }
+        // Absent keys: the miss is cached too — twice, both None.
+        let mut absent = keys[42];
+        absent[0] ^= 0xA5;
+        if keys.binary_search(&absent).is_err() {
+            assert!(cached.get(&absent).is_none());
+            assert!(cached.get(&absent).is_none());
+        }
+    }
+
+    // ---- default open(): env-gated production path stays correct ----
+    #[test]
+    fn open_default_env_gates_correct() {
+        let n = 2_000usize;
+        let keys = gen_keys(n, 0xD00D);
+        let dir = tmp_dir("envopen");
+        write_index(&dir, &keys);
+        playout::build_keys_fence(dir.to_str().unwrap(), false).unwrap();
+        let ix = SortedIndex::open(dir.to_str().unwrap()).unwrap();
+        let plain = SortedIndex::open_with(dir.to_str().unwrap(), false, false).unwrap();
+        for &i in &[0usize, 1, n / 2, n - 1] {
+            assert_bits_eq(&plain.get(&keys[i]), &ix.get(&keys[i]), "env-open present");
+        }
+        let mut absent = keys[0];
+        absent[15] ^= 0x11;
+        if keys.binary_search(&absent).is_err() {
+            assert_bits_eq(&plain.get(&absent), &ix.get(&absent), "env-open absent");
+        }
+    }
+
+    // ---- (d) FULL SOLVE bit-identity: fence/cache gate combinations at a fixed seed ----
+
+    fn pcfg() -> PlayoutConfig {
+        PlayoutConfig {
+            allowed_pre: [true; NUM_ACTIONS],
+            allowed_post: [true; NUM_ACTIONS],
+            bias_mult: 5.0,
+            bias_floor: 0.0,
+            max_depth: 24,
+            num_buckets: 200,
+            emd: None, // made-hand keying: self-contained (no EMD blob dependency in tests)
+        }
+    }
+
+    fn scfg() -> SubgameConfig {
+        SubgameConfig {
+            max_iterations: 40,
+            max_depth: 8,
+            blueprint_mix: 1.0, // exercise the blueprint-prior lookup site, not just leaf playouts
+            rollout_samples: 2,
+            resample_board: true,
+            linear_averaging: true,
+            repair_deck: true,
+            two_sided: true,
+            decouple_sampler: true,
+            range_aware: true,
+            range_uniform_floor: 0.25,
+            range_reach_full: true, // exercise the reach-table blueprint lookups too
+            ensemble_streams: 1,
+            leaf_cache_worlds: 4,
+            avg_skip_frac: 0.0,
+            leaf_biased_continuations: false,
+            leaf_bias_mult: 5.0,
+            serve_final_iterate: false,
+            root_unmask: 0,
+        }
+    }
+
+    #[test]
+    fn solve_bit_identical_fence_cache_on_off() {
+        // Walk real 6-max hands through the engine (game-flow-safe: init_hand -> sample_chance /
+        // legal apply_action only) collecting the fp_key digest of every decision node, so the
+        // synthetic index is keyed exactly like the solve's lookups (real HITS, not just misses).
+        let pc = pcfg();
+        let stacks = [100 * BB_CHIPS; NUM_PLAYERS];
+        let occ = [true; NUM_PLAYERS];
+        let mut rng = Rng::seed_from_u64(0x50BB);
+        let mut keyset: BTreeSet<[u8; 16]> = BTreeSet::new();
+        let mut roots: Vec<(EnvState, usize)> = Vec::new();
+        for hand in 0..300u64 {
+            let mut deck = [0i32; 52];
+            for (i, c) in deck.iter_mut().enumerate() {
+                *c = i as i32;
+            }
+            for i in (1..52usize).rev() {
+                let j = rng.next_below((i + 1) as u64) as usize;
+                deck.swap(i, j);
+            }
+            let mut env = init_hand(
+                (hand % NUM_PLAYERS as u64) as i32,
+                &stacks,
+                &occ,
+                0,
+                &deck,
+                [(hand & 0xffff_ffff) as u32, 7u32],
+            );
+            for _ in 0..200 {
+                if env.done || env.street >= STREET_TERMINAL {
+                    break;
+                }
+                if is_chance_node(&env) {
+                    env = sample_chance(&env);
+                    continue;
+                }
+                let seat = env.action_seat;
+                if seat < 0 {
+                    break;
+                }
+                keyset.insert(pc.fp_key(&env, seat as usize));
+                if env.street >= 1 && roots.len() < 3 && hand % 50 == 3 {
+                    roots.push((env, seat as usize));
+                }
+                let mask = legal_action_mask(&env, seat);
+                let a = if mask[CHECK] {
+                    CHECK
+                } else if mask[CALL] && rng.next_f64() < 0.9 {
+                    CALL
+                } else if mask[FOLD] {
+                    FOLD
+                } else {
+                    (0..NUM_ACTIONS).find(|&x| mask[x]).unwrap()
+                };
+                env = apply_action(&env, a);
+            }
+        }
+        assert!(roots.len() >= 2, "need at least 2 postflop roots (got {})", roots.len());
+        let keys: Vec<[u8; 16]> = keyset.into_iter().collect();
+        assert!(keys.len() > 500, "expected a non-trivial key population, got {}", keys.len());
+
+        let dir = tmp_dir("solveid");
+        write_index(&dir, &keys);
+        playout::build_keys_fence(dir.to_str().unwrap(), false).unwrap();
+
+        let sc = scfg();
+        let mut baseline: Vec<[f64; NUM_ACTIONS]> = Vec::new();
+        for (gi, (use_fence, use_cache)) in
+            [(false, false), (true, false), (false, true), (true, true)].iter().enumerate()
+        {
+            let ix = SortedIndex::open_with(dir.to_str().unwrap(), *use_fence, *use_cache).unwrap();
+            assert_eq!(ix.fence_active(), *use_fence);
+            assert_eq!(ix.cache_active(), *use_cache);
+            let bp = Blueprint::Index(std::sync::Arc::new(ix));
+            // The index must actually HIT on solve-relevant keys (walked-node digests are in it).
+            assert!(
+                bp.get(&keys[0]).is_some(),
+                "synthetic index must serve hits for collected fp keys"
+            );
+            for (ri, (env, hero)) in roots.iter().enumerate() {
+                let probs =
+                    subgame::solve::<NUM_PLAYERS>(env, *hero, &bp, &pc, &sc, 0xC0FFEE ^ ri as u64);
+                if gi == 0 {
+                    baseline.push(probs);
+                } else {
+                    for a in 0..NUM_ACTIONS {
+                        assert_eq!(
+                            probs[a].to_bits(),
+                            baseline[ri][a].to_bits(),
+                            "solve output must be BIT-IDENTICAL (root {ri}, action {a}, \
+fence={use_fence} cache={use_cache})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

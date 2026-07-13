@@ -148,16 +148,146 @@ impl Clone for Blueprint {
     }
 }
 
-/// Memory-mapped sorted key/row store (see `Blueprint::Index`). Send+Sync (read-only mmaps), so
-/// `Arc<Blueprint>` sharing across rayon workers keeps working.
+// ---------------------------------------------------------------------------------------------
+// OPT-BP (2026-07-13, index-lookup worktree) — LOSSLESS fast paths for the tier-1 mmap index.
+//
+// Measured baseline (bench_index_lookup on the REAL 538.85M-row index): per-lookup COLD p50 293µs
+// (~30 binary-search probes over random 4KB pages, each a potential page fault) vs WARM p50 1.2µs;
+// per-solve bp_get = 20k-75k with the SAME keys re-looked-up every CFR iteration. Two independent,
+// individually-gated levers, BOTH bit-identical by construction (a hit returns exactly what a miss
+// recomputes; the fence narrows the search range without changing what is found):
+//
+//   OPT-BP1 FENCE (env POKERBOT_BP_FENCE, default ON; sidecar `keys_fence.bin` built OFFLINE by
+//   `build_keys_fence` / examples/build_keys_fence.rs): the first 16B key of every 4KB keys-page
+//   (256 keys/page) held in process RAM (~34MB for the tier-1 index). Lookup = in-RAM binary search
+//   over the fence -> exactly ONE keys-page probe range (<=8 in-page probes, all in the same 4KB
+//   page) -> at most 1 keys-page fault + 1 rows-page fault per uncached lookup, instead of ~30
+//   probe-page faults. FAIL-OPEN: a missing/invalid sidecar (count/first/last/monotonicity checks)
+//   silently degrades to the plain full-range binary search — the serve never breaks on a missing
+//   or stale sidecar.
+//
+//   OPT-BP2 ROW CACHE (env POKERBOT_BP_ROWCACHE, default ON): bounded sharded key->row memo (64
+//   shards x 16384 entries ~= 1.05M entries, ~90MB worst case, clear-on-cap per shard like the
+//   trainer's FpMemo). The index is immutable for the process lifetime, so the cache is PURE: a hit
+//   returns the exact f32 row bytes a miss would decode. Turns the 20k-75k per-solve lookups into
+//   ~#distinct-keys mmap probes, persists hot rows across solves (recurring infosets across hands),
+//   and caps the catastrophic co-located-load regime (an evicted page faults at most once per
+//   distinct key, not once per CFR iteration).
+//
+// Rows stay raw f32 (decoded to f64 exactly as before — f32->f64 widening is exact); NO
+// quantization anywhere. Solve-level bit-identity ON vs OFF is gated by
+// tests::bp_index_fence_cache::solve_bit_identical_fence_cache_on_off.
+// ---------------------------------------------------------------------------------------------
+
+/// One fence key per 4KB keys-page: 4096 / 16.
+pub const FENCE_KEYS_PER_PAGE: usize = 256;
+const FENCE_MAGIC: &[u8; 8] = b"BPFENCE1";
+const FENCE_HEADER_LEN: usize = 32; // magic(8) + n_keys u64 + keys_per_page u64 + n_fence u64
+
+const ROWCACHE_SHARDS: usize = 64;
+const ROWCACHE_PER_SHARD_CAP: usize = 16 * 1024; // 64 * 16384 = 1,048,576 entries total
+
+/// Identity-style hasher for the 16B blake2b digest keys (already uniform): fold 8-byte chunks.
+/// hashbrown derives bucket + control bits from `finish()`; digest bytes give them full entropy
+/// without a second hash pass.
+#[derive(Default, Clone)]
+struct DigestHasher(u64);
+
+impl std::hash::Hasher for DigestHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut b = [0u8; 8];
+            b[..chunk.len()].copy_from_slice(chunk);
+            self.0 = self.0.rotate_left(29) ^ u64::from_le_bytes(b);
+        }
+    }
+}
+
+#[derive(Default, Clone)]
+struct BuildDigestHasher;
+
+impl std::hash::BuildHasher for BuildDigestHasher {
+    type Hasher = DigestHasher;
+    #[inline]
+    fn build_hasher(&self) -> DigestHasher {
+        DigestHasher::default()
+    }
+}
+
+type RowMap = HashMap<[u8; 16], Option<[f32; NUM_ACTIONS]>, BuildDigestHasher>;
+
+/// OPT-BP2: bounded sharded pure row cache. Shard select uses key byte 8 — independent of the
+/// hasher's fold so shard choice and in-shard bucket bits don't correlate. Misses are cached too
+/// (`None`): an absent key costs the full search exactly once per cap-window.
+struct RowCache {
+    shards: Vec<std::sync::RwLock<RowMap>>,
+}
+
+impl RowCache {
+    fn new() -> Self {
+        RowCache {
+            shards: (0..ROWCACHE_SHARDS)
+                .map(|_| std::sync::RwLock::new(RowMap::default()))
+                .collect(),
+        }
+    }
+
+    #[inline]
+    fn shard(key: &[u8; 16]) -> usize {
+        key[8] as usize & (ROWCACHE_SHARDS - 1)
+    }
+
+    /// Outer None = cache miss; Some(inner) = the cached lookup result (inner None = key absent).
+    #[inline]
+    fn probe(&self, key: &[u8; 16]) -> Option<Option<[f32; NUM_ACTIONS]>> {
+        match self.shards[Self::shard(key)].read() {
+            Ok(m) => m.get(key).copied(),
+            Err(_) => None, // poisoned (panic while held) => treat as miss; never propagate
+        }
+    }
+
+    #[inline]
+    fn insert(&self, key: [u8; 16], v: Option<[f32; NUM_ACTIONS]>) {
+        if let Ok(mut m) = self.shards[Self::shard(&key)].write() {
+            if m.len() >= ROWCACHE_PER_SHARD_CAP {
+                m.clear(); // FpMemo clear-on-cap contract: bounds a long-lived serve process
+            }
+            m.insert(key, v);
+        }
+    }
+}
+
+/// Memory-mapped sorted key/row store (see `Blueprint::Index`). Send+Sync (read-only mmaps; the
+/// row cache is internally locked), so `Arc<Blueprint>` sharing across rayon workers keeps working.
 pub struct SortedIndex {
     keys: memmap2::Mmap,
     rows: memmap2::Mmap,
     n: usize,
+    /// OPT-BP1: first key of every 4KB keys-page, loaded from the `keys_fence.bin` sidecar
+    /// (None = sidecar absent/invalid or gated off => plain full-range binary search).
+    fence: Option<Vec<[u8; 16]>>,
+    /// OPT-BP2: bounded sharded pure key->row memo (None = gated off).
+    cache: Option<RowCache>,
 }
 
 impl SortedIndex {
+    /// Production open: fence + row cache default ON, individually killable via
+    /// `POKERBOT_BP_FENCE=0` / `POKERBOT_BP_ROWCACHE=0` (rollback levers; both paths are
+    /// bit-identical to the plain search by construction and by the tests gate).
     pub fn open(dir: &str) -> std::io::Result<Self> {
+        let use_fence = std::env::var("POKERBOT_BP_FENCE").map(|v| v != "0").unwrap_or(true);
+        let use_cache = std::env::var("POKERBOT_BP_ROWCACHE").map(|v| v != "0").unwrap_or(true);
+        Self::open_with(dir, use_fence, use_cache)
+    }
+
+    /// Explicit-gates twin of `open` (tests exercise every on/off combination without racing the
+    /// process environment).
+    pub fn open_with(dir: &str, use_fence: bool, use_cache: bool) -> std::io::Result<Self> {
         let kp = std::path::Path::new(dir).join("keys_sorted.bin");
         let rp = std::path::Path::new(dir).join("rows_sorted.f32.bin");
         let kf = std::fs::File::open(&kp)?;
@@ -178,7 +308,81 @@ impl SortedIndex {
                         NUM_ACTIONS * 4),
             ));
         }
-        Ok(SortedIndex { keys, rows, n })
+        let mut ix = SortedIndex { keys, rows, n, fence: None, cache: None };
+        if use_fence {
+            ix.fence = ix.load_fence(dir);
+        }
+        if use_cache {
+            ix.cache = Some(RowCache::new());
+        }
+        Ok(ix)
+    }
+
+    /// Load + validate the `keys_fence.bin` sidecar. ANY failure => None (FAIL-OPEN to the plain
+    /// binary search) with a single stderr note when a sidecar exists but is invalid — the serve
+    /// must never break on a missing/stale sidecar. Validation: header (magic/count/page-size),
+    /// exact file length, strictly-increasing fence keys (equal entries would imply >=256
+    /// duplicate index keys — refuse), and mmap spot-checks (first/last/8 spread fence entries
+    /// must equal the actual page-first keys; <=10 page faults at open).
+    fn load_fence(&self, dir: &str) -> Option<Vec<[u8; 16]>> {
+        let fp = std::path::Path::new(dir).join("keys_fence.bin");
+        let data = match std::fs::read(&fp) {
+            Ok(d) => d,
+            Err(_) => return None, // absent sidecar: normal pre-build state, stay silent
+        };
+        let fail = |why: &str| {
+            eprintln!(
+                "[SortedIndex] keys_fence.bin invalid ({why}) — FAIL-OPEN to plain binary search: {}",
+                fp.display()
+            );
+            None
+        };
+        if data.len() < FENCE_HEADER_LEN {
+            return fail("short header");
+        }
+        if &data[..8] != FENCE_MAGIC {
+            return fail("bad magic");
+        }
+        let rd_u64 = |off: usize| u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        let n_keys = rd_u64(8) as usize;
+        let kpp = rd_u64(16) as usize;
+        let n_fence = rd_u64(24) as usize;
+        if n_keys != self.n {
+            return fail("n_keys mismatch vs keys_sorted.bin");
+        }
+        if kpp != FENCE_KEYS_PER_PAGE {
+            return fail("keys_per_page mismatch");
+        }
+        if n_fence != self.n.div_ceil(FENCE_KEYS_PER_PAGE) {
+            return fail("n_fence mismatch");
+        }
+        if data.len() != FENCE_HEADER_LEN + n_fence * 16 {
+            return fail("file length mismatch");
+        }
+        let mut fence: Vec<[u8; 16]> = Vec::with_capacity(n_fence);
+        for i in 0..n_fence {
+            let off = FENCE_HEADER_LEN + i * 16;
+            let k: [u8; 16] = data[off..off + 16].try_into().unwrap();
+            if let Some(prev) = fence.last() {
+                if *prev >= k {
+                    return fail("fence keys not strictly increasing");
+                }
+            }
+            fence.push(k);
+        }
+        // Spot-check against the mmap: first, last, and 8 evenly spread entries.
+        if n_fence > 0 {
+            let mut probes = vec![0usize, n_fence - 1];
+            for j in 1..=8usize {
+                probes.push((n_fence - 1) * j / 9);
+            }
+            for &i in &probes {
+                if fence[i][..] != *self.key_at(i * FENCE_KEYS_PER_PAGE) {
+                    return fail("fence entry != page-first key (stale sidecar?)");
+                }
+            }
+        }
+        Some(fence)
     }
 
     #[inline]
@@ -186,36 +390,231 @@ impl SortedIndex {
         &self.keys[i * 16..i * 16 + 16]
     }
 
-    /// Binary search over the sorted raw 16-byte keys. Raw memcmp order == numpy 'S16' sort order
-    /// for fixed-width 16-byte data (NUL is the smallest byte and S16 pads with NULs), so the
-    /// Python-side searchsorted and this search agree on every key.
-    pub fn get(&self, key: &[u8; 16]) -> Option<[f64; NUM_ACTIONS]> {
-        let (mut lo, mut hi) = (0usize, self.n);
+    /// Binary search for `key` over `[lo, hi)` of the sorted raw 16-byte keys; returns the matched
+    /// row index. Raw memcmp order == numpy 'S16' sort order for fixed-width 16-byte data (NUL is
+    /// the smallest byte and S16 pads with NULs), so the Python-side searchsorted and this search
+    /// agree on every key. The comparison loop is byte-identical to the pre-OPT-BP full search.
+    #[inline]
+    fn search_range(&self, key: &[u8; 16], mut lo: usize, mut hi: usize) -> Option<usize> {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             match self.key_at(mid).cmp(&key[..]) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => {
-                    let off = mid * NUM_ACTIONS * 4;
-                    let mut row = [0.0f64; NUM_ACTIONS];
-                    for (a, slot) in row.iter_mut().enumerate() {
-                        let b = off + a * 4;
-                        *slot = f32::from_le_bytes([
-                            self.rows[b], self.rows[b + 1], self.rows[b + 2], self.rows[b + 3],
-                        ]) as f64;
-                    }
-                    return Some(row);
-                }
+                std::cmp::Ordering::Equal => return Some(mid),
             }
         }
         None
+    }
+
+    /// The pre-OPT-BP lookup: full-range binary search (~log2(n) random-page probes).
+    #[inline]
+    pub(crate) fn search_plain(&self, key: &[u8; 16]) -> Option<usize> {
+        self.search_range(key, 0, self.n)
+    }
+
+    /// OPT-BP1 lookup: in-RAM fence search -> one in-page binary search. Finds a match iff one
+    /// exists: all occurrences of `key` lie in the page whose first key is the greatest fence
+    /// entry <= key (keys are sorted; the next fence entry is > key). With unique keys (the digest
+    /// index invariant, enforced at fence-build and load via strict monotonicity across pages)
+    /// the returned index is exactly `search_plain`'s.
+    #[inline]
+    pub(crate) fn search_fenced(&self, fence: &[[u8; 16]], key: &[u8; 16]) -> Option<usize> {
+        let p = fence.partition_point(|f| f <= key);
+        if p == 0 {
+            return None; // key < keys[0]
+        }
+        let lo = (p - 1) * FENCE_KEYS_PER_PAGE;
+        let hi = (lo + FENCE_KEYS_PER_PAGE).min(self.n);
+        self.search_range(key, lo, hi)
+    }
+
+    /// Raw f32 row at index `i` (LE decode; the exact bytes `get` always decoded).
+    #[inline]
+    fn row32_at(&self, i: usize) -> [f32; NUM_ACTIONS] {
+        let off = i * NUM_ACTIONS * 4;
+        let mut row = [0.0f32; NUM_ACTIONS];
+        for (a, slot) in row.iter_mut().enumerate() {
+            let b = off + a * 4;
+            *slot = f32::from_le_bytes([
+                self.rows[b], self.rows[b + 1], self.rows[b + 2], self.rows[b + 3],
+            ]);
+        }
+        row
+    }
+
+    /// Uncached lookup: fence search when loaded, else plain. Returns the raw f32 row.
+    #[inline]
+    fn lookup_row32(&self, key: &[u8; 16]) -> Option<[f32; NUM_ACTIONS]> {
+        let i = match &self.fence {
+            Some(f) => self.search_fenced(f, key),
+            None => self.search_plain(key),
+        }?;
+        Some(self.row32_at(i))
+    }
+
+    /// Row lookup. Bit-identical to the pre-OPT-BP `get` under every gate combination: the f64 row
+    /// is always `f32::from_le_bytes(..) as f64` of the same 44 row bytes (f32->f64 widening is
+    /// exact, so caching the f32s loses nothing).
+    pub fn get(&self, key: &[u8; 16]) -> Option<[f64; NUM_ACTIONS]> {
+        #[inline]
+        fn widen(r: [f32; NUM_ACTIONS]) -> [f64; NUM_ACTIONS] {
+            let mut out = [0.0f64; NUM_ACTIONS];
+            for (o, v) in out.iter_mut().zip(r.iter()) {
+                *o = *v as f64;
+            }
+            out
+        }
+        if let Some(c) = &self.cache {
+            if let Some(hit) = c.probe(key) {
+                #[cfg(feature = "prof")]
+                crate::prof::count(crate::prof::C_BP_CACHE_HIT);
+                return hit.map(widen);
+            }
+            let r32 = self.lookup_row32(key);
+            c.insert(*key, r32);
+            return r32.map(widen);
+        }
+        self.lookup_row32(key).map(widen)
+    }
+
+    /// Test accessor: fenced search using the loaded sidecar (panics if the fence is not loaded).
+    #[cfg(test)]
+    pub(crate) fn search_fenced_loaded(&self, key: &[u8; 16]) -> Option<usize> {
+        self.search_fenced(self.fence.as_ref().expect("fence not loaded"), key)
+    }
+
+    /// True when the fence sidecar loaded + validated (OPT-BP1 active).
+    pub fn fence_active(&self) -> bool {
+        self.fence.is_some()
+    }
+
+    /// True when the sharded row cache is on (OPT-BP2 active).
+    pub fn cache_active(&self) -> bool {
+        self.cache.is_some()
     }
 
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.n
     }
+}
+
+/// Build the `keys_fence.bin` sidecar for an index dir: ONE sequential scan of `keys_sorted.bin`,
+/// recording the first key of every 4KB page (every 256th key) and verifying sort order along the
+/// way. Refuses to write on any out-of-order pair (corrupt index) and reports duplicate-key count
+/// (duplicates are legal for the searches but a digest index should have none). Writes to a `.tmp`
+/// then renames, so a crashed build never leaves a half-written sidecar (which would anyway
+/// fail-open at load). Returns (n_keys, n_fence).
+///
+/// Tier-1 index cost: an 8.6GB sequential read (~tens of seconds on NVMe) that WILL cycle that
+/// much page cache — run it in a maintenance window, not next to a live bot (standing rule:
+/// progress lines every ~2s when `progress`).
+pub fn build_keys_fence(dir: &str, progress: bool) -> std::io::Result<(usize, usize)> {
+    use std::io::{Read, Write};
+    let kp = std::path::Path::new(dir).join("keys_sorted.bin");
+    let f = std::fs::File::open(&kp)?;
+    let total = f.metadata()?.len();
+    if total % 16 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: size {} not a multiple of 16", kp.display(), total),
+        ));
+    }
+    let n_keys = (total / 16) as usize;
+    let mut reader = std::io::BufReader::with_capacity(8 << 20, f);
+    let mut fence: Vec<u8> = Vec::with_capacity(n_keys.div_ceil(FENCE_KEYS_PER_PAGE) * 16);
+    let mut prev = [0u8; 16];
+    let mut have_prev = false;
+    let mut dups = 0u64;
+    let mut buf = vec![0u8; 4 << 20]; // 4MB, a multiple of 16
+    let mut idx = 0usize;
+    let t0 = std::time::Instant::now();
+    let mut last_tick = std::time::Instant::now();
+    loop {
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let r = reader.read(&mut buf[filled..])?;
+            if r == 0 {
+                break;
+            }
+            filled += r;
+        }
+        if filled == 0 {
+            break;
+        }
+        if filled % 16 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated 16B key record",
+            ));
+        }
+        for rec in buf[..filled].chunks_exact(16) {
+            let k: &[u8; 16] = rec.try_into().unwrap();
+            if have_prev {
+                match prev.cmp(k) {
+                    std::cmp::Ordering::Greater => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("keys_sorted.bin OUT OF ORDER at record {idx} — refusing to build fence"),
+                        ));
+                    }
+                    std::cmp::Ordering::Equal => dups += 1,
+                    std::cmp::Ordering::Less => {}
+                }
+            }
+            if idx % FENCE_KEYS_PER_PAGE == 0 {
+                fence.extend_from_slice(k);
+            }
+            prev = *k;
+            have_prev = true;
+            idx += 1;
+        }
+        if progress && last_tick.elapsed() >= std::time::Duration::from_secs(2) {
+            let done = (idx * 16) as f64;
+            let pct = 100.0 * done / total.max(1) as f64;
+            let mbps = done / 1e6 / t0.elapsed().as_secs_f64().max(1e-9);
+            let eta = ((total as f64 - done) / 1e6 / mbps.max(1e-9)) as u64;
+            eprintln!("[build_keys_fence] {pct:.1}% ({idx}/{n_keys} keys) {mbps:.0} MB/s ETA {eta}s");
+            last_tick = std::time::Instant::now();
+        }
+    }
+    if idx != n_keys {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("read {idx} keys, expected {n_keys}"),
+        ));
+    }
+    if dups > 0 {
+        eprintln!(
+            "[build_keys_fence] WARNING: {dups} duplicate adjacent keys (digest index should have 0; \
+fence still valid unless >=256 in a row)"
+        );
+    }
+    let n_fence = fence.len() / 16;
+    let mut out: Vec<u8> = Vec::with_capacity(FENCE_HEADER_LEN + fence.len());
+    out.extend_from_slice(FENCE_MAGIC);
+    out.extend_from_slice(&(n_keys as u64).to_le_bytes());
+    out.extend_from_slice(&(FENCE_KEYS_PER_PAGE as u64).to_le_bytes());
+    out.extend_from_slice(&(n_fence as u64).to_le_bytes());
+    out.extend_from_slice(&fence);
+    let fp = std::path::Path::new(dir).join("keys_fence.bin");
+    let tmp = std::path::Path::new(dir).join("keys_fence.bin.tmp");
+    {
+        let mut w = std::fs::File::create(&tmp)?;
+        w.write_all(&out)?;
+        w.sync_all()?;
+    }
+    std::fs::rename(&tmp, &fp)?;
+    if progress {
+        eprintln!(
+            "[build_keys_fence] DONE n_keys={n_keys} n_fence={n_fence} ({} bytes) in {:.1}s -> {}",
+            out.len(),
+            t0.elapsed().as_secs_f64(),
+            fp.display()
+        );
+    }
+    Ok((n_keys, n_fence))
 }
 
 impl Blueprint {
