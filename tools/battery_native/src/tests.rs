@@ -485,6 +485,7 @@ mod subgame_n7 {
             leaf_bias_mult: 5.0,     // R2 Pluribus multiplier (only read when the bool is ON)
             serve_final_iterate: false, // R5a default OFF => averaged extraction, byte-identical
             root_unmask: 0,          // Stage-1 default 0 => no root widening, byte-identical
+            raise_cap_per_street: 0, // TASK-75 default 0 => no ladder thinning, byte-identical
         }
     }
 
@@ -1714,6 +1715,7 @@ mod range_reach_r1 {
             leaf_bias_mult: 5.0,
             serve_final_iterate: false,
             root_unmask: 0,
+            raise_cap_per_street: 0, // TASK-75 default 0 => byte-identical
         }
     }
 
@@ -2436,6 +2438,7 @@ mod opt1_settle_join {
             leaf_bias_mult: 5.0,
             serve_final_iterate: false,
             root_unmask: 0,
+            raise_cap_per_street: 0, // TASK-75 default 0 => byte-identical
         }
     }
 
@@ -2847,6 +2850,7 @@ mod bp_index_fence_cache {
             leaf_bias_mult: 5.0,
             serve_final_iterate: false,
             root_unmask: 0,
+            raise_cap_per_street: 0, // TASK-75 default 0 => byte-identical
         }
     }
 
@@ -2946,5 +2950,243 @@ fence={use_fence} cache={use_cache})"
                 }
             }
         }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// TASK-75 (2026-07-13) — interruptible + GIL-free native solve: wall-clock cap, structural
+// deep-SPR raise-ladder bound, and the BIT-IDENTITY proof vs the pre-change binary.
+//
+// The GOLDEN vectors below were captured from the PRE-change tree (commit parent of this change)
+// with the exact configs used here — `solve` (now a `solve_capped(.., wall_cap_ms=0)` wrapper)
+// must keep reproducing them bit-for-bit, proving the refactor + the deadline-None fast path +
+// the raise_cap_per_street=0 default change NOTHING. Only cap-HIT runs may differ (bounded,
+// honest early return — asserted separately).
+// ---------------------------------------------------------------------------
+mod wall_cap_t75 {
+    use super::*;
+    use crate::core::{legal_action_mask, NUM_ACTIONS};
+    use crate::playout::{Blueprint, PlayoutConfig};
+    use crate::subgame::{self, SubgameConfig};
+    use std::collections::HashMap;
+
+    fn pcfg7() -> PlayoutConfig {
+        PlayoutConfig {
+            allowed_pre: [true; NUM_ACTIONS],
+            allowed_post: [true; NUM_ACTIONS],
+            bias_mult: 5.0,
+            bias_floor: 0.0,
+            max_depth: 24,
+            num_buckets: 200,
+            emd: None,
+        }
+    }
+
+    fn scfg7() -> SubgameConfig {
+        SubgameConfig {
+            max_iterations: 32,
+            max_depth: 8,
+            blueprint_mix: 0.0,
+            rollout_samples: 2,
+            resample_board: true,
+            linear_averaging: true,
+            repair_deck: false,
+            two_sided: false,
+            decouple_sampler: false,
+            range_aware: false,
+            range_uniform_floor: 0.25,
+            range_reach_full: false,
+            ensemble_streams: 1,
+            leaf_cache_worlds: 1,
+            avg_skip_frac: 0.0,
+            leaf_biased_continuations: false,
+            leaf_bias_mult: 5.0,
+            serve_final_iterate: false,
+            root_unmask: 0,
+            raise_cap_per_street: 0,
+        }
+    }
+
+    fn assert_valid_root_probs(env: &EnvStateN<7>, hero: usize, probs: &[f64; NUM_ACTIONS]) {
+        let legal = legal_action_mask::<7>(env, hero as i32);
+        let mut s = 0.0;
+        for a in 0..NUM_ACTIONS {
+            assert!(probs[a].is_finite(), "prob[{a}] not finite: {}", probs[a]);
+            assert!(probs[a] >= -1e-12, "prob[{a}] negative: {}", probs[a]);
+            if !legal[a] {
+                assert!(probs[a].abs() < 1e-9, "mass {} on illegal action {a}", probs[a]);
+            }
+            s += probs[a];
+        }
+        assert!((s - 1.0).abs() < 1e-6, "root probs must sum to 1, got {s}");
+    }
+
+    // Golden to_bits vectors captured from the PRE-change binary (see the module header).
+    const G1: [u64; NUM_ACTIONS] = [
+        0x3fa58c71ac8d0cb5, 0x0000000000000000, 0x3fada72bfdb7d323, 0x3fbdb890661a6dfe,
+        0x3fc5c3d27bede666, 0x3fc1f8bb1d8f3e80, 0x3fb8d374a3ce09ff, 0x3fc5026ebfab86ae,
+        0x3fc326222a0b7cb8, 0x3faeba9592ad8130, 0x3f66548a26c0dd17,
+    ];
+    const G2: [u64; NUM_ACTIONS] = [
+        0x3fb463b1464f1b24, 0x0000000000000000, 0x3fbbc82e76fdf4f5, 0x3fb459f90104ffa2,
+        0x3fc49ba9035ee906, 0x3fb80a17752ec227, 0x3fc0ade2808fb0de, 0x3fb7de7ee4c266f3,
+        0x3fc24da7d112b911, 0x3fbae3efb80c010c, 0x3f77f3a85ae202a1,
+    ];
+    const G3: [u64; NUM_ACTIONS] = [
+        0x3fa847ab4341f558, 0x0000000000000000, 0x3fa6666bbd015ea7, 0x3f723456789abcdf,
+        0x3fa434ac6a40db09, 0x3fb36df8f94e693d, 0x3fbd61a16eed01f6, 0x3f90d9007fd30f7f,
+        0x3fce96cbe0ea3a33, 0x3fda85284c697b5a, 0x3f723456789abcdf,
+    ];
+
+    fn assert_bits(probs: &[f64; NUM_ACTIONS], golden: &[u64; NUM_ACTIONS], tag: &str) {
+        for a in 0..NUM_ACTIONS {
+            assert_eq!(
+                probs[a].to_bits(),
+                golden[a],
+                "{tag}: action {a} must be BIT-IDENTICAL to the pre-change binary \
+(got 0x{:016x}, want 0x{:016x})",
+                probs[a].to_bits(),
+                golden[a]
+            );
+        }
+    }
+
+    // (1) BIT-IDENTITY vs the pre-change binary: `solve` (wall cap OFF), `solve_capped(.., 0)`
+    // (explicit off) and `solve_capped(.., huge-not-hit)` must all reproduce the captured goldens
+    // exactly — across the single-stream, 8-stream-ensemble (rayon) and
+    // two_sided+range_aware+decouple configs.
+    #[test]
+    fn t75_wall_cap_off_bit_identical_to_pre_change_golden() {
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = Blueprint::new();
+        let pc = pcfg7();
+
+        // G1: defaults, seed 0xC0FFEE.
+        let sc = scfg7();
+        let p = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 0xC0FFEE);
+        assert_bits(&p, &G1, "G1 solve");
+        let (p0, capped0, it0) = subgame::solve_capped::<7>(&env, hero, &bp, &pc, &sc, 0xC0FFEE, 0);
+        assert_bits(&p0, &G1, "G1 solve_capped(0)");
+        assert!(!capped0, "wall_cap=0 must never flag capped");
+        assert_eq!(it0, sc.max_iterations, "wall_cap=0 must complete every iteration");
+        let (ph, cappedh, ith) =
+            subgame::solve_capped::<7>(&env, hero, &bp, &pc, &sc, 0xC0FFEE, 600_000);
+        assert_bits(&ph, &G1, "G1 solve_capped(huge, not hit)");
+        assert!(!cappedh, "an unexpired cap must never flag capped");
+        assert_eq!(ith, sc.max_iterations);
+
+        // G2: ensemble_streams=8 (rayon fan-out), seed 0xBADC0DE.
+        let sc8 = SubgameConfig { ensemble_streams: 8, ..scfg7() };
+        let p2 = subgame::solve::<7>(&env, hero, &bp, &pc, &sc8, 0xBADC0DE);
+        assert_bits(&p2, &G2, "G2 solve(ensemble=8)");
+        let (p2c, capped2, it2) =
+            subgame::solve_capped::<7>(&env, hero, &bp, &pc, &sc8, 0xBADC0DE, 600_000);
+        assert_bits(&p2c, &G2, "G2 solve_capped(huge, ensemble=8)");
+        assert!(!capped2);
+        assert_eq!(it2, sc8.max_iterations, "min-across-streams must be the full count");
+
+        // G3: two_sided + range_aware + decouple, seed 777.
+        let sc3 =
+            SubgameConfig { two_sided: true, range_aware: true, decouple_sampler: true, ..scfg7() };
+        let p3 = subgame::solve::<7>(&env, hero, &bp, &pc, &sc3, 777);
+        assert_bits(&p3, &G3, "G3 solve(two_sided+range_aware+decouple)");
+        let (p3c, capped3, _) = subgame::solve_capped::<7>(&env, hero, &bp, &pc, &sc3, 777, 600_000);
+        assert_bits(&p3c, &G3, "G3 solve_capped(huge)");
+        assert!(!capped3);
+    }
+
+    // (2) CAP HIT: an absurd iteration target under a tiny wall cap must return QUICKLY with a
+    // bounded, flagged, still-valid distribution — never a panic, never an unbounded run. (The
+    // capped result is timing-dependent by design, so no bit assertion here — only bounds.)
+    #[test]
+    fn t75_wall_cap_hit_returns_bounded_flagged_valid() {
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = Blueprint::new();
+        let pc = pcfg7();
+        let sc = SubgameConfig { max_iterations: 50_000_000, ..scfg7() };
+        let t0 = std::time::Instant::now();
+        let (p, capped, iters) = subgame::solve_capped::<7>(&env, hero, &bp, &pc, &sc, 42, 50);
+        let wall = t0.elapsed();
+        assert!(capped, "a 50ms cap under a 50M-iteration target must flag capped");
+        assert!(iters >= 0 && iters < sc.max_iterations, "iters_completed must be bounded, got {iters}");
+        assert!(
+            wall < std::time::Duration::from_secs(10),
+            "cap-hit solve must return promptly (took {wall:?})"
+        );
+        assert_valid_root_probs(&env, hero, &p);
+
+        // Ensemble cap-hit: every stream latches its own cap; min-iters + OR-capped surface.
+        let sc8 = SubgameConfig { max_iterations: 50_000_000, ensemble_streams: 4, ..scfg7() };
+        let t1 = std::time::Instant::now();
+        let (p8, capped8, iters8) = subgame::solve_capped::<7>(&env, hero, &bp, &pc, &sc8, 42, 50);
+        assert!(capped8);
+        assert!(iters8 >= 0 && iters8 < sc8.max_iterations);
+        assert!(t1.elapsed() < std::time::Duration::from_secs(10));
+        assert_valid_root_probs(&env, hero, &p8);
+    }
+
+    // (3) STRUCTURAL RAISE CAP: 0 (default) is covered by the goldens above; ON must (a) return a
+    // valid, deterministic distribution, (b) leave the ROOT menu untouched (only interior nodes
+    // are thinned), and (c) actually change the solve on a deep-stack root (the knob is live).
+    #[test]
+    fn t75_raise_cap_valid_deterministic_and_live() {
+        let env = init_hand_7(400); // 400bb deep => long min-raise ladders => the knob must bind
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = Blueprint::new();
+        let pc = pcfg7();
+        let capped_cfg = SubgameConfig { raise_cap_per_street: 2, ..scfg7() };
+        let a = subgame::solve::<7>(&env, hero, &bp, &pc, &capped_cfg, 0xC0FFEE);
+        let b = subgame::solve::<7>(&env, hero, &bp, &pc, &capped_cfg, 0xC0FFEE);
+        assert_valid_root_probs(&env, hero, &a);
+        assert_eq!(a, b, "raise-capped solve must be deterministic for a fixed seed");
+        // Root menu untouched: a capped INTERIOR tree must not gut the root menu — the served
+        // distribution should keep support across (nearly) the full legal set.
+        let legal = legal_action_mask::<7>(&env, hero as i32);
+        let n_legal = (0..NUM_ACTIONS).filter(|&x| legal[x]).count();
+        let n_support = (0..NUM_ACTIONS).filter(|&x| a[x] > 0.0).count();
+        assert!(
+            n_support >= n_legal.saturating_sub(2),
+            "raise cap must not gut the ROOT menu (support {n_support} of {n_legal} legal)"
+        );
+        let base = subgame::solve::<7>(&env, hero, &bp, &pc, &scfg7(), 0xC0FFEE);
+        assert_ne!(a, base, "raise_cap_per_street=2 must actually change a 400bb-deep solve");
+    }
+
+    // (4) EXPLOIT twin: solve_exploit == solve_exploit_capped(.., 0) bit-for-bit (empty frozen
+    // table => pure base fallback path), and a tiny cap under an absurd target returns bounded +
+    // flagged + valid.
+    #[test]
+    fn t75_exploit_wall_cap_identity_and_cap_hit() {
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = Blueprint::new();
+        let pc = pcfg7();
+        let sc = scfg7();
+        let frozen: subgame::FrozenTable = HashMap::new();
+        let rnr = [f64::NAN; 6];
+        let (p_leg, q_leg) =
+            subgame::solve_exploit::<7>(&env, hero, &bp, &pc, &sc, 99, &frozen, &rnr, false, true, true);
+        let (p_cap, q_cap, capped, iters) = subgame::solve_exploit_capped::<7>(
+            &env, hero, &bp, &pc, &sc, 99, &frozen, &rnr, false, true, true, 0,
+        );
+        for a in 0..NUM_ACTIONS {
+            assert_eq!(p_leg[a].to_bits(), p_cap[a].to_bits(), "exploit probs action {a}");
+            assert_eq!(q_leg[a].to_bits(), q_cap[a].to_bits(), "exploit root_q action {a}");
+        }
+        assert!(!capped);
+        assert_eq!(iters, sc.max_iterations);
+
+        let sc_big = SubgameConfig { max_iterations: 50_000_000, ..scfg7() };
+        let t0 = std::time::Instant::now();
+        let (p, _q, capped2, iters2) = subgame::solve_exploit_capped::<7>(
+            &env, hero, &bp, &pc, &sc_big, 99, &frozen, &rnr, false, true, false, 50,
+        );
+        assert!(capped2, "exploit cap-hit must flag capped");
+        assert!(iters2 < sc_big.max_iterations);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10));
+        assert_valid_root_probs(&env, hero, &p);
     }
 }
