@@ -517,6 +517,28 @@ def wire_native_exploit_serve(solver) -> bool:
 _NATIVE_FIT_BUDGET_MS = 10_000
 _NATIVE_FIT_PROBE_ITERS = 200
 
+# TASK-75 (2026-07-13): IN-NATIVE WALL-CLOCK CAP. The budget fit above bounds the ITERATION COUNT,
+# but per-iteration cost is unbounded at pathological geometry (deep-SPR min-raise ladders: a live
+# flop solve at SPR ~150 sat 9+ MINUTES inside one FFI call, wedging the whole interpreter because
+# the call also held the GIL). The rebuilt binary (a) releases the GIL for every solve and (b)
+# accepts wall_cap_ms — a cooperative in-native deadline checked per CFR iteration AND per 1024
+# tree nodes; on expiry it returns the strategy_sum banked by the COMPLETED iterations with
+# wall_capped/iters_completed metadata (the under-search guard then judges the serve by its honest
+# iteration count). Under a live-scale budget (the fit regime) every native call gets
+# cap = remaining_budget * PAD + 100ms — a safety NET above the fit, not a scheduler; it never
+# fires on healthy solves (the fit keeps those under budget) and structurally bounds the
+# pathological ones. Eval/battery/cert budgets (>= _NATIVE_FIT_BUDGET_MS) pass cap 0 (off) =>
+# byte-identical certified behavior. POKERBOT_NATIVE_WALL_CAP=0 disables the cap wiring entirely.
+_NATIVE_WALL_CAP_ENABLED = (os.environ.get("POKERBOT_NATIVE_WALL_CAP", "1").strip().lower()
+                            not in ("0", "false", "no", "off"))
+_NATIVE_WALL_CAP_PAD = 1.25
+# TASK-75: structural deep-SPR raise-ladder bound (GTO path only; see subgame.rs
+# raise_cap_per_street). After N aggressive actions on a street INSIDE the subgame tree, non-root
+# nodes keep only fold/check/call/all-in — the Pluribus-style capped-raises abstraction that stops
+# the deep-SPR tree explosion at its root cause. 0 (default) = off, byte-identical; the certified
+# arena re-enable plan is POKERBOT_SUBGAME_RAISE_CAP=3 alongside the wall cap.
+_NATIVE_RAISE_CAP = int(os.environ.get("POKERBOT_SUBGAME_RAISE_CAP", "0") or 0)
+
 
 def _abstraction_masks(client_bet_sizing: bool):
     if not client_bet_sizing:
@@ -1477,11 +1499,28 @@ class PluribusReBeLSolver:
             from pokerbot.search import native_solver as _ns
 
             _pub_seed = self._public_seed(base_state, hero)
+            # TASK-75: per-call cap metadata (wall_capped / iters_completed) from the last native
+            # call — cleared per call; read after each call to keep the honest iteration count.
+            _last_cap_info: dict = {}
+            _fit = eff_budget_ms < _NATIVE_FIT_BUDGET_MS
+
+            def _wall_cap_now() -> int:
+                # Safety-net deadline for ONE native call: the budget remaining on this decision,
+                # padded (the fit is the scheduler; the cap only catches pathological geometry).
+                # 0 (off) outside the live-fit regime => certified eval behavior byte-identical.
+                if not (_fit and _NATIVE_WALL_CAP_ENABLED):
+                    return 0
+                _remaining = max(0.0, float(eff_budget_ms) - (time.perf_counter() - t0) * 1000.0)
+                return int(_remaining * _NATIVE_WALL_CAP_PAD) + 100
 
             def _native_call(_k: int):
+                _last_cap_info.clear()
                 return _ns.native_subgame_solve(
                     base_state, hero, self.adapter,
                     public_seed=_pub_seed,
+                    wall_cap_ms=_wall_cap_now(),
+                    raise_cap_per_street=int(_NATIVE_RAISE_CAP),
+                    cap_info=_last_cap_info,
                     max_iterations=int(_k), max_depth=cfg.max_depth,
                     blueprint_mix=cfg.blueprint_mix,
                     rollout_samples=cfg.leaf.rollout_samples,
@@ -1527,23 +1566,31 @@ class PluribusReBeLSolver:
                                  if self._river_overbet_armed else 0),
                 )
 
-            _fit = eff_budget_ms < _NATIVE_FIT_BUDGET_MS
             k_probe = min(_NATIVE_FIT_PROBE_ITERS, int(eff_max_iters)) if _fit else int(eff_max_iters)
             probs_n = _native_call(k_probe)
             iters_used = int(k_probe)
-            if probs_n is not None and _fit and k_probe < int(eff_max_iters):
+            # TASK-75: honest per-call accounting — a wall-capped native call completed FEWER
+            # iterations than requested; iters_used must reflect that so the under-search guard
+            # (floor semantics on SolveResult.iterations) judges the serve correctly.
+            wall_capped = bool(_last_cap_info.get("wall_capped", False))
+            if wall_capped:
+                iters_used = int(_last_cap_info.get("iters_completed", 0))
+            if probs_n is not None and _fit and k_probe < int(eff_max_iters) and not wall_capped:
                 probe_ms = (time.perf_counter() - t0) * 1000.0
                 # Cancel between the FFI calls (the audit-fixed live cancel wiring): if the user already
                 # acted, serve the probe solve (K>=200 — still far better-converged than the ~tens of
                 # iterations the cancelled Python loop would have banked).
                 if not (cancel_event is not None and cancel_event.is_set()):
-                    rate = max(probe_ms / float(k_probe), 1e-6)  # ms per iteration AT THIS ROOT
+                    rate = max(probe_ms / float(max(iters_used, 1)), 1e-6)  # ms per iteration AT THIS ROOT
                     remaining_ms = float(eff_budget_ms) - probe_ms
                     k_main = min(int(eff_max_iters), int((remaining_ms * 0.9) / rate))
                     if k_main > k_probe:
                         probs_full = _native_call(k_main)
                         if probs_full is not None:
                             probs_n, iters_used = probs_full, int(k_main)
+                            wall_capped = bool(_last_cap_info.get("wall_capped", False))
+                            if wall_capped:
+                                iters_used = int(_last_cap_info.get("iters_completed", 0))
             if probs_n is not None:
                 probs = probs_n * legal
                 probs = probs / max(probs.sum(), 1e-12)
@@ -1568,6 +1615,11 @@ class PluribusReBeLSolver:
                               # True iff the budget fit served fewer iterations than the target (never
                               # triggers the blueprint blend on this path — see the header note).
                               "budget_bound": bool(iters_used < int(eff_max_iters)),
+                              # TASK-75: the IN-NATIVE wall cap fired on the last call — iterations
+                              # above is the honest COMPLETED count (the under-search guard's floor
+                              # semantics judge/downgrade this serve with zero extra wiring).
+                              "wall_capped": wall_capped,
+                              "iters_completed": int(iters_used),
                               # Stage-1 diagnostic: this native serve solved the widened river root.
                               "river_overbet_armed": bool(self._river_overbet_armed)},
                 )
@@ -1623,11 +1675,24 @@ class PluribusReBeLSolver:
                 # to the pre-wiring behavior. eff_max_iters (not cfg.max_iterations) so the live
                 # single-table convergence floor reaches the exploit path exactly like the GTO path.
                 _pub_seed = self._public_seed(base_state, hero)
+                # TASK-75: same in-native wall-cap safety net as the GTO native path (no raise-cap
+                # here — the exploit FFI does not expose the structural knob, firewall).
+                _last_cap_info: dict = {}
+                _fit = eff_budget_ms < _NATIVE_FIT_BUDGET_MS
+
+                def _wall_cap_now() -> int:
+                    if not (_fit and _NATIVE_WALL_CAP_ENABLED):
+                        return 0
+                    _remaining = max(0.0, float(eff_budget_ms) - (time.perf_counter() - t0) * 1000.0)
+                    return int(_remaining * _NATIVE_WALL_CAP_PAD) + 100
 
                 def _native_exploit_call(_k: int):
+                    _last_cap_info.clear()
                     return _ns.native_subgame_solve_exploit(
                         base_state, hero, self.adapter,
                         public_seed=_pub_seed,
+                        wall_cap_ms=_wall_cap_now(),
+                        cap_info=_last_cap_info,
                         max_iterations=int(_k), max_depth=cfg.max_depth,
                         blueprint_mix=cfg.blueprint_mix,
                         rollout_samples=cfg.leaf.rollout_samples,
@@ -1656,23 +1721,29 @@ class PluribusReBeLSolver:
                         # the certified exploit serve is byte-identical regardless of those GTO-path knobs).
                     )
 
-                _fit = eff_budget_ms < _NATIVE_FIT_BUDGET_MS
                 k_probe = min(_NATIVE_FIT_PROBE_ITERS, int(eff_max_iters)) if _fit else int(eff_max_iters)
                 out = _native_exploit_call(k_probe)
                 iters_used = int(k_probe)
-                if out is not None and _fit and k_probe < int(eff_max_iters):
+                # TASK-75: honest per-call accounting (mirrors the GTO native path).
+                wall_capped = bool(_last_cap_info.get("wall_capped", False))
+                if wall_capped:
+                    iters_used = int(_last_cap_info.get("iters_completed", 0))
+                if out is not None and _fit and k_probe < int(eff_max_iters) and not wall_capped:
                     probe_ms = (time.perf_counter() - t0) * 1000.0
                     # Cancel between the FFI calls (audit-fixed live cancel wiring): if the user already
                     # acted, serve the probe solve (K>=200 beats the ~tens of Python-loop iterations a
                     # cancelled dynamic solve would have banked).
                     if not (cancel_event is not None and cancel_event.is_set()):
-                        rate = max(probe_ms / float(k_probe), 1e-6)  # ms/iter AT THIS ROOT (+ table amort.)
+                        rate = max(probe_ms / float(max(iters_used, 1)), 1e-6)  # ms/iter AT THIS ROOT (+ table amort.)
                         remaining_ms = float(eff_budget_ms) - probe_ms
                         k_main = min(int(eff_max_iters), int((remaining_ms * 0.9) / rate))
                         if k_main > k_probe:
                             out_full = _native_exploit_call(k_main)
                             if out_full is not None:
                                 out, iters_used = out_full, int(k_main)
+                                wall_capped = bool(_last_cap_info.get("wall_capped", False))
+                                if wall_capped:
+                                    iters_used = int(_last_cap_info.get("iters_completed", 0))
                 if out is not None:
                     probs_n, root_q = out
                     probs = probs_n * legal
@@ -1701,7 +1772,11 @@ class PluribusReBeLSolver:
                                   # True iff the budget fit served fewer iterations than the target
                                   # (never triggers the blueprint blend — same rationale as the GTO
                                   # native path header note).
-                                  "budget_bound": bool(iters_used < int(eff_max_iters))},
+                                  "budget_bound": bool(iters_used < int(eff_max_iters)),
+                                  # TASK-75 (see the GTO native path): honest completed count under
+                                  # the in-native wall cap; the under-search guard judges it.
+                                  "wall_capped": wall_capped,
+                                  "iters_completed": int(iters_used)},
                     )
 
         root_key = self._infoset_key(base_state, hero)

@@ -591,6 +591,21 @@ def native_subgame_index_capable() -> bool:
     return "subgame_index_dir" in caps
 
 
+def native_wall_cap_capable() -> bool:
+    """True iff the loaded battery_native binary REPORTS the ``solve_wall_cap`` capability
+    (TASK-75: GIL-released solves + SubgameSolver.solve_capped/solve_exploit_capped with the
+    cooperative in-native wall-clock cap + the structural raise-ladder bound). A stale .pyd
+    without it silently keeps the legacy uncapped (and GIL-holding) calls — callers must treat
+    the cap as best-effort and gate on this probe."""
+    if _EXT is None:
+        return False
+    try:
+        caps = set(_EXT.native_caps())
+    except Exception:  # noqa: BLE001
+        return False
+    return "solve_wall_cap" in caps
+
+
 def native_subgame_available(snapshot=None) -> bool:
     """True iff the native extension exposes SubgameSolver (built) AND the native path is enabled.
 
@@ -704,6 +719,7 @@ def native_subgame_solve(
     ensemble_streams: int = 1, leaf_cache_worlds: int = 1,
     avg_skip_frac: float = 0.0, leaf_biased_continuations: bool = False, leaf_bias_mult: float = 5.0,
     serve_final_iterate: bool = False, root_unmask: int = 0,
+    wall_cap_ms: int = 0, raise_cap_per_street: int = 0, cap_info: dict | None = None,
 ):
     """Native root action-probability vector (length 11) for a depth-limited subgame solve, or None
     if the native path is unavailable / the adapter is not in the supported (bounded, client_bet_sizing)
@@ -735,7 +751,20 @@ def native_subgame_solve(
     ``root_unmask`` (Stage-1 river overbet / off-tree root widening, artifacts/offtree_resolve_design.md
     §3/§8): bitmask of action indices to OR into the abstracted legal mask at the ROOT node only
     (full-legality ANDed; the extraction mask is widened identically). 0 (default) = no widening,
-    byte-identical. GTO path only — the exploit FFI does not accept it."""
+    byte-identical. GTO path only — the exploit FFI does not accept it.
+
+    ``wall_cap_ms`` / ``raise_cap_per_street`` / ``cap_info`` (TASK-75, 2026-07-13): when either
+    cap is > 0 AND the loaded binary reports the ``solve_wall_cap`` capability, the solve goes
+    through ``SubgameSolver.solve_capped`` — the cooperative IN-NATIVE wall-clock deadline
+    (checked per CFR iteration + per 1024 tree nodes; on expiry the strategy_sum banked by the
+    COMPLETED iterations is served — bounded, honest, possibly under-searched, never a panic) and
+    the structural deep-SPR raise-ladder bound (after N aggressive actions per street, non-root
+    nodes keep only fold/check/call/all-in). ``cap_info`` (a caller-supplied dict) receives
+    ``{"wall_capped": bool, "iters_completed": int, "wall_cap_supported": bool}`` so the caller
+    can surface the cap in SolveResult.metadata and let the under-search floor judge the serve.
+    Both caps 0 (default) => the legacy ``solve`` call, byte-identical (the binary releases the
+    GIL either way). A stale .pyd without the capability serves the legacy call and reports
+    ``wall_cap_supported: False``."""
     if not native_subgame_available(getattr(adapter, "snapshot", None)):
         return None
     ckey = (id(adapter), int(max_playout_depth), int(num_buckets))
@@ -746,20 +775,43 @@ def native_subgame_solve(
             return None
         _SUBGAME_ENGINE_CACHE[ckey] = eng
     sb = _to_flat(base_state).tobytes()
+    _want_cap = (int(wall_cap_ms) > 0 or int(raise_cap_per_street) > 0)
+    _cap_ok = _want_cap and native_wall_cap_capable() and hasattr(eng, "solve_capped")
+    if _want_cap and cap_info is not None:
+        cap_info["wall_cap_supported"] = bool(_cap_ok)
     try:
-        probs = eng.solve(
-            sb, int(hero), int(public_seed) & 0xFFFFFFFFFFFFFFFF,
-            int(max_iterations), int(max_depth), float(blueprint_mix),
-            int(rollout_samples), bool(resample_board), bool(linear_averaging),
-            bool(repair_deck), bool(two_sided),
-            bool(decouple_sampler), bool(range_aware), float(range_uniform_floor),
-            bool(range_reach_full),
-            int(ensemble_streams),
-            int(leaf_cache_worlds), float(avg_skip_frac),
-            bool(leaf_biased_continuations), float(leaf_bias_mult),
-            bool(serve_final_iterate),
-            int(root_unmask) & 0xFFFFFFFF,
-        )
+        if _cap_ok:
+            probs, _wall_capped, _iters_done = eng.solve_capped(
+                sb, int(hero), int(public_seed) & 0xFFFFFFFFFFFFFFFF,
+                int(max_iterations), int(max_depth), float(blueprint_mix),
+                int(rollout_samples), bool(resample_board), bool(linear_averaging),
+                bool(repair_deck), bool(two_sided),
+                bool(decouple_sampler), bool(range_aware), float(range_uniform_floor),
+                bool(range_reach_full),
+                int(ensemble_streams),
+                int(leaf_cache_worlds), float(avg_skip_frac),
+                bool(leaf_biased_continuations), float(leaf_bias_mult),
+                bool(serve_final_iterate),
+                int(root_unmask) & 0xFFFFFFFF,
+                int(wall_cap_ms), int(raise_cap_per_street),
+            )
+            if cap_info is not None:
+                cap_info["wall_capped"] = bool(_wall_capped)
+                cap_info["iters_completed"] = int(_iters_done)
+        else:
+            probs = eng.solve(
+                sb, int(hero), int(public_seed) & 0xFFFFFFFFFFFFFFFF,
+                int(max_iterations), int(max_depth), float(blueprint_mix),
+                int(rollout_samples), bool(resample_board), bool(linear_averaging),
+                bool(repair_deck), bool(two_sided),
+                bool(decouple_sampler), bool(range_aware), float(range_uniform_floor),
+                bool(range_reach_full),
+                int(ensemble_streams),
+                int(leaf_cache_worlds), float(avg_skip_frac),
+                bool(leaf_biased_continuations), float(leaf_bias_mult),
+                bool(serve_final_iterate),
+                int(root_unmask) & 0xFFFFFFFF,
+            )
     except TypeError:
         # Stale native binary built before the linear_averaging / repair_deck / two_sided / decouple /
         # range_aware / range_reach_full / leaf_cache_worlds / avg_skip_frac /
@@ -804,14 +856,18 @@ def native_subgame_solve_exploit(
     num_buckets: int, linear_averaging: bool, frozen_table, rnr, frozen_read_response: bool,
     rnr_restrict: bool, want_root_q: bool, repair_deck: bool = False,
     decouple_sampler: bool = False, range_aware: bool = False, range_uniform_floor: float = 0.25,
-    range_reach_full: bool = False,
+    range_reach_full: bool = False, wall_cap_ms: int = 0, cap_info: dict | None = None,
 ):
     """Native exploit subgame solve. Returns ``(probs[11], root_q[11] or None)`` or ``None`` when the
     native path is unavailable / the adapter is unsupported / the binary is stale (caller runs Python).
 
     ``frozen_table`` is the FrozenExploitTable (parallel keys_actor / keys_ctx / keys_mask + flat vals).
     ``rnr`` is the length-6 per-actor scalar list (NaN = overwrite-with-frozen). The native side
-    recomputes the context KEY + legal_bits and applies the overwrite / blend against its OWN base."""
+    recomputes the context KEY + legal_bits and applies the overwrite / blend against its OWN base.
+
+    ``wall_cap_ms`` / ``cap_info`` (TASK-75): same in-native wall-clock cap contract as
+    ``native_subgame_solve`` (via ``solve_exploit_capped``; the exploit tree/math are untouched —
+    the cap only bounds how many iterations run). No raise-cap exposure here (firewall)."""
     if not native_subgame_exploit_available():
         return None
     # Tier-1 index snapshots additionally need the subgame_index_dir capability (stale-.pyd guard).
@@ -832,17 +888,38 @@ def native_subgame_solve_exploit(
     keys_mask = [int(x) for x in frozen_table.keys_mask]
     vals = [float(x) for x in frozen_table.vals]
     rnr_list = [float(x) for x in rnr]
+    _cap_ok = (int(wall_cap_ms) > 0 and native_wall_cap_capable()
+               and hasattr(eng, "solve_exploit_capped"))
+    if int(wall_cap_ms) > 0 and cap_info is not None:
+        cap_info["wall_cap_supported"] = bool(_cap_ok)
     try:
-        out = eng.solve_exploit(
-            sb, int(hero), int(public_seed) & 0xFFFFFFFFFFFFFFFF,
-            int(max_iterations), int(max_depth), float(blueprint_mix),
-            int(rollout_samples), bool(resample_board), bool(linear_averaging),
-            keys_actor, keys_ctx, keys_mask, vals, rnr_list,
-            bool(frozen_read_response), bool(rnr_restrict), bool(want_root_q),
-            bool(repair_deck),
-            bool(decouple_sampler), bool(range_aware), float(range_uniform_floor),
-            bool(range_reach_full),
-        )
+        if _cap_ok:
+            probs_c, root_q_c, _wall_capped, _iters_done = eng.solve_exploit_capped(
+                sb, int(hero), int(public_seed) & 0xFFFFFFFFFFFFFFFF,
+                int(max_iterations), int(max_depth), float(blueprint_mix),
+                int(rollout_samples), bool(resample_board), bool(linear_averaging),
+                keys_actor, keys_ctx, keys_mask, vals, rnr_list,
+                bool(frozen_read_response), bool(rnr_restrict), bool(want_root_q),
+                bool(repair_deck),
+                bool(decouple_sampler), bool(range_aware), float(range_uniform_floor),
+                bool(range_reach_full),
+                int(wall_cap_ms),
+            )
+            out = (probs_c, root_q_c)
+            if cap_info is not None:
+                cap_info["wall_capped"] = bool(_wall_capped)
+                cap_info["iters_completed"] = int(_iters_done)
+        else:
+            out = eng.solve_exploit(
+                sb, int(hero), int(public_seed) & 0xFFFFFFFFFFFFFFFF,
+                int(max_iterations), int(max_depth), float(blueprint_mix),
+                int(rollout_samples), bool(resample_board), bool(linear_averaging),
+                keys_actor, keys_ctx, keys_mask, vals, rnr_list,
+                bool(frozen_read_response), bool(rnr_restrict), bool(want_root_q),
+                bool(repair_deck),
+                bool(decouple_sampler), bool(range_aware), float(range_uniform_floor),
+                bool(range_reach_full),
+            )
     except (TypeError, AttributeError):
         # Stale native binary lacking solve_exploit (or a signature mismatch) -> fall back to Python.
         return None

@@ -463,6 +463,21 @@ pub struct SubgameConfig {
     /// `solve` path only; `solve_exploit` NEVER reads it (its Ctx hard-codes 0 and its FFI does not
     /// expose the param — firewall, defense in depth, mirroring leaf_biased/serve_final_iterate).
     pub root_unmask: u32,
+    /// TASK-75 (2026-07-13) — STRUCTURAL RAISE-LADDER BOUND for the deep-SPR tree explosion. At
+    /// extreme geometry (e.g. flop pot 6 / stacks 900, SPR ~150) the min-raise ladder keeps the
+    /// street open for the full `max_depth` recursion budget with the ENTIRE bet-bucket menu legal
+    /// at every hero node (at normal SPR most buckets exceed the effective stack and collapse into
+    /// all-in, and streets close in a few plies) — an expected branching factor > 1 per raise
+    /// level, i.e. an exponentially exploding subgame tree (a live solve sat 9+ minutes). When
+    /// > 0: at every NON-ROOT node (depth > 0 — the hero's actual decision menu is never touched),
+    /// once `raise_cap_per_street` aggressive actions have been taken on the current street
+    /// WITHIN the subgame tree, the bet buckets (BET_BUCKET_START..ALL_IN) are masked OFF —
+    /// fold/check/call/ALL-IN stay, so stacks can still go in and the game stays well-formed (the
+    /// Pluribus-style capped-raises abstraction). Pure function of the tree path => deterministic
+    /// / CRN-stable. Default 0 => no masking, byte-identical to today. GTO `solve` path ONLY; the
+    /// exploit Ctx hard-codes 0 and the exploit FFI does not expose the knob (firewall, defense in
+    /// depth, mirroring leaf_biased/serve_final_iterate/root_unmask).
+    pub raise_cap_per_street: i32,
 }
 
 /// Immutable per-solve context handed down the recursion.
@@ -491,6 +506,17 @@ struct Ctx<'a> {
     /// in `cfv`; 0 = byte-identical). The exploit CtxExploit wraps a base Ctx built with this
     /// FORCED 0 (firewall: solve_exploit's tree can never be widened).
     root_unmask: u32,
+    /// TASK-75 — IN-NATIVE WALL-CLOCK DEADLINE (None = no cap, byte-identical zero-work fast path).
+    /// Checked cooperatively at the solve_stream ITERATION TOP and every `WALL_TICK_MASK+1` `cfv`
+    /// nodes (a pathological deep-SPR iteration can individually run minutes, so the per-iteration
+    /// check alone is not enough). On expiry the per-stream `Tables.capped` latch flips: the
+    /// in-flight traversal unwinds immediately (0.0 returns, NO table writes above the abort point)
+    /// and the iteration loop breaks — the caller serves the strategy_sum banked by the COMPLETED
+    /// iterations (a bounded, honest, possibly-under-searched answer; never a panic).
+    deadline: Option<std::time::Instant>,
+    /// TASK-75 — cached scfg.raise_cap_per_street (0 = off, byte-identical). GTO path only; the
+    /// exploit CtxExploit wraps a base Ctx built with this FORCED 0 (firewall).
+    raise_cap: i32,
 }
 
 /// One infoset's mutable state: cumulative CFR+ regrets + the (linear-)averaged strategy sum.
@@ -518,7 +544,18 @@ struct Tables {
     /// (n frozen at that cap). With leaf_cache_worlds=1 (default) this is exactly the legacy first-touch
     /// single-value cache: `(v, 1)` inserted on the miss, `sum / 1` (== v bit-for-bit) on every hit.
     leaf: FxHashMap<u128, (f64, i32)>,
+    /// TASK-75 wall-cap state (only touched when `ctx.deadline` is Some — zero work otherwise).
+    /// `ticks` counts `cfv` node entries; every `WALL_TICK_MASK+1` nodes one `Instant::now()` runs.
+    ticks: u32,
+    /// Latched when the deadline expires: the current traversal unwinds (0.0 returns, no table
+    /// writes above the abort point) and the iteration loop breaks.
+    capped: bool,
 }
+
+/// TASK-75 — check the wall deadline once per `WALL_TICK_MASK+1` `cfv` node entries (1024: at the
+/// measured ~1-5 µs/node solve pace that is a sub-5 ms cap-detection granularity for ~0.1% counter
+/// overhead, and the `Instant::now()` syscall amortizes to noise).
+const WALL_TICK_MASK: u32 = 1023;
 
 // --------------------------------------------------------------------------------------------------
 // masks / strategy
@@ -2762,6 +2799,7 @@ fn fold_terminal_value<const N: usize>(env: &EnvStateN<N>, hero: usize) -> Optio
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn cfv<const N: usize>(
     env: &EnvStateN<N>,
     hero: usize,
@@ -2771,7 +2809,27 @@ fn cfv<const N: usize>(
     rng: &mut Rng,
     t: i32,
     nd: &NodeDig,
+    street_raises: i32,
 ) -> f64 {
+    // TASK-75 WALL CAP: cooperative deadline check every WALL_TICK_MASK+1 node entries (deadline
+    // None => ONE predictable branch, no counter work — byte-identical). Once capped, unwind
+    // immediately: 0.0 returns all the way up and NO table writes above the abort point (the
+    // hero-node update below is skipped) — sibling/deeper updates that COMPLETED before the cap
+    // are valid CFR updates and stay.
+    if ctx.deadline.is_some() {
+        if tab.capped {
+            return 0.0;
+        }
+        tab.ticks = tab.ticks.wrapping_add(1);
+        if tab.ticks & WALL_TICK_MASK == 0 {
+            if let Some(d) = ctx.deadline {
+                if std::time::Instant::now() >= d {
+                    tab.capped = true;
+                    return 0.0;
+                }
+            }
+        }
+    }
     if env.done {
         return env.rewards[hero] as f64 / CHIP_UNIT;
     }
@@ -2806,6 +2864,15 @@ fn cfv<const N: usize>(
             if ctx.root_unmask >> a & 1 == 1 && full[a] {
                 legal[a] = true;
             }
+        }
+    }
+    // TASK-75 STRUCTURAL RAISE-LADDER BOUND (scfg.raise_cap_per_street, 0 = off => byte-identical):
+    // past the cap, NON-ROOT nodes lose the bet buckets (fold/check/call/ALL-IN stay, so stacks can
+    // still go in) — a deep-SPR min-raise ladder can no longer keep the street open for the whole
+    // depth budget. The root (depth 0 — the hero's actual decision menu) is never masked.
+    if ctx.raise_cap > 0 && depth > 0 && street_raises >= ctx.raise_cap {
+        for a in BET_BUCKET_START..ALL_IN {
+            legal[a] = false;
         }
     }
     if !any_legal(&legal) {
@@ -2844,7 +2911,8 @@ fn cfv<const N: usize>(
             std::sync::atomic::Ordering::Relaxed,
         );
         let cd = child_dig(nd, env.hist_len, actor, a);
-        return cfv(&child, hero, depth + 1, ctx, tab, rng, t, &cd);
+        let cr = next_street_raises(street_raises, env.street, child.street, a);
+        return cfv(&child, hero, depth + 1, ctx, tab, rng, t, &cd, cr);
     }
 
     // hero node: branch all (abstracted-)legal actions, CFR+ regret update.
@@ -2871,8 +2939,14 @@ fn cfv<const N: usize>(
                 std::sync::atomic::Ordering::Relaxed,
             );
             let cd = child_dig(nd, env.hist_len, actor, a);
-            av[a] = cfv(&child, hero, depth + 1, ctx, tab, rng, t, &cd);
+            let cr = next_street_raises(street_raises, env.street, child.street, a);
+            av[a] = cfv(&child, hero, depth + 1, ctx, tab, rng, t, &cd, cr);
         }
+    }
+    // TASK-75: the wall cap fired mid-branch — `av` is partial garbage; skip the regret / strategy
+    // update ENTIRELY (no polluted rows above the abort point) and keep unwinding.
+    if tab.capped {
+        return 0.0;
     }
     let mut ev = 0.0;
     for a in 0..NUM_ACTIONS {
@@ -2902,6 +2976,20 @@ fn cfv<const N: usize>(
     ev
 }
 
+/// TASK-75 — raise count carried down the subgame recursion for `raise_cap_per_street`: reset on a
+/// street change (rare in the depth-limited tree — streets normally end at a chance-node leaf),
+/// +1 when the applied action was aggressive (bet bucket / all-in), else carried unchanged.
+#[inline]
+fn next_street_raises(cur: i32, parent_street: i32, child_street: i32, action: usize) -> i32 {
+    if child_street != parent_street {
+        0
+    } else if (BET_BUCKET_START..=ALL_IN).contains(&action) {
+        cur + 1
+    } else {
+        cur
+    }
+}
+
 /// Odd multiplier that de-correlates the per-stream RNG seeds in the ensemble (a large odd constant so
 /// `public_seed ^ (idx*ODD)` gives well-separated xoshiro states; stream 0 keeps `public_seed` exactly so
 /// the single-stream path is byte/stat-identical to the pre-ensemble binary).
@@ -2923,13 +3011,15 @@ fn solve_stream<const N: usize>(
     rtab: Option<&RangeTable>,
     rs: Option<&RangeSampler>,
     stream_seed: u64,
-) -> ([f64; NUM_ACTIONS], [f64; NUM_ACTIONS], bool) {
+) -> ([f64; NUM_ACTIONS], [f64; NUM_ACTIONS], bool, i32, bool) {
     let scfg = ctx.scfg;
     let mut tab = Tables {
         // Pre-reserve past the early doubling churn (rehash copies showed up on the big river
         // solves); ~3 MB up front, reclaimed at solve end.
         rows: FxHashMap::with_capacity_and_hasher(1 << 14, Default::default()),
         leaf: FxHashMap::with_capacity_and_hasher(1 << 13, Default::default()),
+        ticks: 0,
+        capped: false,
     };
     let mut rng = Rng::seed_from_u64(stream_seed);
     // Q2 DECOUPLE: the opponent-hole deal draws from its OWN deterministic sub-stream (derived from this
@@ -2940,7 +3030,19 @@ fn solve_stream<const N: usize>(
         None
     };
     let iters = scfg.max_iterations.max(0);
+    let mut iters_done = 0i32;
     for t in 0..iters {
+        // TASK-75: iteration-top deadline check (the coarse boundary; the fine granularity is the
+        // per-node check inside `cfv`). Deadline None => no clock read, byte-identical.
+        if tab.capped {
+            break;
+        }
+        if let Some(d) = ctx.deadline {
+            if std::time::Instant::now() >= d {
+                tab.capped = true;
+                break;
+            }
+        }
         let mut world = *root;
         {
             let hrng: &mut Rng = hole_rng.as_mut().unwrap_or(&mut rng);
@@ -2956,19 +3058,24 @@ fn solve_stream<const N: usize>(
             playout::reshuffle_undealt(&mut world, &mut drng);
         }
         let traverser = traversers[(t as usize) % traversers.len()];
-        cfv(&world, traverser, 0, ctx, &mut tab, &mut rng, t, root_nd);
+        cfv(&world, traverser, 0, ctx, &mut tab, &mut rng, t, root_nd, 0);
+        if !tab.capped {
+            // An iteration aborted mid-tree banked no root update — count COMPLETED iterations only.
+            iters_done = t + 1;
+        }
     }
     // Return the ROOT rows raw (unnormalized) so the ensemble can SUM strat_sum across streams.
     let root_row = tab.rows.get(&root_key).copied().unwrap_or(ROW_ZERO);
     let ss = root_row.ss;
     let has_avg = ss.iter().sum::<f64>() > 1e-12;
-    (ss, root_row.reg, has_avg)
+    (ss, root_row.reg, has_avg, iters_done, tab.capped)
 }
 
 /// The full CFR solve MINUS the extraction: the ensemble-merged ROOT rows
 /// `(strategy_sum, regrets, any-avg-mass)` that `solve` reads its served policy off. Pure code
 /// motion from `solve` (behavior byte-identical); `pub(crate)` so the R5a golden test can assert
 /// the exact extraction semantics (averaged vs final-iterate) against the raw rows.
+#[cfg_attr(not(test), allow(dead_code))] // kept for the R5a golden test (extraction semantics gate)
 pub(crate) fn solve_rows<const N: usize>(
     root: &EnvStateN<N>,
     hero: usize,
@@ -2977,6 +3084,25 @@ pub(crate) fn solve_rows<const N: usize>(
     scfg: &SubgameConfig,
     public_seed: u64,
 ) -> ([f64; NUM_ACTIONS], [f64; NUM_ACTIONS], bool) {
+    let (ss, rr, any_avg, _iters, _capped) =
+        solve_rows_capped(root, hero, bp, pcfg, scfg, public_seed, 0);
+    (ss, rr, any_avg)
+}
+
+/// TASK-75 — `solve_rows` plus the in-native wall cap. `wall_cap_ms == 0` => no deadline (the
+/// legacy unbounded solve, byte-identical). Returns `(strategy_sum, regrets, any-avg-mass,
+/// iters_completed, wall_capped)`; under `ensemble_streams > 1` `iters_completed` is the MIN
+/// across streams (the most conservative under-search signal) and `wall_capped` is the OR.
+#[allow(clippy::type_complexity)]
+pub(crate) fn solve_rows_capped<const N: usize>(
+    root: &EnvStateN<N>,
+    hero: usize,
+    bp: &Blueprint,
+    pcfg: &PlayoutConfig,
+    scfg: &SubgameConfig,
+    public_seed: u64,
+    wall_cap_ms: u64,
+) -> ([f64; NUM_ACTIONS], [f64; NUM_ACTIONS], bool, i32, bool) {
     prof_scope!(crate::prof::P_SOLVE);
     let ctx = Ctx {
         bp,
@@ -2994,6 +3120,14 @@ pub(crate) fn solve_rows<const N: usize>(
         leaf_bias_mult: scfg.leaf_bias_mult,
         // STAGE-1 — root-only un-mask (0 default => byte-identical; GTO path only).
         root_unmask: scfg.root_unmask,
+        // TASK-75 — the in-native wall deadline (0 => None => the legacy unbounded solve).
+        deadline: if wall_cap_ms > 0 {
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(wall_cap_ms))
+        } else {
+            None
+        },
+        // TASK-75 — structural raise-ladder bound (0 default => byte-identical; GTO path only).
+        raise_cap: scfg.raise_cap_per_street.max(0),
     };
     // OPT-2: the root digest lanes are a pure function of the root's public board/street/history —
     // invariant across worlds AND ensemble streams — so they are built once here. The extraction key
@@ -3025,17 +3159,23 @@ pub(crate) fn solve_rows<const N: usize>(
     // reduction) and root regrets (for the no-avg fallback). Single stream => stream 0 with seed exactly
     // `public_seed` => byte/stat-identical to the pre-ensemble binary.
     let n_streams = scfg.ensemble_streams.max(1) as usize;
-    let (sum_ss, sum_rr, any_avg): ([f64; NUM_ACTIONS], [f64; NUM_ACTIONS], bool) = if n_streams <= 1 {
-        let (ss, rr, has) = solve_stream(
+    let (sum_ss, sum_rr, any_avg, iters_done, capped): (
+        [f64; NUM_ACTIONS],
+        [f64; NUM_ACTIONS],
+        bool,
+        i32,
+        bool,
+    ) = if n_streams <= 1 {
+        solve_stream(
             root, hero, &ctx, &root_nd, root_key, &traversers, rtab.as_ref(), rs.as_ref(),
             public_seed,
-        );
-        (ss, rr, has)
+        )
     } else {
         use rayon::prelude::*;
         // Each stream is fully independent (own Tables + Rng); the shared refs (bp/pcfg/scfg/root/root_key/
         // traversers/rtab) are read-only => Sync => no locks, no false sharing on the hot tables. Distinct
-        // per-stream seed = public_seed ^ (idx*ODD). Reduce = elementwise sum of the ROOT rows only.
+        // per-stream seed = public_seed ^ (idx*ODD). Reduce = elementwise sum of the ROOT rows only
+        // (+ TASK-75: MIN iters_completed across streams, OR of the per-stream capped flags).
         (0..n_streams)
             .into_par_iter()
             .map(|idx| {
@@ -3046,17 +3186,19 @@ pub(crate) fn solve_rows<const N: usize>(
                 )
             })
             .reduce(
-                || (ZEROS, ZEROS, false),
-                |(mut ass, mut arr, aa), (bss, brr, ba)| {
+                || (ZEROS, ZEROS, false, i32::MAX, false),
+                |(mut ass, mut arr, aa, ai, ac), (bss, brr, ba, bi, bc)| {
                     for a in 0..NUM_ACTIONS {
                         ass[a] += bss[a];
                         arr[a] += brr[a];
                     }
-                    (ass, arr, aa || ba)
+                    (ass, arr, aa || ba, ai.min(bi), ac || bc)
                 },
             )
     };
-    (sum_ss, sum_rr, any_avg)
+    // (reduce identity: i32::MAX min-folds away against >= 1 real streams.)
+    let iters_done = if iters_done == i32::MAX { 0 } else { iters_done };
+    (sum_ss, sum_rr, any_avg, iters_done, capped)
 }
 
 /// Run the depth-limited CFR subgame solve and return the root action probabilities (length 11).
@@ -3068,6 +3210,25 @@ pub fn solve<const N: usize>(
     scfg: &SubgameConfig,
     public_seed: u64,
 ) -> [f64; NUM_ACTIONS] {
+    solve_capped(root, hero, bp, pcfg, scfg, public_seed, 0).0
+}
+
+/// TASK-75 — `solve` plus the in-native wall-clock cap. `wall_cap_ms == 0` => no deadline: the
+/// exact legacy solve (byte-identical — `solve` above is this call). On a cap hit the extraction
+/// below runs UNCHANGED over whatever the completed iterations banked (strategy_sum when any mass,
+/// else regret-match, else uniform-over-legal at 0 completed iterations) — a bounded, honest,
+/// possibly-under-searched answer; NEVER a panic. Returns `(probs, wall_capped, iters_completed)`
+/// so the Python caller can surface the cap in SolveResult.metadata and let the serve-side
+/// under-search floor judge the result.
+pub fn solve_capped<const N: usize>(
+    root: &EnvStateN<N>,
+    hero: usize,
+    bp: &Blueprint,
+    pcfg: &PlayoutConfig,
+    scfg: &SubgameConfig,
+    public_seed: u64,
+    wall_cap_ms: u64,
+) -> ([f64; NUM_ACTIONS], bool, i32) {
     let mut legal_root = abstracted_legal(root, hero, pcfg);
     // STAGE-1 ROOT UN-MASK: widen the EXTRACTION mask identically to the depth-0 widening inside
     // `cfv` — the served child must not be zeroed at extraction (0 default => byte-identical).
@@ -3081,9 +3242,10 @@ pub fn solve<const N: usize>(
     }
     let mut probs = [0.0f64; NUM_ACTIONS];
     if !any_legal(&legal_root) {
-        return probs;
+        return (probs, false, 0);
     }
-    let (sum_ss, sum_rr, any_avg) = solve_rows(root, hero, bp, pcfg, scfg, public_seed);
+    let (sum_ss, sum_rr, any_avg, iters_done, capped) =
+        solve_rows_capped(root, hero, bp, pcfg, scfg, public_seed, wall_cap_ms);
 
     // Root strategy = SUMMED strategy_sum (masked, normalized) when any stream had mass, else regret-match
     // fallback on the SUMMED regrets. Identical extraction shape to the single-stream path.
@@ -3117,7 +3279,7 @@ pub fn solve<const N: usize>(
     for a in 0..NUM_ACTIONS {
         probs[a] /= denom;
     }
-    probs
+    (probs, capped, iters_done)
 }
 
 // --------------------------------------------------------------------------------------------------
@@ -3133,6 +3295,10 @@ struct TablesExploit {
     leaf: HashMap<Vec<i64>, f64>,
     root_av_sum: [f64; NUM_ACTIONS],
     root_av_wsum: f64,
+    /// TASK-75 wall-cap state (mirrors `Tables.ticks`/`Tables.capped`; only touched when
+    /// `cx.base.deadline` is Some — zero work otherwise, byte-identical).
+    ticks: u32,
+    capped: bool,
 }
 
 fn leaf_value_x<const N: usize>(
@@ -3173,6 +3339,22 @@ fn cfv_exploit<const N: usize>(
     t: i32,
     want_root_q: bool,
 ) -> f64 {
+    // TASK-75 WALL CAP (exploit twin of the `cfv` check): deadline None => one predictable branch,
+    // byte-identical; once capped, unwind with 0.0 and NO table writes above the abort point.
+    if cx.base.deadline.is_some() {
+        if tab.capped {
+            return 0.0;
+        }
+        tab.ticks = tab.ticks.wrapping_add(1);
+        if tab.ticks & WALL_TICK_MASK == 0 {
+            if let Some(d) = cx.base.deadline {
+                if std::time::Instant::now() >= d {
+                    tab.capped = true;
+                    return 0.0;
+                }
+            }
+        }
+    }
     if env.done {
         return env.rewards[hero] as f64 / CHIP_UNIT;
     }
@@ -3212,6 +3394,11 @@ fn cfv_exploit<const N: usize>(
             let child = crate::closure::maybe_close_called_street(core::apply_action(env, a));
             av[a] = cfv_exploit(&child, hero, depth + 1, cx, tab, rng, t, want_root_q);
         }
+    }
+    // TASK-75: wall cap fired mid-branch — `av` is partial; skip the regret / strategy / AIVAT
+    // root-CFV updates entirely (no polluted rows) and keep unwinding.
+    if tab.capped {
+        return 0.0;
     }
     let mut ev = 0.0;
     for a in 0..NUM_ACTIONS {
@@ -3262,11 +3449,48 @@ pub fn solve_exploit<const N: usize>(
     frozen_read_response: bool,
     want_root_q: bool,
 ) -> ([f64; NUM_ACTIONS], [f64; NUM_ACTIONS]) {
+    let (probs, rq, _capped, _iters) = solve_exploit_capped(
+        root,
+        hero,
+        bp,
+        pcfg,
+        scfg,
+        public_seed,
+        frozen,
+        rnr,
+        rnr_restrict,
+        frozen_read_response,
+        want_root_q,
+        0,
+    );
+    (probs, rq)
+}
+
+/// TASK-75 — `solve_exploit` plus the in-native wall-clock cap (`wall_cap_ms == 0` => no deadline,
+/// the exact legacy solve — `solve_exploit` above is this call). The exploit MATH is untouched:
+/// the cap only bounds HOW MANY iterations run; the extraction over the banked strategy_sum /
+/// AIVAT root-CFV average is byte-for-byte the certified code below. Returns
+/// `(probs, root_q, wall_capped, iters_completed)`.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_exploit_capped<const N: usize>(
+    root: &EnvStateN<N>,
+    hero: usize,
+    bp: &Blueprint,
+    pcfg: &PlayoutConfig,
+    scfg: &SubgameConfig,
+    public_seed: u64,
+    frozen: &FrozenTable,
+    rnr: &[f64; 6],
+    rnr_restrict: bool,
+    frozen_read_response: bool,
+    want_root_q: bool,
+    wall_cap_ms: u64,
+) -> ([f64; NUM_ACTIONS], [f64; NUM_ACTIONS], bool, i32) {
     let legal_root = abstracted_legal(root, hero, pcfg);
     let mut probs = [0.0f64; NUM_ACTIONS];
     let root_q = [0.0f64; NUM_ACTIONS];
     if !any_legal(&legal_root) {
-        return (probs, root_q);
+        return (probs, root_q, false, 0);
     }
     let cx = CtxExploit {
         base: Ctx {
@@ -3295,6 +3519,17 @@ pub fn solve_exploit<const N: usize>(
             // knob; force 0 here regardless of scfg (defense in depth — the exploit FFI hard-codes
             // it 0 too), so the certified exploit tree can never be widened at the root.
             root_unmask: 0,
+            // TASK-75 — the in-native wall deadline (0 => None => the legacy unbounded solve). The
+            // cap bounds ONLY how long the loop runs; the exploit math per iteration is untouched.
+            deadline: if wall_cap_ms > 0 {
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(wall_cap_ms))
+            } else {
+                None
+            },
+            // FIREWALL: the structural raise cap is a GTO-path knob; force 0 here regardless of
+            // scfg (defense in depth — the exploit FFI does not expose it either), so the certified
+            // exploit tree shape can never be thinned.
+            raise_cap: 0,
         },
         frozen,
         rnr,
@@ -3307,6 +3542,8 @@ pub fn solve_exploit<const N: usize>(
         leaf: HashMap::new(),
         root_av_sum: [0.0; NUM_ACTIONS],
         root_av_wsum: 0.0,
+        ticks: 0,
+        capped: false,
     };
     let root_key = infoset_key(root, hero);
     let mut rng = Rng::seed_from_u64(public_seed);
@@ -3324,7 +3561,19 @@ pub fn solve_exploit<const N: usize>(
     // frozen-read exploit math is untouched — same firewall rationale as range_aware itself).
     let rs = rtab.as_ref().map(|rt| RangeSampler::build(rt, root, hero));
     let iters = scfg.max_iterations.max(0);
+    let mut iters_done = 0i32;
     for t in 0..iters {
+        // TASK-75: iteration-top deadline check (fine granularity is the per-node check inside
+        // `cfv_exploit`). Deadline None => no clock read, byte-identical.
+        if tab.capped {
+            break;
+        }
+        if let Some(d) = cx.base.deadline {
+            if std::time::Instant::now() >= d {
+                tab.capped = true;
+                break;
+            }
+        }
         let mut world = *root;
         {
             let hrng: &mut Rng = hole_rng.as_mut().unwrap_or(&mut rng);
@@ -3338,6 +3587,9 @@ pub fn solve_exploit<const N: usize>(
             playout::reshuffle_undealt(&mut world, &mut drng);
         }
         cfv_exploit(&world, hero, 0, &cx, &mut tab, &mut rng, t, want_root_q);
+        if !tab.capped {
+            iters_done = t + 1;
+        }
     }
 
     let mut used_avg = false;
@@ -3373,5 +3625,5 @@ pub fn solve_exploit<const N: usize>(
             rq[a] = tab.root_av_sum[a] / tab.root_av_wsum;
         }
     }
-    (probs, rq)
+    (probs, rq, tab.capped, iters_done)
 }

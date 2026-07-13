@@ -498,6 +498,15 @@ mod py {
             // engine for a SortedSnapshotDir blueprint only when this cap is present — stale
             // .pyds fall back to the Python CFR loop instead of crashing/serving raw.
             "subgame_index_dir".to_string(),
+            // TASK-75 (2026-07-13): interruptible + GIL-free native solves — the serve-path
+            // entry points (SubgameSolver.solve/solve_capped/solve_exploit/solve_exploit_capped/
+            // range_weights, PlayoutEngine.leaf_value) release the GIL for the full native wall,
+            // and solve_capped/solve_exploit_capped carry the cooperative in-native wall-clock
+            // cap (wall_cap_ms; checked per iteration + per 1024 cfv nodes; bounded honest early
+            // return, never a panic) plus the GTO-path structural deep-SPR raise-ladder bound
+            // (raise_cap_per_street). native_solver.py gates the capped/cap-metadata calls on
+            // this capability — stale .pyds keep the legacy uncapped calls.
+            "solve_wall_cap".to_string(),
         ]
     }
 
@@ -634,8 +643,11 @@ mod py {
         }
 
         /// Uniform-mode continuation leaf value (hero bb) for a depth-limit state.
+        /// TASK-75: GIL released for the rollout (pure Rust on marshaled data — same audit as
+        /// `SubgameSolver::solve`), so a long/cold-fault playout can't freeze the interpreter.
         fn leaf_value(
             &self,
+            py: Python<'_>,
             state: &[u8],
             hero: usize,
             base_seed: u64,
@@ -643,15 +655,17 @@ mod py {
             resample_board: bool,
         ) -> f64 {
             let s = flat::from_flat(&bytes_to_flat(state));
-            playout::uniform_leaf_value(
-                &s,
-                hero,
-                &self.bp,
-                &self.cfg,
-                base_seed,
-                rollout_samples,
-                resample_board,
-            )
+            py.detach(|| {
+                playout::uniform_leaf_value(
+                    &s,
+                    hero,
+                    &self.bp,
+                    &self.cfg,
+                    base_seed,
+                    rollout_samples,
+                    resample_board,
+                )
+            })
         }
     }
 
@@ -777,9 +791,15 @@ mod py {
         }
 
         /// Solve the depth-limited subgame rooted at `state` for `hero`; returns 11 root action probs.
+        ///
+        /// TASK-75: the GIL is RELEASED for the whole native solve (`py.detach`) — the solve body
+        /// touches no Python state (marshaled scalars + the owned/Arc'd blueprint + the `state`
+        /// byte buffer, which the caller's `bytes` object keeps alive and immutable), so watchdog /
+        /// health threads stay live even when a pathological-geometry solve runs long.
         #[allow(clippy::too_many_arguments)]
         fn solve(
             &self,
+            py: Python<'_>,
             state: &[u8],
             hero: usize,
             public_seed: u64,
@@ -834,8 +854,90 @@ mod py {
                 // STAGE-1 — river overbet / off-tree ROOT un-mask bitmask (root-only, depth==0,
                 // full-legal-ANDed; 0 default at the Python caller => byte-identical).
                 root_unmask,
+                // TASK-75 — the legacy `solve` FFI never thins the ladder (byte-identity contract);
+                // the structural bound is a `solve_capped` kwarg.
+                raise_cap_per_street: 0,
             };
-            subgame::solve(&s, hero, &self.bp, &self.cfg, &scfg, public_seed).to_vec()
+            // GIL released for the full solve wall (see the docstring); pure Rust inside.
+            py.detach(|| subgame::solve(&s, hero, &self.bp, &self.cfg, &scfg, public_seed).to_vec())
+        }
+
+        /// TASK-75 — `solve` plus (a) the in-native WALL-CLOCK CAP and (b) the structural deep-SPR
+        /// raise-ladder bound, with cap metadata surfaced. Same 22 leading args as `solve`
+        /// (byte-identical semantics at `wall_cap_ms=0, raise_cap_per_street=0`), then:
+        ///   * `wall_cap_ms` (default 0 = off): cooperative in-native deadline, checked at every
+        ///     CFR iteration top AND every 1024 `cfv` node entries (a pathological deep-SPR
+        ///     iteration can individually run minutes). On expiry the solve returns the
+        ///     strategy_sum-derived answer banked by the COMPLETED iterations — bounded, honest,
+        ///     possibly under-searched; NEVER a panic.
+        ///   * `raise_cap_per_street` (default 0 = off): after this many aggressive actions on a
+        ///     street within the subgame tree, non-root nodes lose the bet buckets (fold/check/
+        ///     call/all-in stay) — the Pluribus-style capped-raises bound on the deep-SPR
+        ///     min-raise-ladder tree explosion. The ROOT menu is never touched.
+        /// Returns `(probs[11], wall_capped, iters_completed)`. GIL released like `solve`.
+        #[allow(clippy::too_many_arguments)]
+        #[pyo3(signature = (state, hero, public_seed, max_iterations, max_depth, blueprint_mix,
+                            rollout_samples, resample_board, linear_averaging, repair_deck,
+                            two_sided, decouple_sampler, range_aware, range_uniform_floor,
+                            range_reach_full, ensemble_streams, leaf_cache_worlds, avg_skip_frac,
+                            leaf_biased_continuations, leaf_bias_mult, serve_final_iterate,
+                            root_unmask, wall_cap_ms=0, raise_cap_per_street=0))]
+        fn solve_capped(
+            &self,
+            py: Python<'_>,
+            state: &[u8],
+            hero: usize,
+            public_seed: u64,
+            max_iterations: i32,
+            max_depth: i32,
+            blueprint_mix: f64,
+            rollout_samples: i32,
+            resample_board: bool,
+            linear_averaging: bool,
+            repair_deck: bool,
+            two_sided: bool,
+            decouple_sampler: bool,
+            range_aware: bool,
+            range_uniform_floor: f64,
+            range_reach_full: bool,
+            ensemble_streams: i32,
+            leaf_cache_worlds: i32,
+            avg_skip_frac: f64,
+            leaf_biased_continuations: bool,
+            leaf_bias_mult: f64,
+            serve_final_iterate: bool,
+            root_unmask: u32,
+            wall_cap_ms: u64,
+            raise_cap_per_street: i32,
+        ) -> (Vec<f64>, bool, i32) {
+            let s = flat::from_flat(&bytes_to_flat(state));
+            let scfg = SubgameConfig {
+                max_iterations,
+                max_depth,
+                blueprint_mix,
+                rollout_samples,
+                resample_board,
+                linear_averaging,
+                repair_deck,
+                two_sided,
+                decouple_sampler,
+                range_aware,
+                range_uniform_floor,
+                range_reach_full,
+                ensemble_streams,
+                leaf_cache_worlds,
+                avg_skip_frac,
+                leaf_biased_continuations,
+                leaf_bias_mult,
+                serve_final_iterate,
+                root_unmask,
+                raise_cap_per_street,
+            };
+            // GIL released for the full solve wall (same Python-touch audit as `solve`).
+            let (probs, capped, iters) = py.detach(|| {
+                subgame::solve_capped(&s, hero, &self.bp, &self.cfg, &scfg, public_seed, wall_cap_ms)
+            });
+            (probs.to_vec(), capped, iters)
         }
 
         /// PROBE/DEBUG (R1, never on the solve hot path): the per-seat opponent-range weights the
@@ -845,7 +947,7 @@ mod py {
         /// Returns a seat-major flattened `N*52*52` weight vector (upper triangle c0<c1 populated,
         /// pre-floor / pre-normalization), or None when no table applies. Used by the offline
         /// sanity + log-loss validation of the reach-range plumbing.
-        fn range_weights(&self, state: &[u8], hero: usize, mode: &str) -> Option<Vec<f64>> {
+        fn range_weights(&self, py: Python<'_>, state: &[u8], hero: usize, mode: &str) -> Option<Vec<f64>> {
             let s = flat::from_flat(&bytes_to_flat(state));
             let (range_aware, range_reach_full) = match mode {
                 "fold_now" => (true, false),
@@ -873,8 +975,11 @@ mod py {
                 leaf_bias_mult: 5.0,
                 serve_final_iterate: false,
                 root_unmask: 0,
+                raise_cap_per_street: 0,
             };
-            subgame::build_rtab(&s, hero, &self.bp, &self.cfg, &scfg).map(|rt| rt.to_flat())
+            // TASK-75: GIL released — the reach replay does blueprint (mmap-index) lookups that
+            // can page-fault; pure Rust inside (same audit as `solve`).
+            py.detach(|| subgame::build_rtab(&s, hero, &self.bp, &self.cfg, &scfg).map(|rt| rt.to_flat()))
         }
 
         /// EXPLOIT solve: same CFR loop as `solve`, but opponent nodes apply a PRECOMPUTED pure-frozen
@@ -888,6 +993,7 @@ mod py {
         #[allow(clippy::too_many_arguments)]
         fn solve_exploit(
             &self,
+            py: Python<'_>,
             state: &[u8],
             hero: usize,
             public_seed: u64,
@@ -952,6 +1058,10 @@ mod py {
                 // additionally forces it 0 in the exploit Ctx, defense in depth) so the certified
                 // exploit tree can never be widened at the root.
                 root_unmask: 0,
+                // FIREWALL: the TASK-75 structural raise cap is a GTO-path knob, NOT exposed on
+                // the exploit FFI — hard-code 0 (subgame.rs additionally forces it 0 in the
+                // exploit Ctx, defense in depth) so the certified exploit tree is never thinned.
+                raise_cap_per_street: 0,
             };
             // Reconstruct the FrozenTable from the parallel key lists + flat vals (chunked by 11).
             let n = keys_actor
@@ -970,20 +1080,121 @@ mod py {
             for i in 0..6.min(rnr.len()) {
                 rnr6[i] = rnr[i];
             }
-            let (probs, root_q) = subgame::solve_exploit(
-                &s,
-                hero,
-                &self.bp,
-                &self.cfg,
-                &scfg,
-                public_seed,
-                &frozen,
-                &rnr6,
-                rnr_restrict,
-                frozen_read_response,
-                want_root_q,
-            );
+            // TASK-75: GIL released for the full exploit solve (same Python-touch audit as `solve`
+            // — the frozen table / rnr are already-extracted plain Rust values).
+            let (probs, root_q) = py.detach(|| {
+                subgame::solve_exploit(
+                    &s,
+                    hero,
+                    &self.bp,
+                    &self.cfg,
+                    &scfg,
+                    public_seed,
+                    &frozen,
+                    &rnr6,
+                    rnr_restrict,
+                    frozen_read_response,
+                    want_root_q,
+                )
+            });
             (probs.to_vec(), root_q.to_vec())
+        }
+
+        /// TASK-75 — `solve_exploit` plus the in-native WALL-CLOCK CAP (`wall_cap_ms`, default 0 =
+        /// off; same cooperative per-iteration + per-1024-nodes checks as `solve_capped`). The
+        /// exploit MATH and tree are untouched (no raise-cap exposure — firewall); the cap only
+        /// bounds how many iterations run. Returns `(probs[11], root_q[11], wall_capped,
+        /// iters_completed)`. GIL released like `solve_exploit`.
+        #[allow(clippy::too_many_arguments)]
+        #[pyo3(signature = (state, hero, public_seed, max_iterations, max_depth, blueprint_mix,
+                            rollout_samples, resample_board, linear_averaging, keys_actor, keys_ctx,
+                            keys_mask, vals, rnr, frozen_read_response, rnr_restrict, want_root_q,
+                            repair_deck, decouple_sampler, range_aware, range_uniform_floor,
+                            range_reach_full, wall_cap_ms=0))]
+        fn solve_exploit_capped(
+            &self,
+            py: Python<'_>,
+            state: &[u8],
+            hero: usize,
+            public_seed: u64,
+            max_iterations: i32,
+            max_depth: i32,
+            blueprint_mix: f64,
+            rollout_samples: i32,
+            resample_board: bool,
+            linear_averaging: bool,
+            keys_actor: Vec<u8>,
+            keys_ctx: Vec<u16>,
+            keys_mask: Vec<u16>,
+            vals: Vec<f64>,
+            rnr: Vec<f64>,
+            frozen_read_response: bool,
+            rnr_restrict: bool,
+            want_root_q: bool,
+            repair_deck: bool,
+            decouple_sampler: bool,
+            range_aware: bool,
+            range_uniform_floor: f64,
+            range_reach_full: bool,
+            wall_cap_ms: u64,
+        ) -> (Vec<f64>, Vec<f64>, bool, i32) {
+            let s = flat::from_flat(&bytes_to_flat(state));
+            // IDENTICAL SubgameConfig construction to `solve_exploit` (all the same firewall
+            // hard-codes) — the ONLY difference on this path is the wall deadline.
+            let scfg = SubgameConfig {
+                max_iterations,
+                max_depth,
+                blueprint_mix,
+                rollout_samples,
+                resample_board,
+                linear_averaging,
+                repair_deck,
+                two_sided: false,
+                decouple_sampler,
+                range_aware,
+                range_uniform_floor,
+                range_reach_full,
+                ensemble_streams: 1,
+                leaf_cache_worlds: 1,
+                avg_skip_frac: 0.0,
+                leaf_biased_continuations: false,
+                leaf_bias_mult: 5.0,
+                serve_final_iterate: false,
+                root_unmask: 0,
+                raise_cap_per_street: 0,
+            };
+            let n = keys_actor
+                .len()
+                .min(keys_ctx.len())
+                .min(keys_mask.len())
+                .min(vals.len() / NUM_ACTIONS);
+            let mut frozen: subgame::FrozenTable = HashMap::with_capacity(n);
+            for i in 0..n {
+                let mut row = [0.0f64; NUM_ACTIONS];
+                row.copy_from_slice(&vals[i * NUM_ACTIONS..(i + 1) * NUM_ACTIONS]);
+                frozen.insert((keys_actor[i], keys_ctx[i], keys_mask[i]), row);
+            }
+            let mut rnr6 = [f64::NAN; 6];
+            for i in 0..6.min(rnr.len()) {
+                rnr6[i] = rnr[i];
+            }
+            let (probs, root_q, capped, iters) = py.detach(|| {
+                subgame::solve_exploit_capped(
+                    &s,
+                    hero,
+                    &self.bp,
+                    &self.cfg,
+                    &scfg,
+                    public_seed,
+                    &frozen,
+                    &rnr6,
+                    rnr_restrict,
+                    frozen_read_response,
+                    want_root_q,
+                    wall_cap_ms,
+                )
+            });
+            (probs.to_vec(), root_q.to_vec(), capped, iters)
         }
     }
 
