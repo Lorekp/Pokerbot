@@ -249,7 +249,25 @@ impl Blueprint {
     pub fn get(&self, key: &[u8; 16]) -> Option<[f64; NUM_ACTIONS]> {
         match self {
             Blueprint::Dict(m) => m.get(key).copied(),
-            Blueprint::Index(ix) => ix.get(key),
+            // The tier-1 32GB mmap serve index. With `feature="prof"` the binary-search probe (where
+            // the page-fault stall lives) is timed under its OWN `bp_lookup` phase and a `bp_miss`
+            // counter tracks None returns. Built WITHOUT `prof` this arm compiles to a bare
+            // `ix.get(key)` (both cfg blocks resolve to the same value expression) — byte-identical.
+            Blueprint::Index(ix) => {
+                #[cfg(not(feature = "prof"))]
+                {
+                    ix.get(key)
+                }
+                #[cfg(feature = "prof")]
+                {
+                    let _prof_scope = crate::prof::Scope::new(crate::prof::P_BP_LOOKUP);
+                    let row = ix.get(key);
+                    if row.is_none() {
+                        crate::prof::count(crate::prof::C_BP_MISS);
+                    }
+                    row
+                }
+            }
         }
     }
 

@@ -47,10 +47,15 @@ pub mod prof {
     pub const P_APPLY: usize = 6;
     pub const P_LEGAL: usize = 7;
     pub const P_MAPS: usize = 8;
-    pub const NP: usize = 9;
+    // bp_lookup: JUST the mmap `SortedIndex::get` binary-search on the tier-1 32GB serve index
+    // (`Blueprint::Index` arm). Isolated from the enclosing scopes (leaf_playout / fp_key) so
+    // mmap/page-fault STALL in the blueprint lookups is attributable vs actual CFR compute. NOTE:
+    // `fp_key` (P_FP_KEY) still times key CONSTRUCTION only — it does NOT include the index probe.
+    pub const P_BP_LOOKUP: usize = 9;
+    pub const NP: usize = 10;
     pub const PHASE_NAMES: [&str; NP] = [
         "solve_total", "rtab_build", "deal_holes", "repair_deck", "leaf_playout", "fp_key",
-        "apply_action", "legal_mask", "map_ops",
+        "apply_action", "legal_mask", "map_ops", "bp_lookup",
     ];
     pub static TSC: [AtomicU64; NP] = [const { AtomicU64::new(0) }; NP];
 
@@ -60,9 +65,12 @@ pub mod prof {
     pub const C_LEAF_MISS: usize = 3;
     pub const C_PLAYOUT_STEP: usize = 4;
     pub const C_BP_GET: usize = 5;
-    pub const NC: usize = 6;
+    // bp_miss: an index `get` (Blueprint::Index arm) returned None -> uniform fallback. Serving the
+    // Index, hit-rate = (bp_get - bp_miss) / bp_get. `bp_get` still counts every key construction.
+    pub const C_BP_MISS: usize = 6;
+    pub const NC: usize = 7;
     pub const COUNT_NAMES: [&str; NC] =
-        ["node_hero", "node_opp", "leaf_hit", "leaf_miss", "playout_step", "bp_get"];
+        ["node_hero", "node_opp", "leaf_hit", "leaf_miss", "playout_step", "bp_get", "bp_miss"];
     pub static CNT: [AtomicU64; NC] = [const { AtomicU64::new(0) }; NC];
 
     #[inline(always)]
