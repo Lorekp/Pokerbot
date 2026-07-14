@@ -244,6 +244,96 @@ def translate_state_for_key(state: Any):
     return state if t is None else t
 
 
+def _nearest_realized_bucket(state, seat: int, observed_to_chips: int, menu: np.ndarray) -> int | None:
+    """Trained-menu bucket whose engine-REALIZED raise-to is pseudo-harmonic-nearest ``observed_to_chips``.
+
+    Twin of ``_translate_bet`` in raise-to-total space, but keyed on an EXTERNALLY OBSERVED size
+    (the opponent's real bet-to, in chips) rather than a recorded bucket's realized size. Used by the
+    arena reconstruction to invert an off-tree observed raise into the trainer's abstraction exactly
+    the way the engine sizes raises (``current_bet + pot*frac``), so the fullhist key lands on the
+    trained node the engine would have keyed. Returns None if the menu offers no legal raise."""
+    from pokerbot.engine.np_engine import _action_amount, _pot_for_sizing
+
+    stack = int(state.stacks[seat])
+    cand: list[tuple[int, int]] = []
+    for b in range(BET_BUCKET_START, ALL_IN):
+        if menu[b] and int(_action_amount(state, seat, b)) < stack:
+            cand.append((b, _raise_to_total(state, seat, b)))
+    if menu[ALL_IN]:
+        cand.append((ALL_IN, _raise_to_total(state, seat, ALL_IN)))
+    if not cand:
+        return None
+    x = int(observed_to_chips)
+    if x <= cand[0][1]:
+        return cand[0][0]
+    if x >= cand[-1][1]:
+        return cand[-1][0]
+    pot = max(1, int(_pot_for_sizing(state)))
+    hi = next(i for i, (_, t) in enumerate(cand) if t >= x)
+    b_act, b_tot = cand[hi]
+    a_act, a_tot = cand[hi - 1]
+    if a_tot == b_tot:
+        return a_act
+    return a_act if _pseudo_harmonic_pick_lower(a_tot, b_tot, x, pot) else b_act
+
+
+def replay_faithful_preflop(button: int, start_stacks, occupancy, rng_key,
+                            hist_seat, hist_action, hist_amount, hist_len: int):
+    """Engine-exact serve-side reconstruction of a PREFLOP arena betting state (POKERBOT_ARENA_
+    FAITHFUL_RECON). Replay the recorded history from a reconstructed root, mapping each recorded
+    BET/RAISE to the trained-menu bucket whose engine-REALIZED raise-to is pseudo-harmonic-nearest
+    the OBSERVED raise-to (``hist_amount[i]`` chips), and step the engine so the resulting betting
+    scalars are self-consistent with those buckets. Returns ``(corrected_hist_action, final_state)``
+    where ``final_state`` is the np EnvState AFTER the recorded history (hero to act) — read its
+    ``committed_street`` / ``current_bet`` to key the SAME trained node the engine would. FAIL-OPEN
+    returns ``(hist_action_unchanged, None)`` on any divergence (chance node reached, actor-order
+    mismatch, out-of-range action).
+
+    WHY: the arena observes an opponent's OFF-TREE raise size; ``actions.action_to_index`` buckets it
+    by nearest-ABSOLUTE-bb distance, collapsing every non-tiny raise to the TOP bucket (a 3bb open
+    keys as a ~4bb bucket-9 open the fullhist-keyed blueprint never trained) -> the tier1 key MISSES
+    -> uniform -> the catastrophic facing-raise fold. Two coupled corrections are needed: (a) the
+    action BUCKET (this replay picks the realized-size-nearest one), and (b) the betting SCALARS
+    committed_street/current_bet, which must equal the CHOSEN bucket's engine-realized size (not the
+    raw observed size) or the pot/to-call fall in a different abstraction bin at a bucket edge (a
+    3-bet's observed 7.5bb-total pot vs its bucketed 8.5bb-total straddles the 12bb pot edge). The
+    engine sizes raises as ``current_bet + pot*frac``, so this replay is the faithful inverse. PREFLOP
+    scope: the reconstructed root deals a dummy deck, so any history reaching a board street diverges
+    into the chance branch and fails open (postflop is search-served, not this blueprint key path)."""
+    from pokerbot.engine import np_engine as _np
+    from pokerbot.engine.jax_weva_fast import _reconstruct_root_np
+
+    raw = [int(a) for a in hist_action]
+    hl = max(0, min(int(hist_len), len(raw)))
+    if hl == 0:
+        return raw, None
+    n = len(start_stacks)
+    try:
+        r = _reconstruct_root_np(int(button), [int(x) for x in start_stacks],
+                                 [bool(x) for x in occupancy], rng_key, n)
+    except Exception:  # noqa: BLE001 -- reconstruction failure -> keep the caller's buckets
+        return raw, None
+    out = list(raw)
+    for i in range(hl):
+        if bool(r.done) or (not bool(r.done) and _np.is_chance_node_np(r)) or int(r.action_seat) < 0:
+            return raw, None  # board street / terminal mid-replay -> fail open (preflop scope)
+        seat = int(r.action_seat)
+        if seat != int(hist_seat[i]):
+            return raw, None  # recorded actor order diverged from the engine rotation -> fail open
+        a = int(hist_action[i])
+        if not (0 <= a < NUM_ACTIONS):
+            return raw, None
+        if BET_BUCKET_START <= a < ALL_IN:
+            nb = _nearest_realized_bucket(r, seat, int(hist_amount[i]), trained_legal(r, seat))
+            if nb is not None:
+                a = nb
+        out[i] = a
+        r = _np._apply_action_np_impl(r, a)
+    if bool(r.done) or (not bool(r.done) and _np.is_chance_node_np(r)):
+        return raw, None  # history closed the preflop round -> not a hero-to-act node -> fail open
+    return out, r
+
+
 def _translate_impl(state: Any):
     from pokerbot.engine import np_engine as _np
 
