@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use battery_native::core::NUM_ACTIONS;
 use battery_native::emd::FrozenEMDLookup;
-use battery_native::trainer::{serialize, NlheTables};
+use battery_native::trainer::{bench_insert_row, serialize, NlheTables};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -54,12 +54,12 @@ fn main() {
         for a in 0..NUM_ACTIONS {
             row[a] = (i as f64 * 1e-9) + (a as f64);
         }
-        tab.cum_regret.insert(key, row);
         let mut srow = [0.0f64; NUM_ACTIONS];
         for a in 0..NUM_ACTIONS {
             srow[a] = 0.1 + (a as f64) * 0.01;
         }
-        tab.strat_sum.insert(key, srow);
+        // Route the (cum_regret, strat_sum) pair to the shard the trainer would place it in.
+        bench_insert_row(&mut tab, key, row, srow);
     }
     tab.iters_done = 62_000;
 
@@ -181,21 +181,12 @@ fn main() {
         (emdfzn_size as f64 / 1e6) / emd_read_dt
     );
 
-    let emd_parse_dt = bench("parse EMDFRZN", 5, || -> f64 {
-        let t0 = Instant::now();
-        let blob = fs::read(&emdfzn_path).expect("read");
-        let _ = FrozenEMDLookup::from_bytes(&blob).expect("parse");
-        t0.elapsed().as_secs_f64()
-    });
-    println!(
-        "    FrozenEMDLookup::from_bytes  best={:.3} ms   throughput={:.1} MB/s",
-        emd_parse_dt * 1e3,
-        (emdfzn_size as f64 / 1e6) / emd_parse_dt
-    );
-
+    // NOTE: the former `FrozenEMDLookup::from_bytes` (parse-only, in-memory) was removed — parsing is
+    // now inlined into `load_path` (read+parse), so the parse-only step can no longer be isolated via
+    // the public API. Report read-only + end-to-end (load_path); parse ≈ end-to-end − read.
     let emd_total_dt = bench("EMDFRZN load end-to-end", 5, || -> f64 {
         let t0 = Instant::now();
-        let _ = FrozenEMDLookup::load(&emdfzn_path).expect("load");
+        let _ = FrozenEMDLookup::load_path(&emdfzn_path).expect("load");
         t0.elapsed().as_secs_f64()
     });
     println!(

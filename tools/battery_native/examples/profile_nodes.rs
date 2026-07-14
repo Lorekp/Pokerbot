@@ -8,12 +8,12 @@
 //!
 //! Usage: cargo run --release --example profile_nodes -- <n_deals> <warm_iters>
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use battery_native::core::{self, EnvStateN, NUM_ACTIONS, NUM_PLAYERS};
 use battery_native::fingerprint::{
-    self, fingerprint_fast_depth, fingerprint_fast_depth_memo, fingerprint_message, FpMemo,
-    CHIP_UNIT,
+    self, fingerprint_fast_depth, fingerprint_fast_depth_memo, FpMemo, CHIP_UNIT,
 };
 use battery_native::playout::Rng;
 use battery_native::trainer::{allowed_mask, NlheTables, TrainerCfg};
@@ -21,6 +21,35 @@ use battery_native::trainer::{allowed_mask, NlheTables, TrainerCfg};
 const ZEROS: [f64; NUM_ACTIONS] = [0.0; NUM_ACTIONS];
 const START_STACK_CHIPS: i32 = 100 * 100;
 const ANTE_CHIPS: i32 = 0;
+
+/// Flat by-key cum_regret view (widened to f64). The persistent `NlheTables` is now shard-partitioned
+/// (`shard_of` routing is private, and there is no public per-key getter across shards), so this dev
+/// profiler flattens the warmed read table ONCE and does its hot by-key regret reads against this map.
+type FlatCum = HashMap<[u8; 16], [f64; NUM_ACTIONS]>;
+
+/// Plain (unsharded) stand-in for a per-traversal partial `NlheTables`. Only call counts + timings
+/// matter here, so the local deltas + the merge/floor micro-benches keep their own flat maps rather
+/// than reconstructing the trainer's private sharded merge.
+#[derive(Default, Clone)]
+struct LocalTab {
+    cum_regret: HashMap<[u8; 16], [f64; NUM_ACTIONS]>,
+    strat_sum: HashMap<[u8; 16], [f64; NUM_ACTIONS]>,
+}
+
+/// Flatten a warmed sharded `NlheTables` cum_regret into one f64 map for by-key reads in the traversal.
+fn flatten_cum(read: &NlheTables) -> FlatCum {
+    let mut m = FlatCum::new();
+    for sh in read.shards.iter() {
+        for (k, row) in sh.cum_regret.iter() {
+            let mut r = [0.0f64; NUM_ACTIONS];
+            for a in 0..NUM_ACTIONS {
+                r[a] = row[a] as f64;
+            }
+            m.insert(*k, r);
+        }
+    }
+    m
+}
 
 // ----- replicate trainer::deal_root (private) via public init_hand_n -----
 fn deal_root<const N: usize>(rng: &mut Rng, deal_idx: u64) -> EnvStateN<N> {
@@ -189,8 +218,8 @@ fn one_traversal<const N: usize>(
     env: &EnvStateN<N>,
     hero: usize,
     cfg: &TrainerCfg,
-    read: &NlheTables,
-    local: &mut NlheTables,
+    read: &FlatCum,
+    local: &mut LocalTab,
     rng: &mut Rng,
     t: u64,
     memo: &mut FpMemo,
@@ -232,7 +261,7 @@ fn one_traversal<const N: usize>(
 
     if actor != hero {
         c.opp_nodes += 1;
-        let regrets = *read.cum_regret.get(&key).unwrap_or(&ZEROS);
+        let regrets = *read.get(&key).unwrap_or(&ZEROS);
         c.regret_match += 1;
         let strat = regret_match(&regrets, &legal);
         let w = t as f64;
@@ -255,7 +284,7 @@ fn one_traversal<const N: usize>(
         return one_traversal(&child, hero, cfg, read, local, rng, t, memo, c);
     }
 
-    let regrets = *read.cum_regret.get(&key).unwrap_or(&ZEROS);
+    let regrets = *read.get(&key).unwrap_or(&ZEROS);
     c.regret_match += 1;
     let strat = regret_match(&regrets, &legal);
     let mut av = [0.0f64; NUM_ACTIONS];
@@ -292,11 +321,11 @@ fn harvest<const N: usize>(
     n_deals: usize,
 ) -> Vec<(EnvStateN<N>, usize, [bool; NUM_ACTIONS])> {
     let mut out = Vec::new();
-    let mut walk = |env: &EnvStateN<N>,
-                    hero: usize,
-                    rng: &mut Rng,
-                    memo: &mut FpMemo,
-                    out: &mut Vec<(EnvStateN<N>, usize, [bool; NUM_ACTIONS])>| {
+    let walk = |env: &EnvStateN<N>,
+                hero: usize,
+                rng: &mut Rng,
+                memo: &mut FpMemo,
+                out: &mut Vec<(EnvStateN<N>, usize, [bool; NUM_ACTIONS])>| {
         // iterative single-line walk down one sampled path, recording opp-style decision states.
         let mut e = *env;
         let mut guard = 0;
@@ -383,6 +412,8 @@ fn main() {
         read.train_iteration(&cfg);
     }
     let t = read.iters_done + 1;
+    // Flatten the warmed sharded cum_regret ONCE for by-key regret reads in the traversal.
+    let read_cum = flatten_cum(&read);
     let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
     let mut memo = FpMemo::default();
     let mut c = Counters::default();
@@ -393,10 +424,10 @@ fn main() {
             .rotate_left(17);
         let mut rng = Rng::seed_from_u64(deal_seed);
         let root = deal_root::<NUM_PLAYERS>(&mut rng, d as u64);
-        let mut local = NlheTables::default();
+        let mut local = LocalTab::default();
         for hero in 0..NUM_PLAYERS {
             one_traversal::<NUM_PLAYERS>(
-                &root, hero, &cfg, &read, &mut local, &mut rng, t, &mut memo, &mut c,
+                &root, hero, &cfg, &read_cum, &mut local, &mut rng, t, &mut memo, &mut c,
             );
         }
     }
@@ -411,14 +442,14 @@ fn main() {
                 .rotate_left(17);
             let mut rng = Rng::seed_from_u64(deal_seed);
             let root = deal_root::<NUM_PLAYERS>(&mut rng, d as u64);
-            let mut local = NlheTables::default();
+            let mut local = LocalTab::default();
             let mut cc = Counters::default();
             for hero in 0..NUM_PLAYERS {
                 count_apply_done::<NUM_PLAYERS>(
                     &root,
                     hero,
                     &cfg,
-                    &read,
+                    &read_cum,
                     &mut local,
                     &mut rng,
                     t,
@@ -493,16 +524,6 @@ fn main() {
         for (s, seat, _) in &states {
             let k = fingerprint_fast_depth(s, *seat, cfg.num_buckets, &cfg.depth_edges);
             acc = acc.wrapping_add(k[0] as u64);
-        }
-        acc
-    }) / ns as f64;
-
-    // fingerprint MESSAGE only (no blake2b): isolates the state-feature extraction cost.
-    let t_fp_msg = time_ns(reps, || {
-        let mut acc = 0u64;
-        for (s, seat, _) in &states {
-            let (m, l) = fingerprint_message(s, *seat, cfg.num_buckets, &cfg.depth_edges);
-            acc = acc.wrapping_add(m[0] as u64 + l as u64);
         }
         acc
     }) / ns as f64;
@@ -670,10 +691,6 @@ fn main() {
         t_fp_miss
     );
     println!(
-        "  fp message-only    {:8.1} ns/call  (feature extract, no hash)",
-        t_fp_msg
-    );
-    println!(
         "  postflop bucket    {:8.1} ns/call  (phevaluator, postflop subset avg)",
         t_bucket
     );
@@ -775,8 +792,8 @@ fn main() {
     // merge of one partial + a full floor pass over the warmed cum_regret, to expose the per-iter tax.
     {
         // floor pass over the full cum_regret table (runs once per iteration).
-        let tbl_n = read.cum_regret.len();
-        let mut floor_clone = read.cum_regret.clone();
+        let tbl_n = read_cum.len();
+        let mut floor_clone = read_cum.clone();
         let t_floor = time_ns(50, || {
             let mut acc = 0u64;
             for row in floor_clone.values_mut() {
@@ -794,18 +811,18 @@ fn main() {
         println!("CFR+ floor pass (full table): {:.1} us/iter", t_floor / 1e3);
         // merge: time merging `n_deals` typical partials into a fresh accumulator (what the iteration
         // does serially after the par_iter). Build representative partials by running one counting iter.
-        let mut partials: Vec<NlheTables> = Vec::new();
+        let mut partials: Vec<LocalTab> = Vec::new();
         for d in 0..n_deals {
             let deal_seed = iter_seed
                 .wrapping_add((d as u64).wrapping_mul(0x100000001b3))
                 .rotate_left(17);
             let mut rng = Rng::seed_from_u64(deal_seed);
             let root = deal_root::<NUM_PLAYERS>(&mut rng, d as u64);
-            let mut local = NlheTables::default();
+            let mut local = LocalTab::default();
             let mut cc = Counters::default();
             for hero in 0..NUM_PLAYERS {
                 one_traversal::<NUM_PLAYERS>(
-                    &root, hero, &cfg, &read, &mut local, &mut rng, t, &mut memo, &mut cc,
+                    &root, hero, &cfg, &read_cum, &mut local, &mut rng, t, &mut memo, &mut cc,
                 );
             }
             partials.push(local);
@@ -816,7 +833,7 @@ fn main() {
             .sum::<usize>() as f64
             / partials.len().max(1) as f64;
         let t_merge = time_ns(20, || {
-            let mut acc = NlheTables::default();
+            let mut acc = LocalTab::default();
             // replicate NlheTables::merge (private) field-by-field.
             for p in &partials {
                 for (k, dr) in &p.cum_regret {
@@ -922,8 +939,8 @@ fn count_apply_done<const N: usize>(
     env: &EnvStateN<N>,
     hero: usize,
     cfg: &TrainerCfg,
-    read: &NlheTables,
-    local: &mut NlheTables,
+    read: &FlatCum,
+    local: &mut LocalTab,
     rng: &mut Rng,
     t: u64,
     memo: &mut FpMemo,
@@ -962,7 +979,7 @@ fn count_apply_done<const N: usize>(
     }
     let key = fingerprint_fast_depth_memo(env, actor, cfg.num_buckets, &cfg.depth_edges, memo);
     if actor != hero {
-        let regrets = *read.cum_regret.get(&key).unwrap_or(&ZEROS);
+        let regrets = *read.get(&key).unwrap_or(&ZEROS);
         let strat = regret_match(&regrets, &legal);
         let u = rng.next_f64();
         let a = sample_action(&strat, &legal, u);
@@ -983,7 +1000,7 @@ fn count_apply_done<const N: usize>(
             cr_in_apply,
         );
     }
-    let regrets = *read.cum_regret.get(&key).unwrap_or(&ZEROS);
+    let regrets = *read.get(&key).unwrap_or(&ZEROS);
     let strat = regret_match(&regrets, &legal);
     let mut av = [0.0f64; NUM_ACTIONS];
     for a in 0..NUM_ACTIONS {

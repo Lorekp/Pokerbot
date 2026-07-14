@@ -77,8 +77,8 @@ fn main() {
     let emd_frozen = if frozen_path.is_empty() {
         None
     } else {
-        let l = FrozenEMDLookup::load(&frozen_path).expect("load emd frozen");
-        println!("loaded frozen: K={} spots={}", l.num_buckets, l.len());
+        let l = FrozenEMDLookup::load_path(&frozen_path).expect("load emd frozen");
+        println!("loaded frozen: K={} spots={}", l.n_buckets, l.rows.len());
         Some(Arc::new(l))
     };
 

@@ -110,7 +110,6 @@ fn main() {
             base_seed,
             n_i32,
             resample_board,
-            false,
         );
 
         let t0 = Instant::now();
@@ -126,7 +125,6 @@ fn main() {
                     seed,
                     n_i32,
                     resample_board,
-                    false,
                 );
                 all_means.push(v);
             }
