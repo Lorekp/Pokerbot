@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Any
 
@@ -687,6 +688,91 @@ def encode_nlhe_bundle_fast(
 _FP_FAST_EMPTY = np.zeros((1,), dtype=np.float32)
 
 
+# --- SERVE-SIDE PREFLOP DEPTH CLAMP (POKERBOT_ARENA_PREFLOP_FAITHFUL) -------------------------------
+# FLOOR = the shallowest depth at which a clamped short-stack arena facing-raise node actually HITS a
+# trained tier-1 row. MEASURED on the real 538M-row idx_tier1_126k index (see the try-50/60/75/90/100bb
+# hit table in the landing report): the arena reconstruction's facing-raise keys are covered ONLY in the
+# 100bb buy-in depth bucket ([90,140) under _DEPTH_EDGES) — clamping to 50/60/75/90bb still MISSES, 100bb
+# HITS and serves defend-premiums / fold-trash. Overridable via POKERBOT_ARENA_PREFLOP_CLAMP_FLOOR_BB.
+_PREFLOP_CLAMP_FLOOR_BB_DEFAULT = 100.0
+
+
+def _preflop_clamp_enabled() -> bool:
+    """The clamp rides the EXISTING arena-preflop faithfulness flag (default OFF)."""
+    return os.environ.get("POKERBOT_ARENA_PREFLOP_FAITHFUL", "0") not in ("0", "", "false", "False")
+
+
+def _preflop_clamp_floor_bb() -> float:
+    raw = os.environ.get("POKERBOT_ARENA_PREFLOP_CLAMP_FLOOR_BB", "")
+    if raw:
+        try:
+            v = float(raw)
+        except ValueError:
+            v = 0.0
+        if v > 0.0:
+            return v
+    return _PREFLOP_CLAMP_FLOOR_BB_DEFAULT
+
+
+class _StackOverrideState:
+    """Read-only view of an ``EnvState`` with ``stacks`` replaced — for the KEY ONLY. Every other field
+    delegates to the wrapped state, so downstream key builders see the REAL pot / committed / history but
+    a scaled effective depth. The real state object is never mutated, so the decider's legal-action and
+    sizing paths (which hold the original state) still see the true short stack."""
+
+    __slots__ = ("_base", "_stacks")
+
+    def __init__(self, base: Any, stacks: np.ndarray) -> None:
+        self._base = base
+        self._stacks = stacks
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "stacks":
+            return self._stacks
+        return getattr(self._base, name)
+
+
+def _maybe_clamp_preflop_depth_for_key(state: EnvState | Any) -> EnvState | Any:
+    """SERVE-SIDE PREFLOP DEPTH CLAMP (gated behind POKERBOT_ARENA_PREFLOP_FAITHFUL, default OFF; caller
+    guarantees this runs on PREFLOP nodes only).
+
+    Root cause: the tier-1 blueprint has NO facing-raise nodes below its coverage floor. At short stacks
+    the reconstructed preflop key MISSES -> uniform-over-legal -> argmax FOLD (folds AA). The tournament
+    starts 100bb and bleeds to ~20bb, so it folds every raise. Owner fix ("use the smallest node under
+    40bb"): when the effective STARTING depth is below FLOOR bb, key the node AS IF at FLOOR depth so the
+    shallowest COVERED trained node is served.
+
+    Mechanism (KEY ONLY): scale every live seat's stack so ``effective_depth_bb == FLOOR``, leaving
+    committed_total / committed_street / pot_dead / current_bet UNCHANGED. Because the pot and the amount-
+    to-call are depth-INDEPENDENT (identical at 20bb vs FLOOR for the same raise), pot_b / tocall_b stay
+    byte-identical; only ``depth_bucket`` and the SPR bucket move up into FLOOR's (covered) buckets. The
+    scale reproduces the real FLOOR-bb facing-raise node exactly (a FLOOR-deep seat that raised to the
+    same to-amount leaves the same remaining stack), so the served key is byte-identical to that trained
+    node. Inert (returns the original object) when disabled or when the depth already >= FLOOR, so deep
+    play and both-flags-off are byte-identical."""
+    if not _preflop_clamp_enabled():
+        return state
+    floor_bb = _preflop_clamp_floor_bb()
+    d = effective_depth_bb(state)
+    if not (d > 0.0) or d >= floor_bb:
+        return state
+    stacks = np.asarray(state.stacks, dtype=np.float64)
+    committed_total = np.asarray(state.committed_total, dtype=np.float64)
+    seat_status = np.asarray(state.seat_status)
+    f = float(floor_bb) / d
+    new = stacks.copy()
+    n = min(len(stacks), len(committed_total), len(seat_status))
+    for s in range(n):
+        if int(seat_status[s]) in (_SEAT_EMPTY_I, _SEAT_FOLDED_I):
+            continue
+        total = float(stacks[s]) + float(committed_total[s])
+        if total <= 0.0:
+            continue
+        # Scale the seat's total depth to FLOOR while keeping its committed chips fixed (pot unchanged).
+        new[s] = f * total - float(committed_total[s])
+    return _StackOverrideState(state, new)
+
+
 def fingerprint_fast(state: EnvState | Any, seat: int, *, weva_table: np.ndarray | None = None) -> bytes:
     """Bounded-mode FAST fingerprint: computes ONLY the bytes the bounded key uses — weva_id (or the
     postflop made-hand bucket) + the betting-abstraction key — and reuses ``NLHEEncodeBundle.fingerprint``
@@ -726,6 +812,13 @@ def fingerprint_fast(state: EnvState | Any, seat: int, *, weva_table: np.ndarray
     pos_enum = int(_POS_BY_OFFSET[(seat - button) % NUM_PLAYERS])
     weva_id = _weva_bucket_from_holes(int(holes[seat, 0]), int(holes[seat, 1]), pos_enum, table)
     bucket = compute_postflop_bucket(holes[seat], board)
+    # SERVE-SIDE PREFLOP DEPTH CLAMP (POKERBOT_ARENA_PREFLOP_FAITHFUL, default OFF): on a PREFLOP node
+    # (street == 0), if the effective depth is below FLOOR, present the KEY builder a depth-scaled view
+    # so depth_bucket + SPR land in FLOOR's (covered) buckets — the shallowest trained facing-raise node.
+    # Gated on street==0 (NOT bucket < 0, which also fires on the rare postflop EMD fail-closed branch),
+    # so it never perturbs postflop keys. Inert (identity) when the flag is off or depth >= FLOOR.
+    if int(np.asarray(state.street)) == 0:
+        state = _maybe_clamp_preflop_depth_for_key(state)
     betting_state = betting_abstraction_key(state, seat)
     # Lossless preflop BETTING (opt-in): the preflop key uses the lossless betting history instead of the
     # bucketed betting_state. Only when BOTH flags set, and only preflop (bucket < 0). The cards-only
