@@ -514,7 +514,16 @@ def wire_native_exploit_serve(solver) -> bool:
 # call that measures THIS root's rate, then one main call fitted to the remaining budget (same public
 # seed => statistically one longer solve). Budgets >= the threshold (eval/battery/measurement configs
 # use 1e9+ or no wall) skip the fit entirely — single full-K call, byte-identical to before.
-_NATIVE_FIT_BUDGET_MS = 10_000
+# Threshold raised 10_000 -> 20_000 (2026-07-13, live evidence): the ARENA decider budgets 15s per
+# decision, which the old 10s threshold classified as "eval-like" -- so NEITHER the budget fit NOR
+# the task-75 wall cap armed in exactly the environment they were built for, and a live flop solve
+# at SPR ~143 ran 36.6s unbounded (blew the action deadline; server auto-checked us). 20s covers the
+# arena's 15s budget; eval/battery/cert configs use 1e9+ or no wall and remain untouched
+# (byte-identical). Env override for experiments.
+try:
+    _NATIVE_FIT_BUDGET_MS = int(os.environ.get("POKERBOT_NATIVE_FIT_BUDGET_MS", "20000"))
+except ValueError:
+    _NATIVE_FIT_BUDGET_MS = 20_000
 _NATIVE_FIT_PROBE_ITERS = 200
 
 # TASK-75 (2026-07-13): IN-NATIVE WALL-CLOCK CAP. The budget fit above bounds the ITERATION COUNT,
@@ -531,7 +540,20 @@ _NATIVE_FIT_PROBE_ITERS = 200
 # byte-identical certified behavior. POKERBOT_NATIVE_WALL_CAP=0 disables the cap wiring entirely.
 _NATIVE_WALL_CAP_ENABLED = (os.environ.get("POKERBOT_NATIVE_WALL_CAP", "1").strip().lower()
                             not in ("0", "false", "no", "off"))
-_NATIVE_WALL_CAP_PAD = 1.25
+# ANYTIME SERVE (2026-07-14): the pad multiplies the remaining budget to size the in-native wall cap.
+# The default 1.25 treats the cap as a loose "pathological-geometry" NET above the fit; but when the
+# probe under-measures the per-iter cost (cold-page faults during the main solve -> short-stack
+# tournament flops measured 34ms/iter vs the probe's optimistic read), the fit over-sizes k_main and
+# the 1.25x net lands the solve AFTER the deadline (live As9d flop: 17.4s vs ~16s clock -> auto-fold).
+# Setting PAD <= 1.0 makes the wall cap a TIGHT scheduler: the solve runs as many iterations as fit
+# under the budget and bails ON TIME with the averaged strategy banked so far ("search as long as we
+# have, use whatever we arrived at"). eff_budget_ms already excludes the narration+safety reserve, so
+# PAD=1.0 still leaves the full reserve for submit. Env POKERBOT_NATIVE_WALL_CAP_PAD (default 1.25 =>
+# byte-identical for eval/cert, which pass cap 0 anyway); the live serve env sets it tighter.
+try:
+    _NATIVE_WALL_CAP_PAD = float(os.environ.get("POKERBOT_NATIVE_WALL_CAP_PAD", "1.25"))
+except ValueError:
+    _NATIVE_WALL_CAP_PAD = 1.25
 # TASK-75: structural deep-SPR raise-ladder bound (GTO path only; see subgame.rs
 # raise_cap_per_street). After N aggressive actions on a street INSIDE the subgame tree, non-root
 # nodes keep only fold/check/call/all-in — the Pluribus-style capped-raises abstraction that stops
@@ -661,6 +683,16 @@ class PluribusReBeLSolver:
         self._regrets: dict[str, np.ndarray] = {}
         self._strategy_sum: dict[str, np.ndarray] = {}
         self._bp_cache: dict[str, np.ndarray] = {}  # blueprint probs by infoset key (within a solve)
+        # SearchHandle per-solve scratch (artifacts/_wf_outputs/design_2.md): the infoset-key / legal-mask
+        # memo layer the handle contract resets every solve so a memoizing serve can never leak a key or
+        # mask across decisions (same per-decision isolation the _bp_cache / _leaf_cache clears give). The
+        # interpreted _cfv loop recomputes _infoset_key / _legal inline and leaves these EMPTY on purpose:
+        # the infoset key is a deliberately lossy abstraction (spr-bucketed, abstracted stacks), so memoizing
+        # _legal by it is NOT provably byte-identical — the certified serve keeps the direct recompute. These
+        # exist as the reset-contract surface the handle-equivalence tests (tests/test_live_handle_equiv.py)
+        # mirror, and are cleared in solve() alongside the other per-solve caches.
+        self._key_cache: dict = {}
+        self._legal_cache: dict = {}
         # Leaf value cache: key -> (sum, n) running mean over the first config.leaf_cache_worlds
         # VISITING hole-worlds (BUG-1 fix; (v, 1) first-touch-frozen at the default of 1).
         self._leaf_cache: dict = {}
@@ -1378,6 +1410,8 @@ class PluribusReBeLSolver:
         self._regrets.clear()
         self._strategy_sum.clear()
         self._bp_cache.clear()
+        self._key_cache.clear()       # SearchHandle key/legal memo scratch (reset per solve — see __init__)
+        self._legal_cache.clear()
         self._leaf_cache.clear()
         self._root_av_sum = None      # reset the AIVAT root-CFV accumulator (per-decision; no carryover)
         self._root_av_wsum = 0.0
@@ -1850,8 +1884,20 @@ class PluribusReBeLSolver:
         self._get_regrets(root_key)
         iterations = 0
         budget_bound = False
+        # ``wall_bound`` is the SUBSET of budget_bound that arms the starvation blueprint blend: ONLY a
+        # wall-clock cutoff (the regime the blend was calibrated for). A cooperative cancel also sets
+        # ``budget_bound`` (the serve WAS cut short — telemetry / decision-log must see it, and the
+        # SearchHandle contract in artifacts/_wf_outputs/design_2.md specifies budget_bound=True on cancel),
+        # but leaves ``wall_bound`` False so the SERVED policy on cancel stays byte-identical to the
+        # pre-fix behavior. Eval/LBR/battery never pass a cancel_event, so their path is untouched either
+        # way; ``wall_bound`` reproduces the old ``budget_bound`` blend trigger exactly (the old flag was
+        # set only by this wall-clock branch), so the blend is byte-identical on every existing path.
+        wall_bound = False
         while iterations < eff_max_iters:
             if cancel_event is not None and cancel_event.is_set():
+                # Cancelled mid-solve (live watchdog / the table moved on): serve the best average so far
+                # and mark the serve as budget-bound (starved) WITHOUT arming the blend (see wall_bound).
+                budget_bound = True
                 break
             if (time.perf_counter() - t0) * 1000.0 >= eff_budget_ms:
                 # Wall-clock budget bound before max_iterations -> the realized average strategy is
@@ -1860,6 +1906,7 @@ class PluribusReBeLSolver:
                 # metadata so the live decision log sees how often decisions are non-reproducible under
                 # load (set a high time_budget_ms / drive purely by max_iterations for a deterministic serve).
                 budget_bound = True
+                wall_bound = True
                 self._budget_bound_count += 1
                 if self._budget_bound_count == 1:
                     print(f"[search] time_budget_ms={eff_budget_ms} bound at {iterations}/"
@@ -1915,8 +1962,10 @@ class PluribusReBeLSolver:
         # the GTO blueprint floor (it can only REDUCE exploitability vs the noisy starved average).
         blueprint_weight = 0.0
         # Measurement mode: a forced fixed-iteration solve is treated as budget-bound at that count, so the
-        # blend fires deterministically (shortfall relative to the real max_iterations target).
-        served_budget_bound = budget_bound or (force_bb is not None and force_bb > 0)
+        # blend fires deterministically (shortfall relative to the real max_iterations target). Keyed off
+        # ``wall_bound`` (NOT ``budget_bound``) so a cooperative cancel reports budget_bound in metadata but
+        # never arms the blend — ``wall_bound`` is exactly the old ``budget_bound`` blend trigger.
+        served_budget_bound = wall_bound or (force_bb is not None and force_bb > 0)
         if served_budget_bound and self._blend_active():
             target_iters = cfg.max_iterations if (force_bb is not None and force_bb > 0) else eff_max_iters
             shortfall = 1.0 - (float(iterations) / float(target_iters)) if target_iters > 0 else 1.0
