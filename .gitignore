@@ -105,3 +105,9 @@ launcher_HEAD_tmp.py
 tools/battery_native/artifacts/
 # ad-hoc scratch note (not project docs)
 discord_tournament_clock_ticket.txt
+# ---- large vendored/regenerable data blobs purged from history 2026-07-15 (kept on disk, never commit) ----
+# GitHub rejects >100MB blobs; these were stripped from all commits via git-filter-repo.
+data/pokerbench/**/postflop_500k_train_set_prompt_and_label.json
+data/pokerbench/**/postflop_500k_train_set_game_scenario_information.csv
+data/pokerbench/**/preflop_60k_train_set_prompt_and_label.json
+data/aof/cfr_base/trio_eq_tensor.npz
