@@ -123,7 +123,7 @@ def test_native_short_budget_uses_single_rust_anytime_solve(monkeypatch):
     pbs = PBSTracker.init_uniform(hero, st.players[hero].hole, st.board)
     root = build_subgame_root(st, pbs, hero)
     solver = _make_solver(iters=1_000_000)
-    solver.cfg.time_budget_ms = 75
+    solver.config.time_budget_ms = 75
     monkeypatch.setattr(ps, "_NATIVE_RUST_ANYTIME_ENABLED", True)
     monkeypatch.setattr(ps, "_NATIVE_WALL_CAP_ENABLED", True)
     monkeypatch.setattr(ps, "_NATIVE_WALL_CAP_PAD", 1.0)
