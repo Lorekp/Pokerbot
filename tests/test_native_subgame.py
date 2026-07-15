@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import random
+import time
 
 import numpy as np
 import pytest
@@ -105,6 +106,45 @@ def test_native_subgame_valid_distribution():
     legal = solver._legal(__import__("pokerbot.engine.np_engine", fromlist=["to_numpy_state"])
                           .to_numpy_state(root.env), hero)
     assert np.all(p[~legal] == 0.0)
+
+
+@native_only
+def test_native_short_budget_uses_single_rust_anytime_solve(monkeypatch):
+    """A live-scale budget belongs to Rust, not a cold Python probe/fit.
+
+    Give the solver an intentionally unreachable K target.  The cooperative
+    native deadline must return a valid accumulated strategy and report the
+    honest completed iteration count without a second fitted FFI call.
+    """
+    if not ns.native_wall_cap_capable():
+        pytest.skip("native extension does not expose solve_wall_cap")
+
+    st, hero = _postflop_root(seed=19)
+    pbs = PBSTracker.init_uniform(hero, st.players[hero].hole, st.board)
+    root = build_subgame_root(st, pbs, hero)
+    solver = _make_solver(iters=1_000_000)
+    solver.cfg.time_budget_ms = 75
+    monkeypatch.setattr(ps, "_NATIVE_RUST_ANYTIME_ENABLED", True)
+    monkeypatch.setattr(ps, "_NATIVE_WALL_CAP_ENABLED", True)
+    monkeypatch.setattr(ps, "_NATIVE_WALL_CAP_PAD", 1.0)
+
+    ps.set_native_subgame(True)
+    t0 = time.perf_counter()
+    try:
+        res = solver.solve(root, pbs)
+    finally:
+        ps.set_native_subgame(False)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    p = np.asarray(res.action_probs, dtype=np.float64)
+    assert res.metadata.get("served") == "search_native"
+    assert res.metadata.get("native_scheduler") == "rust_anytime"
+    assert res.metadata.get("wall_capped") is True
+    assert 0 < int(res.metadata.get("iters_completed", 0)) < 1_000_000
+    assert int(res.iterations) == int(res.metadata["iters_completed"])
+    assert np.all(np.isfinite(p)) and abs(p.sum() - 1.0) < 1e-6
+    # 75 ms budget + 100 ms native guard allowance; leave generous CI jitter.
+    assert elapsed_ms < 2_000.0
 
 
 @native_only
