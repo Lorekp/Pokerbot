@@ -42,6 +42,13 @@ _BIG_LO = max(_BET_LO, NUM_ACTIONS - 4)   # first "big" (>= ~1x pot) bucket; 7 f
 _FOLD_REF = 0.45
 _WSD_REF = 0.50
 _WSD_SPAN = 0.30
+# WTSD is a direct "will this opponent reach showdown?" signal.  Keep it
+# separate from WSD: a player who reaches showdown often *and wins there* is a
+# poor value-escalation target, but an even worse bluff target.  Conflating the
+# two made bluff suppression return zero for the Arena HUD shape (WTSD/WSD but
+# no fold-to-cbet field).
+_WTSD_STICKY_REF = 0.34
+_WTSD_STICKY_SPAN = 0.20
 _MIN_N = 25.0                              # derived-count sample for full confidence (no HUD)
 
 # Overlay gains (logit units). Comparable to the existing exploit terms (~1.0-1.5); α-capped downstream.
@@ -252,6 +259,45 @@ def station_payoff_score(stats) -> tuple[float, float]:
     return float(max(0.0, min(1.0, score))), float(max(0.0, min(1.0, conf)))
 
 
+def bluff_stickiness_score(stats) -> tuple[float, float]:
+    """Resolve ``(score, confidence)`` for *avoiding bluffs* into a non-folder.
+
+    This intentionally differs from :func:`station_payoff_score`.  WSD belongs
+    in the value-sizing guard (a strong showdown range can value-cut us), but it
+    must never erase evidence that a villain calls down too often.  Arena's HUD
+    currently exposes WTSD reliably while fold-to-cbet/FTA may be absent, so
+    WTSD is the conservative fallback for the fold-equity question.
+    """
+    hud = getattr(stats, "hud", None) or {}
+    ftc = _pct(hud, "foldToCbet", "foldtocbet")
+    fta = _pct(hud, "fta", "fold")
+    wtsd = _pct(hud, "wtsd")
+
+    cf = float(getattr(stats, "cbet_faced", 0) or 0)
+    if ftc is None and cf > 0:
+        ftc = float(getattr(stats, "fold_to_cbet", 0) or 0) / cf
+
+    folds = [v for v in (ftc, fta) if v is not None]
+    by_folds = max(0.0, min(1.0, (_FOLD_REF - min(folds)) / _FOLD_REF)) if folds else 0.0
+    by_wtsd = (max(0.0, min(1.0, (wtsd - _WTSD_STICKY_REF) / _WTSD_STICKY_SPAN))
+               if wtsd is not None else 0.0)
+    score = max(by_folds, by_wtsd)
+
+    arch = stats.archetype() if hasattr(stats, "archetype") else "unknown"
+    if arch == "calling_station":
+        score = max(score, 0.5)
+    elif arch in ("lag", "tag"):
+        score *= 0.3
+
+    if folds or wtsd is not None:
+        conf = 0.9
+    else:
+        n = max(cf, float(getattr(stats, "saw_flop", 0) or 0),
+                float(getattr(stats, "hands", 0) or 0) / 2.0)
+        conf = min(1.0, n / _MIN_N)
+    return float(max(0.0, min(1.0, score))), float(max(0.0, min(1.0, conf)))
+
+
 def value_sizing_logits(
     stats, hand_strength: float | None, *, rake_ctx: RakeContext | None = None
 ) -> np.ndarray:
@@ -268,7 +314,9 @@ def value_sizing_logits(
     adj = np.zeros(NUM_ACTIONS, dtype=np.float64)
     if not _enabled() or NUM_ACTIONS < 5:
         return adj
-    h = 0.55 if hand_strength is None else float(np.clip(hand_strength, 0.0, 1.0))
+    if hand_strength is None:                   # fail closed: unknown is not value
+        return adj
+    h = float(np.clip(hand_strength, 0.0, 1.0))
     value = max(0.0, (h - 0.5) * 2.0)         # only value hands escalate (air never over-bets here)
     if value <= 0.0:
         return adj
@@ -295,16 +343,21 @@ def bluff_suppression_logits(stats, hand_strength: float | None) -> np.ndarray:
     adj = np.zeros(NUM_ACTIONS, dtype=np.float64)
     if not _bluff_suppress_enabled() or NUM_ACTIONS < 5:
         return adj
-    h = 0.55 if hand_strength is None else float(np.clip(hand_strength, 0.0, 1.0))
+    if hand_strength is None:                   # unknown is neither proven air nor value
+        return adj
+    h = float(np.clip(hand_strength, 0.0, 1.0))
     air = max(0.0, (0.5 - h) * 2.0)            # only air suppresses (value never suppresses)
     if air <= 0.0:
         return adj
-    score, conf = station_payoff_score(stats)
+    score, conf = bluff_stickiness_score(stats)
     mag = score * conf * air                   # in [0,1]
     if mag <= 0.0:
         return adj
-    adj[_BET_LO:_ALL_IN] -= _K_BLUFF * mag      # de-prioritize bluff bets across sizes (they call anyway)
-    adj[1] += _K_BLUFF_CHECK * mag              # prefer checking/giving up air vs a non-folder
+    # Air is air at every size.  Leaving the all-in bucket untouched while
+    # suppressing smaller bets increases its normalized probability—the exact
+    # opposite of the safety lever.  Suppress the complete aggressive tail.
+    adj[_BET_LO:] -= _K_BLUFF * mag              # de-prioritize bluff bets across all sizes
+    adj[1] += _K_BLUFF_CHECK * mag               # prefer checking/giving up air vs a non-folder
     return adj
 
 

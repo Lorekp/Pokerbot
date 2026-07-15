@@ -120,12 +120,15 @@ mod tests {
         let called = core::apply_action(&s, core::CALL);
         // VARIANT ENGINE: the called open leaves preflop OPEN with the aggressor to act again.
         assert!(!called.pending_deal && called.street == core::STREET_PREFLOP);
-        assert_eq!(called.action_seat, utg as i32, "aggressor dealt the reopen node");
+        assert_eq!(
+            called.action_seat, utg as i32,
+            "aggressor dealt the reopen node"
+        );
         // CLOSURE: the injected check closes preflop -> chance node (flop pending).
         let closed = close_called_street(called);
         assert!(closed.pending_deal, "closure must close the street");
         assert_eq!(closed.street, core::STREET_PREFLOP); // close_street leaves street; sample_chance advances
-        // Idempotent on the closed state.
+                                                         // Idempotent on the closed state.
         let again = close_called_street(closed);
         assert_eq!(again.pending_deal, closed.pending_deal);
         assert_eq!(again.hist_len, closed.hist_len);
@@ -141,7 +144,10 @@ mod tests {
         }
         assert!(l.last_aggressor < 0, "limped pot has no aggressor");
         let kept = close_called_street(l);
-        assert_eq!(kept.action_seat, l.action_seat, "BB option node must survive closure");
+        assert_eq!(
+            kept.action_seat, l.action_seat,
+            "BB option node must survive closure"
+        );
         assert_eq!(kept.hist_len, l.hist_len);
     }
 
@@ -174,7 +180,10 @@ mod tests {
                 let reopen = a == s.last_aggressor
                     && s.current_bet == s.committed_street[a as usize]
                     && s.street < core::STREET_TERMINAL;
-                assert!(!reopen, "closed game dealt an aggressor-reopen node (seed {seed})");
+                assert!(
+                    !reopen,
+                    "closed game dealt an aggressor-reopen node (seed {seed})"
+                );
                 let mask = core::legal_action_mask(&s, a);
                 let legal: Vec<usize> = (0..core::NUM_ACTIONS).filter(|&i| mask[i]).collect();
                 let pick = legal[(rand() % legal.len() as u64) as usize];

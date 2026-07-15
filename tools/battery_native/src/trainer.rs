@@ -897,7 +897,10 @@ fn lcfr_discount_event(v3: &V3Cfg, t: u64) -> bool {
 #[inline]
 fn accumulate_local_into(acc: &mut NlheTables, local: &mut LocalDelta) {
     for (k, row) in local.cum_regret.drain() {
-        let e = acc.shards[shard_of(&k)].cum_regret.entry(k).or_insert(ZEROS_R);
+        let e = acc.shards[shard_of(&k)]
+            .cum_regret
+            .entry(k)
+            .or_insert(ZEROS_R);
         for a in 0..NUM_ACTIONS {
             e[a] = radd(e[a], row[a]);
         }
@@ -1004,8 +1007,7 @@ pub fn parse_keep_list(s: &str) -> Result<Vec<usize>, String> {
 fn keep_env_mask(var: &'static str) -> Option<[bool; NUM_ACTIONS]> {
     match std::env::var(var) {
         Ok(s) if !s.trim().is_empty() => {
-            let keep =
-                parse_keep_list(&s).unwrap_or_else(|e| panic!("{var}={s:?} invalid: {e}"));
+            let keep = parse_keep_list(&s).unwrap_or_else(|e| panic!("{var}={s:?} invalid: {e}"));
             Some(allowed_mask(&keep))
         }
         _ => None,
@@ -1027,7 +1029,8 @@ pub fn keep_mask_from_env(var: &'static str, default_keep: &[usize]) -> [bool; N
 fn pre_rr_keep_env() -> Option<&'static [bool; NUM_ACTIONS]> {
     use std::sync::OnceLock;
     static M: OnceLock<Option<[bool; NUM_ACTIONS]>> = OnceLock::new();
-    M.get_or_init(|| keep_env_mask("POKERBOT_PRE_RR_KEEP")).as_ref()
+    M.get_or_init(|| keep_env_mask("POKERBOT_PRE_RR_KEEP"))
+        .as_ref()
 }
 
 /// ARM-3 MENU KNOB `POKERBOT_FLOP_RR_KEEP` (read once): FLOP RE-RAISE keep list under M-RR.
@@ -1039,7 +1042,8 @@ fn pre_rr_keep_env() -> Option<&'static [bool; NUM_ACTIONS]> {
 fn flop_rr_keep_env() -> Option<&'static [bool; NUM_ACTIONS]> {
     use std::sync::OnceLock;
     static M: OnceLock<Option<[bool; NUM_ACTIONS]>> = OnceLock::new();
-    M.get_or_init(|| keep_env_mask("POKERBOT_FLOP_RR_KEEP")).as_ref()
+    M.get_or_init(|| keep_env_mask("POKERBOT_FLOP_RR_KEEP"))
+        .as_ref()
 }
 
 #[inline]
@@ -1537,7 +1541,9 @@ fn perf_log_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("POKERBOT_PERF_LOG").map(|v| v == "1").unwrap_or(false)
+        std::env::var("POKERBOT_PERF_LOG")
+            .map(|v| v == "1")
+            .unwrap_or(false)
     })
 }
 
@@ -1721,7 +1727,9 @@ fn fp_audit_sink() -> Option<&'static std::sync::Mutex<FpAuditState>> {
     use std::sync::OnceLock;
     static SINK: OnceLock<Option<std::sync::Mutex<FpAuditState>>> = OnceLock::new();
     SINK.get_or_init(|| {
-        let path = std::env::var("POKERBOT_FP_AUDIT_FILE").ok().filter(|p| !p.is_empty())?;
+        let path = std::env::var("POKERBOT_FP_AUDIT_FILE")
+            .ok()
+            .filter(|p| !p.is_empty())?;
         let max_lines = std::env::var("POKERBOT_FP_AUDIT_MAX")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -2153,11 +2161,25 @@ fn showdown_returns<const N: usize>(
     }
     #[cfg(feature = "phe_showdown")]
     {
-        compute_returns_phe(holes, board, seat_status, committed_total, button, n_showdown)
+        compute_returns_phe(
+            holes,
+            board,
+            seat_status,
+            committed_total,
+            button,
+            n_showdown,
+        )
     }
     #[cfg(not(feature = "phe_showdown"))]
     {
-        core::compute_returns(holes, board, seat_status, committed_total, button, n_showdown)
+        core::compute_returns(
+            holes,
+            board,
+            seat_status,
+            committed_total,
+            button,
+            n_showdown,
+        )
     }
 }
 
@@ -2316,7 +2338,12 @@ fn one_traversal<const N: usize>(
     // absent), widening to f64 for regret-matching. Read once and reused by both branches below. The
     // probe loads `RegretT`-width bytes (44B under f32_regret vs 88B f64) — this halved read is the
     // memory-traffic relief; `widen_r` is a no-op copy in the f64 build.
-    let regrets = widen_r(read.shards[shard_of(&key)].cum_regret.get(&key).unwrap_or(&ZEROS_R));
+    let regrets = widen_r(
+        read.shards[shard_of(&key)]
+            .cum_regret
+            .get(&key)
+            .unwrap_or(&ZEROS_R),
+    );
 
     if actor != hero {
         // Opponent node: regret-matching+ strategy, sample ONE action (external sampling). Regrets are
@@ -2648,11 +2675,7 @@ impl<const N: usize> DealTrav<N> {
 /// NOT need a fresh regret read: terminal / chance / no-actor leaves, chance sampling, and Hero RESUME
 /// (consuming a completed child, launching the next, or finalizing). Mirrors `one_traversal` exactly.
 #[inline]
-fn advance_to_probe<const N: usize>(
-    trav: &mut DealTrav<N>,
-    cfg: &TrainerCfg,
-    memo: &mut FpMemo,
-) {
+fn advance_to_probe<const N: usize>(trav: &mut DealTrav<N>, cfg: &TrainerCfg, memo: &mut FpMemo) {
     loop {
         let frame = match trav.stack.last() {
             Some(f) => f,
@@ -2735,7 +2758,17 @@ fn advance_to_probe<const N: usize>(
                 let step;
                 {
                     let top = trav.stack.last_mut().unwrap();
-                    let Frame::Hero { env, key, strat, legal, lidx, ln, av, i } = top else {
+                    let Frame::Hero {
+                        env,
+                        key,
+                        strat,
+                        legal,
+                        lidx,
+                        ln,
+                        av,
+                        i,
+                    } = top
+                    else {
                         unreachable!("Frame::Hero")
                     };
                     let a_done = lidx[*i];
@@ -2763,7 +2796,12 @@ fn advance_to_probe<const N: usize>(
                         trav.stack.push(Frame::Node(child));
                         continue;
                     }
-                    Step::Finalize { strat, av, legal, key } => {
+                    Step::Finalize {
+                        strat,
+                        av,
+                        legal,
+                        key,
+                    } => {
                         // ev = sum_a strat[a]*av[a] over a=0..NUM_ACTIONS — VERBATIM from one_traversal.
                         let mut ev = 0.0;
                         for a in 0..NUM_ACTIONS {
@@ -2799,7 +2837,10 @@ fn consume<const N: usize>(
     cfg: &TrainerCfg,
     t: u64,
 ) {
-    let key = trav.pending_key.take().expect("consume without a pending key");
+    let key = trav
+        .pending_key
+        .take()
+        .expect("consume without a pending key");
     // The actor node env is on top.
     let env = match trav.stack.last() {
         Some(Frame::Node(env)) => *env,
@@ -2885,8 +2926,12 @@ fn run_batch<const N: usize>(
         // PHASE B: issue the B independent cum_regret reads back-to-back (the memory-level parallelism).
         for (j, trav) in travs.iter().enumerate() {
             if let Some(key) = trav.pending_key {
-                regrets[j] =
-                    widen_r(read.shards[shard_of(&key)].cum_regret.get(&key).unwrap_or(&ZEROS_R));
+                regrets[j] = widen_r(
+                    read.shards[shard_of(&key)]
+                        .cum_regret
+                        .get(&key)
+                        .unwrap_or(&ZEROS_R),
+                );
             }
         }
         // PHASE C: consume each read and step one node past the actor.
@@ -2981,7 +3026,12 @@ fn one_traversal_profile<const N: usize>(
     let regrets = if ab_stub_mode() == 2 {
         ZEROS // regret_zero: skip the cum_regret hashmap probe (subtractive attribution stub)
     } else {
-        widen_r(read.shards[shard_of(&key)].cum_regret.get(&key).unwrap_or(&ZEROS_R))
+        widen_r(
+            read.shards[shard_of(&key)]
+                .cum_regret
+                .get(&key)
+                .unwrap_or(&ZEROS_R),
+        )
     };
 
     if actor != hero {
@@ -3222,7 +3272,11 @@ impl NlheTables {
             if v3.regret_floor == f64::NEG_INFINITY {
                 self.merge_partials(cfg, partials);
             } else {
-                self.merge_partials_clamped(cfg, partials, MergeClamp::SignedFloor(v3.regret_floor));
+                self.merge_partials_clamped(
+                    cfg,
+                    partials,
+                    MergeClamp::SignedFloor(v3.regret_floor),
+                );
             }
         } else {
             // CFR+ default: positive-regret floor, applied to the rows this merge touched — value-
@@ -3249,7 +3303,9 @@ impl NlheTables {
         // the batched MLP path — work-steal uses the recursive `one_traversal`; the two are mutually
         // exclusive here (work-steal takes precedence; a future merge could batch within a worker).
         if work_steal_enabled(cfg) {
-            return Self::collect_partials_n_worksteal::<N>(cfg, read, t, iter_seed, eff_prune, v3i);
+            return Self::collect_partials_n_worksteal::<N>(
+                cfg, read, t, iter_seed, eff_prune, v3i,
+            );
         }
         // BATCHED MLP PATH: when `cfg.batch_deals >= 2` AND RBP is OFF (the production regime), step
         // `B` independent deals in lockstep so their cum_regret probes overlap (see `run_batch`). The
@@ -3313,26 +3369,28 @@ impl NlheTables {
                     (NlheTables::default(), LocalDelta::default())
                 },
                 |(mut acc, mut local), d| {
-                let deal_seed = iter_seed
-                    .wrapping_add((d as u64).wrapping_mul(0x100000001b3))
-                    .rotate_left(17);
-                let mut rng = Rng::seed_from_u64(deal_seed);
-                let root = deal_root::<N>(&mut rng, d as u64);
-                // Per-deal DELTA accumulator: EMPTY at this point (drained after the previous deal), so
-                // `local` IS this deal's delta — `one_traversal` reads strategy from the shared `read`
-                // snapshot and `+=`-writes only the touched regret/strat-sum rows here. Drained into the
-                // per-task `acc` immediately after.
-                FP_MEMO.with(|cell| {
-                    let memo = &mut *cell.borrow_mut();
-                    for hero in 0..N {
-                        one_traversal::<N>(
-                            &root, hero, cfg, read, &mut local, &mut rng, t, memo, eff_prune, v3i,
-                        );
-                    }
-                });
-                accumulate_local_into(&mut acc, &mut local);
-                (acc, local)
-            })
+                    let deal_seed = iter_seed
+                        .wrapping_add((d as u64).wrapping_mul(0x100000001b3))
+                        .rotate_left(17);
+                    let mut rng = Rng::seed_from_u64(deal_seed);
+                    let root = deal_root::<N>(&mut rng, d as u64);
+                    // Per-deal DELTA accumulator: EMPTY at this point (drained after the previous deal), so
+                    // `local` IS this deal's delta — `one_traversal` reads strategy from the shared `read`
+                    // snapshot and `+=`-writes only the touched regret/strat-sum rows here. Drained into the
+                    // per-task `acc` immediately after.
+                    FP_MEMO.with(|cell| {
+                        let memo = &mut *cell.borrow_mut();
+                        for hero in 0..N {
+                            one_traversal::<N>(
+                                &root, hero, cfg, read, &mut local, &mut rng, t, memo, eff_prune,
+                                v3i,
+                            );
+                        }
+                    });
+                    accumulate_local_into(&mut acc, &mut local);
+                    (acc, local)
+                },
+            )
             .map(|(acc, _local)| acc)
             .collect()
     }
@@ -3502,7 +3560,11 @@ impl NlheTables {
                 || {
                     fp_memo_cap_check();
                     // R2: reused per-task LocalDelta (see `collect_partials_n` / `accumulate_local_into`).
-                    (NlheTables::default(), TraverseStats::default(), LocalDelta::default())
+                    (
+                        NlheTables::default(),
+                        TraverseStats::default(),
+                        LocalDelta::default(),
+                    )
                 },
                 |(mut acc, mut acc_stats, mut local), d| {
                     let deal_seed = iter_seed
@@ -3515,8 +3577,18 @@ impl NlheTables {
                         let before = memo.len();
                         for hero in 0..N {
                             one_traversal_profile::<N>(
-                                &root, hero, cfg, read, &mut local, &mut rng, t, memo, &mut acc_stats,
-                                0, eff_prune, v3i,
+                                &root,
+                                hero,
+                                cfg,
+                                read,
+                                &mut local,
+                                &mut rng,
+                                t,
+                                memo,
+                                &mut acc_stats,
+                                0,
+                                eff_prune,
+                                v3i,
                             );
                         }
                         acc_stats.fp_memo_new_entries += memo.len().saturating_sub(before) as u64;
@@ -3815,7 +3887,11 @@ impl NlheTables {
             if v3.regret_floor == f64::NEG_INFINITY {
                 self.merge_partials(cfg, partials);
             } else {
-                self.merge_partials_clamped(cfg, partials, MergeClamp::SignedFloor(v3.regret_floor));
+                self.merge_partials_clamped(
+                    cfg,
+                    partials,
+                    MergeClamp::SignedFloor(v3.regret_floor),
+                );
             }
         } else {
             self.merge_partials_clamped(cfg, partials, MergeClamp::Positive);
@@ -4743,7 +4819,9 @@ pub fn serialize_current_strategy(tab: &NlheTables) -> Vec<u8> {
             encode_snap_row(&mut dst[off..off + SNAP_ROW_BYTES], k, row);
         }
     } else {
-        let rows_per_chunk = n_rows.div_ceil(rayon::current_num_threads().max(1) * 4).max(1);
+        let rows_per_chunk = n_rows
+            .div_ceil(rayon::current_num_threads().max(1) * 4)
+            .max(1);
         dst.par_chunks_mut(rows_per_chunk * SNAP_ROW_BYTES)
             .zip(pairs.par_chunks(rows_per_chunk))
             .for_each(|(byte_chunk, pair_chunk)| {
@@ -4808,13 +4886,19 @@ pub struct SnapshotStream<R: std::io::Read> {
 impl<R: std::io::Read> SnapshotStream<R> {
     pub fn open(mut rdr: R) -> Result<Self, String> {
         let mut hdr = [0u8; 24];
-        rdr.read_exact(&mut hdr).map_err(|e| format!("snapshot header: {e}"))?;
+        rdr.read_exact(&mut hdr)
+            .map_err(|e| format!("snapshot header: {e}"))?;
         if &hdr[0..8] != SNAP_MAGIC {
             return Err("bad snapshot magic (want NLSNAP01)".into());
         }
         let iters_done = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
         let n_rows = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
-        Ok(SnapshotStream { iters_done, n_rows, read_rows: 0, rdr })
+        Ok(SnapshotStream {
+            iters_done,
+            n_rows,
+            read_rows: 0,
+            rdr,
+        })
     }
 
     #[allow(clippy::type_complexity)]
@@ -4851,18 +4935,27 @@ pub struct NlcfrStratStream<R: std::io::Read + std::io::Seek> {
 impl<R: std::io::Read + std::io::Seek> NlcfrStratStream<R> {
     pub fn open(mut rdr: R) -> Result<Self, String> {
         let mut hdr = [0u8; 24];
-        rdr.read_exact(&mut hdr).map_err(|e| format!("nlcfr header: {e}"))?;
+        rdr.read_exact(&mut hdr)
+            .map_err(|e| format!("nlcfr header: {e}"))?;
         if &hdr[0..8] != b"NLCFR001" {
             return Err("bad checkpoint magic (want NLCFR001)".into());
         }
         let iters_done = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
         let cum_len = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
-        rdr.seek(std::io::SeekFrom::Current((cum_len * NLCFR_ROW_BYTES) as i64))
-            .map_err(|e| format!("nlcfr cum-section seek: {e}"))?;
+        rdr.seek(std::io::SeekFrom::Current(
+            (cum_len * NLCFR_ROW_BYTES) as i64,
+        ))
+        .map_err(|e| format!("nlcfr cum-section seek: {e}"))?;
         let mut nb = [0u8; 8];
-        rdr.read_exact(&mut nb).map_err(|e| format!("nlcfr strat len: {e}"))?;
+        rdr.read_exact(&mut nb)
+            .map_err(|e| format!("nlcfr strat len: {e}"))?;
         let n_rows = u64::from_le_bytes(nb);
-        Ok(NlcfrStratStream { iters_done, n_rows, read_rows: 0, rdr })
+        Ok(NlcfrStratStream {
+            iters_done,
+            n_rows,
+            read_rows: 0,
+            rdr,
+        })
     }
 
     #[allow(clippy::type_complexity)]
@@ -4923,10 +5016,13 @@ where
     // Header with a strat-count placeholder (fixed up by a final seek — the count is only known after
     // the merge). Cum section: length 0 (the final blueprint carries no regrets).
     out.write_all(b"NLCFR001").map_err(|e| e.to_string())?;
-    out.write_all(&iters_done.to_le_bytes()).map_err(|e| e.to_string())?;
-    out.write_all(&0u64.to_le_bytes()).map_err(|e| e.to_string())?; // cum len = 0
+    out.write_all(&iters_done.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    out.write_all(&0u64.to_le_bytes())
+        .map_err(|e| e.to_string())?; // cum len = 0
     let strat_len_pos = out.stream_position().map_err(|e| e.to_string())?;
-    out.write_all(&0u64.to_le_bytes()).map_err(|e| e.to_string())?; // strat len placeholder
+    out.write_all(&0u64.to_le_bytes())
+        .map_err(|e| e.to_string())?; // strat len placeholder
 
     // Stream heads. Ascending-order violations => corrupt input => hard error.
     let mut heads: Vec<Option<([u8; 16], [f32; NUM_ACTIONS])>> = Vec::with_capacity(snaps.len());
@@ -5004,8 +5100,10 @@ where
 
     // Fix up the strat-count placeholder.
     let end = out.stream_position().map_err(|e| e.to_string())?;
-    out.seek(SeekFrom::Start(strat_len_pos)).map_err(|e| e.to_string())?;
-    out.write_all(&stats.rows_out.to_le_bytes()).map_err(|e| e.to_string())?;
+    out.seek(SeekFrom::Start(strat_len_pos))
+        .map_err(|e| e.to_string())?;
+    out.write_all(&stats.rows_out.to_le_bytes())
+        .map_err(|e| e.to_string())?;
     out.seek(SeekFrom::Start(end)).map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())?;
     Ok(stats)
@@ -5441,15 +5539,24 @@ mod tests {
     #[test]
     fn f32_regret_guard_predicate_fires_only_on_floor_removing_modes() {
         let inert = V3Cfg::default(); // lcfr=false, signed_regrets=false
-        let lcfr = V3Cfg { lcfr: true, ..V3Cfg::default() };
-        let signed = V3Cfg { signed_regrets: true, ..V3Cfg::default() };
+        let lcfr = V3Cfg {
+            lcfr: true,
+            ..V3Cfg::default()
+        };
+        let signed = V3Cfg {
+            signed_regrets: true,
+            ..V3Cfg::default()
+        };
         // Pure CFR+ (no dcfr, inert v3) is ALWAYS safe, regardless of the feature.
         assert!(!f32_regret_unsafe_combo(false, &inert));
         if cfg!(feature = "f32_regret") {
             // Each floor-removing mode trips the guard when the feature is on.
             assert!(f32_regret_unsafe_combo(true, &inert), "dcfr must trip");
             assert!(f32_regret_unsafe_combo(false, &lcfr), "lcfr must trip");
-            assert!(f32_regret_unsafe_combo(false, &signed), "signed_regrets must trip");
+            assert!(
+                f32_regret_unsafe_combo(false, &signed),
+                "signed_regrets must trip"
+            );
         } else {
             // Default f64 build: the guard is inert for every mode (no false ship-block).
             assert!(!f32_regret_unsafe_combo(true, &inert));
@@ -5524,8 +5631,7 @@ mod tests {
         for a in 0..NUM_ACTIONS {
             let want_rr = a == f || a == x || a == c || a == ai || a == bbs + 4;
             assert_eq!(rr[a], want_rr, "mrr_reraise_keep bit {a}");
-            let want_trf =
-                a == f || a == x || a == c || a == ai || a == bbs + 1 || a == bbs + 4;
+            let want_trf = a == f || a == x || a == c || a == ai || a == bbs + 1 || a == bbs + 4;
             assert_eq!(trf[a], want_trf, "mrr_tr_first_keep bit {a}");
         }
 
@@ -5571,7 +5677,10 @@ mod tests {
         ];
         let mut env = pre_root;
         for (seat, action) in script {
-            assert!(!core::is_chance_node(&env), "unexpected chance node mid-script");
+            assert!(
+                !core::is_chance_node(&env),
+                "unexpected chance node mid-script"
+            );
             assert_eq!(env.action_seat, seat, "script actor mismatch");
             env = core::apply_action(&env, action);
         }
@@ -5611,7 +5720,11 @@ mod tests {
         // MRR-ON aggressive bet-size ids ⊆ {bbs+4}.
         for a in bbs..ai {
             if rr_on[a] {
-                assert_eq!(a, bbs + 4, "MRR-ON re-raise aggressive bet id must be 1x-pot only");
+                assert_eq!(
+                    a,
+                    bbs + 4,
+                    "MRR-ON re-raise aggressive bet id must be 1x-pot only"
+                );
             }
         }
         // Behavior change: at least one aggressive bet-size id present OFF is absent ON.
@@ -5621,9 +5734,18 @@ mod tests {
                 changed = true;
             }
         }
-        assert!(changed, "MRR must remove at least one aggressive re-raise size on the flop");
-        assert!(rr_on[f] && rr_off[f], "FOLD present in both arms at re-raise");
-        assert!(rr_on[c] && rr_off[c], "CALL present in both arms at re-raise");
+        assert!(
+            changed,
+            "MRR must remove at least one aggressive re-raise size on the flop"
+        );
+        assert!(
+            rr_on[f] && rr_off[f],
+            "FOLD present in both arms at re-raise"
+        );
+        assert!(
+            rr_on[c] && rr_off[c],
+            "CALL present in both arms at re-raise"
+        );
         // (5) OFF == legacy allowed_post at the flop re-raise node.
         assert_eq!(
             rr_off,
@@ -5740,8 +5862,7 @@ mod tests {
         );
         let s = threbet.action_seat as usize;
         let rr_none = abstracted_legal_menus(&threbet, s, &cfg, false, None, None);
-        let rr_set =
-            abstracted_legal_menus(&threbet, s, &cfg, false, Some(&pre_rr_mask), None);
+        let rr_set = abstracted_legal_menus(&threbet, s, &cfg, false, Some(&pre_rr_mask), None);
         assert_eq!(
             rr_none,
             abstracted_legal_mrr(&threbet, s, &cfg, false),
@@ -5749,7 +5870,11 @@ mod tests {
         );
         for a in bbs..core::ALL_IN {
             if rr_set[a] {
-                assert_eq!(a, bbs + 4, "pre_rr keep [4] governs 3-bet sizes, got id {a}");
+                assert_eq!(
+                    a,
+                    bbs + 4,
+                    "pre_rr keep [4] governs 3-bet sizes, got id {a}"
+                );
             }
         }
         // Premise bites: 1.5x/2x-pot 3-bets are min-raise-legal here, present without pre_rr.
@@ -5787,8 +5912,7 @@ mod tests {
         let fs = facing.action_seat as usize;
         assert!(facing.current_bet > facing.committed_street[fs]);
         let f_none = abstracted_legal_menus(&facing, fs, &cfg, true, None, None);
-        let f_wide =
-            abstracted_legal_menus(&facing, fs, &cfg, true, None, Some(&flop_rr_mask));
+        let f_wide = abstracted_legal_menus(&facing, fs, &cfg, true, None, Some(&flop_rr_mask));
         assert_eq!(
             f_none,
             abstracted_legal_mrr(&facing, fs, &cfg, true),
@@ -5817,8 +5941,7 @@ mod tests {
         let t_facing = core::apply_action(&turn, bbs + 4);
         let ts = t_facing.action_seat as usize;
         assert!(t_facing.current_bet > t_facing.committed_street[ts]);
-        let t_wide =
-            abstracted_legal_menus(&t_facing, ts, &cfg, true, None, Some(&flop_rr_mask));
+        let t_wide = abstracted_legal_menus(&t_facing, ts, &cfg, true, None, Some(&flop_rr_mask));
         assert_eq!(
             t_wide,
             abstracted_legal_mrr(&t_facing, ts, &cfg, true),
@@ -6021,7 +6144,10 @@ mod tests {
     fn shape_probe_rfi() {
         const N: usize = NUM_PLAYERS;
         fn env_u64(k: &str, d: u64) -> u64 {
-            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
         }
         let iters = env_u64("POKERBOT_SHAPE_ITERS", 2000);
         let ndeals = env_u64("POKERBOT_SHAPE_NDEALS", 64) as usize;
@@ -6037,7 +6163,11 @@ mod tests {
             Some(p) if std::path::Path::new(p).exists() => {
                 let bytes = std::fs::read(p).expect("read ckpt");
                 let t = deserialize_parallel(&bytes).expect("bad ckpt");
-                println!("resumed ckpt {p}: iters_done={} rows={}", t.iters_done, t.total_strat_len());
+                println!(
+                    "resumed ckpt {p}: iters_done={} rows={}",
+                    t.iters_done,
+                    t.total_strat_len()
+                );
                 t
             }
             _ => NlheTables::default(),
@@ -6052,7 +6182,10 @@ mod tests {
             tab.train_iteration(&cfg);
             done += 1;
             if done % 500 == 0 || done == iters {
-                println!("  iter {done}/{iters} el={:.0}s", t0.elapsed().as_secs_f64());
+                println!(
+                    "  iter {done}/{iters} el={:.0}s",
+                    t0.elapsed().as_secs_f64()
+                );
             }
         }
         if let Some(p) = &ckpt {
@@ -6063,8 +6196,13 @@ mod tests {
         println!("snapshot rows: {}", snap.len());
 
         // RFI nodes with button=0: acting order 3(UTG) 4(HJ) 5(CO) 0(BTN) 1(SB).
-        let positions: [(usize, &str, usize); 5] =
-            [(3, "UTG", 0), (4, "HJ", 1), (5, "CO", 2), (0, "BTN", 3), (1, "SB", 4)];
+        let positions: [(usize, &str, usize); 5] = [
+            (3, "UTG", 0),
+            (4, "HJ", 1),
+            (5, "CO", 2),
+            (0, "BTN", 3),
+            (1, "SB", 4),
+        ];
         const RANKS: &[u8] = b"23456789TJQKA";
         let specials = ["AA", "KK", "QQ", "AKs", "AKo", "72o"];
         for (seat, pname, nfolds) in positions {
@@ -6148,10 +6286,15 @@ mod tests {
                             // trainer's own measurement of each action's value vs its current mix.
                             // Under CFR+ the floor keeps entries >= 0; a locked-out action shows ~0
                             // while the preferred actions carry large positive regret.
-                            let rrow =
-                                widen_r(tab.shards[shard_of(&key)].cum_regret.get(&key).unwrap_or(&ZEROS_R));
-                            let ropen: f64 =
-                                (core::BET_BUCKET_START..core::ALL_IN).map(|a| rrow[a]).sum();
+                            let rrow = widen_r(
+                                tab.shards[shard_of(&key)]
+                                    .cum_regret
+                                    .get(&key)
+                                    .unwrap_or(&ZEROS_R),
+                            );
+                            let ropen: f64 = (core::BET_BUCKET_START..core::ALL_IN)
+                                .map(|a| rrow[a])
+                                .sum();
                             special_rows.push(format!(
                                 "    {label:4} fold={:.2} limp={:.2} open={:.2} jam={:.2}  R[fold={:.0} limp={:.0} open={:.0} jam={:.0}]",
                                 row[core::FOLD], row[core::CALL], open, row[core::ALL_IN],
@@ -6330,7 +6473,10 @@ mod tests {
                     scalar.rewards, phe.rewards,
                     "site-1 reward mismatch: deal {d} action {a}"
                 );
-                assert!(scalar == phe, "site-1 EnvStateN mismatch: deal {d} action {a}");
+                assert!(
+                    scalar == phe,
+                    "site-1 EnvStateN mismatch: deal {d} action {a}"
+                );
                 if scalar.done {
                     terminals += 1;
                     let n_show = scalar
@@ -6345,7 +6491,10 @@ mod tests {
                 env = scalar;
             }
         }
-        assert!(terminals > 5000, "too few terminals exercised ({terminals})");
+        assert!(
+            terminals > 5000,
+            "too few terminals exercised ({terminals})"
+        );
         assert!(
             multiway_showdowns > 200,
             "too few multiway in-apply showdowns exercised ({multiway_showdowns})"
@@ -6375,7 +6524,8 @@ mod tests {
         let all_live = [core::SEAT_LIVE; N];
         for button in 0..N as i32 {
             let committed = [600i32; N];
-            let want = core::compute_returns(&holes, &board, &all_live, &committed, button, N as i32);
+            let want =
+                core::compute_returns(&holes, &board, &all_live, &committed, button, N as i32);
             let got = showdown_returns(&holes, &board, &all_live, &committed, button, N as i32);
             assert_eq!(want, got, "even-split tie diverged (button={button})");
             assert_eq!(want.iter().sum::<i32>(), 0, "even split not zero-sum");
@@ -6390,8 +6540,7 @@ mod tests {
             status[5] = core::SEAT_FOLDED;
             let committed = [101i32; N];
             for button in 0..N as i32 {
-                let want =
-                    core::compute_returns(&holes, &board, &status, &committed, button, 4);
+                let want = core::compute_returns(&holes, &board, &status, &committed, button, 4);
                 let got = showdown_returns(&holes, &board, &status, &committed, button, 4);
                 assert_eq!(want, got, "odd-chip tie diverged (button={button})");
                 assert_eq!(want.iter().sum::<i32>(), 0, "odd-chip split not zero-sum");
@@ -6608,8 +6757,22 @@ mod tests {
                 let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
                 let ep = cfg.prune_threshold;
                 let partials = match n_seats {
-                    7 => NlheTables::collect_partials_n::<7>(&cfg, &read, t, iter_seed, ep, V3Iter::default()),
-                    _ => NlheTables::collect_partials_n::<6>(&cfg, &read, t, iter_seed, ep, V3Iter::default()),
+                    7 => NlheTables::collect_partials_n::<7>(
+                        &cfg,
+                        &read,
+                        t,
+                        iter_seed,
+                        ep,
+                        V3Iter::default(),
+                    ),
+                    _ => NlheTables::collect_partials_n::<6>(
+                        &cfg,
+                        &read,
+                        t,
+                        iter_seed,
+                        ep,
+                        V3Iter::default(),
+                    ),
                 };
 
                 // Sharded merge (the real default path).
@@ -6659,8 +6822,10 @@ mod tests {
                 );
                 // Separate closures: RegretT::to_bits is u32 under f32_regret, u64 otherwise; strat is
                 // always f64 (u64). Each is only compared against its own kind.
-                let cbits = |r: &[RegretT; NUM_ACTIONS]| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
-                let sbits = |r: &[f64; NUM_ACTIONS]| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                let cbits =
+                    |r: &[RegretT; NUM_ACTIONS]| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                let sbits =
+                    |r: &[f64; NUM_ACTIONS]| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
                 for (k, row) in &ref_cum {
                     let got = sharded.shards[shard_of(k)]
                         .cum_regret
@@ -6716,12 +6881,40 @@ mod tests {
                 let ep_bat = cfg_bat.prune_threshold;
                 let (rec_partials, bat_partials) = match n_seats {
                     7 => (
-                        NlheTables::collect_partials_n::<7>(&cfg_rec, &read, t, iter_seed, ep_rec, V3Iter::default()),
-                        NlheTables::collect_partials_n::<7>(&cfg_bat, &read, t, iter_seed, ep_bat, V3Iter::default()),
+                        NlheTables::collect_partials_n::<7>(
+                            &cfg_rec,
+                            &read,
+                            t,
+                            iter_seed,
+                            ep_rec,
+                            V3Iter::default(),
+                        ),
+                        NlheTables::collect_partials_n::<7>(
+                            &cfg_bat,
+                            &read,
+                            t,
+                            iter_seed,
+                            ep_bat,
+                            V3Iter::default(),
+                        ),
                     ),
                     _ => (
-                        NlheTables::collect_partials_n::<6>(&cfg_rec, &read, t, iter_seed, ep_rec, V3Iter::default()),
-                        NlheTables::collect_partials_n::<6>(&cfg_bat, &read, t, iter_seed, ep_bat, V3Iter::default()),
+                        NlheTables::collect_partials_n::<6>(
+                            &cfg_rec,
+                            &read,
+                            t,
+                            iter_seed,
+                            ep_rec,
+                            V3Iter::default(),
+                        ),
+                        NlheTables::collect_partials_n::<6>(
+                            &cfg_bat,
+                            &read,
+                            t,
+                            iter_seed,
+                            ep_bat,
+                            V3Iter::default(),
+                        ),
                     ),
                 };
 
@@ -6744,7 +6937,8 @@ mod tests {
                 );
                 let cbits =
                     |r: &[RegretT; NUM_ACTIONS]| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
-                let sbits = |r: &[f64; NUM_ACTIONS]| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                let sbits =
+                    |r: &[f64; NUM_ACTIONS]| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
                 for (k, row) in rec.iter_all_cum() {
                     let got = bat.shards[shard_of(k)]
                         .cum_regret
@@ -6788,8 +6982,22 @@ mod tests {
         let iter_seed = cfg_rec.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
         let ep_rec = cfg_rec.prune_threshold;
         let ep_bat = cfg_bat.prune_threshold;
-        let rec_partials = NlheTables::collect_partials_n::<6>(&cfg_rec, &read, t, iter_seed, ep_rec, V3Iter::default());
-        let bat_partials = NlheTables::collect_partials_n::<6>(&cfg_bat, &read, t, iter_seed, ep_bat, V3Iter::default());
+        let rec_partials = NlheTables::collect_partials_n::<6>(
+            &cfg_rec,
+            &read,
+            t,
+            iter_seed,
+            ep_rec,
+            V3Iter::default(),
+        );
+        let bat_partials = NlheTables::collect_partials_n::<6>(
+            &cfg_bat,
+            &read,
+            t,
+            iter_seed,
+            ep_bat,
+            V3Iter::default(),
+        );
 
         let mut rec = NlheTables::new();
         rec.merge_partials(&cfg_rec, rec_partials);
@@ -6847,11 +7055,27 @@ mod tests {
         // iters_done preserved on both paths.
         assert_eq!(ser.iters_done, par.iters_done, "iters_done mismatch");
         // save(load_serial) == save(load_parallel) == original blob (the load-path byte-equivalence gate).
-        assert_eq!(serialize(&par), blob, "parallel-load re-serialize != original blob");
-        assert_eq!(serialize(&ser), serialize(&par), "serial vs parallel re-serialize differ");
+        assert_eq!(
+            serialize(&par),
+            blob,
+            "parallel-load re-serialize != original blob"
+        );
+        assert_eq!(
+            serialize(&ser),
+            serialize(&par),
+            "serial vs parallel re-serialize differ"
+        );
         // Same row counts per map.
-        assert_eq!(ser.total_cum_len(), par.total_cum_len(), "cum row count differs");
-        assert_eq!(ser.total_strat_len(), par.total_strat_len(), "strat row count differs");
+        assert_eq!(
+            ser.total_cum_len(),
+            par.total_cum_len(),
+            "cum row count differs"
+        );
+        assert_eq!(
+            ser.total_strat_len(),
+            par.total_strat_len(),
+            "strat row count differs"
+        );
         // Per-shard key sets identical AND every key correctly routed (no cross-shard leakage).
         for (s, (ssh, psh)) in ser.shards.iter().zip(par.shards.iter()).enumerate() {
             assert_eq!(
@@ -6866,11 +7090,19 @@ mod tests {
             );
             for (k, v) in psh.cum_regret.iter() {
                 assert_eq!(shard_of(k), s, "parallel cum key in wrong shard");
-                assert_eq!(ssh.cum_regret.get(k), Some(v), "parallel cum row differs from serial");
+                assert_eq!(
+                    ssh.cum_regret.get(k),
+                    Some(v),
+                    "parallel cum row differs from serial"
+                );
             }
             for (k, v) in psh.strat_sum.iter() {
                 assert_eq!(shard_of(k), s, "parallel strat key in wrong shard");
-                assert_eq!(ssh.strat_sum.get(k), Some(v), "parallel strat row differs from serial");
+                assert_eq!(
+                    ssh.strat_sum.get(k),
+                    Some(v),
+                    "parallel strat row differs from serial"
+                );
             }
         }
     }
@@ -6882,12 +7114,15 @@ mod tests {
         assert!(deserialize_parallel(b"").is_none());
         assert!(deserialize_parallel(b"NOTMAGIC").is_none());
         assert!(deserialize_parallel(b"NLCFR001").is_none()); // magic but no iters_done
-        // Valid header + cum length claiming rows that aren't there => truncation reject.
+                                                              // Valid header + cum length claiming rows that aren't there => truncation reject.
         let mut bad = Vec::new();
         bad.extend_from_slice(b"NLCFR001");
         bad.extend_from_slice(&7u64.to_le_bytes()); // iters_done
         bad.extend_from_slice(&5u64.to_le_bytes()); // cum: claims 5 rows, provides none
-        assert!(deserialize_parallel(&bad).is_none(), "truncated section must reject");
+        assert!(
+            deserialize_parallel(&bad).is_none(),
+            "truncated section must reject"
+        );
     }
 
     /// `serialize_to_file` writes the EXACT same NLCFR001 blob as `serialize` (the checkpoint-speed
@@ -6907,7 +7142,10 @@ mod tests {
         assert_eq!(n, want.len(), "returned byte count mismatch");
         let got = std::fs::read(p).expect("read back");
         let _ = std::fs::remove_file(p);
-        assert_eq!(got, want, "serialize_to_file blob differs from serialize blob");
+        assert_eq!(
+            got, want,
+            "serialize_to_file blob differs from serialize blob"
+        );
         // And it deserializes back to a re-serialize-identical table (resume bit-identity).
         let b = deserialize(&got).expect("deserialize file blob");
         assert_eq!(serialize(&b), want, "file blob not resume-identical");
@@ -7043,13 +7281,9 @@ mod tests {
         for &jr in &[1usize, 3, 57, FILE_JOB_ROWS] {
             let p = tmp(&format!("jr{jr}"));
             let dirty = tab.dirty.as_deref().unwrap();
-            let n = write_sections_to_file(
-                &p,
-                &nlcfr_header(&tab),
-                &gather_table_sections(&tab),
-                jr,
-            )
-            .unwrap();
+            let n =
+                write_sections_to_file(&p, &nlcfr_header(&tab), &gather_table_sections(&tab), jr)
+                    .unwrap();
             let got = std::fs::read(&p).unwrap();
             assert_eq!(n, want_base.len(), "base byte count at job_rows={jr}");
             assert_eq!(got, want_base, "base file bytes differ at job_rows={jr}");
@@ -7073,7 +7307,11 @@ mod tests {
                 .build()
                 .expect("build local rayon pool");
             pool.install(|| {
-                assert_eq!(serialize(&tab), want_base, "serialize bytes differ at {tc} threads");
+                assert_eq!(
+                    serialize(&tab),
+                    want_base,
+                    "serialize bytes differ at {tc} threads"
+                );
                 assert_eq!(
                     serialize_delta(&tab, base_iter, 1).unwrap(),
                     want_delta,
@@ -7086,7 +7324,9 @@ mod tests {
                     want_base,
                     "serialize_to_file bytes differ at {tc} threads"
                 );
-                serialize_delta_to_file(&tab, &p, base_iter, 1).unwrap().unwrap();
+                serialize_delta_to_file(&tab, &p, base_iter, 1)
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(
                     std::fs::read(&p).unwrap(),
                     want_delta,
@@ -7239,7 +7479,11 @@ mod tests {
         apply_delta(&mut a, &d1).unwrap();
         let once = serialize(&a);
         apply_delta(&mut a, &d1).unwrap();
-        assert_eq!(serialize(&a), once, "re-applying a delta must be idempotent");
+        assert_eq!(
+            serialize(&a),
+            once,
+            "re-applying a delta must be idempotent"
+        );
     }
 
     /// apply_delta_checked FAILURE MODES: a gap (seq skip), a wrong base_iter, a stale iters_done, and a
@@ -7261,22 +7505,34 @@ mod tests {
 
         // Gap: prev_seq=1 means we expect seq=2, but d1 is seq=1 -> reject.
         let mut a = deserialize(&base).unwrap();
-        assert!(apply_delta_checked(&mut a, &d1, base_iter, 1).is_none(), "gap must reject");
+        assert!(
+            apply_delta_checked(&mut a, &d1, base_iter, 1).is_none(),
+            "gap must reject"
+        );
         // Wrong base: chain rooted at a different base_iter -> reject.
         assert!(
             apply_delta_checked(&mut a, &d1, base_iter + 1, 0).is_none(),
             "wrong base must reject"
         );
         // Correct link applies.
-        assert!(apply_delta_checked(&mut a, &d1, base_iter, 0).is_some(), "in-order must apply");
+        assert!(
+            apply_delta_checked(&mut a, &d1, base_iter, 0).is_some(),
+            "in-order must apply"
+        );
         // Stale iters_done: re-applying d1 now (a.iters_done == d1.iters_done) -> reject (not > cur).
         assert!(
             apply_delta_checked(&mut a, &d1, base_iter, 0).is_none(),
             "stale iters_done must reject"
         );
         // Malformed blob (truncated header) -> None.
-        assert!(delta_header(&d1[..16]).is_none(), "truncated header must be None");
-        assert!(apply_delta(&mut a, &d1[..16]).is_none(), "malformed apply must be None");
+        assert!(
+            delta_header(&d1[..16]).is_none(),
+            "truncated header must be None"
+        );
+        assert!(
+            apply_delta(&mut a, &d1[..16]).is_none(),
+            "malformed apply must be None"
+        );
     }
 
     /// Delta tracking is AUXILIARY: arming it and running iterations must NOT change the `serialize()`
@@ -7345,7 +7601,11 @@ mod tests {
         }
         let blob = serialize(&a);
         let b = deserialize(&blob).expect("deserialize");
-        assert_eq!(serialize(&b), blob, "re-serialized f32 checkpoint not byte-stable");
+        assert_eq!(
+            serialize(&b),
+            blob,
+            "re-serialized f32 checkpoint not byte-stable"
+        );
         // Every persistent f32 cum row equals its own widen->narrow image (f32 idempotent).
         for sh in b.shards.iter() {
             for row in sh.cum_regret.values() {
@@ -7726,7 +7986,10 @@ mod tests {
         // LOW strategy-L1 over the shared keys (each row L1 in [0,2]; a tiny mean == essentially the same
         // strategy after 12 iters).
         let (mean_l1, shared) = snapshot_strategy_l1(&snap_static, &snap_steal);
-        assert!(shared > 100, "too few shared infosets to be meaningful ({shared})");
+        assert!(
+            shared > 100,
+            "too few shared infosets to be meaningful ({shared})"
+        );
         assert!(
             mean_l1 < 0.10,
             "work_steal strategy-L1 too high vs static ({mean_l1:.4} over {shared} infosets) — not \
@@ -7747,16 +8010,33 @@ mod tests {
         let t = 1u64;
         let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
         let ep = cfg.prune_threshold;
-        let partials = NlheTables::collect_partials_n_worksteal::<6>(&cfg, &read, t, iter_seed, ep, V3Iter::default());
+        let partials = NlheTables::collect_partials_n_worksteal::<6>(
+            &cfg,
+            &read,
+            t,
+            iter_seed,
+            ep,
+            V3Iter::default(),
+        );
         // One partial per rayon worker thread.
         assert!(!partials.is_empty(), "work-steal produced no partials");
         // Sum the strat rows across partials -> at least one infoset trained (deals were actually run).
         let total_strat: usize = partials.iter().map(|p| p.total_strat_len()).sum();
-        assert!(total_strat > 0, "work-steal trained no infosets (deals not run?)");
+        assert!(
+            total_strat > 0,
+            "work-steal trained no infosets (deals not run?)"
+        );
 
         // Re-run: the merged infoset SET is scheduler-order-invariant (deals are a pure fn of the seed), so
         // a second work-steal collect merges to the same key count.
-        let p2 = NlheTables::collect_partials_n_worksteal::<6>(&cfg, &read, t, iter_seed, ep, V3Iter::default());
+        let p2 = NlheTables::collect_partials_n_worksteal::<6>(
+            &cfg,
+            &read,
+            t,
+            iter_seed,
+            ep,
+            V3Iter::default(),
+        );
         let mut m1 = NlheTables::new();
         m1.merge_partials(&cfg, partials);
         m1.floor_cum_regret();
@@ -7831,7 +8111,10 @@ mod tests {
             any_negative,
             "DCFR produced no negative regret — the signed-regret path is not active (floor still on?)"
         );
-        assert!(all_finite, "DCFR regret went non-finite (NaN/Inf) — discount/clamp bug");
+        assert!(
+            all_finite,
+            "DCFR regret went non-finite (NaN/Inf) — discount/clamp bug"
+        );
 
         // (2) strat_sum finite + snapshot still a valid distribution.
         let snap = snapshot(&tab);
@@ -7859,7 +8142,10 @@ mod tests {
             let want_strat = (tf / (tf + 1.0)).powf(2.0);
             assert!((pos - want_pos).abs() < 1e-12, "pos factor wrong at t={t}");
             assert!((neg - want_neg).abs() < 1e-12, "neg factor wrong at t={t}");
-            assert!((strat - want_strat).abs() < 1e-12, "strat factor wrong at t={t}");
+            assert!(
+                (strat - want_strat).abs() < 1e-12,
+                "strat factor wrong at t={t}"
+            );
             // Sanity: positive discount in (0,1), strat down-weight in (0,1), neg halves.
             assert!(pos > 0.0 && pos < 1.0);
             assert!(strat > 0.0 && strat < 1.0);
@@ -7872,7 +8158,7 @@ mod tests {
     #[test]
     fn rbp_never_prunes_last_betting_round() {
         let ep = -300_000.0; // finite, deeply negative
-        // Preflop/flop/turn (streets 0,1,2) are prune SITES; river (3) and terminal (4) are NOT.
+                             // Preflop/flop/turn (streets 0,1,2) are prune SITES; river (3) and terminal (4) are NOT.
         assert!(dcfr_prune_node_allowed(core::STREET_PREFLOP, ep));
         assert!(dcfr_prune_node_allowed(core::STREET_FLOP, ep));
         assert!(dcfr_prune_node_allowed(2 /* turn */, ep));
@@ -7927,7 +8213,15 @@ mod tests {
                 let mut local = LocalDelta::default();
                 for hero in 0..6 {
                     one_traversal::<6>(
-                        &root, hero, &cfg, &read, &mut local, &mut rng, t, memo, eff_prune,
+                        &root,
+                        hero,
+                        &cfg,
+                        &read,
+                        &mut local,
+                        &mut rng,
+                        t,
+                        memo,
+                        eff_prune,
                         V3Iter::default(),
                     );
                 }
@@ -8059,7 +8353,15 @@ mod tests {
                     let mut local = LocalDelta::default();
                     for hero in 0..6 {
                         one_traversal::<6>(
-                            &root, hero, &cfg, &read, &mut local, &mut rng, t, memo, eff_prune,
+                            &root,
+                            hero,
+                            &cfg,
+                            &read,
+                            &mut local,
+                            &mut rng,
+                            t,
+                            memo,
+                            eff_prune,
                             V3Iter::default(),
                         );
                     }
@@ -8138,10 +8440,22 @@ mod tests {
         // = -2.6667 (above the floor, no clamp).
         tab.apply_lcfr(20, &v3);
         let r1 = widen_r(tab.shards[shard_of(&key1)].cum_regret.get(&key1).unwrap());
-        assert!((r1[0] - 10.0 * (2.0 / 3.0)).abs() < 1e-12, "pos regret discount: {}", r1[0]);
-        assert!((r1[1] - (-4.0 * (2.0 / 3.0))).abs() < 1e-12, "neg regret discount: {}", r1[1]);
+        assert!(
+            (r1[0] - 10.0 * (2.0 / 3.0)).abs() < 1e-12,
+            "pos regret discount: {}",
+            r1[0]
+        );
+        assert!(
+            (r1[1] - (-4.0 * (2.0 / 3.0))).abs() < 1e-12,
+            "neg regret discount: {}",
+            r1[1]
+        );
         let s2 = *tab.shards[shard_of(&key2)].strat_sum.get(&key2).unwrap();
-        assert!((s2[2] - 6.0 * (2.0 / 3.0)).abs() < 1e-12, "strat discount: {}", s2[2]);
+        assert!(
+            (s2[2] - 6.0 * (2.0 / 3.0)).abs() < 1e-12,
+            "strat discount: {}",
+            s2[2]
+        );
         // t=21: NOT a discount event; only the floor applies. Push a value below the floor first.
         {
             let sh = &mut tab.shards[shard_of(&key1)];
@@ -8154,7 +8468,10 @@ mod tests {
         assert_eq!(r1b[0], before_pos, "non-event iteration must not discount");
         assert_eq!(r1b[3], -3.0, "floor must clamp -100 to regret_floor");
         let s2b = *tab.shards[shard_of(&key2)].strat_sum.get(&key2).unwrap();
-        assert!((s2b[2] - 6.0 * (2.0 / 3.0)).abs() < 1e-12, "strat untouched on non-event");
+        assert!(
+            (s2b[2] - 6.0 * (2.0 / 3.0)).abs() < 1e-12,
+            "strat untouched on non-event"
+        );
         // t=40 > lcfr_w=30: no discount even though 40 % 10 == 0.
         tab.apply_lcfr(40, &v3);
         let r1c = widen_r(tab.shards[shard_of(&key1)].cum_regret.get(&key1).unwrap());
@@ -8197,7 +8514,11 @@ mod tests {
             strat_rows += 1;
         }
         assert!(strat_rows > 0, "no strat rows trained");
-        assert_eq!(strat_rows, classic.total_strat_len(), "strat key sets differ");
+        assert_eq!(
+            strat_rows,
+            classic.total_strat_len(),
+            "strat key sets differ"
+        );
         // regrets: identical pre-floor sums => classic == max(lcfr, 0); and some negative survived.
         let mut saw_negative = false;
         for (k, row) in lin.iter_all_cum() {
@@ -8212,10 +8533,17 @@ mod tests {
                 if widened[a] < 0.0 {
                     saw_negative = true;
                 }
-                assert_eq!(c[a], widened[a].max(0.0), "classic must be the positive part");
+                assert_eq!(
+                    c[a],
+                    widened[a].max(0.0),
+                    "classic must be the positive part"
+                );
             }
         }
-        assert!(saw_negative, "LCFR mode floored negatives away (should keep signed regret)");
+        assert!(
+            saw_negative,
+            "LCFR mode floored negatives away (should keep signed regret)"
+        );
     }
 
     /// Arm-2 `signed_regrets` mode (blueprint_v4_arm2_amendment.md): signed regrets like LCFR mode,
@@ -8235,7 +8563,10 @@ mod tests {
         let mut signed = NlheTables::new();
         classic.iters_done = 4; // next iteration is t=5 (w = t = 5 on both arms)
         signed.iters_done = 4;
-        let v3 = V3Cfg { signed_regrets: true, ..V3Cfg::default() };
+        let v3 = V3Cfg {
+            signed_regrets: true,
+            ..V3Cfg::default()
+        };
         classic.train_iteration_v3(&cfg, &V3Cfg::default());
         signed.train_iteration_v3(&cfg, &v3);
         // strat_sum: w=t on BOTH arms + identical traversals => byte-identical rows.
@@ -8267,7 +8598,11 @@ mod tests {
                 if widened[a] < 0.0 {
                     saw_negative = true;
                 }
-                assert_eq!(c[a], widened[a].max(0.0), "classic must be the positive part");
+                assert_eq!(
+                    c[a],
+                    widened[a].max(0.0),
+                    "classic must be the positive part"
+                );
             }
         }
         assert!(saw_negative, "signed_regrets mode floored negatives away");
@@ -8349,7 +8684,10 @@ mod tests {
         let t = tab.iters_done + 1;
         let iter_seed = cfg.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
         let eff_prune = effective_prune_threshold(&cfg, iter_seed, t, &v3);
-        assert_eq!(eff_prune, v3.prune_c, "prune threshold must be C from prune_start");
+        assert_eq!(
+            eff_prune, v3.prune_c,
+            "prune threshold must be C from prune_start"
+        );
         prune_probe_reset();
         let read = &tab;
         FP_MEMO.with(|cell| {
@@ -8372,15 +8710,27 @@ mod tests {
                         t,
                         memo,
                         eff_prune,
-                        V3Iter { unweighted_strat: true, strat_pre_only: false },
+                        V3Iter {
+                            unweighted_strat: true,
+                            strat_pre_only: false,
+                        },
                     );
                 }
             }
         });
         let probe = prune_probe_get();
-        assert!(probe.pruned_total > 0, "v3 hard prune never fired (C=-0.05, 8 warm iters)");
-        assert_eq!(probe.pruned_on_river_or_later, 0, "RULE 1a violated: pruned on river");
-        assert_eq!(probe.terminal_leading_pruned, 0, "RULE 1b violated: pruned terminal-leading");
+        assert!(
+            probe.pruned_total > 0,
+            "v3 hard prune never fired (C=-0.05, 8 warm iters)"
+        );
+        assert_eq!(
+            probe.pruned_on_river_or_later, 0,
+            "RULE 1a violated: pruned on river"
+        );
+        assert_eq!(
+            probe.terminal_leading_pruned, 0,
+            "RULE 1b violated: pruned terminal-leading"
+        );
         // Floor: every stored regret must be >= regret_floor after the iteration passes.
         for (_, row) in tab.iter_all_cum() {
             for a in 0..NUM_ACTIONS {
@@ -8416,8 +8766,15 @@ mod tests {
             f64::NEG_INFINITY,
             "explore_frac=1 must always explore"
         );
-        let v3p = V3Cfg { prune_explore: 0.0, ..v3 };
-        assert_eq!(effective_prune_threshold(&cfg, 7, 200, &v3p), -1000.0, "prune iteration");
+        let v3p = V3Cfg {
+            prune_explore: 0.0,
+            ..v3
+        };
+        assert_eq!(
+            effective_prune_threshold(&cfg, 7, 200, &v3p),
+            -1000.0,
+            "prune iteration"
+        );
         let v3off = V3Cfg { lcfr: false, ..v3p };
         assert_eq!(
             effective_prune_threshold(&cfg, 7, 200, &v3off),
@@ -8425,7 +8782,10 @@ mod tests {
             "lcfr off => legacy threshold"
         );
         // Arm-2: signed_regrets alone (lcfr off) must activate the SAME v3 prune constants.
-        let v3sr = V3Cfg { signed_regrets: true, ..v3off };
+        let v3sr = V3Cfg {
+            signed_regrets: true,
+            ..v3off
+        };
         assert_eq!(
             effective_prune_threshold(&cfg, 7, 200, &v3sr),
             -1000.0,
@@ -8455,7 +8815,10 @@ mod tests {
         let cfg = test_cfg(128);
         let mut full = NlheTables::new();
         let mut snap = NlheTables::new();
-        let v3 = V3Cfg { snapshot_avg: true, ..V3Cfg::default() };
+        let v3 = V3Cfg {
+            snapshot_avg: true,
+            ..V3Cfg::default()
+        };
         for _ in 0..4 {
             full.train_iteration_v3(&cfg, &V3Cfg::default());
             snap.train_iteration_v3(&cfg, &v3);
@@ -8470,7 +8833,11 @@ mod tests {
             "cum row counts differ"
         );
         let cum_end = 24 + (cum_len as usize) * (16 + 8 * NUM_ACTIONS);
-        assert_eq!(sf[..cum_end], ss[..cum_end], "cum sections differ (strat skip leaked)");
+        assert_eq!(
+            sf[..cum_end],
+            ss[..cum_end],
+            "cum sections differ (strat skip leaked)"
+        );
         // strat: strictly smaller, and retained rows byte-equal.
         assert!(
             snap.total_strat_len() < full.total_strat_len(),
@@ -8478,7 +8845,10 @@ mod tests {
             snap.total_strat_len(),
             full.total_strat_len()
         );
-        assert!(snap.total_strat_len() > 0, "snapshot_avg kept no preflop rows");
+        assert!(
+            snap.total_strat_len() > 0,
+            "snapshot_avg kept no preflop rows"
+        );
         for (k, row) in snap.iter_all_strat() {
             let f = full.shards[shard_of(k)]
                 .strat_sum
@@ -8508,7 +8878,12 @@ mod tests {
                 assert!(k > pk, "snapshot keys not strictly ascending");
             }
             prev = Some(k);
-            let cum = widen_r(tab.shards[shard_of(&k)].cum_regret.get(&k).expect("cum row"));
+            let cum = widen_r(
+                tab.shards[shard_of(&k)]
+                    .cum_regret
+                    .get(&k)
+                    .expect("cum row"),
+            );
             let s: f64 = cum.iter().map(|v| v.max(0.0)).sum();
             if s > 0.0 {
                 for a in 0..NUM_ACTIONS {
@@ -8521,7 +8896,10 @@ mod tests {
                     );
                 }
             } else {
-                assert!(row.iter().all(|&v| v == 0.0), "no-positive-mass row must be all-zero");
+                assert!(
+                    row.iter().all(|&v| v == 0.0),
+                    "no-positive-mass row must be all-zero"
+                );
             }
             n += 1;
         }
@@ -8538,7 +8916,11 @@ mod tests {
     fn snapshot_to_file_is_byte_identical() {
         let tmp = |tag: &str| {
             let mut p = std::env::temp_dir();
-            p.push(format!("nlsnap_ser2file_{}_{}.snap", tag, std::process::id()));
+            p.push(format!(
+                "nlsnap_ser2file_{}_{}.snap",
+                tag,
+                std::process::id()
+            ));
             p.to_str().unwrap().to_string()
         };
 
@@ -8550,12 +8932,17 @@ mod tests {
         }
         let want = serialize_current_strategy(&tab);
         let p = tmp("trained");
-        let n = serialize_current_strategy_to_file(&tab, &p).expect("serialize_current_strategy_to_file");
+        let n = serialize_current_strategy_to_file(&tab, &p)
+            .expect("serialize_current_strategy_to_file");
         assert_eq!(n, want.len(), "returned byte count mismatch");
         let got = std::fs::read(&p).expect("read back");
-        assert_eq!(got, want, "snapshot file bytes differ from in-RAM serialize_current_strategy");
+        assert_eq!(
+            got, want,
+            "snapshot file bytes differ from in-RAM serialize_current_strategy"
+        );
         // Re-open via the reader the averager uses: header must round-trip.
-        let mut rd = SnapshotStream::open(std::io::Cursor::new(&got)).expect("open snapshot file blob");
+        let mut rd =
+            SnapshotStream::open(std::io::Cursor::new(&got)).expect("open snapshot file blob");
         assert_eq!(rd.iters_done, 3, "iters_done mismatch");
         assert_eq!(rd.n_rows as usize, tab.total_cum_len(), "n_rows mismatch");
         let mut seen = 0u64;
@@ -8610,11 +8997,19 @@ mod tests {
         };
         let s1 = mk_snap(
             10,
-            vec![(ka, row(&[(0, 1.0)])), (kb, row(&[(1, 0.5), (2, 0.5)])), (kc, row(&[]))],
+            vec![
+                (ka, row(&[(0, 1.0)])),
+                (kb, row(&[(1, 0.5), (2, 0.5)])),
+                (kc, row(&[])),
+            ],
         );
         let s2 = mk_snap(
             20,
-            vec![(ka, row(&[(0, 0.5), (1, 0.5)])), (kc, row(&[])), (kd, row(&[(2, 1.0)]))],
+            vec![
+                (ka, row(&[(0, 0.5), (1, 0.5)])),
+                (kc, row(&[])),
+                (kd, row(&[(2, 1.0)])),
+            ],
         );
         // Checkpoint: cum EMPTY (irrelevant), strat holds kd (the "preflop average" row).
         let mut ckpt_tab = NlheTables::new();
@@ -8642,11 +9037,20 @@ mod tests {
         assert_eq!(tab.total_cum_len(), 0, "final blueprint carries no regrets");
         assert_eq!(tab.total_strat_len(), 3);
         let ra = tab.shards[shard_of(&ka)].strat_sum.get(&ka).unwrap();
-        assert!((ra[0] - 0.75).abs() < 1e-6 && (ra[1] - 0.25).abs() < 1e-6, "mean of snapshots");
+        assert!(
+            (ra[0] - 0.75).abs() < 1e-6 && (ra[1] - 0.25).abs() < 1e-6,
+            "mean of snapshots"
+        );
         let rb = tab.shards[shard_of(&kb)].strat_sum.get(&kb).unwrap();
-        assert!((rb[1] - 0.5).abs() < 1e-6, "single-snapshot mean is the row itself");
+        assert!(
+            (rb[1] - 0.5).abs() < 1e-6,
+            "single-snapshot mean is the row itself"
+        );
         let rdd = tab.shards[shard_of(&kd)].strat_sum.get(&kd).unwrap();
-        assert_eq!(rdd[5], 42.0, "checkpoint strat row must win over the snapshot");
+        assert_eq!(
+            rdd[5], 42.0,
+            "checkpoint strat row must win over the snapshot"
+        );
     }
 
     /// Coverage probe: an EMPTY table misses every lookup; training reduces the preflop miss rate;
@@ -8664,7 +9068,10 @@ mod tests {
         assert_eq!(c0.misses, c0.decisions, "empty table must miss everything");
         // K-COV invariants on the empty table: raised-pot decisions are a postflop-only subset of all
         // decisions, and every raised-pot decision misses (empty table).
-        assert_eq!(c0.raised_decisions[0], 0, "raised classification must be postflop-only");
+        assert_eq!(
+            c0.raised_decisions[0], 0,
+            "raised classification must be postflop-only"
+        );
         for st in 1..4 {
             assert!(
                 c0.raised_decisions[st] <= c0.decisions[st],
@@ -8688,8 +9095,20 @@ mod tests {
         let c2 = coverage_probe(&tab, &cfg, 512, 0xC0FFEE);
         assert_eq!(serialize(&tab), before, "probe mutated the table");
         assert_eq!(
-            (c1.decisions, c1.misses, c1.preflop_allin_runouts, c1.raised_decisions, c1.raised_misses),
-            (c2.decisions, c2.misses, c2.preflop_allin_runouts, c2.raised_decisions, c2.raised_misses),
+            (
+                c1.decisions,
+                c1.misses,
+                c1.preflop_allin_runouts,
+                c1.raised_decisions,
+                c1.raised_misses
+            ),
+            (
+                c2.decisions,
+                c2.misses,
+                c2.preflop_allin_runouts,
+                c2.raised_decisions,
+                c2.raised_misses
+            ),
             "probe not deterministic"
         );
         assert!(
@@ -8701,7 +9120,8 @@ mod tests {
         // K-COV: raised-pot misses are a subset of all postflop misses at every street.
         for st in 1..4 {
             assert!(
-                c1.raised_misses[st] <= c1.misses[st] && c1.raised_misses[st] <= c1.raised_decisions[st],
+                c1.raised_misses[st] <= c1.misses[st]
+                    && c1.raised_misses[st] <= c1.raised_decisions[st],
                 "raised misses not a subset at street {st}: raised_miss={} miss={} raised_dec={}",
                 c1.raised_misses[st],
                 c1.misses[st],
@@ -8725,7 +9145,10 @@ mod tests {
         let cfg_rec = test_cfg(n_deals);
         let mut cfg_bat = test_cfg(n_deals);
         cfg_bat.batch_deals = 8; // must be IGNORED because v3i is active
-        let v3i = V3Iter { unweighted_strat: false, strat_pre_only: true };
+        let v3i = V3Iter {
+            unweighted_strat: false,
+            strat_pre_only: true,
+        };
         let read = NlheTables::new();
         let t = 1u64;
         let iter_seed = cfg_rec.base_seed ^ t.wrapping_mul(0x9E3779B97F4A7C15);
@@ -8792,12 +9215,23 @@ mod tests {
         assert_eq!(st.pos_vals, 100);
         assert_eq!(st.neg_max, 100.0);
         // Histogram-resolution (~12%) checks around the true percentiles (p50 ~ 50, p90 ~ 90).
-        assert!(st.neg_p50 > 35.0 && st.neg_p50 < 70.0, "neg_p50 {}", st.neg_p50);
-        assert!(st.neg_p90 > 70.0 && st.neg_p90 < 120.0, "neg_p90 {}", st.neg_p90);
-        assert!(st.pos_p99 > 3.5 && st.pos_p99 < 7.0, "pos_p99 {}", st.pos_p99);
+        assert!(
+            st.neg_p50 > 35.0 && st.neg_p50 < 70.0,
+            "neg_p50 {}",
+            st.neg_p50
+        );
+        assert!(
+            st.neg_p90 > 70.0 && st.neg_p90 < 120.0,
+            "neg_p90 {}",
+            st.neg_p90
+        );
+        assert!(
+            st.pos_p99 > 3.5 && st.pos_p99 < 7.0,
+            "pos_p99 {}",
+            st.pos_p99
+        );
     }
 }
-
 
 // cache-buster 2026-07-06: shifts the S3 build-cache key after an unauthorized artifact was
 // repeatedly re-seeded under the previous key by an unidentified local actor (see

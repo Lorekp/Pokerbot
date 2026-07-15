@@ -22,7 +22,8 @@ from __future__ import annotations
 import json
 import os
 
-__all__ = ["SortedSnapshotDir", "load_blueprint_index_dir"]
+__all__ = ["SortedSnapshotDir", "load_blueprint_index_dir",
+           "validate_preflop_depth_contract", "preflop_serve_band"]
 
 _REQUIRED_FILES = ("keys_sorted.bin", "rows_sorted.f32.bin", "meta.json", "serve_config.json")
 
@@ -47,6 +48,10 @@ class SortedSnapshotDir:
             raise ValueError(
                 f"{dirpath}: keys/rows row-count mismatch "
                 f"({self.keys.shape[0]:,} vs {self.rows.shape[0]:,}) — corrupt/partial download")
+        # Populated by load_blueprint_index_dir after its fail-closed checks.
+        # Keeping provenance on the serve object lets the live router select a
+        # policy only inside the stack interval the artifact itself certifies.
+        self.serve_config: dict = {}
 
     def __len__(self) -> int:
         return int(self.keys.shape[0])
@@ -62,6 +67,65 @@ class SortedSnapshotDir:
 
     def __contains__(self, key) -> bool:
         return self.get(key) is not None
+
+
+def validate_preflop_depth_contract(stamp: dict) -> tuple[float, float] | None:
+    """Validate and return an artifact's certified preflop depth interval.
+
+    Depth-keyed rows are not automatically trustworthy: every advertised bucket
+    must have been trained and passed promotion gates. Legacy fixed-depth objects
+    return ``None`` and remain restricted by the solver's configured 100bb band.
+    """
+    abstraction = stamp.get("abstraction") or {}
+    depth_keyed = bool(abstraction.get("depth_bucketed", False))
+    contract = stamp.get("preflop_depth_contract")
+    if contract is None:
+        if depth_keyed:
+            raise RuntimeError(
+                "depth-bucketed blueprint has no preflop_depth_contract; bucketed keys "
+                "alone do not certify strategy coverage")
+        return None
+    if not depth_keyed:
+        raise RuntimeError(
+            "preflop_depth_contract present on a non-depth-bucketed blueprint")
+    if contract.get("status") != "certified":
+        raise RuntimeError("preflop_depth_contract is not certified")
+    try:
+        lo = float(contract["min_bb"])
+        hi = float(contract["max_bb"])
+        edges = tuple(float(x) for x in contract["depth_edges"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"invalid preflop_depth_contract: {exc}") from exc
+    stamped_edges = tuple(float(x) for x in abstraction.get("depth_edges", ()))
+    if not (0.0 < lo < hi):
+        raise RuntimeError(f"invalid certified preflop depth interval: {(lo, hi)}")
+    if not edges or any(a >= b for a, b in zip(edges, edges[1:])):
+        raise RuntimeError(f"invalid preflop depth edges: {edges}")
+    if edges != stamped_edges:
+        raise RuntimeError(
+            f"preflop depth contract edges {edges} != abstraction stamp {stamped_edges}")
+    gates = contract.get("gates") or {}
+    required_gates = {"coverage", "strategy_shape", "paired_strength", "exploitability"}
+    missing_gates = sorted(required_gates - set(gates))
+    failed_gates = sorted(k for k in required_gates if not bool(gates.get(k)))
+    if missing_gates or failed_gates:
+        raise RuntimeError(
+            "preflop_depth_contract must record passing promotion gates "
+            f"(missing={missing_gates}, failed={failed_gates})")
+    return lo, hi
+
+
+def preflop_serve_band(snapshot, fallback: tuple[float, float] | None
+                       ) -> tuple[float, float] | None:
+    """Resolve the preflop blueprint band from verified artifact provenance.
+
+    Fixed-depth/legacy objects retain ``fallback``. A certified depth artifact
+    replaces it with its promoted interval. This function never invents an
+    unbounded band.
+    """
+    stamp = getattr(snapshot, "serve_config", {}) or {}
+    certified = validate_preflop_depth_contract(stamp) if stamp else None
+    return certified if certified is not None else fallback
 
 
 def load_blueprint_index_dir(path: str) -> tuple["SortedSnapshotDir", dict]:
@@ -102,7 +166,12 @@ def load_blueprint_index_dir(path: str) -> tuple["SortedSnapshotDir", dict]:
 
         check_blueprint_serve_env(expected=expected, strict=True)
 
+    # Key parity proves addressability, not strategy quality. Require an explicit
+    # promotion contract before any depth-conditioned artifact can be served.
+    validate_preflop_depth_contract(stamp)
+
     snap = SortedSnapshotDir(path)
+    snap.serve_config = stamp
     want_rows = int(stamp.get("expected_rows", meta.get("n_strat", 0)) or 0)
     if want_rows and len(snap) != want_rows:
         raise RuntimeError(

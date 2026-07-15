@@ -110,6 +110,19 @@ def test_abstains_deep_stack():
     assert pushfold_root_prior(env, hero, legal, band_bb=(0.0, 20.0)) is None
 
 
+def test_one_short_opponent_does_not_force_deep_hero_into_open_shove_model():
+    env = _root(6, depth_bb=60.0)
+    hero = int(np.asarray(env.action_seat))
+    short = next(s for s in range(6) if s != hero)
+    stacks = np.asarray(env.stacks).copy()
+    stacks[short] = 10 * je.CHIP_UNIT
+    env = env._replace(stacks=stacks)
+    legal = legal_action_mask_np(env, hero).astype(bool)
+
+    assert pushfold_root_prior(
+        env, hero, legal, band_bb=(0.0, 20.0)) is None
+
+
 def test_abstains_postflop():
     env = _root(7, depth_bb=10.0)
     # Move off preflop by faking the street (postflop is never a push/fold spot).

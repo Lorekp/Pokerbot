@@ -728,11 +728,17 @@ def legal_action_mask_np(state: EnvState, seat=None) -> np.ndarray:
         prod = np.int32(np.float32(np.float32(pot) * frac))
         target_total = max(cur_bet, int(prod))
         raise_by = target_total - committed
+        # `_action_amount` commits `to_call + raise_by`.  The old
+        # `raise_by <= stack` test let over-stack buckets through and `_commit`
+        # silently clamped each one to ALL_IN, creating multiple identical
+        # shove actions in the game tree.  Nonterminal buckets must fit with
+        # chips left; exact-stack semantics belong exclusively to ALL_IN.
+        commit_amount = to_call + raise_by
         bucket_ok = (
             is_live
             and (stack > to_call)
             and (raise_by >= min_raise_amt)
-            and (raise_by <= stack)
+            and (commit_amount < stack)
             and reopen_ok
         )
         mask[BET_BUCKET_START + i] = bucket_ok

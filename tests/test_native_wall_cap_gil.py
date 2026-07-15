@@ -4,7 +4,7 @@ Live wedge class this closes: `SubgameSolver.solve` was one non-interruptible FF
 THE GIL for its full wall — at pathological deep-SPR geometry (flop pot 6 / stacks 900) a solve sat
 9+ minutes, freezing health threads / watchdogs (one child became unkillable). The rebuilt binary
 (a) releases the GIL for every serve-path solve and (b) accepts an in-native cooperative wall-clock
-cap (`wall_cap_ms`, checked per CFR iteration + per 1024 tree nodes) returning a bounded, honest,
+cap (`wall_cap_ms`, checked per CFR iteration + per 8 tree nodes) returning a bounded, honest,
 flagged result.
 
 These tests exercise the REBUILT worktree binary through the same loader the serve uses

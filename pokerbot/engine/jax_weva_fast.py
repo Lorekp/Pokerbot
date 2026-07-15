@@ -149,15 +149,13 @@ def _bucket(x: float, edges: tuple[float, ...]) -> int:
 _POT_EDGES = (3.0, 6.0, 12.0, 25.0, 50.0, 100.0, 200.0)        # total pot in BB
 _TOCALL_EDGES = (0.01, 0.34, 0.67, 1.01, 2.01)                  # amount-to-call as fraction of pot
 _SPR_EDGES = (1.0, 2.5, 5.0, 10.0, 20.0)                        # effective-stack-to-pot ratio
-# Effective STARTING-stack depth (absolute BB) for the depth-aware PREFLOP key (A2). 4 buckets for
-# CoinPoker cash: short [..,50) (40-50bb buy-ins + lost-down tail), mid [50,90), full [90,140) (the
-# 100bb buy-in cluster), deep [140,..) (run-ups). NOTE: the 100bb MAX buy-in bounds the START depth, NOT
-# the running stack — winners accumulate above 100bb and stay deep until they lose back (no mid-session
-# cash-out), and losers reloading at <=100bb feed that persistent deep tail, so a WINNING bot genuinely
-# plays 130-200bb deep-vs-deep. (Multiway all-ins make a 200-300bb POT, not >100bb DEPTH — pot is keyed
-# separately by _POT_EDGES/SPR.) Absolute (not pot-relative): preflop pot ~1.5bb so SPR is uninformative.
-# Only consulted when POKERBOT_DEPTH_BUCKETS.
-_DEPTH_EDGES = (50.0, 90.0, 140.0)
+# Effective STARTING-stack depth (absolute BB) for the depth-aware PREFLOP key.
+# The former terminal [140, inf) bucket aliased 150bb and the arena's 500bb game,
+# recreating the fixed-depth error the key was meant to remove. These edges cover
+# tournament-short through Playground-deep stacks while keeping 100bb in its own
+# [90,140) bucket. They are stamped into every depth artifact and checked at load,
+# so changing them cannot silently address old rows.
+_DEPTH_EDGES = (25.0, 50.0, 90.0, 140.0, 250.0, 400.0)
 
 
 def effective_depth_bb(state: EnvState | Any) -> float:

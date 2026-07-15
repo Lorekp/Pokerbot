@@ -77,7 +77,9 @@ fn class_equity(cls: i32, n_mc: usize, seed: u64) -> f64 {
         }
         let opp = [deck[0], deck[1]];
         let board = [deck[2], deck[3], deck[4], deck[5], deck[6]];
-        let mut h7 = [hole[0], hole[1], board[0], board[1], board[2], board[3], board[4]];
+        let mut h7 = [
+            hole[0], hole[1], board[0], board[1], board[2], board[3], board[4],
+        ];
         let hr = evaluate_cards(&h7);
         h7[0] = opp[0];
         h7[1] = opp[1];
@@ -168,7 +170,10 @@ fn sample_spot(seed: u64) -> ([i32; 2], [i32; 5]) {
         let j = i + rng.next_below((52 - i) as u64) as usize;
         deck.swap(i, j);
     }
-    ([deck[0], deck[1]], [deck[2], deck[3], deck[4], deck[5], deck[6]])
+    (
+        [deck[0], deck[1]],
+        [deck[2], deck[3], deck[4], deck[5], deck[6]],
+    )
 }
 
 fn main() {
@@ -184,7 +189,10 @@ fn main() {
     let t0 = Instant::now();
 
     // ---- step 1+2: opponent clusters ------------------------------------------------------
-    eprintln!("[fit] step 1/4: per-class equity ({} MC/class, 169 classes)", n_mc_class);
+    eprintln!(
+        "[fit] step 1/4: per-class equity ({} MC/class, 169 classes)",
+        n_mc_class
+    );
     let eqs: Vec<f64> = (0..N_PREFLOP_CLASSES as i32)
         .into_par_iter()
         .map(|c| class_equity(c, n_mc_class, seed))
@@ -192,11 +200,18 @@ fn main() {
     let mut eq = [0.0f64; N_PREFLOP_CLASSES];
     eq.copy_from_slice(&eqs);
     let class_to_cluster = cluster_classes(&eq);
-    eprintln!("[fit] step 2/4: class clusters done ({:.1}s)", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "[fit] step 2/4: class clusters done ({:.1}s)",
+        t0.elapsed().as_secs_f64()
+    );
 
     // ---- step 3: OCHS vectors of sampled river spots ---------------------------------------
     // A provisional table (centroids empty) carries class_to_cluster for ochs_vector.
-    let proto = RiverOchs { n_buckets: 0, class_to_cluster, centroids: vec![] };
+    let proto = RiverOchs {
+        n_buckets: 0,
+        class_to_cluster,
+        centroids: vec![],
+    };
     eprintln!("[fit] step 3/4: OCHS vectors for {} river spots", n_spots);
     let progress = std::sync::atomic::AtomicUsize::new(0);
     let t3 = Instant::now();
@@ -220,7 +235,10 @@ fn main() {
         .collect();
 
     // ---- step 4: K-means over the vectors --------------------------------------------------
-    eprintln!("[fit] step 4/4: k-means K={} over {} vectors, {} iters", k, n_spots, kmeans_iters);
+    eprintln!(
+        "[fit] step 4/4: k-means K={} over {} vectors, {} iters",
+        k, n_spots, kmeans_iters
+    );
     let mut cents: Vec<[f64; N_CLUSTERS]> = Vec::with_capacity(k);
     let mut seen = std::collections::HashSet::new();
     let stride = (n_spots / k).max(1);
@@ -230,7 +248,11 @@ fn main() {
         if seen.insert(key) {
             cents.push(vecs[i]);
         }
-        i = if cents.len() * stride > i { cents.len() * stride } else { i + 1 };
+        i = if cents.len() * stride > i {
+            cents.len() * stride
+        } else {
+            i + 1
+        };
     }
     let mut j = 0usize;
     while cents.len() < k && j < n_spots {
@@ -295,20 +317,37 @@ fn main() {
             }
         }
         if (it + 1) % 5 == 0 || it + 1 == kmeans_iters {
-            eprintln!("[fit]   k-means iter {}/{} ({:.0}s)", it + 1, kmeans_iters, t0.elapsed().as_secs_f64());
+            eprintln!(
+                "[fit]   k-means iter {}/{} ({:.0}s)",
+                it + 1,
+                kmeans_iters,
+                t0.elapsed().as_secs_f64()
+            );
         }
     }
 
-    let table = RiverOchs { n_buckets: k as u32, class_to_cluster, centroids: cents };
+    let table = RiverOchs {
+        n_buckets: k as u32,
+        class_to_cluster,
+        centroids: cents,
+    };
     std::fs::write(&out_path, table.to_bytes()).expect("write blob");
-    eprintln!("[fit] wrote {} ({} bytes)", out_path, table.to_bytes().len());
+    eprintln!(
+        "[fit] wrote {} ({} bytes)",
+        out_path,
+        table.to_bytes().len()
+    );
 
     // ---- goldens: held-out spots (disjoint seed stream) through the FINAL table ------------
     let mut g = std::fs::File::create(&golden_path).expect("create golden");
-    writeln!(g, "# river_ochs golden parity rows: h0 h1 b0 b1 b2 b3 b4 bucket (card=rank*4+suit)")
-        .unwrap();
+    writeln!(
+        g,
+        "# river_ochs golden parity rows: h0 h1 b0 b1 b2 b3 b4 bucket (card=rank*4+suit)"
+    )
+    .unwrap();
     for i in 0..n_golden {
-        let (hole, board) = sample_spot(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) ^ (0xABCD_0000 + i as u64));
+        let (hole, board) =
+            sample_spot(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) ^ (0xABCD_0000 + i as u64));
         let b = table.bucket(&hole, &board).unwrap();
         writeln!(
             g,

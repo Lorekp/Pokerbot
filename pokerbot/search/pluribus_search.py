@@ -33,6 +33,7 @@ from pokerbot.engine.actions import BET_SIZE_BUCKETS, pseudo_harmonic_bucket
 from pokerbot.engine.jax_engine import BET_BUCKET_START, CHIP_UNIT, NUM_ACTIONS
 from pokerbot.engine.np_engine import (
     to_numpy_state,
+    SEAT_EMPTY,
     SEAT_FOLDED,
     SEAT_LIVE,
 )
@@ -45,6 +46,8 @@ from pokerbot.search.native_solver import (
 )
 from pokerbot.search.isomorphism import cached_canonicalize_key
 from pokerbot.search.pbs_tracker import PBSTracker
+from pokerbot.search.preflop_projection import project_deep_preflop_blueprint
+from pokerbot.search.preflop_miss_prior import coverage_hole_policy
 from pokerbot.search.state_bridge import SubgameRoot
 from pokerbot.search.tabular_blueprint_adapter import TabularBlueprintAdapter
 from pokerbot.search.pluribus_rollout import (
@@ -259,6 +262,40 @@ class PluribusReBeLConfig:
         not in ("0", "", "false", "False"))
     client_bet_sizing: bool = True    # use the SAME action abstraction as training (blueprint keys hit)
     search_preflop: bool = False      # Pluribus: serve preflop from blueprint, search postflop only
+    # Apply the faithful Pluribus leaf/final-iterate construction specifically when preflop is outside
+    # the certified blueprint depth band. This fixes the real-stack lane without changing promoted
+    # in-band blueprint serves or the existing postflop search policy. The arena enables it explicitly;
+    # default False keeps offline baselines byte-identical.
+    offdepth_preflop_pluribus: bool = False
+    # Rare exact preflop histories can be addressable in a very large tabular
+    # blueprint yet still be statistically under-trained.  A live 6-way row for
+    # 73o in the BB was a real hit but put 39.8% on a 127bb shove; deterministic
+    # selection jammed it.  Without retraining or visit-count side data, use the
+    # action's own exposure as a confidence boundary: if a hit assigns material
+    # mass to an action that invests more than N current pots, do Pluribus-style
+    # real-time search instead of treating row existence as strategy quality.
+    # Default False preserves offline/cert baselines; the arena opts in.
+    preflop_risky_action_resolve: bool = False
+    preflop_risky_commit_pot_ratio: float = 3.0
+    preflop_risky_mass_floor: float = 0.05
+    # Deep-stack semantic projection for a fixed-depth preflop blueprint. At depths above the
+    # certified band, explicit ALL_IN and every raise bucket that would be terminal/illegal in a
+    # shadow state at the reference depth are mapped back into the source-depth nonterminal menu.
+    # This prevents a 100bb terminal 5-bet from becoming a nominally nonterminal 330bb raise.
+    # The arena enables this explicitly; default False preserves offline baselines.
+    deep_preflop_projection: bool = False
+    # Short-stack counterpart to deep_preflop_projection.  In an UNRAISED pot,
+    # normalize occupied seats to the 100bb source depth for lookup only, then
+    # translate the learned row back through the live nonterminal action menu.
+    # Facing aggression remains depth-sensitive and is deliberately excluded.
+    # The arena opts in after the <=20bb certified push/fold route; default False
+    # preserves offline baselines.
+    short_unraised_preflop_projection: bool = False
+    preflop_blueprint_reference_bb: float = 100.0
+    # A technically non-all-in source action is still terminal in game semantics
+    # when it leaves too little stack for a meaningful future betting decision.
+    # Classify source-depth raises below this post-action SPR as terminal-like.
+    preflop_blueprint_nonterminal_spr_floor: float = 0.5
     # A1 stack-agnostic preflop: the preflop blueprint is keyed on (hole, position) only and trained at
     # 100bb, so it is the one engine component that is NOT depth-general (the postflop key + rollout leaf
     # already key on real stacks / SPR). Trust it ONLY when the effective stack is within this band of its
@@ -530,7 +567,7 @@ _NATIVE_FIT_PROBE_ITERS = 200
 # but per-iteration cost is unbounded at pathological geometry (deep-SPR min-raise ladders: a live
 # flop solve at SPR ~150 sat 9+ MINUTES inside one FFI call, wedging the whole interpreter because
 # the call also held the GIL). The rebuilt binary (a) releases the GIL for every solve and (b)
-# accepts wall_cap_ms — a cooperative in-native deadline checked per CFR iteration AND per 1024
+# accepts wall_cap_ms — a cooperative in-native deadline checked per CFR iteration AND per 8
 # tree nodes; on expiry it returns the strategy_sum banked by the COMPLETED iterations with
 # wall_capped/iters_completed metadata (the under-search guard then judges the serve by its honest
 # iteration count). Under a live-scale budget (the fit regime) every native call gets
@@ -560,6 +597,11 @@ except ValueError:
 # the deep-SPR tree explosion at its root cause. 0 (default) = off, byte-identical; the certified
 # arena re-enable plan is POKERBOT_SUBGAME_RAISE_CAP=3 alongside the wall cap.
 _NATIVE_RAISE_CAP = int(os.environ.get("POKERBOT_SUBGAME_RAISE_CAP", "0") or 0)
+
+
+def native_raise_cap_per_street() -> int:
+    """Import-latched structural cap used by native arena subgame calls."""
+    return max(0, int(_NATIVE_RAISE_CAP))
 
 
 def _river_leaf_unfreeze_enabled() -> bool:
@@ -720,6 +762,9 @@ class PluribusReBeLSolver:
         # R2 biased continuation leaves: set per-solve (config.leaf_biased_continuations, GTO path only —
         # mirrors the two_sided gating). False (default) => the legacy leaf path, byte-identical.
         self._leaf_biased_active = False
+        self._offdepth_preflop_profile_active = False
+        self._preflop_risky_resolve_active = False
+        self._preflop_risky_resolve_meta: dict = {}
         # BUG-5 delayed averaging: iterations t < this accumulate NO strat_sum / AIVAT root CFVs. Set
         # per-solve from config.avg_skip_frac * the solve's iteration target; 0 (default) = legacy.
         self._avg_skip_iters = 0
@@ -768,11 +813,58 @@ class PluribusReBeLSolver:
     def _effective_stack_bb(env) -> float:
         """Effective starting stack in BB = min over in-hand (non-folded) seats of (stack + committed_total).
         Chips only move from stack to committed within a hand, so the sum is each seat's depth at hand
-        start; the min is the effective depth that caps the action. Used by the A1 preflop-blueprint band."""
+        start; the min is the table-wide effective depth used by true all-player
+        commitments such as push/fold qualification.  Do not use this scalar to
+        gate a multiway opening blueprint: one short stack does not cap hero's
+        exposure to every other opponent."""
         totals = np.asarray(env.stacks, dtype=np.float64) + np.asarray(env.committed_total, dtype=np.float64)
         live = (np.asarray(env.seat_status) != SEAT_FOLDED) & (totals > 0)
         chips = totals[live].min() if live.any() else (totals.max() if totals.size else 100.0 * CHIP_UNIT)
         return float(chips) / float(CHIP_UNIT)
+
+    @staticmethod
+    def _preflop_last_aggressor_seat(base_state) -> int | None:
+        """Seat of the most recent preflop bet/raise action, if reconstructable."""
+        n = int(np.asarray(base_state.hist_len))
+        seats = np.asarray(base_state.hist_seat)
+        actions = np.asarray(base_state.hist_action)
+        for i in range(n - 1, -1, -1):
+            if int(actions[i]) >= BET_BUCKET_START:
+                seat = int(seats[i])
+                return seat if 0 <= seat < len(np.asarray(base_state.stacks)) else None
+        return None
+
+    @classmethod
+    def _preflop_relevant_stack_bb(cls, base_state, hero: int) -> float:
+        """Action-relevant pairwise depth for fixed-depth blueprint trust.
+
+        Multiway NLHE has no single global effective stack.  Facing aggression,
+        the relevant exposure is hero versus the last aggressor.  With no
+        aggressor, an open can still play against every remaining opponent, so
+        use hero versus the deepest live opponent.  This prevents one unrelated
+        short stack from disabling a valid 100bb opening strategy for the whole
+        table while still routing genuine short/deep pairwise confrontations out
+        of the fixed-depth artifact.
+        """
+        totals = (np.asarray(base_state.stacks, dtype=np.float64)
+                  + np.asarray(base_state.committed_total, dtype=np.float64))
+        status = np.asarray(base_state.seat_status)
+        hero = int(hero)
+        if not (0 <= hero < totals.size) or totals[hero] <= 0:
+            return cls._effective_stack_bb(base_state)
+        aggressor = cls._preflop_last_aggressor_seat(base_state)
+        if (aggressor is not None and aggressor != hero
+                and status[aggressor] != SEAT_EMPTY
+                and status[aggressor] != SEAT_FOLDED
+                and totals[aggressor] > 0):
+            opponent_chips = totals[aggressor]
+        else:
+            live_opp = ((status != SEAT_EMPTY) & (status != SEAT_FOLDED)
+                        & (totals > 0))
+            live_opp[hero] = False
+            opponent_chips = (totals[live_opp].max()
+                              if live_opp.any() else totals[hero])
+        return float(min(totals[hero], opponent_chips)) / float(CHIP_UNIT)
 
     def _offtree_extra_bucket(self, env, hero: int) -> int | None:
         """Off-tree re-solve trigger. Inspect the bet the hero is FACING at this root and derive its
@@ -1371,6 +1463,303 @@ class PluribusReBeLSolver:
         s = bp.sum()
         return bp / s if s > 1e-12 else legal.astype(np.float64) / max(legal.sum(), 1)
 
+    def _trusted_root_blueprint(
+        self, base_state, hero: int, legal: np.ndarray
+    ) -> np.ndarray | None:
+        """Return a certified root prior, or ``None`` when the blueprint is off-domain.
+
+        The fixed-depth preflop blueprint is not a valid safety prior outside its
+        promoted stack band.  Keeping this check beside the solver's normal preflop
+        routing gives every caller (starvation blend and arena guards included) one
+        authoritative trust boundary.  Postflop and certified push/fold priors keep
+        their existing behavior.
+        """
+        policy, _meta = self._trusted_root_blueprint_with_meta(
+            base_state, hero, legal)
+        return policy
+
+    def _trusted_root_blueprint_with_meta(
+        self, base_state, hero: int, legal: np.ndarray
+    ) -> tuple[np.ndarray | None, dict]:
+        """Trusted in-band row, or a source-depth row for deep postflop states.
+
+        Tier-1 was trained at 100bb and its postflop key contains SPR.  A deep
+        direct *hit* is not proof that the state is in-domain: the bounded SPR
+        key saturates, so a 200-500bb node can alias the artifact's highest SPR
+        bucket.  For >130bb postflop nodes we therefore address only the 100bb
+        shadow whose cards, pot, commitments and full action history are
+        unchanged.  Source-terminal actions are translated before the policy
+        crosses this trust boundary.  Direct rows remain trusted inside the
+        artifact's depth band.
+        """
+        pf = self._pushfold_prior(base_state, hero, legal)
+        if pf is not None:
+            return pf, {"fallback_source": "pushfold", "blueprint_source_hit": True}
+        if int(base_state.street) == 0:
+            band = self.config.preflop_blueprint_band_bb
+            eff_bb = self._preflop_relevant_stack_bb(base_state, hero)
+            if band is not None and not (band[0] <= eff_bb <= band[1]):
+                return None, {"blueprint_source_hit": False}
+
+        if int(base_state.street) > 0:
+            from pokerbot.search.postflop_projection import (
+                DEEP_PROJECTION_MIN_BB,
+                REFERENCE_DEPTH_BB,
+                project_postflop_source_policy,
+                project_postflop_state_to_reference,
+            )
+            shadow, effective_bb = project_postflop_state_to_reference(base_state)
+            if effective_bb > DEEP_PROJECTION_MIN_BB:
+                if shadow is not None:
+                    projected_raw, projected_hit = self.adapter.blueprint_with_status(
+                        shadow, hero)
+                    if projected_hit:
+                        source_legal = np.asarray(self._legal(shadow, hero), dtype=bool)
+                        projected, target, moved = project_postflop_source_policy(
+                            projected_raw, shadow, hero, source_legal, legal)
+                        projected_total = float(projected.sum())
+                        if np.isfinite(projected_total) and projected_total > 1e-12:
+                            return projected / projected_total, {
+                                "fallback_source": "postflop_depth_projected_blueprint",
+                                "blueprint_source_hit": False,
+                                "projection_source_hit": True,
+                                "blueprint_direct_skipped_offdepth": True,
+                                "projected_terminal_mass": moved,
+                                "projected_target_action": target,
+                                "postflop_projection_reference_bb": REFERENCE_DEPTH_BB,
+                                "postflop_projection_effective_bb": effective_bb,
+                            }
+                # A saturated direct SPR key is not a certified fallback.  If
+                # the 100bb shadow is unavailable/missing, let the guard use its
+                # bounded equity prior rather than serve an aliased deep row.
+                return None, {
+                    "blueprint_source_hit": False,
+                    "projection_source_hit": False,
+                    "blueprint_direct_skipped_offdepth": True,
+                    "postflop_projection_effective_bb": effective_bb,
+                }
+
+        # The compatibility API maps a missing row to uniform legal.  Explicit
+        # provenance prevents that vector from masquerading as learned policy.
+        # This direct lookup is deliberately after the deep-postflop branch.
+        raw, source_hit = self.adapter.blueprint_with_status(base_state, hero)
+        bp = np.asarray(raw, dtype=np.float64) * legal
+        total = float(bp.sum())
+        if source_hit and np.isfinite(total) and total > 1e-12:
+            return bp / total, {
+                "fallback_source": "blueprint",
+                "blueprint_source_hit": True,
+            }
+        return None, {"blueprint_source_hit": False}
+
+    def _trusted_root_fallback(
+        self, base_state, hero: int, legal: np.ndarray
+    ) -> tuple[np.ndarray | None, dict]:
+        """Return the best trusted policy available when search cannot be served.
+
+        This is the single trust boundary used by arena integrity guards.  An
+        in-domain blueprint remains first choice.  Off-depth preflop has no
+        certified blueprint, but it does have the explicit passive, price-aware
+        coverage prior used for deep lookup misses; reusing it here prevents CPU
+        starvation from turning AQ+/premium hands into unconditional folds while
+        preserving the invariant that an untrusted fallback can never raise or
+        jam.  Postflop without a trusted blueprint still abstains.
+        """
+        bp, bp_meta = self._trusted_root_blueprint_with_meta(
+            base_state, hero, legal)
+        if bp is not None:
+            return bp, bp_meta
+        if int(base_state.street) != 0:
+            return None, {"blueprint_source_hit": False}
+        eff_bb = self._preflop_relevant_stack_bb(base_state, hero)
+        probs, miss_meta = self._preflop_coverage_policy(
+            base_state, hero, legal, eff_bb)
+        return probs, {
+            "fallback_source": "preflop_miss_prior",
+            "blueprint_source_hit": False,
+            **miss_meta,
+        }
+
+    @staticmethod
+    def _preflop_position(base_state, seat: int) -> str | None:
+        """Return the canonical position for an occupied engine seat.
+
+        Positions are derived from the actual occupied ring, not the fixed
+        six-seat array, so short-handed arena tables remain correct. Folded
+        players stay in the ring because their seat still defines this hand's
+        positions; empty seats do not.
+        """
+        status = np.asarray(base_state.seat_status)
+        occupied = [int(s) for s in np.flatnonzero(status != SEAT_EMPTY)]
+        if not occupied or int(seat) not in occupied:
+            return None
+        button = int(base_state.button)
+        if button not in occupied:
+            return None
+        ring = sorted(occupied, key=lambda s: (s - button) % len(status))
+        offset = ring.index(int(seat))
+        names = {
+            2: ("BTN", "BB"),
+            3: ("BTN", "SB", "BB"),
+            4: ("BTN", "SB", "BB", "CO"),
+            5: ("BTN", "SB", "BB", "UTG", "CO"),
+            6: ("BTN", "SB", "BB", "UTG", "HJ", "CO"),
+        }.get(len(ring))
+        return names[offset] if names is not None and offset < len(names) else None
+
+    def _preflop_opener_position(self, base_state) -> str | None:
+        """Position of the most recent preflop aggressor, if reconstructable."""
+        seat = self._preflop_last_aggressor_seat(base_state)
+        return self._preflop_position(base_state, seat) if seat is not None else None
+
+    def _preflop_coverage_policy(
+        self, base_state, hero: int, legal: np.ndarray, eff_bb: float
+    ) -> tuple[np.ndarray, dict]:
+        """One authoritative, observable policy for every preflop coverage miss."""
+        committed = np.asarray(base_state.committed_street, dtype=np.float64)
+        to_call_bb = max(
+            0.0, float(base_state.current_bet) - float(committed[hero])
+        ) / float(CHIP_UNIT)
+        hero_position = self._preflop_position(base_state, hero)
+        opener_position = self._preflop_opener_position(base_state)
+        pot_bb = (float(base_state.pot_dead) + float(committed.sum())) / float(CHIP_UNIT)
+        probs, score, threshold, equity, required_equity, equity_override = coverage_hole_policy(
+            np.asarray(base_state.holes)[hero], legal,
+            to_call_bb=to_call_bb, effective_stack_bb=eff_bb,
+            pot_bb=pot_bb,
+            hero_position=hero_position, opener_position=opener_position,
+        )
+        return probs, {
+            "preflop_miss_score": score,
+            "preflop_miss_threshold": threshold,
+            "preflop_miss_hero_position": hero_position,
+            "preflop_miss_opener_position": opener_position,
+            "preflop_miss_to_call_bb": round(to_call_bb, 3),
+            "preflop_miss_equity": equity,
+            "preflop_miss_required_equity": required_equity,
+            "preflop_miss_equity_override": equity_override,
+        }
+
+    def _risky_preflop_blueprint_action(
+        self, base_state, hero: int, probs: np.ndarray, legal: np.ndarray
+    ) -> dict | None:
+        """Return provenance for a materially represented, high-exposure action.
+
+        This is a routing predicate, not an action override.  The original row is
+        never edited: a risky row is resolved by the normal two-sided CFR path.
+        Exposure is the chips the action adds divided by the pot immediately
+        before acting, derived by applying the engine action itself so raise and
+        all-in semantics cannot drift from the game implementation.
+        """
+        if not bool(getattr(self.config, "preflop_risky_action_resolve", False)):
+            return None
+        pot = (float(base_state.pot_dead)
+               + float(np.asarray(base_state.committed_street, dtype=np.float64).sum()))
+        pot = max(float(CHIP_UNIT), pot)
+        before = float(np.asarray(base_state.committed_total, dtype=np.float64)[hero])
+        ratio_floor = max(0.0, float(self.config.preflop_risky_commit_pot_ratio))
+        mass_floor = max(0.0, float(self.config.preflop_risky_mass_floor))
+        best = None
+        for action in range(BET_BUCKET_START, NUM_ACTIONS):
+            mass = float(probs[action]) if action < probs.size else 0.0
+            if not bool(legal[action]) or not np.isfinite(mass) or mass < mass_floor:
+                continue
+            try:
+                child = apply_action_np(base_state, int(action))
+                after = float(np.asarray(child.committed_total, dtype=np.float64)[hero])
+            except Exception:
+                continue
+            ratio = max(0.0, after - before) / pot
+            if ratio <= ratio_floor:
+                continue
+            if best is None or ratio > best["preflop_risky_commit_pot_ratio"]:
+                best = {
+                    "preflop_risky_resolve": True,
+                    "preflop_risky_action": int(action),
+                    "preflop_risky_mass": mass,
+                    "preflop_risky_commit_pot_ratio": ratio,
+                }
+        return best
+
+    @staticmethod
+    def _project_deep_preflop_blueprint(
+        probs: np.ndarray, legal: np.ndarray, *, source_hit: bool = True,
+        source_legal: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, int | None, float]:
+        """Remove reference-depth terminal semantics from an off-depth policy.
+
+        Returns ``(projected, target_action, moved_mass)``. The projection is purely
+        action-semantic: hand ranges and all other blueprint probabilities are untouched.
+        """
+        return project_deep_preflop_blueprint(
+            probs, legal, bet_bucket_start=BET_BUCKET_START,
+            num_actions=NUM_ACTIONS, source_hit=source_hit,
+            source_legal=source_legal)
+
+    def _reference_depth_preflop_state(self, base_state, *, normalize_short: bool = False):
+        """Same public preflop state with chips-behind capped at source depth.
+
+        Public commitments, pot and raise history stay byte-identical.  Only each
+        seat's chips-behind is capped; a genuinely shorter seat is never inflated.
+        The returned state is suitable both for the source-row fingerprint and
+        for certifying which source actions remain nonterminal.
+        """
+        ref_total = max(1, int(round(
+            float(self.config.preflop_blueprint_reference_bb) * CHIP_UNIT)))
+        stacks = np.asarray(base_state.stacks).copy()
+        committed = np.asarray(base_state.committed_total, dtype=np.int64)
+        source_behind = np.maximum(0, ref_total - committed)
+        if normalize_short:
+            # This is an address projection, never a playable state.  Normalize
+            # every occupied source seat so the fingerprint addresses the actual
+            # fixed-100bb artifact. Empty seats must remain empty/zero because
+            # table occupancy is part of the public game state.
+            occupied = np.asarray(base_state.seat_status) != SEAT_EMPTY
+            shadow_stacks = stacks.astype(np.int64)
+            shadow_stacks[occupied] = source_behind[occupied]
+            shadow_stacks = shadow_stacks.astype(stacks.dtype)
+        else:
+            # Deep projection may cap, but must never inflate a genuinely short
+            # opponent into a strategy-valid responder.
+            shadow_stacks = np.minimum(
+                stacks.astype(np.int64), source_behind).astype(stacks.dtype)
+        return base_state._replace(stacks=shadow_stacks)
+
+    def _nonterminal_preflop_legal(self, state, hero: int) -> np.ndarray:
+        """Abstract legal menu with terminal-like raises removed for ``state``."""
+        source = self._abstract(
+            legal_action_mask_np(state, hero).astype(bool), 0)
+        spr_floor = max(0.0, float(
+            self.config.preflop_blueprint_nonterminal_spr_floor))
+        if spr_floor <= 0.0:
+            return source
+        for action in range(BET_BUCKET_START, NUM_ACTIONS - 1):
+            if not source[action]:
+                continue
+            try:
+                child = apply_action_np(state, action)
+                behind = max(0.0, float(np.asarray(child.stacks)[hero]))
+                pot_after = max(
+                    1.0,
+                    float(child.pot_dead)
+                    + float(np.asarray(child.committed_street).sum()),
+                )
+                if behind / pot_after < spr_floor:
+                    source[action] = False
+            except Exception:
+                # Failure to certify nonterminal semantics cannot grant an
+                # oversized action authority.
+                source[action] = False
+        return source
+
+    def _reference_depth_preflop_legal(
+        self, base_state, hero: int, *, normalize_short: bool = False
+    ) -> np.ndarray:
+        """Abstract legal menu in the exact source-depth lookup shadow."""
+        shadow = self._reference_depth_preflop_state(
+            base_state, normalize_short=normalize_short)
+        return self._nonterminal_preflop_legal(shadow, hero)
+
     def solve(self, root: SubgameRoot, pbs: PBSTracker, cancel_event=None,
               single_table: bool | None = None) -> SolveResult:
         # ``cancel_event`` (optional threading.Event): if set mid-solve (e.g. by a live watchdog or the
@@ -1382,6 +1771,10 @@ class PluribusReBeLSolver:
         # max_iterations bind UNCHANGED (no multi-table slowdown). None falls back to the per-solver config
         # default (single_table_iter_floor / single_table_budget_ms gate whether the floor is active at all).
         t0 = time.perf_counter()
+        # Per-decision cache consumed by the arena under-search guard. It is
+        # populated below only for deep postflop, inside this solve's measured
+        # budget, and reset before every early-return path.
+        self._arena_prepared_trusted_fallback = None
         cfg = self.config
         hero = int(root.hero_seat)
         # SINGLE-TABLE ITERATION FLOOR: under single-table play we have spare wall-clock, so let the solve
@@ -1448,12 +1841,25 @@ class PluribusReBeLSolver:
             self._hole_rng = self.rng
         self._leaf_cont_weights = self._build_leaf_cont_weights(hero)
 
+        self._preflop_risky_resolve_active = False
+        self._preflop_risky_resolve_meta = {}
+
+        band = cfg.preflop_blueprint_band_bb
+        self._offdepth_preflop_profile_active = bool(
+            cfg.offdepth_preflop_pluribus
+            and int(base_state.street) == 0
+            and band is not None
+            and not (band[0] <= self._preflop_relevant_stack_bb(
+                base_state, hero) <= band[1])
+            and self.opponent_model is None
+        )
+
         # R2 BIASED CONTINUATION LEAVES (config.leaf_biased_continuations, GTO/base only — mirrors the
         # two_sided gating): the exploit path (opponent_model set) keeps its certified leaf, and the
         # model-aware leaf weights (_leaf_cont_weights, which require an opponent model) can never
         # coexist with this flag. False (default) => the legacy leaf, byte-identical.
         self._leaf_biased_active = bool(
-            cfg.leaf_biased_continuations
+            (cfg.leaf_biased_continuations or self._offdepth_preflop_profile_active)
             and self.opponent_model is None
             and self._leaf_cont_weights is None
         )
@@ -1525,6 +1931,25 @@ class PluribusReBeLSolver:
             return SolveResult(action_probs=probs, ev=0.0, iterations=0,
                                metadata={"served": "no_legal"})
 
+        # A native wall-cap hit is judged by the arena under-search guard. The
+        # guard may need a 100bb source-depth fallback; a cold lookup in the
+        # 538M-row mmap costs ~1.18s live. Performing that lookup *after* the
+        # native deadline caused a reproducible 4.0s cap -> 5.18s solve. Prepare
+        # it here so `_wall_cap_now()` subtracts its real elapsed cost and the
+        # guard can reuse the exact policy without post-deadline I/O. Deep only:
+        # in-band completed searches keep their legacy hot path unchanged.
+        if int(base_state.street) > 0:
+            from pokerbot.search.postflop_projection import (
+                DEEP_PROJECTION_MIN_BB,
+                project_postflop_state_to_reference,
+            )
+            _shadow, _effective_bb = project_postflop_state_to_reference(base_state)
+            if _effective_bb > DEEP_PROJECTION_MIN_BB:
+                _fallback, _fallback_meta = self._trusted_root_fallback(
+                    base_state, hero, legal)
+                self._arena_prepared_trusted_fallback = (
+                    _fallback, dict(_fallback_meta or {}))
+
         # TOURNAMENT SHALLOW-STACK PRIOR: a folded-to-hero / facing-one-jam SHALLOW preflop spot is an
         # exact-game push/fold node. Serve the CERTIFIED ante-aware ICM open-shove / call-vs-jam Nash
         # range (pushfold_prior, reusing tournament.open_shove_icm) directly — at N>6 the blueprint is a
@@ -1548,14 +1973,150 @@ class PluribusReBeLSolver:
         # depth-general search so we never serve an off-depth 100bb preflop range.
         if int(base_state.street) == 0 and not cfg.search_preflop:
             band = cfg.preflop_blueprint_band_bb
-            eff_bb = self._effective_stack_bb(base_state)
+            eff_bb = self._preflop_relevant_stack_bb(base_state, hero)
             if band is None or band[0] <= eff_bb <= band[1]:
-                probs = self._root_blueprint(base_state, hero, legal).astype(np.float32)
+                probs, fallback_meta = self._trusted_root_fallback(
+                    base_state, hero, legal)
+                if probs is None:  # preflop always has the passive miss prior
+                    probs = legal.astype(np.float64) / max(legal.sum(), 1)
+                    fallback_meta = {"fallback_source": "conservative"}
+                source_hit = fallback_meta.get("fallback_source") == "blueprint"
+                served = ("blueprint_preflop" if source_hit
+                          else "preflop_lookup_miss_prior")
+                risky = (self._risky_preflop_blueprint_action(
+                    base_state, hero, np.asarray(probs, dtype=np.float64), legal)
+                    if source_hit else None)
+                if risky is None:
+                    return SolveResult(
+                        action_probs=np.asarray(probs, dtype=np.float32),
+                        ev=0.0, iterations=0,
+                        metadata={
+                            "served": served,
+                            "eff_stack_bb": round(eff_bb, 1),
+                            "blueprint_source_hit": source_hit,
+                            **fallback_meta,
+                        },
+                    )
+                # A hit proves addressability, not convergence.  Route this
+                # high-exposure row through the same faithful Pluribus profile
+                # used for off-depth preflop.  No hand chart or forced action is
+                # introduced; the subgame may still choose the risky action if
+                # the equilibrium solve supports it.
+                self._preflop_risky_resolve_active = True
+                self._preflop_risky_resolve_meta = dict(risky)
+                self._offdepth_preflop_profile_active = bool(
+                    cfg.offdepth_preflop_pluribus and self.opponent_model is None)
+                self._leaf_biased_active = bool(
+                    self._offdepth_preflop_profile_active
+                    and self.opponent_model is None
+                    and self._leaf_cont_weights is None)
+            if cfg.deep_preflop_projection and band is not None and eff_bb > band[1]:
+                raw, direct_source_hit = self.adapter.blueprint_with_status(
+                    base_state, hero)
+                source_shadow = self._reference_depth_preflop_state(base_state)
+                reference_source_hit = False
+                if not direct_source_hit:
+                    # The old implementation projected terminal ACTIONS but
+                    # still addressed the deep-SPR key.  On the fixed-100bb
+                    # artifact that misses ~60% of 200-500bb preflop states.
+                    # Address the same public state at source depth before
+                    # falling back; no card, pot, commitment or history changes.
+                    projected_raw, reference_source_hit = (
+                        self.adapter.blueprint_with_status(source_shadow, hero))
+                    if reference_source_hit:
+                        raw = projected_raw
+                source_hit = bool(direct_source_hit or reference_source_hit)
+                raw = raw * legal
+                raw = raw / max(raw.sum(), 1e-12)
+                raw_allin_mass = float(raw[NUM_ACTIONS - 1])
+                if source_hit:
+                    source_legal = self._reference_depth_preflop_legal(
+                        base_state, hero)
+                    probs, target, moved = self._project_deep_preflop_blueprint(
+                        raw, legal, source_hit=True,
+                        source_legal=source_legal)
+                    miss_meta = {
+                        "preflop_miss_score": None,
+                        "preflop_miss_threshold": None,
+                        "preflop_miss_hero_position": None,
+                        "preflop_miss_opener_position": None,
+                        "preflop_miss_to_call_bb": None,
+                    }
+                else:
+                    probs, miss_meta = self._preflop_coverage_policy(
+                        base_state, hero, legal, eff_bb)
+                    target = None
+                    moved = float(raw[NUM_ACTIONS - 1])
                 return SolveResult(
-                    action_probs=probs, ev=0.0, iterations=0,
-                    metadata={"served": "blueprint_preflop", "eff_stack_bb": round(eff_bb, 1)},
+                    action_probs=probs.astype(np.float32), ev=0.0, iterations=0,
+                    metadata={
+                        "served": "blueprint_preflop_deep_projected",
+                        "eff_stack_bb": round(eff_bb, 1),
+                        "projected_allin_mass": raw_allin_mass,
+                        "projected_terminal_mass": moved,
+                        "projected_target_action": target,
+                        "projection_source_hit": source_hit,
+                        "blueprint_source_hit": bool(direct_source_hit),
+                        "reference_projection_source_hit": bool(reference_source_hit),
+                        **miss_meta,
+                    },
                 )
-            # else: off-depth preflop -> depth-general search (pot-relative buckets + real-stack leaf).
+            if band is not None and eff_bb < band[0]:
+                # A fixed-100bb opening RANGE remains useful in an unraised pot,
+                # but its stack-dependent action semantics do not. Address the
+                # learned row in a normalized 100bb shadow, then retain only
+                # raises that are nonterminal in BOTH source and live states.
+                # Never do this facing aggression: call/raise-off ranges are
+                # materially stack-dependent and stay on the price/equity prior.
+                unraised = self._preflop_last_aggressor_seat(base_state) is None
+                if cfg.short_unraised_preflop_projection and unraised:
+                    source_shadow = self._reference_depth_preflop_state(
+                        base_state, normalize_short=True)
+                    raw, reference_source_hit = self.adapter.blueprint_with_status(
+                        source_shadow, hero)
+                    if reference_source_hit:
+                        raw = np.asarray(raw, dtype=np.float64) * legal
+                        raw = raw / max(float(raw.sum()), 1e-12)
+                        source_nonterminal = self._reference_depth_preflop_legal(
+                            base_state, hero, normalize_short=True)
+                        live_nonterminal = self._nonterminal_preflop_legal(
+                            base_state, hero)
+                        transferable = source_nonterminal & live_nonterminal
+                        probs, target, moved = self._project_deep_preflop_blueprint(
+                            raw, legal, source_hit=True,
+                            source_legal=transferable)
+                        return SolveResult(
+                            action_probs=probs.astype(np.float32), ev=0.0,
+                            iterations=0,
+                            metadata={
+                                "served": "blueprint_preflop_short_projected",
+                                "eff_stack_bb": round(eff_bb, 1),
+                                "projected_allin_mass": float(raw[NUM_ACTIONS - 1]),
+                                "projected_terminal_mass": moved,
+                                "projected_target_action": target,
+                                "projection_source_hit": True,
+                                "blueprint_source_hit": False,
+                                "reference_projection_source_hit": True,
+                            },
+                        )
+                # The fixed-depth artifact is off-domain and the live real-stack
+                # search has not earned authority here: a 200/500 native solve
+                # open-jammed Q3s. Certified push/fold nodes were handled above;
+                # every other short/off-depth node uses the same explicit passive
+                # prior as a proven blueprint miss. No search iteration count can
+                # turn an unvalidated depth model into a trusted aggressive policy.
+                probs, miss_meta = self._preflop_coverage_policy(
+                    base_state, hero, legal, eff_bb)
+                return SolveResult(
+                    action_probs=probs.astype(np.float32), ev=0.0, iterations=0,
+                    metadata={
+                        "served": "preflop_offdepth_prior",
+                        "eff_stack_bb": round(eff_bb, 1),
+                        **miss_meta,
+                    },
+                )
+            # Else: deep preflop with semantic projection explicitly disabled ->
+            # legacy depth-general search. Arena enables the projection.
 
         # NATIVE FAST PATH (opt-in): run the entire CFR subgame solve in Rust (one call, no per-node
         # EnvState marshaling). Gated on opponent_model is None (firewall: the exploit tail stays in
@@ -1642,14 +2203,18 @@ class PluribusReBeLSolver:
                     # R2 biased continuation leaves (GTO-only; this branch is gated on opponent_model
                     # is None, mirroring _leaf_biased_active). False (default) => the legacy uniform
                     # native leaf, byte-identical.
-                    leaf_biased_continuations=bool(cfg.leaf_biased_continuations
-                                                   and self.opponent_model is None),
+                    leaf_biased_continuations=bool(
+                        (cfg.leaf_biased_continuations
+                         or self._offdepth_preflop_profile_active)
+                        and self.opponent_model is None),
                     leaf_bias_mult=float(cfg.leaf_bias_mult),
                     # R5a final-iterate serving (GTO-only; this branch is gated on opponent_model is
                     # None, mirroring the Python-loop _serve_final gate). False (default) => the
                     # averaged extraction, byte-identical.
-                    serve_final_iterate=bool(cfg.serve_final_iterate
-                                             and self.opponent_model is None),
+                    serve_final_iterate=bool(
+                        (cfg.serve_final_iterate
+                         or self._offdepth_preflop_profile_active)
+                        and self.opponent_model is None),
                     # STAGE-1 river overbet: root-only un-mask of bet bucket 6 when armed above
                     # (native mirrors the Python _root_extra_post widening; do NOT skip the native
                     # path for this knob — unlike offtree today, native support is the point).
@@ -1712,7 +2277,8 @@ class PluribusReBeLSolver:
                               "wall_capped": wall_capped,
                               "iters_completed": int(iters_used),
                               # Stage-1 diagnostic: this native serve solved the widened river root.
-                              "river_overbet_armed": bool(self._river_overbet_armed)},
+                              "river_overbet_armed": bool(self._river_overbet_armed),
+                              **self._preflop_risky_resolve_meta},
                 )
             # BUG-4c DEAD-KNOB TRAP (loud, never silent): a river_overbet-armed solve that reached
             # the native path but got None back (stale pyd without root_unmask / unsupported config)
@@ -1937,7 +2503,9 @@ class PluribusReBeLSolver:
         # branch and serve the regret-match of the root's cumulative (CFR+-clamped) regrets AFTER the
         # last iteration — the CFR's current strategy at iteration K, exactly the expression the
         # no-average fallback below computes. Default False => the averaged serve, byte-identical.
-        _serve_final = bool(cfg.serve_final_iterate and self.opponent_model is None)
+        _serve_final = bool(
+            (cfg.serve_final_iterate or self._offdepth_preflop_profile_active)
+            and self.opponent_model is None)
         # Serve-side reads use .get(...) with an explicit default (never a raw ``dict[root_key]``): a
         # root infoset the traversal never populated must degrade to the uniform-over-legal
         # regret-match, NOT raise KeyError (the SERVE-KEY GUARANTEE above already registers root_key;
@@ -1966,17 +2534,23 @@ class PluribusReBeLSolver:
         # ``wall_bound`` (NOT ``budget_bound``) so a cooperative cancel reports budget_bound in metadata but
         # never arms the blend — ``wall_bound`` is exactly the old ``budget_bound`` blend trigger.
         served_budget_bound = wall_bound or (force_bb is not None and force_bb > 0)
-        if served_budget_bound and self._blend_active():
+        if (served_budget_bound and self._blend_active()
+                and not self._preflop_risky_resolve_active):
             target_iters = cfg.max_iterations if (force_bb is not None and force_bb > 0) else eff_max_iters
             shortfall = 1.0 - (float(iterations) / float(target_iters)) if target_iters > 0 else 1.0
             shortfall = float(np.clip(shortfall, 0.0, 1.0))
             blueprint_weight = float(np.clip(self.config.blueprint_blend_max, 0.0, 1.0)) * shortfall
             if blueprint_weight > 1e-9:
-                bp_root = self._root_blueprint(base_state, hero, legal)
-                blended = (1.0 - blueprint_weight) * probs + blueprint_weight * bp_root
-                blended = blended * legal  # convex combo of two legal-supported dists stays legal-supported
-                s = blended.sum()
-                probs = blended / s if s > 1e-12 else probs
+                bp_root = self._trusted_root_blueprint(base_state, hero, legal)
+                if bp_root is not None:
+                    blended = (1.0 - blueprint_weight) * probs + blueprint_weight * bp_root
+                    blended = blended * legal  # convex combo of two legal-supported dists stays legal-supported
+                    s = blended.sum()
+                    probs = blended / s if s > 1e-12 else probs
+                else:
+                    # Off-depth preflop: never pull a real-stack solve back toward
+                    # the fixed-100bb policy that the solve was invoked to replace.
+                    blueprint_weight = 0.0
 
         budget_ms = (time.perf_counter() - t0) * 1000.0
         return SolveResult(
@@ -1998,6 +2572,7 @@ class PluribusReBeLSolver:
                 # native call returned None (loud warning already printed — BUG-4c dead-knob trap).
                 "river_overbet_armed": bool(self._river_overbet_armed),
                 "river_overbet_native_fallback": bool(self._river_overbet_native_fallback),
+                **self._preflop_risky_resolve_meta,
                 "served": "search",
             },
         )

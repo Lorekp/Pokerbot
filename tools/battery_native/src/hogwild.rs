@@ -153,7 +153,9 @@ impl SharedHogwildTable {
             }
             // Apparently empty — claim under the per-slot lock (re-check: a barrier vs concurrent claims).
             {
-                let _guard = self.locks[slot % N_LOCKS].lock().unwrap_or_else(|e| e.into_inner());
+                let _guard = self.locks[slot % N_LOCKS]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if self.occ[slot].load(Ordering::Acquire) == 0 {
                     // Publish the key BEFORE occ=1 (readers check occ first, then the key).
                     self.klo[slot].store(lo, Ordering::Relaxed);
@@ -277,7 +279,12 @@ impl SharedHogwildTable {
 
     /// Add a per-action strat-sum contribution to `slot` (f64 cells, no floor). Only `legal` lanes.
     #[inline]
-    pub fn add_strat(&self, slot: usize, legal: &[bool; NUM_ACTIONS], contrib: &[f64; NUM_ACTIONS]) {
+    pub fn add_strat(
+        &self,
+        slot: usize,
+        legal: &[bool; NUM_ACTIONS],
+        contrib: &[f64; NUM_ACTIONS],
+    ) {
         let base = slot * NUM_ACTIONS;
         for a in 0..NUM_ACTIONS {
             if legal[a] {
@@ -462,7 +469,10 @@ mod tests {
         for (key, row) in &m1 {
             let r3 = m3.get(key).expect("key present after roundtrip");
             for a in 0..NUM_ACTIONS {
-                assert!((row[a] - r3[a]).abs() < 1e-12, "row mismatch at key after roundtrip");
+                assert!(
+                    (row[a] - r3[a]).abs() < 1e-12,
+                    "row mismatch at key after roundtrip"
+                );
             }
         }
     }

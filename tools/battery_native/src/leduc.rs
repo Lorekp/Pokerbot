@@ -844,8 +844,14 @@ mod tests {
         // DCFR must (a) be zero-sum, (b) clear the same Leduc gate, and (c) converge at least as fast as
         // CFR+ at matched iters -- the exact, monotone Leduc read of the convergence-rate lever.
         let (ed, u0, u1, _, _) = solve_and_exploitability_dcfr(1000);
-        assert!((u0 + u1).abs() < 1e-6, "DCFR profile not zero-sum: {u0} {u1}");
-        assert!(ed < 1.0, "DCFR exploitability {ed} mbb not below the 1.0 gate @1000 iters");
+        assert!(
+            (u0 + u1).abs() < 1e-6,
+            "DCFR profile not zero-sum: {u0} {u1}"
+        );
+        assert!(
+            ed < 1.0,
+            "DCFR exploitability {ed} mbb not below the 1.0 gate @1000 iters"
+        );
         let (ec, ..) = solve_and_exploitability(1000);
         assert!(
             ed <= ec * 1.05,
@@ -865,7 +871,10 @@ mod tests {
         train_dcfr(&mut part, 400);
         assert_eq!(part.iters_done, 1000);
         let (ep, ..) = infoset_exploitability_mbb(&average_strategy(&part));
-        assert!((es - ep).abs() < 1e-9, "DCFR resume changed exploitability: {es} vs {ep}");
+        assert!(
+            (es - ep).abs() < 1e-9,
+            "DCFR resume changed exploitability: {es} vs {ep}"
+        );
     }
 
     #[test]

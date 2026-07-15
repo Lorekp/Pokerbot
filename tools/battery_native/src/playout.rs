@@ -280,8 +280,12 @@ impl SortedIndex {
     /// `POKERBOT_BP_FENCE=0` / `POKERBOT_BP_ROWCACHE=0` (rollback levers; both paths are
     /// bit-identical to the plain search by construction and by the tests gate).
     pub fn open(dir: &str) -> std::io::Result<Self> {
-        let use_fence = std::env::var("POKERBOT_BP_FENCE").map(|v| v != "0").unwrap_or(true);
-        let use_cache = std::env::var("POKERBOT_BP_ROWCACHE").map(|v| v != "0").unwrap_or(true);
+        let use_fence = std::env::var("POKERBOT_BP_FENCE")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let use_cache = std::env::var("POKERBOT_BP_ROWCACHE")
+            .map(|v| v != "0")
+            .unwrap_or(true);
         Self::open_with(dir, use_fence, use_cache)
     }
 
@@ -304,11 +308,22 @@ impl SortedIndex {
         if rows.len() != n * NUM_ACTIONS * 4 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("{}: rows size {} != n({}) * {}", rp.display(), rows.len(), n,
-                        NUM_ACTIONS * 4),
+                format!(
+                    "{}: rows size {} != n({}) * {}",
+                    rp.display(),
+                    rows.len(),
+                    n,
+                    NUM_ACTIONS * 4
+                ),
             ));
         }
-        let mut ix = SortedIndex { keys, rows, n, fence: None, cache: None };
+        let mut ix = SortedIndex {
+            keys,
+            rows,
+            n,
+            fence: None,
+            cache: None,
+        };
         if use_fence {
             ix.fence = ix.load_fence(dir);
         }
@@ -437,7 +452,10 @@ impl SortedIndex {
         for (a, slot) in row.iter_mut().enumerate() {
             let b = off + a * 4;
             *slot = f32::from_le_bytes([
-                self.rows[b], self.rows[b + 1], self.rows[b + 2], self.rows[b + 3],
+                self.rows[b],
+                self.rows[b + 1],
+                self.rows[b + 2],
+                self.rows[b + 3],
             ]);
         }
         row
@@ -575,7 +593,9 @@ pub fn build_keys_fence(dir: &str, progress: bool) -> std::io::Result<(usize, us
             let pct = 100.0 * done / total.max(1) as f64;
             let mbps = done / 1e6 / t0.elapsed().as_secs_f64().max(1e-9);
             let eta = ((total as f64 - done) / 1e6 / mbps.max(1e-9)) as u64;
-            eprintln!("[build_keys_fence] {pct:.1}% ({idx}/{n_keys} keys) {mbps:.0} MB/s ETA {eta}s");
+            eprintln!(
+                "[build_keys_fence] {pct:.1}% ({idx}/{n_keys} keys) {mbps:.0} MB/s ETA {eta}s"
+            );
             last_tick = std::time::Instant::now();
         }
     }
@@ -628,7 +648,9 @@ impl Blueprint {
 
     /// Open the nlcfr_key_index.py `--with-rows` output dir as an immutable mmap blueprint.
     pub fn from_index_dir(dir: &str) -> std::io::Result<Self> {
-        Ok(Blueprint::Index(std::sync::Arc::new(SortedIndex::open(dir)?)))
+        Ok(Blueprint::Index(std::sync::Arc::new(SortedIndex::open(
+            dir,
+        )?)))
     }
 
     /// Insert (Dict only). The mmap index is immutable by construction; every constructor that
@@ -1054,6 +1076,42 @@ pub fn uniform_leaf_value<const N: usize>(
     total / rollout_samples as f64
 }
 
+/// Deadline-aware twin of [`uniform_leaf_value`] used only by capped subgame
+/// solves.  A CFR node can spend most of its wall time inside one continuation
+/// leaf, so checking the deadline only on `cfv` entry does not bound the solve.
+/// Check both rollout boundaries and betting steps and return `None` without a
+/// partial mean when the deadline fires.  The uncapped function above remains a
+/// separate, clock-free path so its output and hot loop stay byte-identical.
+pub(crate) fn uniform_leaf_value_capped<const N: usize>(
+    env: &EnvStateN<N>,
+    hero: usize,
+    bp: &Blueprint,
+    cfg: &PlayoutConfig,
+    base_seed: u64,
+    rollout_samples: i32,
+    resample_board: bool,
+    deadline: std::time::Instant,
+) -> Option<f64> {
+    if env.done {
+        return Some(env.rewards[hero] as f64 / CHIP_UNIT);
+    }
+    let mut total = 0.0f64;
+    for r in 0..rollout_samples {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let rr = (r as u64).wrapping_add(1);
+        let mut env_r = *env;
+        if resample_board {
+            let mut brng = Rng::seed_from_u64(base_seed.wrapping_add(7919u64.wrapping_mul(rr)));
+            reshuffle_undealt(&mut env_r, &mut brng);
+        }
+        let mut arng = Rng::seed_from_u64(base_seed.wrapping_add(1_000_003u64.wrapping_mul(rr)));
+        total += playout_capped(&env_r, hero, bp, cfg, &mut arng, deadline)?;
+    }
+    Some(total / rollout_samples as f64)
+}
+
 /// PLURIBUS BIASED-CONTINUATION LEAF (2026-07-02): leaf value under a FIXED per-seat continuation
 /// PROFILE with an explicit bias multiplier. Mean over `rollout_samples` runouts of `playout_fixed`
 /// — same runout/seed schedule as `uniform_leaf_value` (7919/1000003 offsets), so the two paths draw
@@ -1088,6 +1146,127 @@ pub fn biased_leaf_value<const N: usize>(
     total / rollout_samples as f64
 }
 
+/// Deadline-aware twin of [`biased_leaf_value`].  As above, interruption
+/// discards the incomplete leaf evaluation rather than caching a biased partial
+/// rollout average.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn biased_leaf_value_capped<const N: usize>(
+    env: &EnvStateN<N>,
+    hero: usize,
+    bp: &Blueprint,
+    cfg: &PlayoutConfig,
+    base_seed: u64,
+    rollout_samples: i32,
+    resample_board: bool,
+    choices: &[i32; N],
+    bias_mult: f64,
+    deadline: std::time::Instant,
+) -> Option<f64> {
+    if env.done {
+        return Some(env.rewards[hero] as f64 / CHIP_UNIT);
+    }
+    let mut total = 0.0f64;
+    for r in 0..rollout_samples {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let rr = (r as u64).wrapping_add(1);
+        let mut env_r = *env;
+        if resample_board {
+            let mut brng = Rng::seed_from_u64(base_seed.wrapping_add(7919u64.wrapping_mul(rr)));
+            reshuffle_undealt(&mut env_r, &mut brng);
+        }
+        let mut arng = Rng::seed_from_u64(base_seed.wrapping_add(1_000_003u64.wrapping_mul(rr)));
+        total += playout_fixed_capped(
+            &env_r, hero, bp, cfg, &mut arng, choices, bias_mult, deadline,
+        )?;
+    }
+    Some(total / rollout_samples as f64)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn playout_fixed_capped<const N: usize>(
+    env_in: &EnvStateN<N>,
+    hero: usize,
+    bp: &Blueprint,
+    cfg: &PlayoutConfig,
+    rng: &mut Rng,
+    choices: &[i32; N],
+    bias_mult: f64,
+    deadline: std::time::Instant,
+) -> Option<f64> {
+    let mut env = *env_in;
+    let mut depth = 0;
+    while depth < cfg.max_depth && !env.done {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        if core::is_chance_node(&env) {
+            env = core::sample_chance(&env);
+            continue;
+        }
+        let seat_i = env.action_seat;
+        if seat_i < 0 {
+            break;
+        }
+        let seat = seat_i as usize;
+        let full = core::legal_action_mask(&env, seat_i);
+        let abst = abstracted_mask(&full, env.street, cfg);
+        let bp_row = blueprint_policy(&env, seat, &abst, bp, cfg);
+        let group = if choices[seat] >= 0 {
+            choices[seat] as usize
+        } else {
+            0
+        };
+        let row = bias_continuation_mult(&bp_row, group, &abst, cfg, bias_mult);
+        let u = rng.next_f64();
+        let a = sample_action(&row, &full, u);
+        env = crate::closure::maybe_close_called_street(crate::subgame::subgame_apply(&env, a));
+        depth += 1;
+    }
+    Some(playout_terminal_value(&env, hero))
+}
+
+fn playout_capped<const N: usize>(
+    env_in: &EnvStateN<N>,
+    hero: usize,
+    bp: &Blueprint,
+    cfg: &PlayoutConfig,
+    rng: &mut Rng,
+    deadline: std::time::Instant,
+) -> Option<f64> {
+    let mut env = *env_in;
+    let mut choices: [i32; N] = [-1; N];
+    let mut depth = 0;
+    while depth < cfg.max_depth && !env.done {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        if core::is_chance_node(&env) {
+            env = core::sample_chance(&env);
+            continue;
+        }
+        let seat_i = env.action_seat;
+        if seat_i < 0 {
+            break;
+        }
+        let seat = seat_i as usize;
+        let full = core::legal_action_mask(&env, seat_i);
+        let abst = abstracted_mask(&full, env.street, cfg);
+        let bp_row = blueprint_policy(&env, seat, &abst, bp, cfg);
+        if choices[seat] < 0 {
+            choices[seat] = rng.next_below(NUM_CONTINUATIONS as u64) as i32;
+        }
+        let group = choices[seat] as usize;
+        let row = bias_continuation(&bp_row, group, &abst, cfg);
+        let u = rng.next_f64();
+        let a = sample_action(&row, &full, u);
+        env = crate::closure::maybe_close_called_street(crate::subgame::subgame_apply(&env, a));
+        depth += 1;
+    }
+    Some(playout_terminal_value(&env, hero))
+}
+
 /// `_playout` under a FIXED per-seat continuation profile: `choices[seat]` in 0..NUM_CONTINUATIONS
 /// selects that seat's continuation for the whole playout; a seat with `choices[seat] < 0` (a seat
 /// that could not act at the leaf — folded/all-in — and therefore was given no choice node) falls
@@ -1118,7 +1297,11 @@ pub fn playout_fixed<const N: usize>(
         let full = core::legal_action_mask(&env, seat_i);
         let abst = abstracted_mask(&full, env.street, cfg);
         let bp_row = blueprint_policy(&env, seat, &abst, bp, cfg);
-        let group = if choices[seat] >= 0 { choices[seat] as usize } else { 0 };
+        let group = if choices[seat] >= 0 {
+            choices[seat] as usize
+        } else {
+            0
+        };
         let row = bias_continuation_mult(&bp_row, group, &abst, cfg, bias_mult);
         let u = rng.next_f64();
         let a = sample_action(&row, &full, u);

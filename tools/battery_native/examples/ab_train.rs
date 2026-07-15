@@ -54,7 +54,10 @@ fn env_flag(name: &str) -> bool {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let out_path = args.get(1).map(|s| s.as_str()).unwrap_or("ab_train_out.bin");
+    let out_path = args
+        .get(1)
+        .map(|s| s.as_str())
+        .unwrap_or("ab_train_out.bin");
     let iters: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4000);
     let n_deals: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
     // argv[4] (or env POKERBOT_BATCH_DEALS): batched-MLP traversal width. 0/1 = recursive (default);
@@ -62,7 +65,11 @@ fn main() {
     let batch_deals: usize = args
         .get(4)
         .and_then(|s| s.parse().ok())
-        .or_else(|| std::env::var("POKERBOT_BATCH_DEALS").ok().and_then(|s| s.parse().ok()))
+        .or_else(|| {
+            std::env::var("POKERBOT_BATCH_DEALS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
         .unwrap_or(0);
 
     let num_buckets: i32 = std::env::var("POKERBOT_AB_NUM_BUCKETS")
@@ -72,9 +79,9 @@ fn main() {
     let dcfr = env_flag("POKERBOT_AB_DCFR");
     let work_steal = env_flag("POKERBOT_WORKSTEAL");
     let emd_frozen = match std::env::var("POKERBOT_AB_EMD_FROZEN") {
-        Ok(p) if !p.is_empty() => Some(
-            battery_native::emd::load_shared(&p).expect("load POKERBOT_AB_EMD_FROZEN"),
-        ),
+        Ok(p) if !p.is_empty() => {
+            Some(battery_native::emd::load_shared(&p).expect("load POKERBOT_AB_EMD_FROZEN"))
+        }
         _ => None,
     };
     let river_ochs = match std::env::var("POKERBOT_AB_RIVER_OCHS") {

@@ -268,7 +268,7 @@ def test_eg12_overlay_bails_not_all_villains_fish_with_real_profiles():
     out: dict = {}
     res = apply_live_value_sizing(state, hero, probs.copy(), profiles, out=out)
     assert np.allclose(res, probs)                      # unchanged
-    assert out["reason"] in ("not_all_villains_fish", "table_too_aggressive")
+    assert out["reason"] in ("zero_overlay", "table_too_aggressive")
     assert out["fired"] is False
 
 

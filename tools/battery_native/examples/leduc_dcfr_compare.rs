@@ -15,7 +15,10 @@ fn main() {
     let targets = [10.0f64, 1.0, 0.1, 0.01];
 
     println!("Leduc DCFR-vs-CFR+ EXACT info-set-BR exploitability (mbb; lower = closer to Nash)");
-    println!("{:>8} | {:>13} | {:>13} | {:>10}", "iters", "CFR+", "DCFR", "DCFR/CFR+");
+    println!(
+        "{:>8} | {:>13} | {:>13} | {:>10}",
+        "iters", "CFR+", "DCFR", "DCFR/CFR+"
+    );
 
     let mut cfr = leduc::Tables::default();
     let mut dcfr = leduc::Tables::default();

@@ -810,10 +810,15 @@ pub fn legal_action_mask<const N: usize>(s: &EnvStateN<N>, seat_in: i32) -> [boo
         let prod = bucket_prod(pot, frac);
         let target_total = cur_bet.max(prod);
         let raise_by = target_total - committed;
+        // action_amount() pays to_call and then adds raise_by.  Checking only
+        // raise_by <= stack admitted over-stack buckets which commit() then
+        // clamped into duplicate ALL_IN actions.  Keep bet buckets strictly
+        // nonterminal; the dedicated ALL_IN action owns stack-sized commits.
+        let commit_amount = to_call.saturating_add(raise_by);
         let bucket_ok = is_live
             && (stack > to_call)
             && (raise_by >= min_raise_amt)
-            && (raise_by <= stack)
+            && (commit_amount < stack)
             && reopen_ok;
         mask[BET_BUCKET_START + i] = bucket_ok;
     }
@@ -864,7 +869,11 @@ pub fn apply_action<const N: usize>(s_in: &EnvStateN<N>, action: usize) -> EnvSt
 /// values are unchanged). `settle` MUST be chip-identical to `compute_returns` (gates:
 /// `apply_action_with_phe_matches_scalar_byte_for_byte` + `showdown_returns_matches_compute_returns`);
 /// the only effect is the per-terminal eval speed.
-pub fn apply_action_with<const N: usize, F>(s_in: &EnvStateN<N>, action: usize, settle: F) -> EnvStateN<N>
+pub fn apply_action_with<const N: usize, F>(
+    s_in: &EnvStateN<N>,
+    action: usize,
+    settle: F,
+) -> EnvStateN<N>
 where
     F: Fn(&[[i32; 2]; N], &[i32; MAX_BOARD], &[i8; N], &[i32; N], i32, i32) -> [i32; N],
 {

@@ -117,6 +117,7 @@ class SearchAgent:
             )
 
         self._decision_rng = None
+        self._decision_sample_serves: tuple[str, ...] = ()
         self._decision_capture: list | None = None
         # Root-policy exploitation: apply the VALIDATED read->mixer_logits->safe_mix adjustment (the
         # same mechanism the heuristic battery hero proved extracts CI>0 value from leaky archetypes)
@@ -274,11 +275,42 @@ class SearchAgent:
         probs = np.asarray(result.action_probs, dtype=float)
         if self.root_exploit_mixer and self._opponent_profiles and not kill:
             probs = self._apply_root_mixer(state, seat, probs)
-        if self._decision_rng is not None and probs.sum() > 0:
-            w = np.clip(probs, 0.0, None)
+        served_path = str(result.metadata.get("served", ""))
+        sample_this_serve = any(
+            served_path.startswith(prefix) for prefix in self._decision_sample_serves)
+        w = np.clip(probs, 0.0, None)
+        w_total = float(w.sum())
+        # AIVAT capture with an RNG samples every served policy; standalone
+        # live sampling is restricted to explicitly enabled serve prefixes.
+        capture_sampling = bool(
+            self._decision_capture is not None and self._decision_rng is not None)
+        sampled = bool(
+            self._decision_rng is not None and (capture_sampling or sample_this_serve)
+            and w_total > 0.0)
+        if sampled:
             idx = int(self._decision_rng.choices(range(len(w)), weights=w.tolist())[0])
         else:
             idx = int(probs.argmax())
+        # The solve wrapper runs before action selection.  Update its sidecar
+        # here so live diagnostics distinguish a sampled mixed-policy action
+        # from the legacy argmax without enabling the AIVAT capture path.
+        if w_total > 0.0:
+            normalized = w / w_total
+            selected_prob = float(normalized[idx])
+            positive = normalized[normalized > 0.0]
+            policy_entropy = float(-(positive * np.log(positive)).sum())
+        else:
+            selected_prob = 0.0
+            policy_entropy = 0.0
+        selector_meta = {
+            "policy_sampled": sampled,
+            "selected_action_prob": selected_prob,
+            "policy_entropy": policy_entropy,
+        }
+        self._state.last_solve_metadata.update(selector_meta)
+        telemetry = getattr(self.solver, "last_solve_telemetry", None)
+        if isinstance(telemetry, dict):
+            telemetry.update(selector_meta)
         if self._decision_capture is not None:
             # The leaf value net's Q-row at the decision node = the rigorous per-action AIVAT baseline
             # (value-net AIVAT). Cached in the solver from the just-completed solve. Skipped when
@@ -336,6 +368,17 @@ class SearchAgent:
         # cannot expose per-action root CFVs) -- acceptable for eval, where AIVAT buys far fewer hands.
         if getattr(self, "solver", None) is not None:
             self.solver._aivat_capture = bool(self.aivat_leaf_q)
+
+    def enable_action_sampling(self, rng, serves: tuple[str, ...] = ("search",)) -> None:
+        """Sample the served mixed strategy without enabling AIVAT capture.
+
+        Live equilibrium play must not collapse a mixed CFR policy to argmax.
+        This seam deliberately does not touch ``_decision_capture`` or
+        ``solver._aivat_capture``, so the native search path remains available.
+        Pass ``None`` to restore the legacy deterministic argmax behavior.
+        """
+        self._decision_rng = rng
+        self._decision_sample_serves = tuple(serves) if rng is not None else ()
 
     def pop_decisions_raw(self) -> list:
         if self._decision_capture is None:

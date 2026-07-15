@@ -327,13 +327,21 @@ def legal_action_mask(state: EnvState, seat: Array | None = None) -> Array:
         frac = BET_BUCKETS[i]
         target_total = jnp.maximum(state.current_bet, (pot * frac).astype(jnp.int32))
         raise_by = target_total - committed
+        # `_action_amount` first pays `to_call` and then adds `raise_by`.
+        # Testing only `raise_by <= stack` admitted buckets whose true commit
+        # exceeded the stack; `_commit` then clamped every such bucket into the
+        # same short ALL_IN.  Besides advertising an illegal full raise, this
+        # duplicated the terminal action several times inside CFR.  A bucket
+        # must leave chips behind; the dedicated ALL_IN action owns the exact-
+        # stack and over-stack cases.
+        commit_amount = to_call + raise_by
         is_full = target_total >= full_raise_target
         reopen_ok = (~state.acted[seat]) | state.last_raise_full | (to_call == 0)
         return (
             (status == SEAT_LIVE)
             & (stack > to_call)
             & (raise_by >= min_raise_amt)
-            & (raise_by <= stack)
+            & (commit_amount < stack)
             & reopen_ok
         )
 

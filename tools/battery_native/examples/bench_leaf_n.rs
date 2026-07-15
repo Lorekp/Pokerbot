@@ -102,30 +102,15 @@ fn main() {
         let mut all_means: Vec<f64> = Vec::with_capacity(n_leaves * reps);
 
         // Warmup.
-        let _ = uniform_leaf_value::<6>(
-            &deals[0],
-            hero,
-            &bp,
-            &cfg,
-            base_seed,
-            n_i32,
-            resample_board,
-        );
+        let _ =
+            uniform_leaf_value::<6>(&deals[0], hero, &bp, &cfg, base_seed, n_i32, resample_board);
 
         let t0 = Instant::now();
         for leaf_i in 0..n_leaves {
             let env = &deals[leaf_i];
             let seed = base_seed.wrapping_add(0x9E3779B97F4A7C15u64.wrapping_mul(leaf_i as u64));
             for _rep in 0..reps {
-                let v = uniform_leaf_value::<6>(
-                    env,
-                    hero,
-                    &bp,
-                    &cfg,
-                    seed,
-                    n_i32,
-                    resample_board,
-                );
+                let v = uniform_leaf_value::<6>(env, hero, &bp, &cfg, seed, n_i32, resample_board);
                 all_means.push(v);
             }
         }

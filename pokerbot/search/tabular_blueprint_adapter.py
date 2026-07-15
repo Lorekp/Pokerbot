@@ -146,6 +146,11 @@ class TabularBlueprintAdapter:
         from pokerbot.eval.lbr import _POST_KEEP, _PRE_KEEP, _PRE_RR_KEEP, make_blueprint_policy
 
         self._policy = make_blueprint_policy(self.snapshot, client_bet_sizing=self.client_bet_sizing)
+        self._policy_with_status = make_blueprint_policy(
+            self.snapshot,
+            client_bet_sizing=self.client_bet_sizing,
+            return_lookup_status=True,
+        )
         # Precompute the street action-abstraction masks ONCE (rebuilding per-leaf is wasteful).
         if self.client_bet_sizing:
             self._allowed_pre = _build_allowed_action_mask(_PRE_KEEP)
@@ -161,6 +166,16 @@ class TabularBlueprintAdapter:
     def blueprint(self, env, seat: int) -> np.ndarray:
         """The unbiased blueprint policy at ``(env, seat)`` (already legal-masked + renormalized)."""
         return np.asarray(self._policy(env, seat), dtype=np.float64)
+
+    def blueprint_with_status(self, env, seat: int) -> tuple[np.ndarray, bool]:
+        """Return the policy and whether a usable snapshot row backed it.
+
+        A missing row and a present row that loses all mass under the legal/action-
+        abstraction mask are both misses. This keeps the uniform-legal compatibility
+        fallback from being mistaken for learned strategy by safety-critical routes.
+        """
+        probs, hit = self._policy_with_status(env, seat)
+        return np.asarray(probs, dtype=np.float64), bool(hit)
 
     # Backwards/clarity alias — the solver's opponent-node mix uses the plain blueprint.
     __call__ = blueprint

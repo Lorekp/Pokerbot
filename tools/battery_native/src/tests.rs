@@ -475,16 +475,16 @@ mod subgame_n7 {
             repair_deck: false, // default OFF => byte/stat-identical to the legacy solve
             two_sided: false,   // default OFF => traverser is always hero
             decouple_sampler: false, // Q2 default OFF => byte/stat-identical
-            range_aware: false,      // Q3 default OFF => uniform opponent-hole deal
+            range_aware: false, // Q3 default OFF => uniform opponent-hole deal
             range_uniform_floor: 0.25,
             range_reach_full: false, // R1 default OFF => legacy fold-now/uniform deal, byte-identical
             ensemble_streams: 1,     // default 1 => single-stream, byte/stat-identical
             leaf_cache_worlds: 1,    // BUG-1 default 1 => first-touch leaf freeze, byte-identical
             avg_skip_frac: 0.0,      // BUG-5 default 0.0 => accumulate the average from t=0
             leaf_biased_continuations: false, // R2 default OFF => legacy uniform leaf, byte-identical
-            leaf_bias_mult: 5.0,     // R2 Pluribus multiplier (only read when the bool is ON)
+            leaf_bias_mult: 5.0, // R2 Pluribus multiplier (only read when the bool is ON)
             serve_final_iterate: false, // R5a default OFF => averaged extraction, byte-identical
-            root_unmask: 0,          // Stage-1 default 0 => no root widening, byte-identical
+            root_unmask: 0,      // Stage-1 default 0 => no root widening, byte-identical
             raise_cap_per_street: 0, // TASK-75 default 0 => no ladder thinning, byte-identical
         }
     }
@@ -577,14 +577,25 @@ mod subgame_n7 {
         let hero = env.action_seat as usize;
         let bp: Blueprint = Blueprint::new(); // empty => reach factors all-miss => flat table
         let pc = pcfg();
-        let reach = SubgameConfig { range_aware: true, range_reach_full: true, ..scfg() };
+        let reach = SubgameConfig {
+            range_aware: true,
+            range_reach_full: true,
+            ..scfg()
+        };
         let a = subgame::solve::<7>(&env, hero, &bp, &pc, &reach, 4242);
         let b = subgame::solve::<7>(&env, hero, &bp, &pc, &reach, 4242);
         assert_valid_root_probs(&env, hero, &a);
-        assert_eq!(a, b, "range_reach_full solve must be deterministic for a fixed seed");
+        assert_eq!(
+            a, b,
+            "range_reach_full solve must be deterministic for a fixed seed"
+        );
         // Empty blueprint: fold-now weight = 1 - 1/n_legal (flat) vs reach weight = 1.0 (flat) —
         // both normalize to the SAME per-combo distribution, so the solves must coincide exactly.
-        let fold_now = SubgameConfig { range_aware: true, range_reach_full: false, ..scfg() };
+        let fold_now = SubgameConfig {
+            range_aware: true,
+            range_reach_full: false,
+            ..scfg()
+        };
         let c = subgame::solve::<7>(&env, hero, &bp, &pc, &fold_now, 4242);
         assert_eq!(
             a, c,
@@ -600,11 +611,17 @@ mod subgame_n7 {
         let hero = env.action_seat as usize;
         let bp: Blueprint = Blueprint::new();
         let pc = pcfg();
-        let sc = SubgameConfig { decouple_sampler: true, ..scfg() };
+        let sc = SubgameConfig {
+            decouple_sampler: true,
+            ..scfg()
+        };
         let a = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 777);
         let b = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 777);
         assert_valid_root_probs(&env, hero, &a);
-        assert_eq!(a, b, "decoupled solve must be deterministic for a fixed seed");
+        assert_eq!(
+            a, b,
+            "decoupled solve must be deterministic for a fixed seed"
+        );
     }
 
     // Q3 RANGE-AWARE: with a real blueprint absent (uniform fallback => continue_weight is flat, no fold
@@ -619,11 +636,18 @@ mod subgame_n7 {
         let bp: Blueprint = Blueprint::new(); // empty => uniform fallback => flat continue_weight
         let pc = pcfg();
         for floor in [0.15_f64, 0.25, 0.4] {
-            let sc = SubgameConfig { range_aware: true, range_uniform_floor: floor, ..scfg() };
+            let sc = SubgameConfig {
+                range_aware: true,
+                range_uniform_floor: floor,
+                ..scfg()
+            };
             let a = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 2024);
             let b = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 2024);
             assert_valid_root_probs(&env, hero, &a);
-            assert_eq!(a, b, "range-aware solve must be deterministic (floor={floor})");
+            assert_eq!(
+                a, b,
+                "range-aware solve must be deterministic (floor={floor})"
+            );
         }
     }
 
@@ -638,16 +662,28 @@ mod subgame_n7 {
         let pc = pcfg();
         // ensemble=1 (explicit) == legacy (scfg() default 1): byte-identical.
         let base = scfg();
-        let one = SubgameConfig { ensemble_streams: 1, ..scfg() };
+        let one = SubgameConfig {
+            ensemble_streams: 1,
+            ..scfg()
+        };
         let p_base = subgame::solve::<7>(&env, hero, &bp, &pc, &base, 0xC0FFEE);
         let p_one = subgame::solve::<7>(&env, hero, &bp, &pc, &one, 0xC0FFEE);
-        assert_eq!(p_base, p_one, "ensemble_streams=1 must be byte-identical to legacy single-stream");
+        assert_eq!(
+            p_base, p_one,
+            "ensemble_streams=1 must be byte-identical to legacy single-stream"
+        );
         // ensemble=8: valid + deterministic (same seed twice => identical, proving fixed per-stream seeds).
-        let sc8 = SubgameConfig { ensemble_streams: 8, ..scfg() };
+        let sc8 = SubgameConfig {
+            ensemble_streams: 8,
+            ..scfg()
+        };
         let a = subgame::solve::<7>(&env, hero, &bp, &pc, &sc8, 0xC0FFEE);
         let b = subgame::solve::<7>(&env, hero, &bp, &pc, &sc8, 0xC0FFEE);
         assert_valid_root_probs(&env, hero, &a);
-        assert_eq!(a, b, "ensemble solve must be deterministic for a fixed seed");
+        assert_eq!(
+            a, b,
+            "ensemble solve must be deterministic for a fixed seed"
+        );
         // The 8-stream average should differ from the 1-stream (independent seeds => more effective samples).
         // Not asserting a direction (that is the H2H's job), only that the ensemble is actually engaged.
     }
@@ -663,7 +699,10 @@ mod subgame_n7 {
         let pc = pcfg();
         let base = scfg(); // leaf_cache_worlds: 1 (default)
         let probs_base = subgame::solve::<7>(&env, hero, &bp, &pc, &base, 0xBADC0DE);
-        let one = SubgameConfig { leaf_cache_worlds: 1, ..scfg() };
+        let one = SubgameConfig {
+            leaf_cache_worlds: 1,
+            ..scfg()
+        };
         let probs_one = subgame::solve::<7>(&env, hero, &bp, &pc, &one, 0xBADC0DE);
         assert_eq!(
             probs_base, probs_one,
@@ -671,11 +710,17 @@ mod subgame_n7 {
         );
         // M=4: valid distribution + deterministic (per-(leaf, n) seeds are pure functions of the key),
         // proving the multi-world path is CRN-stable. Direction/effect is the H2H's job, not this gate's.
-        let m4 = SubgameConfig { leaf_cache_worlds: 4, ..scfg() };
+        let m4 = SubgameConfig {
+            leaf_cache_worlds: 4,
+            ..scfg()
+        };
         let a = subgame::solve::<7>(&env, hero, &bp, &pc, &m4, 0xBADC0DE);
         let b = subgame::solve::<7>(&env, hero, &bp, &pc, &m4, 0xBADC0DE);
         assert_valid_root_probs(&env, hero, &a);
-        assert_eq!(a, b, "leaf_cache_worlds=4 solve must be deterministic for a fixed seed");
+        assert_eq!(
+            a, b,
+            "leaf_cache_worlds=4 solve must be deterministic for a fixed seed"
+        );
     }
 
     // BUG-5 GATE: avg_skip_frac=0.0 (the default) MUST reproduce the pre-change solve bit-for-bit
@@ -688,7 +733,10 @@ mod subgame_n7 {
         let pc = pcfg();
         let base = scfg(); // avg_skip_frac: 0.0 (default)
         let probs_base = subgame::solve::<7>(&env, hero, &bp, &pc, &base, 0xBADC0DE);
-        let zero = SubgameConfig { avg_skip_frac: 0.0, ..scfg() };
+        let zero = SubgameConfig {
+            avg_skip_frac: 0.0,
+            ..scfg()
+        };
         let probs_zero = subgame::solve::<7>(&env, hero, &bp, &pc, &zero, 0xBADC0DE);
         assert_eq!(
             probs_base, probs_zero,
@@ -696,11 +744,17 @@ mod subgame_n7 {
         );
         // frac=0.5: valid + deterministic. The traversal (worlds, sampled actions, regrets, leaf cache)
         // is UNCHANGED by the gate — only the served average excludes early iterates.
-        let half = SubgameConfig { avg_skip_frac: 0.5, ..scfg() };
+        let half = SubgameConfig {
+            avg_skip_frac: 0.5,
+            ..scfg()
+        };
         let a = subgame::solve::<7>(&env, hero, &bp, &pc, &half, 0xBADC0DE);
         let b = subgame::solve::<7>(&env, hero, &bp, &pc, &half, 0xBADC0DE);
         assert_valid_root_probs(&env, hero, &a);
-        assert_eq!(a, b, "avg_skip_frac=0.5 solve must be deterministic for a fixed seed");
+        assert_eq!(
+            a, b,
+            "avg_skip_frac=0.5 solve must be deterministic for a fixed seed"
+        );
     }
 
     // R2 GATE: leaf_biased_continuations=false (the default) MUST reproduce the pre-change solve
@@ -746,7 +800,10 @@ mod subgame_n7 {
             let a = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 0xFEED5);
             let b = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 0xFEED5);
             assert_valid_root_probs(&env, hero, &a);
-            assert_eq!(a, b, "biased-leaf solve must be deterministic (mult={mult})");
+            assert_eq!(
+                a, b,
+                "biased-leaf solve must be deterministic (mult={mult})"
+            );
         }
         // Also under two_sided (the traverser cycles; choice nodes belong to the traverser) the
         // feature must stay deterministic + valid.
@@ -772,7 +829,10 @@ mod subgame_n7 {
         let pc = pcfg();
         let base = scfg(); // serve_final_iterate: false (default)
         let probs_base = subgame::solve::<7>(&env, hero, &bp, &pc, &base, 0xBADC0DE);
-        let off = SubgameConfig { serve_final_iterate: false, ..scfg() };
+        let off = SubgameConfig {
+            serve_final_iterate: false,
+            ..scfg()
+        };
         let probs_off = subgame::solve::<7>(&env, hero, &bp, &pc, &off, 0xBADC0DE);
         assert_eq!(
             probs_base, probs_off,
@@ -792,7 +852,10 @@ mod subgame_n7 {
         let hero = env.action_seat as usize;
         let bp: Blueprint = Blueprint::new();
         let pc = pcfg();
-        let sc_on = SubgameConfig { serve_final_iterate: true, ..scfg() };
+        let sc_on = SubgameConfig {
+            serve_final_iterate: true,
+            ..scfg()
+        };
         let sc_off = scfg();
         let legal = subgame::abstracted_legal::<7>(&env, hero, &pc);
 
@@ -801,8 +864,14 @@ mod subgame_n7 {
         let (ss_on, rr_on, _) = subgame::solve_rows::<7>(&env, hero, &bp, &pc, &sc_on, 0xFEED5);
         let (ss_off, rr_off, has_avg) =
             subgame::solve_rows::<7>(&env, hero, &bp, &pc, &sc_off, 0xFEED5);
-        assert_eq!(ss_on, ss_off, "the flag must not touch the traversal (strategy_sum)");
-        assert_eq!(rr_on, rr_off, "the flag must not touch the traversal (regrets)");
+        assert_eq!(
+            ss_on, ss_off,
+            "the flag must not touch the traversal (strategy_sum)"
+        );
+        assert_eq!(
+            rr_on, rr_off,
+            "the flag must not touch the traversal (regrets)"
+        );
         assert!(has_avg, "test premise: the root accumulated average mass");
 
         // ON == regret-match of the final cumulative regrets (already normalized over legal).
@@ -818,7 +887,10 @@ mod subgame_n7 {
         }
         assert_valid_root_probs(&env, hero, &probs_on);
         let probs_on2 = subgame::solve::<7>(&env, hero, &bp, &pc, &sc_on, 0xFEED5);
-        assert_eq!(probs_on, probs_on2, "final-iterate serve must be deterministic");
+        assert_eq!(
+            probs_on, probs_on2,
+            "final-iterate serve must be deterministic"
+        );
 
         // OFF == masked+normalized averaged strategy_sum.
         let probs_off = subgame::solve::<7>(&env, hero, &bp, &pc, &sc_off, 0xFEED5);
@@ -840,8 +912,13 @@ mod subgame_n7 {
             );
         }
         // The knob must actually move the served policy at this state (final != average here).
-        let l1: f64 = (0..NUM_ACTIONS).map(|a| (probs_on[a] - probs_off[a]).abs()).sum();
-        assert!(l1 > 1e-9, "final-iterate serve identical to the average — placebo knob? L1={l1}");
+        let l1: f64 = (0..NUM_ACTIONS)
+            .map(|a| (probs_on[a] - probs_off[a]).abs())
+            .sum();
+        assert!(
+            l1 > 1e-9,
+            "final-iterate serve identical to the average — placebo knob? L1={l1}"
+        );
     }
 
     // STAGE-1 ZERO-GATE: root_unmask=0 (the default) MUST reproduce the pre-change solve
@@ -859,7 +936,10 @@ mod subgame_n7 {
         pc.allowed_post[BET_BUCKET_START + 6] = false;
         let base = scfg(); // root_unmask: 0 (default)
         let probs_base = subgame::solve::<7>(&env, hero, &bp, &pc, &base, 0xBADC0DE);
-        let zero = SubgameConfig { root_unmask: 0, ..scfg() };
+        let zero = SubgameConfig {
+            root_unmask: 0,
+            ..scfg()
+        };
         let probs_zero = subgame::solve::<7>(&env, hero, &bp, &pc, &zero, 0xBADC0DE);
         assert_eq!(
             probs_base, probs_zero,
@@ -887,14 +967,26 @@ mod subgame_n7 {
         // Test premises: bucket 6 is fully-LEGAL at this root (only the keep-list drops it), and
         // CHECK is engine-ILLEGAL (UTG faces the blind).
         let full = legal_action_mask::<7>(&env, hero as i32);
-        assert!(full[BET_BUCKET_START + 6], "premise: 2x-pot bucket must be engine-legal here");
-        assert!(!full[crate::core::CHECK], "premise: CHECK must be engine-illegal facing the blind");
+        assert!(
+            full[BET_BUCKET_START + 6],
+            "premise: 2x-pot bucket must be engine-legal here"
+        );
+        assert!(
+            !full[crate::core::CHECK],
+            "premise: CHECK must be engine-illegal facing the blind"
+        );
         let unmask: u32 = (1u32 << (BET_BUCKET_START + 6)) | (1u32 << crate::core::CHECK);
-        let sc = SubgameConfig { root_unmask: unmask, ..scfg() };
+        let sc = SubgameConfig {
+            root_unmask: unmask,
+            ..scfg()
+        };
         let a = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 0xFEED5);
         let b = subgame::solve::<7>(&env, hero, &bp, &pc, &sc, 0xFEED5);
         assert_valid_root_probs(&env, hero, &a);
-        assert_eq!(a, b, "root_unmask solve must be deterministic for a fixed seed");
+        assert_eq!(
+            a, b,
+            "root_unmask solve must be deterministic for a fixed seed"
+        );
         assert!(
             a[BET_BUCKET_START + 6] > 0.0,
             "un-masked fully-legal bucket 6 must receive served mass at the root, got {}",
@@ -908,7 +1000,10 @@ mod subgame_n7 {
         // And the widened solve must genuinely differ from the un-widened one (knob engaged).
         let off = subgame::solve::<7>(&env, hero, &bp, &pc, &scfg(), 0xFEED5);
         let l1: f64 = (0..NUM_ACTIONS).map(|x| (a[x] - off[x]).abs()).sum();
-        assert!(l1 > 1e-9, "root_unmask ON identical to OFF — placebo knob? L1={l1}");
+        assert!(
+            l1 > 1e-9,
+            "root_unmask ON identical to OFF — placebo knob? L1={l1}"
+        );
     }
 
     // R2 CONSISTENCY GATE: the continuation-choice infoset is keyed by the seat + PUBLIC leaf context
@@ -929,7 +1024,10 @@ mod subgame_n7 {
         for seat in 0..7usize {
             let k1 = subgame::cont_choice_key(&env, seat);
             let k2 = subgame::cont_choice_key(&env2, seat);
-            assert_eq!(k1, k2, "choice infoset must ignore private holes (seat {seat})");
+            assert_eq!(
+                k1, k2,
+                "choice infoset must ignore private holes (seat {seat})"
+            );
             let mut prev: Option<usize> = None;
             for t in [0, 1, 7, 512, 1999] {
                 let c1 = subgame::sample_cont_choice(&zeros, &k1, t, 0xABCDEF);
@@ -938,7 +1036,10 @@ mod subgame_n7 {
                     c1, c2,
                     "same infoset + same iteration must sample the SAME continuation (seat {seat}, t {t})"
                 );
-                assert!(c1 < crate::playout::NUM_CONTINUATIONS, "choice out of range");
+                assert!(
+                    c1 < crate::playout::NUM_CONTINUATIONS,
+                    "choice out of range"
+                );
                 if let Some(p) = prev {
                     if p != c1 {
                         any_t_diff = true;
@@ -949,7 +1050,10 @@ mod subgame_n7 {
         }
         // The iteration index must actually be mixed into the draw (across 7 seats x 5 iterations,
         // at least one consecutive pair differs — probability of failure under correct mixing ~0).
-        assert!(any_t_diff, "continuation draw ignores the iteration index (t not mixed in)");
+        assert!(
+            any_t_diff,
+            "continuation draw ignores the iteration index (t not mixed in)"
+        );
     }
 
     #[test]
@@ -1602,10 +1706,16 @@ mod emd_serve_keying {
         let seat = 3usize;
         let key = canonical_frozen_key(&env.holes[seat], &env.board).expect("flop canonical key");
         let lookup = lookup_with(&[(key, 7)]);
-        assert_eq!(frozen_bucket_memoed(&lookup, &env.holes[seat], &env.board), Some(7));
+        assert_eq!(
+            frozen_bucket_memoed(&lookup, &env.holes[seat], &env.board),
+            Some(7)
+        );
         let got = fingerprint_fast_depth_emd(&env, seat, 160, &[], &lookup, true);
         let want = fingerprint_fast_depth_postflop_bucket(&env, seat, 7);
-        assert_eq!(got, want, "flop EMD key must be the frozen-bucket postflop digest");
+        assert_eq!(
+            got, want,
+            "flop EMD key must be the frozen-bucket postflop digest"
+        );
     }
 
     #[test]
@@ -1620,7 +1730,10 @@ mod emd_serve_keying {
         // fail-on-miss: Python's bucket=-1 -> the preflop b"w" branch digest.
         let failed = fingerprint_fast_depth_emd(&env, seat, 160, &[], &lookup, false);
         assert_eq!(failed, fingerprint_from_bucket(&env, seat, -1, &[]));
-        assert_ne!(mirrored, failed, "the two miss semantics must key differently");
+        assert_ne!(
+            mirrored, failed,
+            "the two miss semantics must key differently"
+        );
     }
 
     #[test]
@@ -1659,11 +1772,17 @@ mod emd_serve_keying {
         };
         // None => exactly the legacy made-hand key.
         let cfg_none = mk_cfg(None);
-        assert_eq!(cfg_none.fp_key(&env, seat), fingerprint_fast(&env, seat, 160));
+        assert_eq!(
+            cfg_none.fp_key(&env, seat),
+            fingerprint_fast(&env, seat, 160)
+        );
         // Some => the frozen-bucket key.
         let key = canonical_frozen_key(&env.holes[seat], &env.board).unwrap();
         let lookup = Arc::new(lookup_with(&[(key, 42)]));
-        let cfg_emd = mk_cfg(Some(EmdKeyCfg { lookup, miss_made_hand: true }));
+        let cfg_emd = mk_cfg(Some(EmdKeyCfg {
+            lookup,
+            miss_made_hand: true,
+        }));
         assert_eq!(
             cfg_emd.fp_key(&env, seat),
             fingerprint_fast_depth_postflop_bucket(&env, seat, 42)
@@ -1732,8 +1851,14 @@ mod range_reach_r1 {
         let mut env = init_hand_n::<6>(0, &stacks, &occ, 0, &deck, [0u32, 0u32]);
         let st0 = env; // seat 3 (UTG) to act — the limp decision the reach factor conditions on.
         assert_eq!(env.action_seat, 3, "6-max UTG is the first preflop actor");
-        let script: [(i32, usize); 6] =
-            [(3, CALL), (4, FOLD), (5, FOLD), (0, FOLD), (1, FOLD), (2, CHECK)];
+        let script: [(i32, usize); 6] = [
+            (3, CALL),
+            (4, FOLD),
+            (5, FOLD),
+            (0, FOLD),
+            (1, FOLD),
+            (2, CHECK),
+        ];
         for (seat, action) in script {
             assert!(!is_chance_node(&env), "unexpected chance node mid-script");
             assert_eq!(env.action_seat, seat, "script actor mismatch");
@@ -1743,7 +1868,10 @@ mod range_reach_r1 {
             env = sample_chance(&env);
         }
         assert_eq!(env.street, STREET_FLOP);
-        assert_eq!(env.action_seat, 2, "BB acts first on the flop (button 0, seat 1 folded)");
+        assert_eq!(
+            env.action_seat, 2,
+            "BB acts first on the flop (button 0, seat 1 folded)"
+        );
         (env, st0)
     }
 
@@ -1755,9 +1883,15 @@ mod range_reach_r1 {
         let steps = subgame::replay_public_states(&root).expect("replay must succeed");
         assert_eq!(steps.len(), root.hist_len as usize);
         assert_eq!(steps.len(), 6);
-        let expected: [(usize, usize); 6] =
-            [(3, CALL), (4, FOLD), (5, FOLD), (0, FOLD), (1, FOLD), (2, CHECK)];
-        for (k, (seat, action, st)) in steps.iter().enumerate() {
+        let expected: [(usize, usize); 6] = [
+            (3, CALL),
+            (4, FOLD),
+            (5, FOLD),
+            (0, FOLD),
+            (1, FOLD),
+            (2, CHECK),
+        ];
+        for (k, (seat, action, st, _observed_to)) in steps.iter().enumerate() {
             assert_eq!((*seat, *action), expected[k], "step {k} actor/action");
             assert_eq!(st.street, 0, "all scripted decisions are preflop");
             assert_eq!(st.action_seat, *seat as i32, "snapshot actor");
@@ -1775,6 +1909,100 @@ mod range_reach_r1 {
         assert!(
             subgame::replay_public_states(&bad).is_none(),
             "corrupted history must fail the replay verification"
+        );
+    }
+
+    #[test]
+    fn reach_lookup_projection_is_lookup_only_and_fail_closed() {
+        let (root, _) = scripted_limp_root();
+        let mut deep = root;
+        for seat in 0..6 {
+            // Reconstruct a 500bb starting total without changing any public
+            // commitment/history field in the replay state.
+            deep.stacks[seat] = 500 * BB_CHIPS - deep.committed_total[seat];
+        }
+        let shadow = subgame::project_reach_lookup_state(&deep)
+            .expect("deep postflop replay state must project to source depth");
+        for seat in 0..6 {
+            if !matches!(deep.seat_status[seat], SEAT_FOLDED | SEAT_EMPTY) {
+                assert_eq!(
+                    shadow.stacks[seat] + shadow.committed_total[seat],
+                    100 * BB_CHIPS,
+                    "eligible seat {seat} must address the 100bb source index"
+                );
+            } else {
+                assert_eq!(shadow.stacks[seat], deep.stacks[seat]);
+            }
+        }
+        assert_eq!(shadow.committed_total, deep.committed_total);
+        assert_eq!(shadow.committed_street, deep.committed_street);
+        assert_eq!(shadow.current_bet, deep.current_bet);
+        assert_eq!(shadow.pot_dead, deep.pot_dead);
+        assert_eq!(shadow.hist_len, deep.hist_len);
+        assert_eq!(shadow.hist_action, deep.hist_action);
+        assert_eq!(shadow.hist_amount, deep.hist_amount);
+        assert_eq!(shadow.board, deep.board);
+
+        assert!(subgame::project_reach_lookup_state(&root).is_none());
+        let mut preflop = deep;
+        preflop.street = 0;
+        assert!(subgame::project_reach_lookup_state(&preflop).is_none());
+        let mut overcommitted = deep;
+        let live = (0..6)
+            .find(|&seat| !matches!(deep.seat_status[seat], SEAT_FOLDED | SEAT_EMPTY))
+            .expect("at least one eligible seat");
+        overcommitted.committed_total[live] = 100 * BB_CHIPS;
+        assert!(subgame::project_reach_lookup_state(&overcommitted).is_none());
+    }
+
+    #[test]
+    fn root_raise_cap_counts_observed_current_street_aggression() {
+        let stacks = [500 * BB_CHIPS; 6];
+        let occ = [true, false, false, true, false, false];
+        let mut deck = [0i32; 52];
+        for (i, d) in deck.iter_mut().enumerate() {
+            *d = i as i32;
+        }
+        let mut env = init_hand_n::<6>(0, &stacks, &occ, 0, &deck, [0u32, 0u32]);
+        while env.street < STREET_RIVER {
+            if is_chance_node(&env) {
+                env = sample_chance(&env);
+                continue;
+            }
+            let actor = env.action_seat as i32;
+            let legal = legal_action_mask(&env, actor);
+            env = apply_action(&env, if legal[CHECK] { CHECK } else { CALL });
+        }
+        assert!(!is_chance_node(&env));
+        for _ in 0..3 {
+            let actor = env.action_seat as i32;
+            let legal = legal_action_mask(&env, actor);
+            let action = (BET_BUCKET_START..ALL_IN)
+                .find(|&a| legal[a])
+                .expect("deep river must support the next non-all-in raise");
+            env = apply_action(&env, action);
+        }
+        assert_eq!(subgame::observed_root_street_raises(&env), 3);
+        let actor = env.action_seat as usize;
+        let mut legal = subgame::abstracted_legal(&env, actor, &pcfg6());
+        assert!(
+            legal[ALL_IN],
+            "uncapped live root exposes the unsupported fourth raise"
+        );
+        subgame::apply_root_raise_cap(&env, &mut legal, 3);
+        assert!(legal[FOLD] || legal[CHECK] || legal[CALL]);
+        for action in BET_BUCKET_START..=ALL_IN {
+            assert!(
+                !legal[action],
+                "root cap must remove aggressive action {action}"
+            );
+        }
+
+        let mut below_cap = subgame::abstracted_legal(&env, actor, &pcfg6());
+        subgame::apply_root_raise_cap(&env, &mut below_cap, 4);
+        assert!(
+            below_cap[ALL_IN],
+            "a street below the configured cap is unchanged"
         );
     }
 
@@ -1825,9 +2053,18 @@ mod range_reach_r1 {
         // Hit counts at seat 3's limp decision: always-call 1 combo (p=1), always-jam 4 combos
         // (p=0), always-fold 6 combos (p=0) => mean_hit = 1/11.
         let mean_hit = 1.0 / 11.0;
-        assert!((rt.get(3, 6, 7) - 1.0).abs() < 1e-12, "limp-call class keeps weight 1");
-        assert!(rt.get(3, 16, 20).abs() < 1e-12, "always-jam premium is zeroed for a CALL line");
-        assert!(rt.get(3, 44, 45).abs() < 1e-12, "always-fold trash is zeroed for a CALL line");
+        assert!(
+            (rt.get(3, 6, 7) - 1.0).abs() < 1e-12,
+            "limp-call class keeps weight 1"
+        );
+        assert!(
+            rt.get(3, 16, 20).abs() < 1e-12,
+            "always-jam premium is zeroed for a CALL line"
+        );
+        assert!(
+            rt.get(3, 44, 45).abs() < 1e-12,
+            "always-fold trash is zeroed for a CALL line"
+        );
         assert!(
             (rt.get(3, 24, 25) - mean_hit).abs() < 1e-12,
             "blueprint-miss combo gets the decision's mean hit probability, got {}",
@@ -1926,9 +2163,12 @@ mod stage2a_amount_faithful {
     fn bb_3bet_decision_state() -> EnvStateN<6> {
         let root = scripted_3bet_root();
         let steps = subgame::replay_with_ante(&root, &[0i32; 6]).expect("legacy replay");
-        let (seat, action, st) = steps[5];
+        let (seat, action, st, _observed_to) = steps[5];
         assert_eq!((seat, action), (2, BET_BUCKET_START + 5));
-        assert_eq!(st.committed_street[2], 100, "BB blind committed before the 3-bet");
+        assert_eq!(
+            st.committed_street[2], 100,
+            "BB blind committed before the 3-bet"
+        );
         assert_eq!(st.current_bet, 250);
         st
     }
@@ -1941,9 +2181,22 @@ mod stage2a_amount_faithful {
         let root = scripted_3bet_root();
         let legacy = subgame::replay_with_ante(&root, &[0i32; 6]).expect("legacy replay");
         let recorded = subgame::replay_recorded_amounts(&root).expect("recorded replay");
-        assert_eq!(recorded, legacy, "recorded-amount replay must reproduce legacy bit-for-bit");
+        let public = |v: &Vec<subgame::ReplayStep<6>>| {
+            v.iter()
+                .map(|(s, a, st, _)| (*s, *a, *st))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            public(&recorded),
+            public(&legacy),
+            "recorded-amount replay must reproduce legacy public states bit-for-bit"
+        );
         let chain = subgame::replay_public_states(&root).expect("full chain");
-        assert_eq!(chain, legacy, "replay_public_states must be unchanged on engine histories");
+        assert_eq!(
+            public(&chain),
+            public(&legacy),
+            "replay_public_states public states must be unchanged on engine histories"
+        );
     }
 
     // (2a) CALL-TOTAL CONVENTION (telemetry finding 2): live records a call's bet-TO street total
@@ -1956,11 +2209,23 @@ mod stage2a_amount_faithful {
         let mut live = root;
         live.hist_amount[6] = 750; // seat 3's call recorded as bet-TO total (engine inc = 500)
         let steps = subgame::replay_public_states(&live).expect("call-total must replay");
-        assert_eq!(steps, pristine, "call-total replay must yield identical decision states");
+        let public = |v: &Vec<subgame::ReplayStep<6>>| {
+            v.iter()
+                .map(|(s, a, st, _)| (*s, *a, *st))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            public(&steps),
+            public(&pristine),
+            "call-total replay must yield identical public decision states"
+        );
         // Arbitrary recorded call amounts are ignored (engine-forced) — still replays.
         let mut junk = root;
         junk.hist_amount[6] = 123_456;
-        assert!(subgame::replay_public_states(&junk).is_some(), "call amount is engine-forced");
+        assert!(
+            subgame::replay_public_states(&junk).is_some(),
+            "call amount is engine-forced"
+        );
     }
 
     // (2b) BET-TOTAL CONVENTION (design section 0.2): live records a raise's bet-TO street total
@@ -1975,7 +2240,10 @@ mod stage2a_amount_faithful {
         live.hist_amount[5] = 750; // BB 3-bet recorded as bet-TO total (engine inc = 650)
         live.hist_amount[6] = 750; // call as total too (the live recorder is uniform)
         let steps = subgame::replay_public_states(&live).expect("bet-total must replay");
-        assert_eq!(steps, pristine, "bet-total replay must yield identical decision states");
+        assert_eq!(
+            steps, pristine,
+            "bet-total replay must yield identical decision states"
+        );
         // Reach tables byte-identical between the two encodings of the SAME hand.
         use crate::playout::{Blueprint, PlayoutConfig};
         let pc = PlayoutConfig {
@@ -2013,7 +2281,48 @@ mod stage2a_amount_faithful {
         );
     }
 
-    // (2c) PHANTOM AGGRESSOR-OPTION CHECK (live street-close mismatch): the engine's
+    // (2c) NUMERIC CONVENTION COLLISION: in a live SB-vs-BB pot, a raise-to total can equal the
+    // engine bucket's computed increment. Equality is not evidence that the record is incremental:
+    // the SB already posted 50 chips. This exact class detached the arena's 6d2d turn/river roots
+    // from reach conditioning by inventing one extra small blind, then failing final public_eq.
+    #[test]
+    fn recorded_replay_bet_total_equal_to_engine_increment_uses_total() {
+        let stacks = [1_000 * BB_CHIPS; 6];
+        let occ = [true; 6];
+        let mut deck = [0i32; 52];
+        for (i, d) in deck.iter_mut().enumerate() {
+            *d = i as i32;
+        }
+        let mut before = init_hand_n::<6>(0, &stacks, &occ, 0, &deck, [7u32, 15u32]);
+        for seat in [3, 4, 5, 0] {
+            assert_eq!(before.action_seat, seat);
+            before = apply_action(&before, FOLD);
+        }
+        assert_eq!(before.action_seat, 1, "small blind acts after four folds");
+        assert_eq!(before.committed_street[1], SB_CHIPS);
+        let action = BET_BUCKET_START + 6;
+        let engine = apply_action(&before, action);
+        assert_eq!(
+            engine.committed_street[1], 350,
+            "engine bucket adds 300 on top of the 50-chip small blind"
+        );
+
+        let idx = before.hist_len as usize;
+        let mut live =
+            subgame::apply_action_recorded(&before, action, 300, true).expect("live raise-to 300");
+        assert_eq!(
+            live.committed_street[1], 300,
+            "total convention must add only 250 after the posted blind"
+        );
+        // apply_action_recorded stores its internal increment; the arena history stores bet-to.
+        live.hist_amount[idx] = 300;
+        let replayed = subgame::replay_public_states(&live)
+            .expect("numeric collision must retain verified reach replay");
+        assert_eq!(replayed.len(), live.hist_len as usize);
+        assert_eq!(replayed.last().unwrap().0, 1);
+    }
+
+    // (2d) PHANTOM AGGRESSOR-OPTION CHECK (live street-close mismatch): the engine's
     // street_complete rule returns the action to the aggressor after a bet-call sequence, so
     // engine histories contain a closing CHECK that REAL live histories never record. A
     // live-shaped history (closing check stripped + bet/call amounts as bet-TO totals) must
@@ -2024,7 +2333,11 @@ mod stage2a_amount_faithful {
         let root = scripted_3bet_root();
         let pristine = subgame::replay_with_ante(&root, &[0i32; 6]).expect("legacy replay");
         assert_eq!(pristine.len(), 8);
-        assert_eq!((pristine[7].0, pristine[7].1), (2, CHECK), "step 7 is the closing option");
+        assert_eq!(
+            (pristine[7].0, pristine[7].1),
+            (2, CHECK),
+            "step 7 is the closing option"
+        );
         // Live-shaped root: same public state, history without the synthetic closing check and
         // with live-convention amounts (bet-TO street totals).
         let mut live = root;
@@ -2035,10 +2348,14 @@ mod stage2a_amount_faithful {
         live.hist_amount[5] = 750; // BB 3-bet as bet-TO total
         live.hist_amount[6] = 750; // call as bet-TO total
         let steps = subgame::replay_public_states(&live).expect("phantom insertion must bridge");
-        assert_eq!(steps.len(), 7, "exactly the recorded decisions are reconstructed");
+        assert_eq!(
+            steps.len(),
+            7,
+            "exactly the recorded decisions are reconstructed"
+        );
         for k in 0..7 {
-            let (es, ea, est) = pristine[k];
-            let (ls, la, lst) = steps[k];
+            let (es, ea, est, _expected_to) = pristine[k];
+            let (ls, la, lst, _live_to) = steps[k];
             assert_eq!((ls, la), (es, ea), "step {k} actor/action");
             // Public decision states identical except the hist bookkeeping (same arrays here,
             // since the phantom is the LAST pristine entry): full equality must hold.
@@ -2067,9 +2384,9 @@ mod stage2a_amount_faithful {
         let st = bb_3bet_decision_state();
         let a = BET_BUCKET_START + 5;
         let engine = apply_action(&st, a);
-        // Engine passthrough: recorded == engine increment (650).
+        // Engine passthrough belongs to the explicit increment convention.
         assert_eq!(
-            subgame::apply_action_recorded(&st, a, 650, true).expect("passthrough"),
+            subgame::apply_action_recorded(&st, a, 650, false).expect("passthrough"),
             engine
         );
         // Total convention: recorded bet-TO 750 => same committed state (inc = 750 - 100 = 650).
@@ -2086,7 +2403,7 @@ mod stage2a_amount_faithful {
         // Forced call: recorded total is ignored, engine semantics applied.
         let root = scripted_3bet_root();
         let steps = subgame::replay_with_ante(&root, &[0i32; 6]).expect("legacy replay");
-        let (seat6, act6, st6) = steps[6];
+        let (seat6, act6, st6, _observed_to) = steps[6];
         assert_eq!((seat6, act6), (3, CALL));
         assert_eq!(
             subgame::apply_action_recorded(&st6, CALL, 750, true).expect("forced call"),
@@ -2119,7 +2436,9 @@ mod settle_showdown_leaf {
         }
         let mut s = seed;
         for i in (1..52usize).rev() {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let j = ((s >> 33) % (i as u64 + 1)) as usize;
             d.swap(i, j);
         }
@@ -2216,7 +2535,10 @@ mod settle_showdown_leaf {
             assert_eq!(v, showdown_leaf_return(&env, hero));
             settled_sum += v;
         }
-        assert!(settled_sum.abs() < 1e-9, "settled bb values must be zero-sum");
+        assert!(
+            settled_sum.abs() < 1e-9,
+            "settled bb values must be zero-sum"
+        );
     }
 
     #[test]
@@ -2234,16 +2556,28 @@ mod settle_showdown_leaf {
         assert!(env.done, "fold-around must be engine-settled");
         for hero in 0..NUM_PLAYERS {
             let want = env.rewards[hero] as f64 / CHIP_UNIT as f64;
-            assert_eq!(crate::playout::playout_terminal_value_gated(&env, hero, false), want);
-            assert_eq!(crate::playout::playout_terminal_value_gated(&env, hero, true), want);
+            assert_eq!(
+                crate::playout::playout_terminal_value_gated(&env, hero, false),
+                want
+            );
+            assert_eq!(
+                crate::playout::playout_terminal_value_gated(&env, hero, true),
+                want
+            );
         }
         // Mid-hand (depth-capped) state: street < TERMINAL, not done — stale read under BOTH
         // settings (the gate must not invent a value for an unfinished betting round).
         let mid = root_6max(100);
         assert!(!mid.done && mid.street < STREET_TERMINAL);
         for hero in 0..NUM_PLAYERS {
-            assert_eq!(crate::playout::playout_terminal_value_gated(&mid, hero, false), 0.0);
-            assert_eq!(crate::playout::playout_terminal_value_gated(&mid, hero, true), 0.0);
+            assert_eq!(
+                crate::playout::playout_terminal_value_gated(&mid, hero, false),
+                0.0
+            );
+            assert_eq!(
+                crate::playout::playout_terminal_value_gated(&mid, hero, true),
+                0.0
+            );
         }
     }
 
@@ -2296,7 +2630,10 @@ mod settle_showdown_leaf {
         // River all-in + calls: close_street's run_out is gated street<RIVER, so this terminal is
         // reached via sample_chance -> STREET_TERMINAL with done=false (the same unsettled class).
         assert!(jammed, "the river jam must have happened");
-        assert!(is_unsettled_showdown(&env), "river all-in+call must land unsettled");
+        assert!(
+            is_unsettled_showdown(&env),
+            "river all-in+call must land unsettled"
+        );
         assert!(env.rewards.iter().all(|&r| r == 0));
         let n_show = env
             .seat_status
@@ -2326,7 +2663,10 @@ mod settle_showdown_leaf {
         for hero in 0..NUM_PLAYERS {
             let v = crate::playout::playout_terminal_value_gated(&env, hero, true);
             assert_eq!(v, rets[hero] as f64 / CHIP_UNIT as f64);
-            assert_eq!(crate::playout::playout_terminal_value_gated(&env, hero, false), 0.0);
+            assert_eq!(
+                crate::playout::playout_terminal_value_gated(&env, hero, false),
+                0.0
+            );
             sum += v;
         }
         assert!(sum.abs() < 1e-9);
@@ -2360,7 +2700,9 @@ mod opt1_settle_join {
         }
         let mut s = seed;
         for i in (1..52usize).rev() {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let j = ((s >> 33) % (i as u64 + 1)) as usize;
             d.swap(i, j);
         }
@@ -2379,7 +2721,10 @@ mod opt1_settle_join {
     /// `chance=false` -> the first RIVER ACTION node (river card dealt, an actor to move).
     fn drive_to_river(mut env: EnvState, chance: bool) -> EnvState {
         for _ in 0..200 {
-            assert!(!env.done, "check/call drive must not settle before the river");
+            assert!(
+                !env.done,
+                "check/call drive must not settle before the river"
+            );
             if is_chance_node(&env) {
                 if chance && env.street == STREET_RIVER {
                     return env;
@@ -2630,7 +2975,11 @@ mod bp_index_fence_cache {
                     );
                 }
             }
-            _ => panic!("{ctx}: presence mismatch ({} vs {})", a.is_some(), b.is_some()),
+            _ => panic!(
+                "{ctx}: presence mismatch ({} vs {})",
+                a.is_some(),
+                b.is_some()
+            ),
         }
     }
 
@@ -2669,8 +3018,16 @@ mod bp_index_fence_cache {
         }
         for &i in &idxs {
             let k = keys[i];
-            assert_eq!(plain.search_plain(&k), Some(i), "plain search must find index {i}");
-            assert_eq!(fenced.search_fenced_loaded(&k), Some(i), "fenced search must find index {i}");
+            assert_eq!(
+                plain.search_plain(&k),
+                Some(i),
+                "plain search must find index {i}"
+            );
+            assert_eq!(
+                fenced.search_fenced_loaded(&k),
+                Some(i),
+                "fenced search must find index {i}"
+            );
             let a = plain.get(&k);
             let b = fenced.get(&k);
             assert!(a.is_some());
@@ -2709,7 +3066,9 @@ mod bp_index_fence_cache {
         // Correctness never degrades: a few present keys (exact expected row) + one absent key.
         let probe = |ix: &SortedIndex, why: &str| {
             for &i in &[0usize, n / 2, n - 1] {
-                let got = ix.get(&keys[i]).unwrap_or_else(|| panic!("{why}: present key lost"));
+                let got = ix
+                    .get(&keys[i])
+                    .unwrap_or_else(|| panic!("{why}: present key lost"));
                 let want = ((i as f32) * 16.0 + 0.25) as f64;
                 assert_eq!(got[0].to_bits(), want.to_bits(), "{why}: wrong row");
             }
@@ -2741,8 +3100,14 @@ mod bp_index_fence_cache {
                 }),
             ),
             ("bad magic", Box::new(|d: &mut Vec<u8>| d[0] ^= 1)),
-            ("n_keys mismatch", Box::new(|d: &mut Vec<u8>| d[8] = d[8].wrapping_add(1))),
-            ("keys_per_page mismatch", Box::new(|d: &mut Vec<u8>| d[16] = d[16].wrapping_add(1))),
+            (
+                "n_keys mismatch",
+                Box::new(|d: &mut Vec<u8>| d[8] = d[8].wrapping_add(1)),
+            ),
+            (
+                "keys_per_page mismatch",
+                Box::new(|d: &mut Vec<u8>| d[16] = d[16].wrapping_add(1)),
+            ),
             (
                 "non-monotone",
                 Box::new(|d: &mut Vec<u8>| {
@@ -2783,7 +3148,11 @@ mod bp_index_fence_cache {
         // (mix of fresh inserts + cache hits). Every read must be bit-identical to the uncached path.
         for pass in 0..2 {
             for (i, k) in keys.iter().enumerate() {
-                assert_bits_eq(&plain.get(k), &cached.get(k), &format!("pass {pass} key {i}"));
+                assert_bits_eq(
+                    &plain.get(k),
+                    &cached.get(k),
+                    &format!("pass {pass} key {i}"),
+                );
             }
         }
         // Absent keys: the miss is cached too — twice, both None.
@@ -2911,9 +3280,17 @@ mod bp_index_fence_cache {
                 env = apply_action(&env, a);
             }
         }
-        assert!(roots.len() >= 2, "need at least 2 postflop roots (got {})", roots.len());
+        assert!(
+            roots.len() >= 2,
+            "need at least 2 postflop roots (got {})",
+            roots.len()
+        );
         let keys: Vec<[u8; 16]> = keyset.into_iter().collect();
-        assert!(keys.len() > 500, "expected a non-trivial key population, got {}", keys.len());
+        assert!(
+            keys.len() > 500,
+            "expected a non-trivial key population, got {}",
+            keys.len()
+        );
 
         let dir = tmp_dir("solveid");
         write_index(&dir, &keys);
@@ -2922,7 +3299,9 @@ mod bp_index_fence_cache {
         let sc = scfg();
         let mut baseline: Vec<[f64; NUM_ACTIONS]> = Vec::new();
         for (gi, (use_fence, use_cache)) in
-            [(false, false), (true, false), (false, true), (true, true)].iter().enumerate()
+            [(false, false), (true, false), (false, true), (true, true)]
+                .iter()
+                .enumerate()
         {
             let ix = SortedIndex::open_with(dir.to_str().unwrap(), *use_fence, *use_cache).unwrap();
             assert_eq!(ix.fence_active(), *use_fence);
@@ -2952,7 +3331,6 @@ fence={use_fence} cache={use_cache})"
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // TASK-75 (2026-07-13) — interruptible + GIL-free native solve: wall-clock cap, structural
@@ -3015,28 +3393,65 @@ mod wall_cap_t75 {
             assert!(probs[a].is_finite(), "prob[{a}] not finite: {}", probs[a]);
             assert!(probs[a] >= -1e-12, "prob[{a}] negative: {}", probs[a]);
             if !legal[a] {
-                assert!(probs[a].abs() < 1e-9, "mass {} on illegal action {a}", probs[a]);
+                assert!(
+                    probs[a].abs() < 1e-9,
+                    "mass {} on illegal action {a}",
+                    probs[a]
+                );
             }
             s += probs[a];
         }
         assert!((s - 1.0).abs() < 1e-6, "root probs must sum to 1, got {s}");
     }
 
+    #[test]
+    fn t75_wall_check_interval_stays_live_calibrated() {
+        assert_eq!(
+            subgame::WALL_TICK_MASK + 1,
+            8,
+            "production EMD solves require an eight-node deadline-check cadence"
+        );
+    }
+
     // Golden to_bits vectors captured from the PRE-change binary (see the module header).
     const G1: [u64; NUM_ACTIONS] = [
-        0x3fa58c71ac8d0cb5, 0x0000000000000000, 0x3fada72bfdb7d323, 0x3fbdb890661a6dfe,
-        0x3fc5c3d27bede666, 0x3fc1f8bb1d8f3e80, 0x3fb8d374a3ce09ff, 0x3fc5026ebfab86ae,
-        0x3fc326222a0b7cb8, 0x3faeba9592ad8130, 0x3f66548a26c0dd17,
+        0x3fa58c71ac8d0cb5,
+        0x0000000000000000,
+        0x3fada72bfdb7d323,
+        0x3fbdb890661a6dfe,
+        0x3fc5c3d27bede666,
+        0x3fc1f8bb1d8f3e80,
+        0x3fb8d374a3ce09ff,
+        0x3fc5026ebfab86ae,
+        0x3fc326222a0b7cb8,
+        0x3faeba9592ad8130,
+        0x3f66548a26c0dd17,
     ];
     const G2: [u64; NUM_ACTIONS] = [
-        0x3fb463b1464f1b24, 0x0000000000000000, 0x3fbbc82e76fdf4f5, 0x3fb459f90104ffa2,
-        0x3fc49ba9035ee906, 0x3fb80a17752ec227, 0x3fc0ade2808fb0de, 0x3fb7de7ee4c266f3,
-        0x3fc24da7d112b911, 0x3fbae3efb80c010c, 0x3f77f3a85ae202a1,
+        0x3fb463b1464f1b24,
+        0x0000000000000000,
+        0x3fbbc82e76fdf4f5,
+        0x3fb459f90104ffa2,
+        0x3fc49ba9035ee906,
+        0x3fb80a17752ec227,
+        0x3fc0ade2808fb0de,
+        0x3fb7de7ee4c266f3,
+        0x3fc24da7d112b911,
+        0x3fbae3efb80c010c,
+        0x3f77f3a85ae202a1,
     ];
     const G3: [u64; NUM_ACTIONS] = [
-        0x3fa847ab4341f558, 0x0000000000000000, 0x3fa6666bbd015ea7, 0x3f723456789abcdf,
-        0x3fa434ac6a40db09, 0x3fb36df8f94e693d, 0x3fbd61a16eed01f6, 0x3f90d9007fd30f7f,
-        0x3fce96cbe0ea3a33, 0x3fda85284c697b5a, 0x3f723456789abcdf,
+        0x3fa847ab4341f558,
+        0x0000000000000000,
+        0x3fa6666bbd015ea7,
+        0x3f723456789abcdf,
+        0x3fa434ac6a40db09,
+        0x3fb36df8f94e693d,
+        0x3fbd61a16eed01f6,
+        0x3f90d9007fd30f7f,
+        0x3fce96cbe0ea3a33,
+        0x3fda85284c697b5a,
+        0x3f723456789abcdf,
     ];
 
     fn assert_bits(probs: &[f64; NUM_ACTIONS], golden: &[u64; NUM_ACTIONS], tag: &str) {
@@ -3070,7 +3485,10 @@ mod wall_cap_t75 {
         let (p0, capped0, it0) = subgame::solve_capped::<7>(&env, hero, &bp, &pc, &sc, 0xC0FFEE, 0);
         assert_bits(&p0, &G1, "G1 solve_capped(0)");
         assert!(!capped0, "wall_cap=0 must never flag capped");
-        assert_eq!(it0, sc.max_iterations, "wall_cap=0 must complete every iteration");
+        assert_eq!(
+            it0, sc.max_iterations,
+            "wall_cap=0 must complete every iteration"
+        );
         let (ph, cappedh, ith) =
             subgame::solve_capped::<7>(&env, hero, &bp, &pc, &sc, 0xC0FFEE, 600_000);
         assert_bits(&ph, &G1, "G1 solve_capped(huge, not hit)");
@@ -3078,21 +3496,32 @@ mod wall_cap_t75 {
         assert_eq!(ith, sc.max_iterations);
 
         // G2: ensemble_streams=8 (rayon fan-out), seed 0xBADC0DE.
-        let sc8 = SubgameConfig { ensemble_streams: 8, ..scfg7() };
+        let sc8 = SubgameConfig {
+            ensemble_streams: 8,
+            ..scfg7()
+        };
         let p2 = subgame::solve::<7>(&env, hero, &bp, &pc, &sc8, 0xBADC0DE);
         assert_bits(&p2, &G2, "G2 solve(ensemble=8)");
         let (p2c, capped2, it2) =
             subgame::solve_capped::<7>(&env, hero, &bp, &pc, &sc8, 0xBADC0DE, 600_000);
         assert_bits(&p2c, &G2, "G2 solve_capped(huge, ensemble=8)");
         assert!(!capped2);
-        assert_eq!(it2, sc8.max_iterations, "min-across-streams must be the full count");
+        assert_eq!(
+            it2, sc8.max_iterations,
+            "min-across-streams must be the full count"
+        );
 
         // G3: two_sided + range_aware + decouple, seed 777.
-        let sc3 =
-            SubgameConfig { two_sided: true, range_aware: true, decouple_sampler: true, ..scfg7() };
+        let sc3 = SubgameConfig {
+            two_sided: true,
+            range_aware: true,
+            decouple_sampler: true,
+            ..scfg7()
+        };
         let p3 = subgame::solve::<7>(&env, hero, &bp, &pc, &sc3, 777);
         assert_bits(&p3, &G3, "G3 solve(two_sided+range_aware+decouple)");
-        let (p3c, capped3, _) = subgame::solve_capped::<7>(&env, hero, &bp, &pc, &sc3, 777, 600_000);
+        let (p3c, capped3, _) =
+            subgame::solve_capped::<7>(&env, hero, &bp, &pc, &sc3, 777, 600_000);
         assert_bits(&p3c, &G3, "G3 solve_capped(huge)");
         assert!(!capped3);
     }
@@ -3106,12 +3535,21 @@ mod wall_cap_t75 {
         let hero = env.action_seat as usize;
         let bp: Blueprint = Blueprint::new();
         let pc = pcfg7();
-        let sc = SubgameConfig { max_iterations: 50_000_000, ..scfg7() };
+        let sc = SubgameConfig {
+            max_iterations: 50_000_000,
+            ..scfg7()
+        };
         let t0 = std::time::Instant::now();
         let (p, capped, iters) = subgame::solve_capped::<7>(&env, hero, &bp, &pc, &sc, 42, 50);
         let wall = t0.elapsed();
-        assert!(capped, "a 50ms cap under a 50M-iteration target must flag capped");
-        assert!(iters >= 0 && iters < sc.max_iterations, "iters_completed must be bounded, got {iters}");
+        assert!(
+            capped,
+            "a 50ms cap under a 50M-iteration target must flag capped"
+        );
+        assert!(
+            iters >= 0 && iters < sc.max_iterations,
+            "iters_completed must be bounded, got {iters}"
+        );
         assert!(
             wall < std::time::Duration::from_secs(10),
             "cap-hit solve must return promptly (took {wall:?})"
@@ -3119,13 +3557,52 @@ mod wall_cap_t75 {
         assert_valid_root_probs(&env, hero, &p);
 
         // Ensemble cap-hit: every stream latches its own cap; min-iters + OR-capped surface.
-        let sc8 = SubgameConfig { max_iterations: 50_000_000, ensemble_streams: 4, ..scfg7() };
+        let sc8 = SubgameConfig {
+            max_iterations: 50_000_000,
+            ensemble_streams: 4,
+            ..scfg7()
+        };
         let t1 = std::time::Instant::now();
         let (p8, capped8, iters8) = subgame::solve_capped::<7>(&env, hero, &bp, &pc, &sc8, 42, 50);
         assert!(capped8);
         assert!(iters8 >= 0 && iters8 < sc8.max_iterations);
         assert!(t1.elapsed() < std::time::Duration::from_secs(10));
         assert_valid_root_probs(&env, hero, &p8);
+    }
+
+    #[test]
+    fn t75_wall_cap_interrupts_expensive_leaf_rollouts() {
+        // Regression for the live 12.0s cap that returned after 13.3s: the
+        // deadline was checked in `cfv`, but one continuation leaf could spend
+        // the whole overshoot inside its rollout loop.  Make a single leaf
+        // deliberately enormous; both continuation modes must abort inside the
+        // leaf rather than wait for the next CFR-node entry.
+        let env = init_hand_7(40);
+        let hero = env.action_seat as usize;
+        let bp: Blueprint = Blueprint::new();
+        let pc = pcfg7();
+        for biased in [false, true] {
+            let sc = SubgameConfig {
+                max_iterations: 50_000_000,
+                rollout_samples: 1_000_000,
+                leaf_biased_continuations: biased,
+                ..scfg7()
+            };
+            let t0 = std::time::Instant::now();
+            let (p, capped, iters) =
+                subgame::solve_capped::<7>(&env, hero, &bp, &pc, &sc, 0x75, 25);
+            let wall = t0.elapsed();
+            assert!(
+                capped,
+                "expensive leaf must observe the cap (biased={biased})"
+            );
+            assert!(iters < sc.max_iterations);
+            assert!(
+                wall < std::time::Duration::from_secs(2),
+                "leaf cancellation must be prompt (biased={biased}, wall={wall:?})"
+            );
+            assert_valid_root_probs(&env, hero, &p);
+        }
     }
 
     // (3) STRUCTURAL RAISE CAP: 0 (default) is covered by the goldens above; ON must (a) return a
@@ -3137,11 +3614,17 @@ mod wall_cap_t75 {
         let hero = env.action_seat as usize;
         let bp: Blueprint = Blueprint::new();
         let pc = pcfg7();
-        let capped_cfg = SubgameConfig { raise_cap_per_street: 2, ..scfg7() };
+        let capped_cfg = SubgameConfig {
+            raise_cap_per_street: 2,
+            ..scfg7()
+        };
         let a = subgame::solve::<7>(&env, hero, &bp, &pc, &capped_cfg, 0xC0FFEE);
         let b = subgame::solve::<7>(&env, hero, &bp, &pc, &capped_cfg, 0xC0FFEE);
         assert_valid_root_probs(&env, hero, &a);
-        assert_eq!(a, b, "raise-capped solve must be deterministic for a fixed seed");
+        assert_eq!(
+            a, b,
+            "raise-capped solve must be deterministic for a fixed seed"
+        );
         // Root menu untouched: a capped INTERIOR tree must not gut the root menu — the served
         // distribution should keep support across (nearly) the full legal set.
         let legal = legal_action_mask::<7>(&env, hero as i32);
@@ -3152,7 +3635,10 @@ mod wall_cap_t75 {
             "raise cap must not gut the ROOT menu (support {n_support} of {n_legal} legal)"
         );
         let base = subgame::solve::<7>(&env, hero, &bp, &pc, &scfg7(), 0xC0FFEE);
-        assert_ne!(a, base, "raise_cap_per_street=2 must actually change a 400bb-deep solve");
+        assert_ne!(
+            a, base,
+            "raise_cap_per_street=2 must actually change a 400bb-deep solve"
+        );
     }
 
     // (4) EXPLOIT twin: solve_exploit == solve_exploit_capped(.., 0) bit-for-bit (empty frozen
@@ -3167,19 +3653,31 @@ mod wall_cap_t75 {
         let sc = scfg7();
         let frozen: subgame::FrozenTable = HashMap::new();
         let rnr = [f64::NAN; 6];
-        let (p_leg, q_leg) =
-            subgame::solve_exploit::<7>(&env, hero, &bp, &pc, &sc, 99, &frozen, &rnr, false, true, true);
+        let (p_leg, q_leg) = subgame::solve_exploit::<7>(
+            &env, hero, &bp, &pc, &sc, 99, &frozen, &rnr, false, true, true,
+        );
         let (p_cap, q_cap, capped, iters) = subgame::solve_exploit_capped::<7>(
             &env, hero, &bp, &pc, &sc, 99, &frozen, &rnr, false, true, true, 0,
         );
         for a in 0..NUM_ACTIONS {
-            assert_eq!(p_leg[a].to_bits(), p_cap[a].to_bits(), "exploit probs action {a}");
-            assert_eq!(q_leg[a].to_bits(), q_cap[a].to_bits(), "exploit root_q action {a}");
+            assert_eq!(
+                p_leg[a].to_bits(),
+                p_cap[a].to_bits(),
+                "exploit probs action {a}"
+            );
+            assert_eq!(
+                q_leg[a].to_bits(),
+                q_cap[a].to_bits(),
+                "exploit root_q action {a}"
+            );
         }
         assert!(!capped);
         assert_eq!(iters, sc.max_iterations);
 
-        let sc_big = SubgameConfig { max_iterations: 50_000_000, ..scfg7() };
+        let sc_big = SubgameConfig {
+            max_iterations: 50_000_000,
+            ..scfg7()
+        };
         let t0 = std::time::Instant::now();
         let (p, _q, capped2, iters2) = subgame::solve_exploit_capped::<7>(
             &env, hero, &bp, &pc, &sc_big, 99, &frozen, &rnr, false, true, false, 50,

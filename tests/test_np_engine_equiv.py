@@ -116,6 +116,54 @@ def _run_one_hand(seed: int, occ: tuple[bool, ...], stacks=None) -> dict:
     return {"steps": steps, "showdown": saw_showdown, "max_street": int(np.asarray(s_np.street))}
 
 
+def test_short_allin_does_not_alias_overstack_raise_buckets():
+    """A full re-raise that cannot fit must expose only the dedicated ALL_IN.
+
+    Regression for the live 2026-07-15 deep KK river node: hero faced a raise
+    from 241 to 792 with 751 behind.  Paying the 551 call plus any legal full
+    raise exceeded the stack, but the old mask checked only the post-call
+    component.  Four bucket actions were therefore admitted and execution
+    clamped all four to the same short all-in, giving CFR five shove aliases.
+    """
+    occ = jnp.asarray([True, False, True, False, True, False], dtype=bool)
+    s_jax = je.init_hand(jax.random.PRNGKey(91), occupancy=occ)
+    status = jnp.asarray(
+        [ne.SEAT_FOLDED, ne.SEAT_EMPTY, ne.SEAT_LIVE,
+         ne.SEAT_EMPTY, ne.SEAT_LIVE, ne.SEAT_EMPTY],
+        dtype=jnp.int8,
+    )
+    stacks = jnp.asarray([0, 0, 16100, 0, 37550, 0], dtype=jnp.int32)
+    committed = jnp.asarray([0, 0, 39600, 0, 12050, 0], dtype=jnp.int32)
+    s_jax = s_jax._replace(
+        street=jnp.asarray(je.STREET_RIVER, dtype=jnp.int32),
+        action_seat=jnp.asarray(4, dtype=jnp.int32),
+        seat_status=status,
+        stacks=stacks,
+        committed_street=committed,
+        committed_total=committed,
+        pot_dead=jnp.asarray(6550, dtype=jnp.int32),
+        current_bet=jnp.asarray(39600, dtype=jnp.int32),
+        min_raise=jnp.asarray(27550, dtype=jnp.int32),
+        acted=jnp.asarray([False, False, True, False, False, False]),
+        last_raise_full=jnp.asarray(True),
+        last_aggressor=jnp.asarray(2, dtype=jnp.int32),
+        done=jnp.asarray(False),
+    )
+    s_np = ne.to_numpy_state(s_jax)
+    mask = _assert_mask_equal(s_jax, s_np, "short-allin bucket alias")
+
+    assert mask[ne.FOLD] and mask[ne.CALL] and mask[ne.ALL_IN]
+    assert not mask[ne.BET_BUCKET_START:ne.ALL_IN].any(), mask.astype(int).tolist()
+
+    # The one legal short all-in still returns action to the prior aggressor,
+    # who owes the unmatched 200-chip increment.
+    after = ne.apply_action_np(s_np, ne.ALL_IN)
+    assert not ne.is_terminal_np(after)
+    assert ne.current_player_np(after) == 2
+    assert int(after.current_bet) == 49600
+    assert int(after.committed_street[2]) == 39600
+
+
 # Build the hand matrix: >=2000 hands per layout, with stack variation that forces
 # unequal all-in side pots.
 def _stack_variants(seed: int):

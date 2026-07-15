@@ -103,7 +103,9 @@ fn walk(s: &EnvStateN<{ NUM_PLAYERS }>, hero: usize, ctx: &mut Ctx, rng: &mut Rn
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let ckpt = args.get(1).expect("usage: row_census <ckpt> <n_deals> <out.json> [seed]");
+    let ckpt = args
+        .get(1)
+        .expect("usage: row_census <ckpt> <n_deals> <out.json> [seed]");
     let n_deals: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2000);
     let out_path = args.get(3).map(|s| s.as_str()).unwrap_or("row_census.json");
     let seed: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0xBEEF);
@@ -113,9 +115,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
     let emd_frozen = match std::env::var("POKERBOT_AB_EMD_FROZEN") {
-        Ok(p) if !p.is_empty() => {
-            Some(battery_native::emd::load_shared(&p).expect("load emd"))
-        }
+        Ok(p) if !p.is_empty() => Some(battery_native::emd::load_shared(&p).expect("load emd")),
         _ => None,
     };
     let river_ochs = match std::env::var("POKERBOT_AB_RIVER_OCHS") {

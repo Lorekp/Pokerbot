@@ -395,9 +395,14 @@ fn run_solve(
         }),
     };
     // Deployed config, with K overridden and streams forced to 1 (single-stream, as specified).
-    let streams: i32 = cfgm.get("ensemble_streams").map(|s| s.parse().unwrap()).unwrap_or(1);
+    let streams: i32 = cfgm
+        .get("ensemble_streams")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(1);
     if streams != 1 {
-        eprintln!("[solve] WARNING config ensemble_streams={streams}; forcing 1 (single-stream bench)");
+        eprintln!(
+            "[solve] WARNING config ensemble_streams={streams}; forcing 1 (single-stream bench)"
+        );
     }
     let scfg = SubgameConfig {
         max_iterations: iters,
@@ -471,10 +476,11 @@ Rebuild with `--features prof` for bp_lookup vs solve_total."
         let probs = subgame::solve(env, *hero, &bp, &pcfg, &scfg, seed);
         let wall_ns = t.elapsed().as_nanos() as u64;
         walls.push(wall_ns);
-        let top = probs
-            .iter()
-            .enumerate()
-            .fold((0usize, 0.0f64), |acc, (a, &p)| if p > acc.1 { (a, p) } else { acc });
+        let top =
+            probs.iter().enumerate().fold(
+                (0usize, 0.0f64),
+                |acc, (a, &p)| if p > acc.1 { (a, p) } else { acc },
+            );
         eprintln!(
             "[solve] state {}/{} street={} hero={hero} wall_ms={:.2} top_action={} p={:.3}",
             i + 1,
@@ -646,9 +652,8 @@ fn main() {
                 n_states = n_states.min(l);
             }
             // Default config: <crate>/bench_data/config.txt (resolves regardless of cwd).
-            let cfg_path = config.unwrap_or_else(|| {
-                format!("{}/bench_data/config.txt", env!("CARGO_MANIFEST_DIR"))
-            });
+            let cfg_path = config
+                .unwrap_or_else(|| format!("{}/bench_data/config.txt", env!("CARGO_MANIFEST_DIR")));
             run_solve(
                 &index_dir,
                 Path::new(&cfg_path),

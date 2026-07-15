@@ -156,7 +156,14 @@ fn settle_checked<const N: usize>(
         }
     }
     // Fold-win (n_showdown <= 1, no eval) or a degenerate world: the scalar legacy settle.
-    core::compute_returns(holes, board, seat_status, committed_total, button, n_showdown)
+    core::compute_returns(
+        holes,
+        board,
+        seat_status,
+        committed_total,
+        button,
+        n_showdown,
+    )
 }
 #[cfg(not(all(feature = "phe_showdown", feature = "phe_site1")))]
 #[inline(always)]
@@ -477,6 +484,10 @@ pub struct SubgameConfig {
     /// / CRN-stable. Default 0 => no masking, byte-identical to today. GTO `solve` path ONLY; the
     /// exploit Ctx hard-codes 0 and the exploit FFI does not expose the knob (firewall, defense in
     /// depth, mirroring leaf_biased/serve_final_iterate/root_unmask).
+    /// Amended complete-street contract: verified aggressive actions already
+    /// present at the root count toward this cap. If they have exhausted it,
+    /// the root response is fold/check/call only; the subgame boundary does not
+    /// reset the abstraction's raise count.
     pub raise_cap_per_street: i32,
 }
 
@@ -489,6 +500,10 @@ struct Ctx<'a> {
     /// Cached `scfg.two_sided` for the hot cfv branch (GTO path only; the exploit CtxExploit wraps a
     /// base Ctx built with this forced false).
     two_sided: bool,
+    /// Aggressive actions already observed on the root's current street. The
+    /// structural raise cap applies to the complete street, not merely actions
+    /// appended after the subgame boundary.
+    root_street_raises: i32,
     /// Precomputed floor(scfg.avg_skip_frac * max_iterations): strat_sum accumulation begins at
     /// iteration t >= avg_skip (0 = legacy accumulate-from-t=0). The exploit CtxExploit wraps a base
     /// Ctx built with this forced 0 (firewall: solve_exploit is byte-identical regardless of the knob).
@@ -552,10 +567,15 @@ struct Tables {
     capped: bool,
 }
 
-/// TASK-75 — check the wall deadline once per `WALL_TICK_MASK+1` `cfv` node entries (1024: at the
-/// measured ~1-5 µs/node solve pace that is a sub-5 ms cap-detection granularity for ~0.1% counter
-/// overhead, and the `Instant::now()` syscall amortizes to noise).
-const WALL_TICK_MASK: u32 = 1023;
+/// Check the wall deadline once per `WALL_TICK_MASK+1` `cfv` node entries.
+///
+/// Production EMD/continuation leaves make a node materially heavier than the
+/// original 1-5 µs micro-benchmark suggested.  A 1024-node interval produced
+/// measured live cap overshoots of 1.4-3.3 seconds, and a 64-node follow-up
+/// still overshot by 1.37 seconds.  At 8 nodes the latter observed pace gives
+/// about 170 ms detection latency, while one amortized `Instant::now()` per
+/// eight nodes remains negligible beside production leaf evaluation.
+pub(crate) const WALL_TICK_MASK: u32 = 7;
 
 // --------------------------------------------------------------------------------------------------
 // masks / strategy
@@ -587,7 +607,10 @@ fn any_legal(m: &[bool; NUM_ACTIONS]) -> bool {
 
 /// `_regret_match`: positive regrets over legal, renormalized; uniform-over-legal when no positive mass.
 #[inline]
-pub(crate) fn regret_match(regrets: &[f64; NUM_ACTIONS], legal: &[bool; NUM_ACTIONS]) -> [f64; NUM_ACTIONS] {
+pub(crate) fn regret_match(
+    regrets: &[f64; NUM_ACTIONS],
+    legal: &[bool; NUM_ACTIONS],
+) -> [f64; NUM_ACTIONS] {
     let mut pos = [0.0f64; NUM_ACTIONS];
     let mut s = 0.0;
     for a in 0..NUM_ACTIONS {
@@ -1432,7 +1455,13 @@ fn nth_live_after_rs<const N: usize>(seat_status: &[i8; N], from_seat: i32, n: i
 /// the PUBLIC state at which the decision was taken. Holes are NOT reconstructed (they are unknowable
 /// and unused): the reach builder substitutes each candidate combo into `state.holes[seat]` before the
 /// fingerprint lookup — the only reader of hole data on this path.
-pub(crate) type ReplayStep<const N: usize> = (usize, usize, EnvStateN<N>);
+/// `(seat, action, pre_action_state, observed_raise_to)`.  The final field is
+/// the exact post-action street commitment for bet-family observations (and
+/// the ordinary post-action commitment for other classes).  Keeping it in the
+/// replay result lets reach conditioning evaluate off-menu live sizes without
+/// guessing whether `hist_amount` used the engine-increment or arena bet-to
+/// convention.
+pub(crate) type ReplayStep<const N: usize> = (usize, usize, EnvStateN<N>, i32);
 
 /// PUBLIC-field equality between the replayed end state and the solve root — the replay's acceptance
 /// gate. Deliberately excludes private/derived fields the replay cannot or need not reproduce: holes
@@ -1502,7 +1531,9 @@ pub(crate) fn replay_with_ante<const N: usize>(
         if !full[action as usize] {
             return None;
         }
-        steps.push((seat as usize, action as usize, s));
+        let observed_to =
+            s.committed_street[seat as usize].saturating_add(root.hist_amount[t].max(0));
+        steps.push((seat as usize, action as usize, s, observed_to));
         s = core::apply_action(&s, action as usize);
         // The replayed engine re-records the action it just applied; the recorded (seat, action,
         // amount) triple must reproduce the root's history entry exactly (amount mismatches catch a
@@ -1819,8 +1850,16 @@ pub(crate) fn apply_action_recorded<const N: usize>(
     let full = core::legal_action_mask(s_in, seat as i32);
     let engine_amt = engine_action_amount_rs(s_in, seat, action);
 
-    // Engine-forced classes + exact-amount passthrough: the frozen engine IS the semantics.
-    if action < BET_BUCKET_START || action == ALL_IN || recorded == engine_amt {
+    // Engine-forced classes + increment-convention exact-amount passthrough: the frozen engine IS
+    // the semantics.  IMPORTANT: an arena bet-TO total can numerically equal the engine-computed
+    // INCREMENT while the actor already has chips committed (most commonly the small blind).  In
+    // total convention that equality is a unit/convention collision, not proof of an engine-shaped
+    // history; always apply `recorded - committed` and let final public equality verify it.  A true
+    // engine-increment history is handled by the separate `total_convention=false` attempt.
+    if action < BET_BUCKET_START
+        || action == ALL_IN
+        || (!total_convention && recorded == engine_amt)
+    {
         if !full[action] {
             return None; // exact class legality per the engine mask.
         }
@@ -1984,12 +2023,31 @@ fn replay_recorded<const N: usize>(
     total_convention: bool,
     insert_phantom_checks: bool,
 ) -> Option<Vec<ReplayStep<N>>> {
+    let debug = std::env::var("POKERBOT_REPLAY_DEBUG")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
     let hist_len = root.hist_len;
     if root.done || !(0..=core::MAX_HISTORY as i32).contains(&hist_len) {
         return None;
     }
     let hist_len = hist_len as usize;
-    let mut s = rebuild_hand_start(root, ante_each)?;
+    let mut s = match rebuild_hand_start(root, ante_each) {
+        Some(s) => s,
+        None => {
+            if debug {
+                eprintln!(
+                    "[replay-debug] rebuild failed total={} phantom={} ante={:?}",
+                    total_convention, insert_phantom_checks, ante_each
+                );
+            }
+            return None;
+        }
+    };
 
     let mut steps: Vec<ReplayStep<N>> = Vec::with_capacity(hist_len);
     for t in 0..hist_len {
@@ -2020,10 +2078,42 @@ fn replay_recorded<const N: usize>(
             return None;
         }
         if s.action_seat != seat {
+            if debug {
+                eprintln!("[replay-debug] actor mismatch t={} total={} phantom={} expected={} got={} street={} pending={} hist={:?}",
+                          t, total_convention, insert_phantom_checks, seat, s.action_seat,
+                          s.street, s.pending_deal,
+                          &root.hist_seat[..hist_len]);
+            }
             return None;
         }
-        steps.push((seat as usize, action as usize, s));
-        s = apply_action_recorded(&s, action as usize, root.hist_amount[t], total_convention)?;
+        let observed_to = if (BET_BUCKET_START..ALL_IN).contains(&(action as usize)) {
+            if total_convention {
+                root.hist_amount[t]
+            } else {
+                s.committed_street[seat as usize].saturating_add(root.hist_amount[t].max(0))
+            }
+        } else {
+            s.committed_street[seat as usize].saturating_add(engine_action_amount_rs(
+                &s,
+                seat as usize,
+                action as usize,
+            ))
+        };
+        steps.push((seat as usize, action as usize, s, observed_to));
+        s = match apply_action_recorded(&s, action as usize, root.hist_amount[t], total_convention)
+        {
+            Some(next) => next,
+            None => {
+                if debug {
+                    eprintln!("[replay-debug] apply failed t={} total={} phantom={} seat={} action={} amount={} street={} bet={} min_raise={} stacks={:?} committed_street={:?} acted={:?} last_aggressor={} last_raise_full={}",
+                              t, total_convention, insert_phantom_checks, seat, action,
+                              root.hist_amount[t], s.street, s.current_bet, s.min_raise,
+                              s.stacks, s.committed_street, s.acted, s.last_aggressor,
+                              s.last_raise_full);
+                }
+                return None;
+            }
+        };
         if s.hist_len as usize != t + 1 {
             return None;
         }
@@ -2047,6 +2137,18 @@ fn replay_recorded<const N: usize>(
         }
     }
     if !public_eq(&s, root) {
+        if debug {
+            eprintln!("[replay-debug] final mismatch total={} phantom={} street={}/{} board={:?}/{:?} pot={}/{} bet={}/{} min_raise={}/{} button={}/{} actor={}/{} last_aggressor={}/{} last_raise_full={}/{} pending={}/{} hist_len={}/{} status={:?}/{:?} stacks={:?}/{:?} committed_street={:?}/{:?} committed_total={:?}/{:?} acted={:?}/{:?}",
+                      total_convention, insert_phantom_checks,
+                      s.street, root.street, s.board, root.board, s.pot_dead, root.pot_dead,
+                      s.current_bet, root.current_bet, s.min_raise, root.min_raise,
+                      s.button, root.button, s.action_seat, root.action_seat,
+                      s.last_aggressor, root.last_aggressor, s.last_raise_full,
+                      root.last_raise_full, s.pending_deal, root.pending_deal,
+                      s.hist_len, root.hist_len, s.seat_status, root.seat_status,
+                      s.stacks, root.stacks, s.committed_street, root.committed_street,
+                      s.committed_total, root.committed_total, s.acted, root.acted);
+        }
         return None;
     }
     Some(steps)
@@ -2061,7 +2163,9 @@ fn replay_recorded<const N: usize>(
 /// identity, so its derived antes are usually refused and zero antes carry the live path). Every
 /// attempt is fully verified per-step + final `public_eq`; a wrong convention or ante guess can
 /// only produce None, never a mis-keyed table.
-pub(crate) fn replay_recorded_amounts<const N: usize>(root: &EnvStateN<N>) -> Option<Vec<ReplayStep<N>>> {
+pub(crate) fn replay_recorded_amounts<const N: usize>(
+    root: &EnvStateN<N>,
+) -> Option<Vec<ReplayStep<N>>> {
     let hist_len = root.hist_len;
     if root.done || !(0..=core::MAX_HISTORY as i32).contains(&hist_len) {
         return None;
@@ -2136,7 +2240,9 @@ pub(crate) fn replay_recorded_amounts<const N: usize>(root: &EnvStateN<N>) -> Op
 /// regimes this serves). Every attempt is fully verified (per-step + final public equality), so a
 /// wrong guess can never produce states — only a None (=> the caller falls back to the legacy
 /// range behavior).
-pub(crate) fn replay_public_states<const N: usize>(root: &EnvStateN<N>) -> Option<Vec<ReplayStep<N>>> {
+pub(crate) fn replay_public_states<const N: usize>(
+    root: &EnvStateN<N>,
+) -> Option<Vec<ReplayStep<N>>> {
     // Stage 2a — amount-faithful attempts FIRST (fully verified; None falls through to legacy).
     if let Some(v) = replay_recorded_amounts(root) {
         return Some(v);
@@ -2224,6 +2330,158 @@ fn blueprint_action_prob<const N: usize>(
     Some(row[action].max(0.0) / tot)
 }
 
+/// Smooth likelihood projection for a live bet/raise whose recorded action is
+/// outside the blueprint's trained menu.  Returns the bracketing trained
+/// actions, pseudo-harmonic mass on the lower action, and an extrapolation
+/// temper.  Far-above-menu sizes approach an uninformative likelihood rather
+/// than pretending to be an exact top-bucket action.
+fn offtree_likelihood_projection<const N: usize>(
+    st: &EnvStateN<N>,
+    seat: usize,
+    legal: &[bool; NUM_ACTIONS],
+    observed_to: i32,
+) -> Option<(usize, usize, f64, f64)> {
+    let mut cand: Vec<(usize, i64)> = Vec::new();
+    for a in BET_BUCKET_START..ALL_IN {
+        if legal[a] {
+            let to = st.committed_street[seat].saturating_add(engine_action_amount_rs(st, seat, a));
+            if cand.last().map_or(true, |&(_, prev)| prev != to as i64) {
+                cand.push((a, to as i64));
+            }
+        }
+    }
+    if cand.is_empty() || observed_to <= st.current_bet {
+        return None;
+    }
+    let x = observed_to as i64;
+    if x <= cand[0].1 {
+        return Some((cand[0].0, cand[0].0, 1.0, 1.0));
+    }
+    let (top_a, top_to) = cand[cand.len() - 1];
+    if x >= top_to {
+        let obs_raise = (x - st.current_bet as i64).max(1) as f64;
+        let top_raise = (top_to - st.current_bet as i64).max(1) as f64;
+        let temper = (top_raise / obs_raise).clamp(0.25, 1.0);
+        return Some((top_a, top_a, 1.0, temper));
+    }
+    let hi = cand.iter().position(|&(_, t)| t >= x)?;
+    let (b_act, b) = cand[hi];
+    let (a_act, a) = cand[hi - 1];
+    if a == b {
+        return Some((a_act, a_act, 1.0, 1.0));
+    }
+    let pot = pot_for_sizing_rs(st).max(1) as f64;
+    // Pseudo-harmonic interpolation used by the action translator:
+    // f_A=(B-X)(P+A)/((B-A)(P+X)).
+    let f_a = (((b - x) as f64) * (pot + a as f64) / (((b - a) as f64) * (pot + x as f64)))
+        .clamp(0.0, 1.0);
+    Some((a_act, b_act, f_a, 1.0))
+}
+
+#[inline]
+fn offtree_reach_kernel_enabled() -> bool {
+    std::env::var("POKERBOT_OFFTREE_REACH_KERNEL")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[inline]
+fn offtree_reach_debug_enabled() -> bool {
+    std::env::var("POKERBOT_OFFTREE_REACH_DEBUG")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Count aggressive actions already observed on the root's current street.
+/// A verified replay supplies street boundaries absent from the compact action
+/// history. Replay failure is fail-open (zero): it must never mask a legal live
+/// action based on guessed history.
+pub(crate) fn observed_root_street_raises<const N: usize>(root: &EnvStateN<N>) -> i32 {
+    replay_public_states(root)
+        .map(|steps| {
+            steps
+                .iter()
+                .filter(|(_, action, st, _)| {
+                    st.street == root.street && (BET_BUCKET_START..=ALL_IN).contains(action)
+                })
+                .count() as i32
+        })
+        .unwrap_or(0)
+}
+
+pub(crate) fn apply_root_raise_cap<const N: usize>(
+    root: &EnvStateN<N>,
+    legal: &mut [bool; NUM_ACTIONS],
+    cap: i32,
+) {
+    if cap > 0 && observed_root_street_raises(root) >= cap {
+        // At a live root there is no need to preserve another all-in child for
+        // tree closure: fold/check/call are the complete response abstraction.
+        // This is the source-domain counterpart of the interior ladder cap.
+        for a in BET_BUCKET_START..=ALL_IN {
+            legal[a] = false;
+        }
+    }
+}
+
+/// Present a deep postflop replay state at the fixed 100bb source depth used by
+/// the promoted blueprint.  This shadow is used only for fingerprint/legal-menu
+/// likelihood queries while constructing opponent reach.  The replay itself,
+/// the live solve root, action translation, stacks, pot and terminal payoffs are
+/// never changed.
+///
+/// This intentionally mirrors `search/postflop_projection.py`: mixed/shallow
+/// pots are left alone, folded/empty seats do not set effective depth, and the
+/// projection abstains once any still-eligible seat has already committed the
+/// entire source stack.
+pub(crate) fn project_reach_lookup_state<const N: usize>(
+    st: &EnvStateN<N>,
+) -> Option<EnvStateN<N>> {
+    if st.street <= 0 {
+        return None;
+    }
+    let source = 100 * BB_CHIPS;
+    let deep_min = 130 * BB_CHIPS;
+    let mut effective: Option<i64> = None;
+    for seat in 0..N {
+        if matches!(st.seat_status[seat], SEAT_FOLDED | core::SEAT_EMPTY) {
+            continue;
+        }
+        let total = st.stacks[seat] as i64 + st.committed_total[seat] as i64;
+        if total > 0 {
+            effective = Some(effective.map_or(total, |old| old.min(total)));
+        }
+    }
+    if effective.map_or(true, |bb| bb <= deep_min as i64) {
+        return None;
+    }
+    for seat in 0..N {
+        if !matches!(st.seat_status[seat], SEAT_FOLDED | core::SEAT_EMPTY)
+            && st.committed_total[seat] >= source
+        {
+            return None;
+        }
+    }
+
+    let mut shadow = *st;
+    for seat in 0..N {
+        if !matches!(st.seat_status[seat], SEAT_FOLDED | core::SEAT_EMPTY) {
+            shadow.stacks[seat] = source - st.committed_total[seat];
+        }
+    }
+    Some(shadow)
+}
+
 /// R1 — build the REACH-CONSISTENT range table: `w_s[combo] = Π_{observed decisions t of seat s}
 /// P_bp(a_t | combo, state_t)` over the replayed public history. Hero's decisions are skipped (his
 /// hand is a known point mass). Per decision: the abstracted legal mask is hole-independent (computed
@@ -2266,23 +2524,53 @@ pub(crate) fn build_range_table_reach<const N: usize>(
     }
     let mut p = vec![0.0f64; combos.len()];
     let mut hit = vec![false; combos.len()];
-    for (seat, action, st) in steps.iter() {
-        let (seat, action) = (*seat, *action);
+    for (seat, action, st, observed_to) in steps.iter() {
+        let (seat, action, observed_to) = (*seat, *action, *observed_to);
         if seat == hero {
             continue;
         }
-        let legal = abstracted_legal(st, seat, pcfg);
-        if !legal[action] {
-            continue; // observed action outside the search abstraction: no info under this keying.
+        // The tier-1 artifact is a fixed-100bb blueprint.  Replaying a 250-500bb
+        // live state directly changes its SPR key and turns every postflop row
+        // into a MISS, making even a correct off-tree kernel inert.  Query the
+        // same lookup-only source projection already used by root fallback.
+        let projected = project_reach_lookup_state(st);
+        let lookup_state = projected.unwrap_or(*st);
+        let lookup = &lookup_state;
+        let legal = abstracted_legal(lookup, seat, pcfg);
+        let kernel = if legal[action] {
+            None
+        } else if offtree_reach_kernel_enabled() && (BET_BUCKET_START..ALL_IN).contains(&action) {
+            offtree_likelihood_projection(lookup, seat, &legal, observed_to)
+        } else {
+            None
+        };
+        if !legal[action] && kernel.is_none() {
+            continue; // kill switch / no trained bracket: retain the legacy uninformative skip.
         }
-        let mut scratch = *st;
+        let mut scratch = *lookup;
         let mut sum_hit = 0.0f64;
         let mut n_hit = 0usize;
         let mut max_p = 0.0f64;
         for (k, &(c0, c1)) in combos.iter().enumerate() {
             scratch.holes[seat][0] = c0;
             scratch.holes[seat][1] = c1;
-            match blueprint_action_prob(&scratch, seat, &legal, action, bp, pcfg) {
+            let prob = if let Some((a, b, f_a, _temper)) = kernel {
+                let pa = blueprint_action_prob(&scratch, seat, &legal, a, bp, pcfg);
+                if a == b {
+                    pa
+                } else {
+                    match (
+                        pa,
+                        blueprint_action_prob(&scratch, seat, &legal, b, bp, pcfg),
+                    ) {
+                        (Some(x), Some(y)) => Some(f_a * x + (1.0 - f_a) * y),
+                        _ => None,
+                    }
+                }
+            } else {
+                blueprint_action_prob(&scratch, seat, &legal, action, bp, pcfg)
+            };
+            match prob {
                 Some(prob) => {
                     p[k] = prob;
                     hit[k] = true;
@@ -2296,12 +2584,42 @@ pub(crate) fn build_range_table_reach<const N: usize>(
             }
         }
         if n_hit == 0 || max_p <= 1e-12 {
+            if offtree_reach_debug_enabled() {
+                eprintln!(
+                    "[reach-debug] street={} seat={} action={} projected={} kernel={:?} hits={} max_p={:.6}",
+                    st.street,
+                    seat,
+                    action,
+                    projected.is_some(),
+                    kernel,
+                    n_hit,
+                    max_p
+                );
+            }
             continue; // no per-combo signal at this decision (all-miss, or action prob 0 everywhere).
         }
+        if offtree_reach_debug_enabled() {
+            eprintln!(
+                "[reach-debug] street={} seat={} action={} projected={} kernel={:?} hits={} max_p={:.6} mean={:.6}",
+                st.street,
+                seat,
+                action,
+                projected.is_some(),
+                kernel,
+                n_hit,
+                max_p,
+                sum_hit / n_hit as f64
+            );
+        }
         let mean_hit = sum_hit / n_hit as f64;
+        let temper = kernel.map_or(1.0, |(_, _, _, k)| k);
         let base = seat * stride;
         for (k, &(c0, c1)) in combos.iter().enumerate() {
-            let f = if hit[k] { p[k] } else { mean_hit };
+            let f = if hit[k] {
+                mean_hit + temper * (p[k] - mean_hit)
+            } else {
+                mean_hit
+            };
             w[base + (c0 as usize) * 52 + c1 as usize] *= f;
         }
     }
@@ -2369,7 +2687,11 @@ fn sample_range_combo(
         }
     }
     // Mix normalized blueprint-range with uniform; if the range mass is degenerate collapse to uniform.
-    let range_norm = if range_mass > 1e-12 { 1.0 / range_mass } else { 0.0 };
+    let range_norm = if range_mass > 1e-12 {
+        1.0 / range_mass
+    } else {
+        0.0
+    };
     let mut total = 0.0f64;
     let mut weights: Vec<f64> = Vec::with_capacity(n_combos);
     for &r in range.iter() {
@@ -2477,7 +2799,8 @@ pub(crate) fn cont_choice_key<const N: usize>(env: &EnvStateN<N>, seat: usize) -
 /// cannot change mid-iteration: a non-traverser's choice regrets only update on ITS traverser turns).
 pub(crate) fn cont_choice_u(key: &[i64], t: i32, public_seed: u64) -> f64 {
     let h = leaf_seed(key, public_seed);
-    let mut r = Rng::seed_from_u64(h ^ ((t as u64).wrapping_add(1)).wrapping_mul(CONT_ITER_SEED_ODD));
+    let mut r =
+        Rng::seed_from_u64(h ^ ((t as u64).wrapping_add(1)).wrapping_mul(CONT_ITER_SEED_ODD));
     r.next_f64()
 }
 
@@ -2541,17 +2864,38 @@ fn biased_profile_value<const N: usize>(
     }
     let base = leaf_seed(&key, ctx.public_seed);
     let seed = base ^ (n0 as u64).wrapping_mul(LEAF_WORLD_SEED_ODD);
-    let v = playout::biased_leaf_value(
-        env,
-        hero,
-        ctx.bp,
-        ctx.pcfg,
-        seed,
-        ctx.scfg.rollout_samples,
-        ctx.scfg.resample_board,
-        choices,
-        ctx.leaf_bias_mult,
-    );
+    let v = if let Some(deadline) = ctx.deadline {
+        match playout::biased_leaf_value_capped(
+            env,
+            hero,
+            ctx.bp,
+            ctx.pcfg,
+            seed,
+            ctx.scfg.rollout_samples,
+            ctx.scfg.resample_board,
+            choices,
+            ctx.leaf_bias_mult,
+            deadline,
+        ) {
+            Some(v) => v,
+            None => {
+                tab.capped = true;
+                return 0.0;
+            }
+        }
+    } else {
+        playout::biased_leaf_value(
+            env,
+            hero,
+            ctx.bp,
+            ctx.pcfg,
+            seed,
+            ctx.scfg.rollout_samples,
+            ctx.scfg.resample_board,
+            choices,
+            ctx.leaf_bias_mult,
+        )
+    };
     let sum = if n0 == 0 { v } else { sum0 + v };
     let n = n0 + 1;
     tab.leaf.insert(dkey, (sum, n));
@@ -2721,11 +3065,11 @@ fn leaf_value<const N: usize>(
     let trav = if ctx.two_sided { Some(hero) } else { None };
     let dkey = leaf_dig(nd, env, trav);
     prof_count!(crate::prof::C_LEAF_HIT); // counts every non-terminal uniform-leaf visit (hits = this - miss)
-    // BUG-1 FIX: the cache entry is a RUNNING MEAN (sum, n) over the first `leaf_worlds` VISITING
-    // hole-worlds. The env at each visit carries THAT iteration's sampled opponent holes, so while
-    // n < M every hit re-evaluates under the CURRENT world (deterministic per-(leaf, n) seed => the
-    // CRN/pure-function contract holds) and the mean integrates M independent hole-worlds instead of
-    // freezing the first-touch draw. n >= M => frozen mean (M=1 default == legacy first-touch freeze).
+                                          // BUG-1 FIX: the cache entry is a RUNNING MEAN (sum, n) over the first `leaf_worlds` VISITING
+                                          // hole-worlds. The env at each visit carries THAT iteration's sampled opponent holes, so while
+                                          // n < M every hit re-evaluates under the CURRENT world (deterministic per-(leaf, n) seed => the
+                                          // CRN/pure-function contract holds) and the mean integrates M independent hole-worlds instead of
+                                          // freezing the first-touch draw. n >= M => frozen mean (M=1 default == legacy first-touch freeze).
     let m = ctx.leaf_worlds;
     let (sum0, n0) = match tab.leaf.get(&dkey) {
         Some(&(s, n)) => {
@@ -2744,15 +3088,34 @@ fn leaf_value<const N: usize>(
     }
     let base = leaf_seed(&key, ctx.public_seed);
     let seed = base ^ (n0 as u64).wrapping_mul(LEAF_WORLD_SEED_ODD); // n0=0 => base exactly (legacy)
-    let v = playout::uniform_leaf_value(
-        env,
-        hero,
-        ctx.bp,
-        ctx.pcfg,
-        seed,
-        ctx.scfg.rollout_samples,
-        ctx.scfg.resample_board,
-    );
+    let v = if let Some(deadline) = ctx.deadline {
+        match playout::uniform_leaf_value_capped(
+            env,
+            hero,
+            ctx.bp,
+            ctx.pcfg,
+            seed,
+            ctx.scfg.rollout_samples,
+            ctx.scfg.resample_board,
+            deadline,
+        ) {
+            Some(v) => v,
+            None => {
+                tab.capped = true;
+                return 0.0;
+            }
+        }
+    } else {
+        playout::uniform_leaf_value(
+            env,
+            hero,
+            ctx.bp,
+            ctx.pcfg,
+            seed,
+            ctx.scfg.rollout_samples,
+            ctx.scfg.resample_board,
+        )
+    };
     // n0=0: sum IS v (not 0.0+v, which would flip a -0.0 sign) and v/1.0 == v bit-for-bit, so the
     // M=1 default path returns/caches EXACTLY the legacy first-touch value.
     let sum = if n0 == 0 { v } else { sum0 + v };
@@ -2872,6 +3235,15 @@ fn cfv<const N: usize>(
     // depth budget. The root (depth 0 — the hero's actual decision menu) is never masked.
     if ctx.raise_cap > 0 && depth > 0 && street_raises >= ctx.raise_cap {
         for a in BET_BUCKET_START..ALL_IN {
+            legal[a] = false;
+        }
+    }
+    // The subgame boundary does not reset the real street's raise count. Once
+    // the configured abstraction cap was already reached in observed play,
+    // the root response is fold/check/call only; a fourth live raise is outside
+    // the source game and must not be invented by deep-stack search.
+    if depth == 0 && ctx.raise_cap > 0 && ctx.root_street_raises >= ctx.raise_cap {
+        for a in BET_BUCKET_START..=ALL_IN {
             legal[a] = false;
         }
     }
@@ -3068,7 +3440,18 @@ fn solve_stream<const N: usize>(
     let root_row = tab.rows.get(&root_key).copied().unwrap_or(ROW_ZERO);
     let ss = root_row.ss;
     let has_avg = ss.iter().sum::<f64>() > 1e-12;
-    (ss, root_row.reg, has_avg, iters_done, tab.capped)
+    let capped = tab.capped;
+    let out = (ss, root_row.reg, has_avg, iters_done, capped);
+    // A live cap hit returned 1.18s after its deadline even after traversal and
+    // leaf-rollout cancellation became fine-grained.  The remaining wall was
+    // the allocator synchronously reclaiming large per-solve hash tables while
+    // unwinding this function.  Policy extraction above is complete; transfer
+    // ownership to the bounded recycler so deallocation is outside the action
+    // clock. Completed/uncapped solves retain the exact legacy drop path.
+    if capped && ctx.deadline.is_some() {
+        retire_capped_tables(RetiredTables::Gto(tab));
+    }
+    out
 }
 
 /// The full CFR solve MINUS the extraction: the ensemble-merged ROOT rows
@@ -3110,6 +3493,11 @@ pub(crate) fn solve_rows_capped<const N: usize>(
         scfg,
         public_seed,
         two_sided: scfg.two_sided,
+        root_street_raises: if scfg.raise_cap_per_street > 0 {
+            observed_root_street_raises(root)
+        } else {
+            0
+        },
         // Delayed averaging: skip the first floor(avg_skip_frac * K) iterations of strat_sum
         // accumulation (0.0 default => 0 => accumulate from t=0, byte-identical to today).
         avg_skip: (scfg.avg_skip_frac.clamp(0.0, 1.0) * scfg.max_iterations.max(0) as f64).floor()
@@ -3139,7 +3527,9 @@ pub(crate) fn solve_rows_capped<const N: usize>(
     // included so its served average still builds (mirrors pluribus_search.py:858-865). OFF => [hero], so
     // the traverser is always hero and the loop is byte-identical to today.
     let traversers: Vec<usize> = if scfg.two_sided {
-        let mut v: Vec<usize> = (0..N).filter(|&s| root.seat_status[s] == SEAT_LIVE).collect();
+        let mut v: Vec<usize> = (0..N)
+            .filter(|&s| root.seat_status[s] == SEAT_LIVE)
+            .collect();
         if !v.contains(&hero) {
             v = vec![hero];
         }
@@ -3167,7 +3557,14 @@ pub(crate) fn solve_rows_capped<const N: usize>(
         bool,
     ) = if n_streams <= 1 {
         solve_stream(
-            root, hero, &ctx, &root_nd, root_key, &traversers, rtab.as_ref(), rs.as_ref(),
+            root,
+            hero,
+            &ctx,
+            &root_nd,
+            root_key,
+            &traversers,
+            rtab.as_ref(),
+            rs.as_ref(),
             public_seed,
         )
     } else {
@@ -3181,8 +3578,15 @@ pub(crate) fn solve_rows_capped<const N: usize>(
             .map(|idx| {
                 let seed = public_seed ^ (idx as u64).wrapping_mul(ENSEMBLE_SEED_ODD);
                 solve_stream(
-                    root, hero, &ctx, &root_nd, root_key, &traversers, rtab.as_ref(),
-                    rs.as_ref(), seed,
+                    root,
+                    hero,
+                    &ctx,
+                    &root_nd,
+                    root_key,
+                    &traversers,
+                    rtab.as_ref(),
+                    rs.as_ref(),
+                    seed,
                 )
             })
             .reduce(
@@ -3197,7 +3601,11 @@ pub(crate) fn solve_rows_capped<const N: usize>(
             )
     };
     // (reduce identity: i32::MAX min-folds away against >= 1 real streams.)
-    let iters_done = if iters_done == i32::MAX { 0 } else { iters_done };
+    let iters_done = if iters_done == i32::MAX {
+        0
+    } else {
+        iters_done
+    };
     (sum_ss, sum_rr, any_avg, iters_done, capped)
 }
 
@@ -3240,6 +3648,7 @@ pub fn solve_capped<const N: usize>(
             }
         }
     }
+    apply_root_raise_cap(root, &mut legal_root, scfg.raise_cap_per_street);
     let mut probs = [0.0f64; NUM_ACTIONS];
     if !any_legal(&legal_root) {
         return (probs, false, 0);
@@ -3301,6 +3710,51 @@ struct TablesExploit {
     capped: bool,
 }
 
+/// Cap-hit solve tables are dead immediately after root extraction, but freeing
+/// their large hash-map allocations can take over a second on the live Windows
+/// heap.  One process-wide bounded worker owns that teardown.  Capacity two is
+/// ample for the arena's one-table cadence; if it is ever saturated, a named
+/// overflow worker preserves the action-clock invariant without leaking memory.
+enum RetiredTables {
+    Gto(Tables),
+    Exploit(TablesExploit),
+}
+
+fn drop_retired_tables(tables: RetiredTables) {
+    match tables {
+        RetiredTables::Gto(tab) => drop(tab),
+        RetiredTables::Exploit(tab) => drop(tab),
+    }
+}
+
+fn retire_capped_tables(tables: RetiredTables) {
+    use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+    use std::sync::OnceLock;
+
+    static TX: OnceLock<SyncSender<RetiredTables>> = OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = sync_channel::<RetiredTables>(2);
+        let _ = std::thread::Builder::new()
+            .name("battery-native-recycler".to_string())
+            .spawn(move || {
+                while let Ok(tables) = rx.recv() {
+                    drop_retired_tables(tables);
+                }
+            });
+        tx
+    });
+    match tx.try_send(tables) {
+        Ok(()) => {}
+        Err(TrySendError::Full(tables)) | Err(TrySendError::Disconnected(tables)) => {
+            // Saturation/disconnection must never put heap teardown back on the
+            // deadline thread. This path is exceptional and remains leak-free.
+            let _ = std::thread::Builder::new()
+                .name("battery-native-recycler-overflow".to_string())
+                .spawn(move || drop_retired_tables(tables));
+        }
+    }
+}
+
 fn leaf_value_x<const N: usize>(
     env: &EnvStateN<N>,
     hero: usize,
@@ -3315,15 +3769,34 @@ fn leaf_value_x<const N: usize>(
         return v;
     }
     let seed = leaf_seed(&key, cx.base.public_seed);
-    let v = playout::uniform_leaf_value(
-        env,
-        hero,
-        cx.base.bp,
-        cx.base.pcfg,
-        seed,
-        cx.base.scfg.rollout_samples,
-        cx.base.scfg.resample_board,
-    );
+    let v = if let Some(deadline) = cx.base.deadline {
+        match playout::uniform_leaf_value_capped(
+            env,
+            hero,
+            cx.base.bp,
+            cx.base.pcfg,
+            seed,
+            cx.base.scfg.rollout_samples,
+            cx.base.scfg.resample_board,
+            deadline,
+        ) {
+            Some(v) => v,
+            None => {
+                tab.capped = true;
+                return 0.0;
+            }
+        }
+    } else {
+        playout::uniform_leaf_value(
+            env,
+            hero,
+            cx.base.bp,
+            cx.base.pcfg,
+            seed,
+            cx.base.scfg.rollout_samples,
+            cx.base.scfg.resample_board,
+        )
+    };
     tab.leaf.insert(key, v);
     v
 }
@@ -3502,6 +3975,7 @@ pub fn solve_exploit_capped<const N: usize>(
             // Force two_sided false regardless of scfg so even a caller mistake can't cycle traversers or
             // per-traverser-key the leaf here.
             two_sided: false,
+            root_street_raises: 0,
             // FIREWALL: leaf_cache_worlds / avg_skip_frac are GTO-path knobs; force their no-op values
             // here so solve_exploit stays byte-identical regardless of scfg (leaf_value_x keeps its own
             // single-world cache and cfv_exploit accumulates strat_sum + AIVAT root CFVs from t=0).
@@ -3625,5 +4099,10 @@ pub fn solve_exploit_capped<const N: usize>(
             rq[a] = tab.root_av_sum[a] / tab.root_av_wsum;
         }
     }
-    (probs, rq, tab.capped, iters_done)
+    let capped = tab.capped;
+    let out = (probs, rq, capped, iters_done);
+    if capped && cx.base.deadline.is_some() {
+        retire_capped_tables(RetiredTables::Exploit(tab));
+    }
+    out
 }

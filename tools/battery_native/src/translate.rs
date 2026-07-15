@@ -436,7 +436,11 @@ mod tests {
             // Check/call bias so hands reach postflop.
             let mut pool = Vec::new();
             for &a in &legal {
-                let w = if a == core::CHECK || a == core::CALL { 6 } else { 1 };
+                let w = if a == core::CHECK || a == core::CALL {
+                    6
+                } else {
+                    1
+                };
                 for _ in 0..w {
                     pool.push(a);
                 }
@@ -507,7 +511,11 @@ mod tests {
                 let legal: Vec<usize> = (0..NUM_ACTIONS).filter(|&a| menu[a]).collect();
                 let mut pool = Vec::new();
                 for &a in &legal {
-                    let w = if a == core::CHECK || a == core::CALL { 6 } else { 1 };
+                    let w = if a == core::CHECK || a == core::CALL {
+                        6
+                    } else {
+                        1
+                    };
                     for _ in 0..w {
                         pool.push(a);
                     }

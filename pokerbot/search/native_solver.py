@@ -451,6 +451,31 @@ def _native_fingerprint_matches_serve_abstraction() -> bool:
             return False
         if "action_translate" not in caps:
             return False
+    # Off-tree reach likelihoods are native-only.  A stale binary would accept
+    # the env flag but retain the legacy "skip observed dropped bucket" belief,
+    # silently recreating uniform/depolarized ranges at the highest-exposure
+    # live nodes.  Fail closed instead.
+    if os.environ.get("POKERBOT_OFFTREE_REACH_KERNEL", "") == "1":
+        if _EXT is None:
+            return False
+        try:
+            caps = set(_EXT.native_caps())
+        except Exception:  # noqa: BLE001
+            return False
+        if "offtree_reach_kernel" not in caps:
+            return False
+    # The arena's structural cap is a complete-street abstraction. A stale
+    # binary counts only actions appended below the subgame root and leaves the
+    # fatal fourth-raise lane open, so fail closed when the cap is requested.
+    if int(os.environ.get("POKERBOT_SUBGAME_RAISE_CAP", "0") or 0) > 0:
+        if _EXT is None:
+            return False
+        try:
+            caps = set(_EXT.native_caps())
+        except Exception:  # noqa: BLE001
+            return False
+        if "root_history_raise_cap" not in caps:
+            return False
     if os.environ.get("POKERBOT_POSTFLOP_MODE", "fast").lower() != "emd":
         return True
     if os.environ.get("POKERBOT_NATIVE_ALLOW_EMD_MISKEY", "0").lower() in ("1", "true", "yes", "on"):
@@ -756,7 +781,7 @@ def native_subgame_solve(
     ``wall_cap_ms`` / ``raise_cap_per_street`` / ``cap_info`` (TASK-75, 2026-07-13): when either
     cap is > 0 AND the loaded binary reports the ``solve_wall_cap`` capability, the solve goes
     through ``SubgameSolver.solve_capped`` — the cooperative IN-NATIVE wall-clock deadline
-    (checked per CFR iteration + per 1024 tree nodes; on expiry the strategy_sum banked by the
+    (checked per CFR iteration + per 8 tree nodes; on expiry the strategy_sum banked by the
     COMPLETED iterations is served — bounded, honest, possibly under-searched, never a panic) and
     the structural deep-SPR raise-ladder bound (after N aggressive actions per street, non-root
     nodes keep only fold/check/call/all-in). ``cap_info`` (a caller-supplied dict) receives

@@ -127,6 +127,20 @@ def _all_live_villains_fish(state, hero: int, profiles: dict | None) -> bool:
     return all(_is_value_fish(profiles.get(s)) for s in live)
 
 
+def _live_profile_items(state, hero: int, profiles: dict | None):
+    """Return profiled, non-folded villains in deterministic seat order.
+
+    In a heads-up remainder the hero commonly remains ``last_aggressor`` after
+    betting a prior street.  Falling back to the first entry in the table-wide
+    profile dict then reads a folded, unrelated seat.  Live-seat filtering is
+    the stable ownership boundary for all opponent-specific overlays.
+    """
+    if not profiles:
+        return []
+    return [(s, profiles.get(s)) for s, p in enumerate(state.players)
+            if s != hero and not p.folded and profiles.get(s) is not None]
+
+
 # Table-aggression kill-switch (Phase 2): the cloud gauntlet showed the WHOLE exploit (solver opponent-
 # tail + facing branch, not just the unopened tilt) is +EV on every realistic field — incl. a 5-TAG "pro"
 # table (+0.99) — and loses ONLY vs a pathological 5-LAG table (-0.48). So disable the entire exploit when
@@ -547,10 +561,11 @@ def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict 
 
     The validated value_sizing overlay (value_sizing.py, +11.9 bb/100 vs stations) lived ONLY on the
     HybridAgent/battery path; the live LiveSearchAdvisor exploited via the root mixer above, so the
-    headline HUD lever never fired live. This wires it on: vs a confirmed STATION table that is NOT
-    loose-aggressive (the SAME firewalls the root mixer uses), tilt the hero's own value bets toward
-    bigger sizes + cut bluffs, bounded by the alpha-cap. Distinct from the proven-dead bluff-CATCH read
-    mixer (this is sizing, not a frequency call-boost). Returns ``probs`` unchanged when it doesn't fire.
+    headline HUD lever never fired live. This wires it on with asymmetric evidence gates: value sizing
+    still requires every live villain to be a confirmed payoff fish, while bluff suppression reads the
+    decision-relevant live villain's fold-equity evidence (including WTSD when fold stats are absent).
+    Both are bounded by the alpha-cap. Distinct from the proven-dead bluff-CATCH read mixer (this changes
+    hero betting, not calling). Returns ``probs`` unchanged when neither component fires.
 
     RNR CEILING (Workstream F): the alpha ceiling is no longer the flat 0.7 — it is the N-DEPENDENT
     Restricted-Nash-Response cap ``rnr_cap.default_exploit_cap(n_players)`` (1.0 heads-up / 3-max where
@@ -581,7 +596,9 @@ def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict 
             out.update({
                 "fired": False, "reason": "", "exp_size_pre": _exp_size(probs),
                 "exp_size_post": _exp_size(probs), "bet_shift": 0.0,
-                "station_score": 0.0, "station_conf": 0.0, "n_players": 0,
+                "policy_shift_l1": 0.0,
+                "station_score": 0.0, "station_conf": 0.0,
+                "bluff_score": 0.0, "bluff_conf": 0.0, "n_players": 0,
                 "rnr_ceiling": 0.0, "alpha": 0.0, "rake_keep": 1.0,
                 "street": str(_street), "hand_strength": float("nan"),
             })
@@ -600,20 +617,35 @@ def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict 
         return _bail("kill_switch_off")
     if profiles is None or probs.sum() <= 0:
         return _bail("no_profiles_or_empty_probs")
-    # FIREWALLS (reuse the root-mixer gates): only vs an all-station table, never vs a lag-heavy one.
+    # FIREWALL: a pathological LAG-heavy table disables every exploit tilt.
     if _table_too_aggressive(profiles):
         return _bail("table_too_aggressive")
-    if not _all_live_villains_fish(state, seat, profiles):
-        return _bail("not_all_villains_fish")
-    prof = _select_profile(profiles, getattr(state, "last_aggressor", None))
-    if prof is None:
+    live_items = _live_profile_items(state, seat, profiles)
+    if not live_items:
         return _bail("no_profile_selected")
 
     from pokerbot.opponent.mixer import _stats_confidence, safe_mix_policies
     from pokerbot.opponent.rnr_cap import default_exploit_cap, effective_alpha, n_live_players
-    from pokerbot.opponent.value_sizing import (bluff_suppression_logits, river_thin_value_logits,
-                                                station_payoff_score, value_sizing_logits)
+    from pokerbot.opponent.value_sizing import (bluff_stickiness_score, bluff_suppression_logits,
+                                                river_thin_value_logits, station_payoff_score,
+                                                value_sizing_logits)
     from pokerbot.training.self_play import _legal_mask
+
+    # Facing a villain, read that aggressor.  When hero retained initiative,
+    # read the sole live villain; multiway, the stickiest remaining range is the
+    # conservative fold-equity constraint (one non-folder is enough to spoil a
+    # bluff).  Folded seats are never candidates.
+    last_aggressor = getattr(state, "last_aggressor", None)
+    by_seat = dict(live_items)
+    if last_aggressor in by_seat:
+        selected_seat = last_aggressor
+        prof = by_seat[last_aggressor]
+    elif len(live_items) == 1:
+        selected_seat, prof = live_items[0]
+    else:
+        selected_seat, prof = max(
+            live_items, key=lambda item: bluff_stickiness_score(item[1])[0]
+        )
 
     # BOARD-AWARE strength (not the preflop-rank proxy): so the value-SIZE escalation never fires on air.
     hs = _overlay_hand_strength(state, seat)
@@ -624,17 +656,26 @@ def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict 
     rake_ctx = _live_rake_context(state)
     if out is not None:
         try:
-            from pokerbot.opponent.value_sizing import rake_keep_factor, station_payoff_score
+            from pokerbot.opponent.value_sizing import rake_keep_factor
             _ssc, _scf = station_payoff_score(prof)
+            _bsc, _bcf = bluff_stickiness_score(prof)
             out["station_score"] = float(_ssc)
             out["station_conf"] = float(_scf)
+            out["bluff_score"] = float(_bsc)
+            out["bluff_conf"] = float(_bcf)
             out["hand_strength"] = float(hs) if hs is not None else float("nan")
             out["rake_keep"] = float(rake_keep_factor(prof, rake_ctx))
         except Exception:  # noqa: BLE001
             pass
-    overlay = (value_sizing_logits(prof, hs, rake_ctx=rake_ctx)
-               + bluff_suppression_logits(prof, hs)
-               + river_thin_value_logits(prof, hs, board))
+    # Value escalation/thin value retain the strict all-live-villains-fish
+    # firewall because betting larger can value-cut us.  Bluff suppression is
+    # a different proposition: it keys only on lost fold equity and therefore
+    # remains available against a high-WTSD/strong-WSD caller.
+    value_allowed = _all_live_villains_fish(state, seat, profiles)
+    value_overlay = (value_sizing_logits(prof, hs, rake_ctx=rake_ctx)
+                     + river_thin_value_logits(prof, hs, board)) if value_allowed else np.zeros_like(probs)
+    bluff_overlay = bluff_suppression_logits(prof, hs)
+    overlay = value_overlay + bluff_overlay
     if not np.any(overlay):
         return _bail("zero_overlay")
 
@@ -653,7 +694,7 @@ def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict 
     # mirroring the AoF _per_read_stability single-opponent case for this targeted overlay).
     vkey = villain_key
     if vkey is None:
-        vkey = getattr(state, "last_aggressor", None)
+        vkey = selected_seat
     stability = 1.0
     if stability_tracker is not None and vkey is not None:
         try:
@@ -685,8 +726,11 @@ def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict 
     # EXTREMITY-gate the blend weight (mirrors the root mixer's tv-scaling): the live overlay previously
     # blended at a fixed _stats_confidence*max_alpha, which over-deviates against a marginal/neutral read.
     # Scale alpha by the station score so a borderline station collapses the tilt toward 0.
-    score, _sconf = station_payoff_score(prof)
-    confidence = _stats_confidence(prof) * float(min(1.0, score))
+    value_score, _sconf = station_payoff_score(prof)
+    bluff_score, _bconf = bluff_stickiness_score(prof)
+    driver_score = max(value_score if np.any(value_overlay) else 0.0,
+                       bluff_score if np.any(bluff_overlay) else 0.0)
+    confidence = _stats_confidence(prof) * float(min(1.0, driver_score))
     # The single RNR clamp: alpha = min(confidence, ceiling). `effective_alpha` enforces the same
     # min(confidence, cap_eff) shape; we additionally min with `ceiling` so an override/gift-relaxed
     # bound is honoured. safe_mix_policies re-clips at max_alpha=ceiling as a defensive backstop.
@@ -703,8 +747,11 @@ def apply_live_value_sizing(state, seat: int, probs: np.ndarray, profiles: dict 
             out["alpha"] = float(alpha)
             out["exp_size_post"] = float(post)
             out["bet_shift"] = float(post - out.get("exp_size_pre", post))
-            # "fired" = the overlay actually moved the policy (alpha > 0 and a measurable size shift).
-            fired = bool(alpha > 1e-6 and abs(out["bet_shift"]) > 1e-9)
+            out["policy_shift_l1"] = float(np.abs(final - probs).sum())
+            # Bluff suppression changes bet frequency and can leave conditional
+            # expected sizing unchanged.  Diagnose the actual policy movement,
+            # not only the historical value-sizing proxy.
+            fired = bool(alpha > 1e-6 and out["policy_shift_l1"] > 1e-9)
             out["fired"] = fired
             out["reason"] = "fired" if fired else "alpha_zero_or_no_shift"
         except Exception:  # noqa: BLE001

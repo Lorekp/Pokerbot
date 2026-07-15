@@ -498,7 +498,9 @@ pub fn preflop_hist_key_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("POKERBOT_PREFLOP_HIST_KEY").map(|v| v == "1").unwrap_or(false)
+        std::env::var("POKERBOT_PREFLOP_HIST_KEY")
+            .map(|v| v == "1")
+            .unwrap_or(false)
     })
 }
 
@@ -533,7 +535,9 @@ pub fn full_hist_key_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("POKERBOT_FULLHIST_KEY").map(|v| v == "1").unwrap_or(false)
+        std::env::var("POKERBOT_FULLHIST_KEY")
+            .map(|v| v == "1")
+            .unwrap_or(false)
     })
 }
 
@@ -571,7 +575,9 @@ pub fn presum_key_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("POKERBOT_PRESUM_KEY").map(|v| v == "1").unwrap_or(false)
+        std::env::var("POKERBOT_PRESUM_KEY")
+            .map(|v| v == "1")
+            .unwrap_or(false)
     })
 }
 
@@ -608,7 +614,10 @@ struct MsgBuf {
 impl MsgBuf {
     #[inline]
     fn new() -> Self {
-        MsgBuf { buf: [0; MSG_MAX], len: 0 }
+        MsgBuf {
+            buf: [0; MSG_MAX],
+            len: 0,
+        }
     }
     #[inline]
     fn as_slice(&self) -> &[u8] {
@@ -723,7 +732,12 @@ fn preflop_summary_bytes<const N: usize>(s: &EnvStateN<N>, n_preflop: usize) -> 
     } else {
         -1
     };
-    [n_calls, n_raises, (opener_pos + 1) as u8, presum_n_active(s)]
+    [
+        n_calls,
+        n_raises,
+        (opener_pos + 1) as u8,
+        presum_n_active(s),
+    ]
 }
 
 /// The presum PREFLOP pot-type of a state, exposed for the K-COV on-policy coverage instrument
@@ -960,11 +974,9 @@ pub fn fingerprint_fast_depth_emd_servememo<const N: usize>(
             // mirror). Rows trained under river-OCHS are hit with the exact trainer keying.
             if nb == 5 {
                 if let Some(table) = serve_river_ochs() {
-                    if let Some(bucket) = crate::river_ochs::river_ochs_bucket_memoed(
-                        table,
-                        &s.holes[seat],
-                        &s.board,
-                    ) {
+                    if let Some(bucket) =
+                        crate::river_ochs::river_ochs_bucket_memoed(table, &s.holes[seat], &s.board)
+                    {
                         return fingerprint_fast_depth_postflop_bucket_memo(s, seat, bucket, memo);
                     }
                 }
@@ -1198,8 +1210,8 @@ pub fn fingerprint_fast_depth_postflop_bucket_memo<const N: usize>(
 #[cfg(test)]
 mod presum_tests {
     use crate::core::{
-        self, apply_action, init_hand_n, is_chance_node, legal_action_mask, sample_chance, EnvState,
-        NUM_ACTIONS, NUM_PLAYERS,
+        self, apply_action, init_hand_n, is_chance_node, legal_action_mask, sample_chance,
+        EnvState, NUM_ACTIONS, NUM_PLAYERS,
     };
 
     /// Tiny deterministic xorshift RNG (test-local; not a serve path).
@@ -1278,7 +1290,11 @@ mod presum_tests {
             let a = if u < 90 && mask[core::FOLD] && legal.len() > 1 {
                 core::FOLD
             } else if u < 640 && (mask[core::CHECK] || mask[core::CALL]) {
-                if mask[core::CHECK] { core::CHECK } else { core::CALL }
+                if mask[core::CHECK] {
+                    core::CHECK
+                } else {
+                    core::CALL
+                }
             } else if u < 940 && !sized.is_empty() {
                 sized[rng.below(sized.len())]
             } else if mask[core::ALL_IN] && rng.below(4) == 0 {
@@ -1330,7 +1346,11 @@ mod presum_tests {
             }
         }
         assert!(nodes >= 50_000, "too few nodes: {}", nodes);
-        assert!(postflop_nodes >= 5_000, "too few postflop nodes: {}", postflop_nodes);
+        assert!(
+            postflop_nodes >= 5_000,
+            "too few postflop nodes: {}",
+            postflop_nodes
+        );
     }
 
     /// The raw presum A-segment for a state (b"A" + street + 4 summary + postflop bytes), assembled
@@ -1389,7 +1409,11 @@ mod presum_tests {
                 );
             }
         }
-        assert!(checked >= 4_000, "too few postflop states checked: {}", checked);
+        assert!(
+            checked >= 4_000,
+            "too few postflop states checked: {}",
+            checked
+        );
     }
 
     /// GATE 3 (collapse + distinctness): two postflop states differing ONLY in preflop bet SIZES
@@ -1458,7 +1482,14 @@ mod presum_tests {
         let bet = (core::BET_BUCKET_START..core::ALL_IN)
             .find(|&x| mask_a[x])
             .expect("a flop bet must be legal");
-        let a_check = apply_action(&a, if mask_a[core::CHECK] { core::CHECK } else { bet });
+        let a_check = apply_action(
+            &a,
+            if mask_a[core::CHECK] {
+                core::CHECK
+            } else {
+                bet
+            },
+        );
         let a_bet = apply_action(&a, bet);
         fn next_decision(mut s: EnvState) -> Option<EnvState> {
             let mut guard = 0;

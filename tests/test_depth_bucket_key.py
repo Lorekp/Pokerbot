@@ -41,11 +41,14 @@ def depth_on(monkeypatch):
 def test_effective_depth_and_bucket():
     assert abs(effective_depth_bb(_preflop_env(100.0)) - 100.0) < 1e-6
     assert abs(effective_depth_bb(_preflop_env(40.0)) - 40.0) < 1e-6
-    # edges (50,90,140) -> 40bb=0 (short), 70bb=1 (mid), 110bb=2 (full/100bb cluster), 170bb=3 (deep run-up)
-    assert depth_bucket(_preflop_env(40.0)) == 0
-    assert depth_bucket(_preflop_env(70.0)) == 1
-    assert depth_bucket(_preflop_env(110.0)) == 2
-    assert depth_bucket(_preflop_env(170.0)) == 3
+    # The arena grid distinguishes tournament-short, 100bb, and multiple deep bands.
+    assert depth_bucket(_preflop_env(20.0)) == 0
+    assert depth_bucket(_preflop_env(40.0)) == 1
+    assert depth_bucket(_preflop_env(70.0)) == 2
+    assert depth_bucket(_preflop_env(110.0)) == 3
+    assert depth_bucket(_preflop_env(170.0)) == 4
+    assert depth_bucket(_preflop_env(300.0)) == 5
+    assert depth_bucket(_preflop_env(450.0)) == 6
 
 
 def test_v1_train_serve_key_identity(depth_on):
@@ -116,17 +119,17 @@ def test_depth_sampler_fills_all_buckets(monkeypatch):
     # independent per-seat draw collapsed the min to the short end and starved the deep buckets (~0%),
     # which is the entire failure this sampler shape fixes.
     from pokerbot.training.sd_cfr_nlhe_hogwild import _sample_depth_stacks
-    monkeypatch.setenv("POKERBOT_TRAIN_DEPTH_BB", "30,200")
-    counts = [0, 0, 0, 0]
+    monkeypatch.setenv("POKERBOT_TRAIN_DEPTH_BB", "15,500")
+    counts = [0] * (len(_DEPTH_EDGES) + 1)
     N = 600
     for i in range(N):
         env = to_numpy_state(init_hand(jax.random.PRNGKey(1000 + i), occupancy=_OCC,
                                        stacks=_sample_depth_stacks(jax.random.PRNGKey(1000 + i))))
         counts[depth_bucket(env)] += 1
-    assert len(_DEPTH_EDGES) + 1 == 4
-    # every bucket including the deep tail [140,200) must be non-trivially sampled (log-U over 30-200)
+    assert len(_DEPTH_EDGES) + 1 == 7
+    # Every bucket, including [400,500], must receive real training mass.
     for b, c in enumerate(counts):
-        assert c >= 0.08 * N, f"bucket {b} starved: {c}/{N} ({counts})"
+        assert c >= 0.03 * N, f"bucket {b} starved: {c}/{N} ({counts})"
 
 
 def test_sampled_stacks_feed_init_hand(monkeypatch):

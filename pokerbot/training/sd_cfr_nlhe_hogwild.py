@@ -51,7 +51,7 @@ def _sample_depth_stacks(deal_key):
     """A3 depth-randomized retrain: ONE per-deal effective starting depth ~ log-U(lo,hi)bb, broadcast to
     every seat, drawn from a SUB-key of the deal key so it is deterministic/CRN-reproducible and INDEPENDENT
     of the deck shuffle (which uses ``deal_key`` directly). Returns None when ``POKERBOT_TRAIN_DEPTH_BB`` is
-    unset → ``init_hand`` keeps the fixed 100bb default (legacy). Set e.g. ``POKERBOT_TRAIN_DEPTH_BB=40,200``
+    unset → ``init_hand`` keeps the fixed 100bb default (legacy). Set e.g. ``POKERBOT_TRAIN_DEPTH_BB=15,500``
     (+ POKERBOT_DEPTH_BUCKETS=1 so the depth bucket is keyed). Log-uniform over-weights SHORT stacks, where
     strategy is most depth-sensitive.
 

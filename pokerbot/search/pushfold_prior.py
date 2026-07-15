@@ -139,13 +139,11 @@ def detect_pushfold_spot(env, hero: int) -> dict | None:
     return {"kind": "call", "jammer": j, "behind": behind, "blinds": blinds}
 
 
-def _effective_bb(env, hero: int, contenders: Sequence[int]) -> float:
-    """Effective stack (bb) = min over hero + contenders of (stack + committed_total)/CHIP_UNIT."""
+def _starting_total_bb(env, seat: int) -> float:
+    """Seat's hand-start stack reconstructed from behind + committed chips."""
     totals = (np.asarray(env.stacks, dtype=np.float64)
               + np.asarray(env.committed_total, dtype=np.float64))
-    rel = [int(hero)] + [int(c) for c in contenders]
-    chips = min(float(totals[s]) for s in rel) if rel else float(totals.max())
-    return chips / float(CHIP_UNIT)
+    return float(totals[int(seat)]) / float(CHIP_UNIT)
 
 
 def pushfold_root_prior(env, hero: int, legal: np.ndarray, *,
@@ -166,10 +164,21 @@ def pushfold_root_prior(env, hero: int, legal: np.ndarray, *,
     if spot is None:
         return None
 
-    # Effective stack band gate: only serve the push/fold prior in the jam/fold zone.
-    contenders = spot["behind"] if spot["kind"] == "open_shove" else [spot["jammer"], *spot["behind"]]
+    # Domain gate must follow the actor whose action space is being collapsed.
+    # A table-minimum gate is wrong: one 10bb opponent must never turn a 400bb
+    # hero's open into jam/fold. For an open, HERO must be shallow. Facing a
+    # jam, the call itself is binary at the hero-vs-jammer effective depth; if
+    # players remain behind, however, a deep hero also has a strategically real
+    # isolation/re-jam option that the call/fold game omits, so abstain.
     if band_bb is not None:
-        eff = _effective_bb(env, hero, contenders)
+        hero_bb = _starting_total_bb(env, hero)
+        if spot["kind"] == "open_shove":
+            eff = hero_bb
+        else:
+            jammer_bb = _starting_total_bb(env, spot["jammer"])
+            eff = min(hero_bb, jammer_bb)
+            if spot["behind"] and hero_bb > band_bb[1]:
+                return None
         if not (band_bb[0] <= eff <= band_bb[1]):
             return None
 

@@ -38,7 +38,8 @@ fn load_blueprint(path: &Path) -> Blueprint {
         key.copy_from_slice(&data[off..off + 16]);
         let mut row = [0f64; 11];
         for a in 0..11 {
-            row[a] = f64::from_le_bytes(data[off + 16 + a * 8..off + 24 + a * 8].try_into().unwrap());
+            row[a] =
+                f64::from_le_bytes(data[off + 16 + a * 8..off + 24 + a * 8].try_into().unwrap());
         }
         bp.insert(key, row);
     }
@@ -63,7 +64,8 @@ fn load_states(path: &Path) -> Vec<BenchState> {
         let hero = data[off + 1] as usize;
         let mut buf = vec![0i64; flat_len];
         for j in 0..flat_len {
-            buf[j] = i64::from_le_bytes(data[off + 2 + j * 8..off + 10 + j * 8].try_into().unwrap());
+            buf[j] =
+                i64::from_le_bytes(data[off + 2 + j * 8..off + 10 + j * 8].try_into().unwrap());
         }
         out.push(BenchState {
             cls,

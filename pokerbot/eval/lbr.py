@@ -423,11 +423,16 @@ def validate_snapshot(
     return inner
 
 
-def make_blueprint_policy(snapshot: dict[bytes, np.ndarray], *, client_bet_sizing: bool = True):
+def make_blueprint_policy(
+    snapshot: dict[bytes, np.ndarray], *, client_bet_sizing: bool = True,
+    return_lookup_status: bool = False,
+):
     """Return a numpy-native policy_fn(env, seat)->probs matching the trained table keys.
 
     Replicates ``TabularBlueprintBot._probs_for_env`` but with the numpy engine and
     ``fingerprint_fast`` (the exact key used during training), so lookups hit.
+    With ``return_lookup_status=True``, the returned callable yields
+    ``(probs, usable_row_hit)``; the default probability-only API is unchanged.
     """
     from pokerbot.engine.jax_weva_fast import default_weva_bucket_table
     # Gated native fingerprint: ``fingerprint_native.fingerprint_fast`` dispatches to the Rust core
@@ -452,7 +457,7 @@ def make_blueprint_policy(snapshot: dict[bytes, np.ndarray], *, client_bet_sizin
                    if _MRR_ON and _FLOP_RR_KEEP is not None else None)
     mrr_tr_first = _build_allowed_action_mask((1, 4)) if _MRR_ON else None
 
-    def policy(env, seat: int) -> np.ndarray:
+    def policy(env, seat: int):
         mask = legal_action_mask_np(env, seat).astype(bool)
         street = int(env.street)
         if client_bet_sizing:
@@ -484,11 +489,13 @@ def make_blueprint_policy(snapshot: dict[bytes, np.ndarray], *, client_bet_sizin
             if tot > 1e-12:
                 if _BP_COVERAGE_ON:
                     _BP_COVERAGE.setdefault(int(env.street), [0, 0])[0] += 1  # hit: row used
-                return p / tot
+                probs = p / tot
+                return (probs, True) if return_lookup_status else probs
         if _BP_COVERAGE_ON:
             _BP_COVERAGE.setdefault(int(env.street), [0, 0])[1] += 1  # miss: uniform-legal fallback
         m = mask.astype(np.float64)
-        return m / max(m.sum(), 1.0)
+        probs = m / max(m.sum(), 1.0)
+        return (probs, False) if return_lookup_status else probs
 
     return policy
 

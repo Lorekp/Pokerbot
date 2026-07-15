@@ -40,13 +40,17 @@ fn main() {
         let f = File::open(p).unwrap_or_else(|e| panic!("open snapshot {p}: {e}"));
         let s = SnapshotStream::open(BufReader::new(f))
             .unwrap_or_else(|e| panic!("parse snapshot {p}: {e}"));
-        eprintln!("[snap_avg] snapshot {} iters={} rows={}", p, s.iters_done, s.n_rows);
+        eprintln!(
+            "[snap_avg] snapshot {} iters={} rows={}",
+            p, s.iters_done, s.n_rows
+        );
         max_snap_iters = max_snap_iters.max(s.iters_done);
         snaps.push(s);
     }
 
     let mut ckpt: Option<NlcfrStratStream<BufReader<File>>> = if ckpt_path != "-" {
-        let f = File::open(ckpt_path).unwrap_or_else(|e| panic!("open checkpoint {ckpt_path}: {e}"));
+        let f =
+            File::open(ckpt_path).unwrap_or_else(|e| panic!("open checkpoint {ckpt_path}: {e}"));
         let c = NlcfrStratStream::open(BufReader::new(f))
             .unwrap_or_else(|e| panic!("parse checkpoint {ckpt_path}: {e}"));
         eprintln!(
@@ -59,7 +63,10 @@ fn main() {
         None
     };
 
-    let iters_done = ckpt.as_ref().map(|c| c.iters_done).unwrap_or(max_snap_iters);
+    let iters_done = ckpt
+        .as_ref()
+        .map(|c| c.iters_done)
+        .unwrap_or(max_snap_iters);
     let tmp = format!("{out_path}.tmp");
     let out_f = File::create(&tmp).unwrap_or_else(|e| panic!("create {tmp}: {e}"));
     let mut out = BufWriter::new(out_f);

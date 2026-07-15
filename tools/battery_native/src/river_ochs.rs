@@ -60,7 +60,10 @@ impl RiverOchs {
         let n_buckets = u32::from_le_bytes(b[8..12].try_into().unwrap());
         let n_clusters = u32::from_le_bytes(b[12..16].try_into().unwrap());
         if n_clusters as usize != N_CLUSTERS {
-            return Err(format!("river_ochs: n_clusters {} != {}", n_clusters, N_CLUSTERS));
+            return Err(format!(
+                "river_ochs: n_clusters {} != {}",
+                n_clusters, N_CLUSTERS
+            ));
         }
         let mut class_to_cluster = [0u8; N_PREFLOP_CLASSES];
         class_to_cluster.copy_from_slice(&b[16..16 + N_PREFLOP_CLASSES]);
@@ -71,7 +74,11 @@ impl RiverOchs {
         }
         let expected = 16 + N_PREFLOP_CLASSES + (n_buckets as usize) * N_CLUSTERS * 8;
         if b.len() != expected {
-            return Err(format!("river_ochs: blob len {} != expected {}", b.len(), expected));
+            return Err(format!(
+                "river_ochs: blob len {} != expected {}",
+                b.len(),
+                expected
+            ));
         }
         let mut centroids = Vec::with_capacity(n_buckets as usize);
         let mut p = 16 + N_PREFLOP_CLASSES;
@@ -83,7 +90,11 @@ impl RiverOchs {
             }
             centroids.push(row);
         }
-        Ok(Self { n_buckets, class_to_cluster, centroids })
+        Ok(Self {
+            n_buckets,
+            class_to_cluster,
+            centroids,
+        })
     }
 
     pub fn load_path(path: &str) -> Result<Self, String> {
@@ -217,7 +228,11 @@ thread_local! {
 
 #[inline]
 fn pack_key(table: &RiverOchs, hole: &[i32; 2], board5: &[i32; 5]) -> (usize, u64) {
-    let (h0, h1) = if hole[0] <= hole[1] { (hole[0], hole[1]) } else { (hole[1], hole[0]) };
+    let (h0, h1) = if hole[0] <= hole[1] {
+        (hole[0], hole[1])
+    } else {
+        (hole[1], hole[0])
+    };
     let mut b = *board5;
     b.sort_unstable();
     let mut k: u64 = 0;
@@ -274,7 +289,11 @@ mod tests {
         for (i, c) in class_to_cluster.iter_mut().enumerate() {
             *c = (i % N_CLUSTERS) as u8;
         }
-        RiverOchs { n_buckets: 4, class_to_cluster, centroids }
+        RiverOchs {
+            n_buckets: 4,
+            class_to_cluster,
+            centroids,
+        }
     }
 
     // card id = rank*4 + suit; rank 0=2 .. 12=A; suit 0..3.
@@ -290,7 +309,12 @@ mod tests {
         let board = [cid(10, 0), cid(9, 0), cid(8, 0), cid(0, 1), cid(1, 2)];
         let v = t.ochs_vector(&hole, &board);
         for c in 0..N_CLUSTERS {
-            assert!((v[c] - 1.0).abs() < 1e-15, "cluster {} win-rate {} != 1.0", c, v[c]);
+            assert!(
+                (v[c] - 1.0).abs() < 1e-15,
+                "cluster {} win-rate {} != 1.0",
+                c,
+                v[c]
+            );
         }
         assert_eq!(t.bucket(&hole, &board), Some(3)); // nearest to the 0.875 centroid
     }
@@ -328,7 +352,10 @@ mod tests {
         let t = tiny_table();
         let hole = [cid(12, 0), cid(11, 0)];
         assert_eq!(t.bucket(&hole, &[cid(10, 0), cid(9, 0), cid(8, 0)]), None); // flop
-        assert_eq!(t.bucket(&hole, &[cid(10, 0), cid(9, 0), cid(8, 0), cid(7, 0)]), None); // turn
+        assert_eq!(
+            t.bucket(&hole, &[cid(10, 0), cid(9, 0), cid(8, 0), cid(7, 0)]),
+            None
+        ); // turn
         assert_eq!(t.bucket(&[-1, cid(11, 0)], &[0, 1, 2, 3, 4]), None); // bad hole
     }
 
@@ -353,7 +380,10 @@ mod tests {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let f: Vec<i32> = line.split_whitespace().map(|x| x.parse().unwrap()).collect();
+            let f: Vec<i32> = line
+                .split_whitespace()
+                .map(|x| x.parse().unwrap())
+                .collect();
             assert_eq!(f.len(), 8, "golden row must be h0 h1 b0 b1 b2 b3 b4 bucket");
             let hole = [f[0], f[1]];
             let board = [f[2], f[3], f[4], f[5], f[6]];

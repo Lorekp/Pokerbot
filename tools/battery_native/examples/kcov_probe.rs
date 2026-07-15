@@ -63,9 +63,15 @@ fn main() {
         river_ochs,
     };
 
-    let fullhist = std::env::var("POKERBOT_FULLHIST_KEY").map(|v| v == "1").unwrap_or(false);
-    let presum = std::env::var("POKERBOT_PRESUM_KEY").map(|v| v == "1").unwrap_or(false);
-    let mrr = std::env::var("POKERBOT_MRR").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    let fullhist = std::env::var("POKERBOT_FULLHIST_KEY")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let presum = std::env::var("POKERBOT_PRESUM_KEY")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let mrr = std::env::var("POKERBOT_MRR")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     eprintln!(
         "[kcov_probe] loading {ckpt} ... fullhist={fullhist} presum={presum} mrr={mrr} \
          num_buckets={num_buckets} n_hands={n_hands}"

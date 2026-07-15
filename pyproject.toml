@@ -16,6 +16,7 @@ dependencies = [
     "tqdm>=4.66",
     "pandas>=2.0",
     "pyarrow>=14.0",
+    "requests>=2.31,<3",
 ]
 
 [project.optional-dependencies]

@@ -224,7 +224,10 @@ fn sha256_hex(b: &[u8]) -> String {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(4_000_000);
+    let n: usize = args
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4_000_000);
     let reps: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
 
     println!("== SERIALIZE PHASE PROFILE ==");
@@ -256,17 +259,26 @@ fn main() {
     let blob = serialize(&tab);
     let ref_blob = serialize_serial_reference(&tab);
     let ident = blob == ref_blob;
-    println!("\n[GATE] parallel serialize == serial reference : {}", ident);
+    println!(
+        "\n[GATE] parallel serialize == serial reference : {}",
+        ident
+    );
     println!("[GATE] parallel blob sha256   = {}", sha256_hex(&blob));
     println!("[GATE] serial   blob sha256   = {}", sha256_hex(&ref_blob));
-    assert!(ident, "BYTE-IDENTITY GATE FAILED: parallel encode diverged from serial reference");
+    assert!(
+        ident,
+        "BYTE-IDENTITY GATE FAILED: parallel encode diverged from serial reference"
+    );
     drop(ref_blob); // free the 2nd full blob before the memory-heavier phases (large-n RAM headroom)
 
     // -- round-trip GATE: serialize -> deserialize -> serialize --------------------------------------
     let tab2 = deserialize(&blob).expect("deserialize");
     let blob2 = serialize(&tab2);
     let rt = blob == blob2;
-    println!("[GATE] serialize->deserialize->serialize identical : {}", rt);
+    println!(
+        "[GATE] serialize->deserialize->serialize identical : {}",
+        rt
+    );
     assert!(rt, "ROUND-TRIP GATE FAILED");
     drop(tab2);
     drop(blob2);
@@ -294,7 +306,7 @@ fn main() {
     {
         use rayon::prelude::*;
         let cum = tab.dump_cum_rows(); // owned (key,row)
-        // collect phase (already have owned rows; time a representative clone+ref build)
+                                       // collect phase (already have owned rows; time a representative clone+ref build)
         let t_c = Instant::now();
         let mut pairs: Vec<(&[u8; 16], &[f64; NUM_ACTIONS])> =
             cum.iter().map(|(k, r)| (k, r)).collect();
@@ -306,7 +318,10 @@ fn main() {
         let nb = pairs.len() * SER_ROW_BYTES;
         let mut buf = vec![0u8; nb];
         let t_pe = Instant::now();
-        let rpc = pairs.len().div_ceil(rayon::current_num_threads().max(1) * 4).max(1);
+        let rpc = pairs
+            .len()
+            .div_ceil(rayon::current_num_threads().max(1) * 4)
+            .max(1);
         buf.par_chunks_mut(rpc * SER_ROW_BYTES)
             .zip(pairs.par_chunks(rpc))
             .for_each(|(bc, pc)| {
@@ -336,9 +351,21 @@ fn main() {
         let cum_gb = nb as f64 / 1e9;
         println!("\n-- PHASE BREAKDOWN (cum map only, {:.3} GB) --", cum_gb);
         println!("  collect refs   : {:.4}s", collect_dt);
-        println!("  par_sort       : {:.4}s  ({:.1} MB/s)", sort_dt, nb as f64 / 1e6 / sort_dt);
-        println!("  encode PARALLEL: {:.4}s  ({:.1} MB/s)", penc_dt, nb as f64 / 1e6 / penc_dt);
-        println!("  encode SERIAL  : {:.4}s  ({:.1} MB/s)", senc_dt, nb as f64 / 1e6 / senc_dt);
+        println!(
+            "  par_sort       : {:.4}s  ({:.1} MB/s)",
+            sort_dt,
+            nb as f64 / 1e6 / sort_dt
+        );
+        println!(
+            "  encode PARALLEL: {:.4}s  ({:.1} MB/s)",
+            penc_dt,
+            nb as f64 / 1e6 / penc_dt
+        );
+        println!(
+            "  encode SERIAL  : {:.4}s  ({:.1} MB/s)",
+            senc_dt,
+            nb as f64 / 1e6 / senc_dt
+        );
         println!("  encode speedup : {:.2}x", senc_dt / penc_dt);
     }
 
@@ -364,12 +391,18 @@ fn main() {
     println!("\nSPEEDUP (serial -> parallel) = {:.2}x", best_ser / best);
 
     // -- projection to production blob sizes ---------------------------------------------------------
-    println!("\n== PROJECTION (at parallel best rate {:.1} MB/s) ==", mbps_best);
+    println!(
+        "\n== PROJECTION (at parallel best rate {:.1} MB/s) ==",
+        mbps_best
+    );
     for gb in [41.0f64, 58.0, 80.0] {
         let secs = gb * 1e9 / (mbps_best * 1e6);
         println!("  {:>4.0} GB blob : pause ~{:.1}s", gb, secs);
     }
-    println!("\n== PROJECTION (serial reference rate {:.1} MB/s) ==", mbps_ser);
+    println!(
+        "\n== PROJECTION (serial reference rate {:.1} MB/s) ==",
+        mbps_ser
+    );
     for gb in [41.0f64, 58.0, 80.0] {
         let secs = gb * 1e9 / (mbps_ser * 1e6);
         println!("  {:>4.0} GB blob : pause ~{:.1}s", gb, secs);
@@ -382,7 +415,9 @@ fn main() {
     // must produce byte-identical files (and == serialize()).
     // ================================================================================================
     println!("\n\n== FULL-BASE TO-FILE (OLD impl vs NEW streaming writer) ==");
-    let file_dir = env::var("BENCH_FILE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| env::temp_dir());
+    let file_dir = env::var("BENCH_FILE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| env::temp_dir());
     println!("file dir = {}", file_dir.display());
     let p_old = file_dir.join("bench_ser_old.nlcfr");
     let p_new = file_dir.join("bench_ser_new.nlcfr");
@@ -395,10 +430,16 @@ fn main() {
     old_impl_write(p_old.to_str().unwrap(), &old_blob).expect("old write");
     let old_wr_dt = t0.elapsed().as_secs_f64();
     let old_total = old_enc_dt + old_wr_dt;
-    assert_eq!(old_blob, blob, "[GATE] OLD-impl blob != current serialize() blob");
+    assert_eq!(
+        old_blob, blob,
+        "[GATE] OLD-impl blob != current serialize() blob"
+    );
     println!(
         "  OLD  encode {:.3}s + write+fsync {:.3}s = {:.3}s  ({:.1} MB/s end-to-end)",
-        old_enc_dt, old_wr_dt, old_total, blob_len as f64 / 1e6 / old_total
+        old_enc_dt,
+        old_wr_dt,
+        old_total,
+        blob_len as f64 / 1e6 / old_total
     );
     drop(old_blob);
 
@@ -412,7 +453,8 @@ fn main() {
     }
     println!(
         "  NEW  (no fsync)  {:.3}s  ({:.1} MB/s end-to-end)",
-        best_new, blob_len as f64 / 1e6 / best_new
+        best_new,
+        blob_len as f64 / 1e6 / best_new
     );
     // NEW with POKERBOT_CKPT_FSYNC=1 (restores the old durability wait).
     env::set_var("POKERBOT_CKPT_FSYNC", "1");
@@ -422,16 +464,23 @@ fn main() {
     env::remove_var("POKERBOT_CKPT_FSYNC");
     println!(
         "  NEW  (fsync=1)   {:.3}s  ({:.1} MB/s end-to-end)",
-        new_fsync_dt, blob_len as f64 / 1e6 / new_fsync_dt
+        new_fsync_dt,
+        blob_len as f64 / 1e6 / new_fsync_dt
     );
     let old_bytes = std::fs::read(&p_old).expect("read old file");
     let new_bytes = std::fs::read(&p_new).expect("read new file");
     println!("  [GATE] old-impl file sha256 = {}", sha256_hex(&old_bytes));
     println!("  [GATE] new-impl file sha256 = {}", sha256_hex(&new_bytes));
-    assert_eq!(old_bytes, new_bytes, "[GATE] FULL-BASE FILE BYTES DIVERGED old vs new");
+    assert_eq!(
+        old_bytes, new_bytes,
+        "[GATE] FULL-BASE FILE BYTES DIVERGED old vs new"
+    );
     assert_eq!(new_bytes, blob, "[GATE] new file != serialize() blob");
     println!("  [GATE] full-base file bytes identical (old == new == serialize()) : true");
-    println!("  SPEEDUP (old -> new, no-fsync default) = {:.2}x", old_total / best_new);
+    println!(
+        "  SPEEDUP (old -> new, no-fsync default) = {:.2}x",
+        old_total / best_new
+    );
     drop(old_bytes);
     drop(new_bytes);
     let _ = std::fs::remove_file(&p_old);
@@ -491,7 +540,10 @@ fn main() {
         let mut base_tab = deserialize(&want_dt).unwrap();
         base_tab.set_iters_done(62_000);
         let applied = apply_delta_checked(&mut base_tab, &dblob, 62_000, 0);
-        assert!(applied.is_some(), "delta chain-verify failed at every={every}");
+        assert!(
+            applied.is_some(),
+            "delta chain-verify failed at every={every}"
+        );
         assert_eq!(
             serialize(&base_tab),
             want_dt,
@@ -525,7 +577,10 @@ fn main() {
         let t0 = Instant::now();
         old_impl_write(dp_old.to_str().unwrap(), &old_dblob).expect("old delta write");
         let old_wr = t0.elapsed().as_secs_f64();
-        assert_eq!(old_dblob, dblob, "[GATE] OLD delta blob != current serialize_delta blob");
+        assert_eq!(
+            old_dblob, dblob,
+            "[GATE] OLD delta blob != current serialize_delta blob"
+        );
         let mut best_nf = f64::INFINITY;
         for _ in 0..2 {
             let t0 = Instant::now();
@@ -537,8 +592,14 @@ fn main() {
         }
         let old_file_bytes = std::fs::read(&dp_old).unwrap();
         let new_file_bytes = std::fs::read(&dp_new).unwrap();
-        assert_eq!(old_file_bytes, new_file_bytes, "[GATE] DELTA FILE BYTES DIVERGED old vs new");
-        assert_eq!(new_file_bytes, dblob, "[GATE] delta file != serialize_delta blob");
+        assert_eq!(
+            old_file_bytes, new_file_bytes,
+            "[GATE] DELTA FILE BYTES DIVERGED old vs new"
+        );
+        assert_eq!(
+            new_file_bytes, dblob,
+            "[GATE] delta file != serialize_delta blob"
+        );
         let _ = std::fs::remove_file(&dp_old);
         let _ = std::fs::remove_file(&dp_new);
         println!(
@@ -580,9 +641,18 @@ fn main() {
         serialize(&t_lp)
     };
     let load_ident = ser_blob == par_blob && ser_blob == blob;
-    println!("[GATE] serial-load re-serialize == original          : {}", ser_blob == blob);
-    println!("[GATE] parallel-load re-serialize == serial-load     : {}", ser_blob == par_blob);
-    println!("[GATE] parallel-load re-serialize == original        : {}", par_blob == blob);
+    println!(
+        "[GATE] serial-load re-serialize == original          : {}",
+        ser_blob == blob
+    );
+    println!(
+        "[GATE] parallel-load re-serialize == serial-load     : {}",
+        ser_blob == par_blob
+    );
+    println!(
+        "[GATE] parallel-load re-serialize == original        : {}",
+        par_blob == blob
+    );
     assert!(load_ident, "LOAD BYTE-EQUIVALENCE GATE FAILED");
     drop(ser_blob);
     drop(par_blob);
@@ -610,15 +680,37 @@ fn main() {
     let rps_ld = n_rows_total as f64 / best_ld;
     let rps_lp = n_rows_total as f64 / best_lp;
     println!("\nload rows (cum+strat) = {}", n_rows_total);
-    println!("-- deserialize SERIAL   : {:.4}s  {:.3} GB/s  {:.2}e6 rows/s", best_ld, gbps_ld, rps_ld / 1e6);
-    println!("-- deserialize PARALLEL : {:.4}s  {:.3} GB/s  {:.2}e6 rows/s", best_lp, gbps_lp, rps_lp / 1e6);
-    println!("LOAD SPEEDUP (serial -> parallel) = {:.2}x", best_ld / best_lp);
+    println!(
+        "-- deserialize SERIAL   : {:.4}s  {:.3} GB/s  {:.2}e6 rows/s",
+        best_ld,
+        gbps_ld,
+        rps_ld / 1e6
+    );
+    println!(
+        "-- deserialize PARALLEL : {:.4}s  {:.3} GB/s  {:.2}e6 rows/s",
+        best_lp,
+        gbps_lp,
+        rps_lp / 1e6
+    );
+    println!(
+        "LOAD SPEEDUP (serial -> parallel) = {:.2}x",
+        best_ld / best_lp
+    );
 
-    println!("\n== LOAD PROJECTION (serial {:.3} GB/s | parallel {:.3} GB/s) ==", gbps_ld, gbps_lp);
+    println!(
+        "\n== LOAD PROJECTION (serial {:.3} GB/s | parallel {:.3} GB/s) ==",
+        gbps_ld, gbps_lp
+    );
     for pgb in [41.0f64, 55.0, 58.0, 80.0, 100.0] {
         let s_ld = pgb / gbps_ld;
         let s_lp = pgb / gbps_lp;
-        println!("  {:>4.0} GB blob : serial ~{:.1}s ({:.1} min)  parallel ~{:.1}s ({:.1} min)",
-                 pgb, s_ld, s_ld / 60.0, s_lp, s_lp / 60.0);
+        println!(
+            "  {:>4.0} GB blob : serial ~{:.1}s ({:.1} min)  parallel ~{:.1}s ({:.1} min)",
+            pgb,
+            s_ld,
+            s_ld / 60.0,
+            s_lp,
+            s_lp / 60.0
+        );
     }
 }

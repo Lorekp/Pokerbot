@@ -270,7 +270,7 @@ def test_serve_final_iterate_exploit_path_gated():
     assert np.array_equal(r_on.action_probs, r_off.action_probs)
 
 
-def test_preflop_served_from_blueprint():
+def test_preflop_lookup_miss_served_from_passive_prior():
     env = to_numpy_state(init_hand(jax.random.PRNGKey(5), occupancy=_OCC))
     while is_chance_node_np(env):
         env = sample_chance_np(env)
@@ -279,7 +279,9 @@ def test_preflop_served_from_blueprint():
                        legal_mask=legal_action_mask_np(env, hero).astype(bool))
     cfg = PluribusReBeLConfig(search_preflop=False)
     res = PluribusReBeLSolver({}, cfg).solve(root, _StubPBS(env, hero))
-    assert res.metadata.get("served") == "blueprint_preflop"
+    assert res.metadata.get("served") == "preflop_lookup_miss_prior"
+    assert res.metadata.get("blueprint_source_hit") is False
+    assert float(res.action_probs[3:].sum()) == 0.0
     assert abs(float(res.action_probs.sum()) - 1.0) < 1e-5
 
 

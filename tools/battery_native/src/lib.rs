@@ -54,8 +54,16 @@ pub mod prof {
     pub const P_BP_LOOKUP: usize = 9;
     pub const NP: usize = 10;
     pub const PHASE_NAMES: [&str; NP] = [
-        "solve_total", "rtab_build", "deal_holes", "repair_deck", "leaf_playout", "fp_key",
-        "apply_action", "legal_mask", "map_ops", "bp_lookup",
+        "solve_total",
+        "rtab_build",
+        "deal_holes",
+        "repair_deck",
+        "leaf_playout",
+        "fp_key",
+        "apply_action",
+        "legal_mask",
+        "map_ops",
+        "bp_lookup",
     ];
     pub static TSC: [AtomicU64; NP] = [const { AtomicU64::new(0) }; NP];
 
@@ -74,7 +82,13 @@ pub mod prof {
     pub const C_BP_CACHE_HIT: usize = 7;
     pub const NC: usize = 8;
     pub const COUNT_NAMES: [&str; NC] = [
-        "node_hero", "node_opp", "leaf_hit", "leaf_miss", "playout_step", "bp_get", "bp_miss",
+        "node_hero",
+        "node_opp",
+        "leaf_hit",
+        "leaf_miss",
+        "playout_step",
+        "bp_get",
+        "bp_miss",
         "bp_cache_hit",
     ];
     pub static CNT: [AtomicU64; NC] = [const { AtomicU64::new(0) }; NC];
@@ -492,6 +506,14 @@ mod py {
             // env-gated (POKERBOT_ACTION_TRANSLATE=1) pseudo-harmonic off-menu action translation
             // (translate.rs; default-off byte-identical).
             "action_translate".to_string(),
+            // Stage-2b live reach conditioning: dropped/off-menu observed bet
+            // sizes are projected smoothly onto bracketing trained actions
+            // instead of being discarded as range-uninformative.
+            "offtree_reach_kernel".to_string(),
+            // Structural raise caps include aggressive actions already observed
+            // on the root's current street; a stale binary resets the count at
+            // the subgame boundary and can invent unsupported fourth raises.
+            "root_history_raise_cap".to_string(),
             // tier-1 serve flip (2026-07-12): SubgameSolver::from_index_dir — the native subgame
             // CFR consumes the nlcfr_key_index.py --with-rows mmap index directly (538.85M-row
             // full table; Python-dict marshaling impossible). native_solver.py builds the native
@@ -502,7 +524,7 @@ mod py {
             // entry points (SubgameSolver.solve/solve_capped/solve_exploit/solve_exploit_capped/
             // range_weights, PlayoutEngine.leaf_value) release the GIL for the full native wall,
             // and solve_capped/solve_exploit_capped carry the cooperative in-native wall-clock
-            // cap (wall_cap_ms; checked per iteration + per 1024 cfv nodes; bounded honest early
+            // cap (wall_cap_ms; checked per iteration + per 8 cfv nodes; bounded honest early
             // return, never a panic) plus the GTO-path structural deep-SPR raise-ladder bound
             // (raise_cap_per_street). native_solver.py gates the capped/cap-metadata calls on
             // this capability — stale .pyds keep the legacy uncapped calls.
@@ -518,8 +540,8 @@ mod py {
         match emd_frozen_path {
             None => Ok(None),
             Some(p) => {
-                let lookup = crate::emd::load_shared(&p)
-                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
+                let lookup =
+                    crate::emd::load_shared(&p).map_err(pyo3::exceptions::PyValueError::new_err)?;
                 Ok(Some(crate::playout::EmdKeyCfg {
                     lookup,
                     miss_made_hand: emd_miss_made_hand,
@@ -866,7 +888,7 @@ mod py {
         /// raise-ladder bound, with cap metadata surfaced. Same 22 leading args as `solve`
         /// (byte-identical semantics at `wall_cap_ms=0, raise_cap_per_street=0`), then:
         ///   * `wall_cap_ms` (default 0 = off): cooperative in-native deadline, checked at every
-        ///     CFR iteration top AND every 1024 `cfv` node entries (a pathological deep-SPR
+        ///     CFR iteration top AND every 8 `cfv` node entries (a pathological deep-SPR
         ///     iteration can individually run minutes). On expiry the solve returns the
         ///     strategy_sum-derived answer banked by the COMPLETED iterations — bounded, honest,
         ///     possibly under-searched; NEVER a panic.
@@ -935,7 +957,15 @@ mod py {
             };
             // GIL released for the full solve wall (same Python-touch audit as `solve`).
             let (probs, capped, iters) = py.detach(|| {
-                subgame::solve_capped(&s, hero, &self.bp, &self.cfg, &scfg, public_seed, wall_cap_ms)
+                subgame::solve_capped(
+                    &s,
+                    hero,
+                    &self.bp,
+                    &self.cfg,
+                    &scfg,
+                    public_seed,
+                    wall_cap_ms,
+                )
             });
             (probs.to_vec(), capped, iters)
         }
@@ -947,7 +977,13 @@ mod py {
         /// Returns a seat-major flattened `N*52*52` weight vector (upper triangle c0<c1 populated,
         /// pre-floor / pre-normalization), or None when no table applies. Used by the offline
         /// sanity + log-loss validation of the reach-range plumbing.
-        fn range_weights(&self, py: Python<'_>, state: &[u8], hero: usize, mode: &str) -> Option<Vec<f64>> {
+        fn range_weights(
+            &self,
+            py: Python<'_>,
+            state: &[u8],
+            hero: usize,
+            mode: &str,
+        ) -> Option<Vec<f64>> {
             let s = flat::from_flat(&bytes_to_flat(state));
             let (range_aware, range_reach_full) = match mode {
                 "fold_now" => (true, false),
@@ -979,7 +1015,9 @@ mod py {
             };
             // TASK-75: GIL released — the reach replay does blueprint (mmap-index) lookups that
             // can page-fault; pure Rust inside (same audit as `solve`).
-            py.detach(|| subgame::build_rtab(&s, hero, &self.bp, &self.cfg, &scfg).map(|rt| rt.to_flat()))
+            py.detach(|| {
+                subgame::build_rtab(&s, hero, &self.bp, &self.cfg, &scfg).map(|rt| rt.to_flat())
+            })
         }
 
         /// EXPLOIT solve: same CFR loop as `solve`, but opponent nodes apply a PRECOMPUTED pure-frozen
@@ -1101,7 +1139,7 @@ mod py {
         }
 
         /// TASK-75 — `solve_exploit` plus the in-native WALL-CLOCK CAP (`wall_cap_ms`, default 0 =
-        /// off; same cooperative per-iteration + per-1024-nodes checks as `solve_capped`). The
+        /// off; same cooperative per-iteration + per-8-nodes checks as `solve_capped`). The
         /// exploit MATH and tree are untouched (no raise-cap exposure — firewall); the cap only
         /// bounds how many iterations run. Returns `(probs[11], root_q[11], wall_capped,
         /// iters_completed)`. GIL released like `solve_exploit`.
@@ -1331,8 +1369,8 @@ mod py {
             path: String,
             miss_made_hand: bool,
         ) -> PyResult<(usize, usize, usize, usize)> {
-            let lookup = crate::emd::load_shared(&path)
-                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            let lookup =
+                crate::emd::load_shared(&path).map_err(pyo3::exceptions::PyValueError::new_err)?;
             let meta = (
                 lookup.n_buckets,
                 lookup.n_bins,
@@ -1952,7 +1990,10 @@ mod py {
                     "save_current_strategy_bytes: unsupported on the hogwild path",
                 ));
             }
-            Ok(PyBytes::new(py, &nlhe_trainer::serialize_current_strategy(&self.tab)))
+            Ok(PyBytes::new(
+                py,
+                &nlhe_trainer::serialize_current_strategy(&self.tab),
+            ))
         }
 
         /// Serialize the CURRENT strategy (`NLSNAP01`) DIRECTLY to `path` (Rust file write under

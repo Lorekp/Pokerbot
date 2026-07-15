@@ -15,6 +15,7 @@ from pokerbot.opponent.value_sizing import (
     _BET_LO,
     _BIG_LO,
     _ALL_IN,
+    bluff_stickiness_score,
     bluff_suppression_logits,
     river_thin_value_logits,
     station_payoff_score,
@@ -74,6 +75,12 @@ def test_no_data_is_near_zero():
     assert np.allclose(value_sizing_logits(empty, 0.8), 0.0)  # conf 0 => no escalation
 
 
+def test_unknown_hand_strength_fails_closed():
+    s = _station(wtsd=48, wsd=40, foldToCbet=25)
+    assert np.allclose(value_sizing_logits(s, None), 0.0)
+    assert np.allclose(bluff_suppression_logits(s, None), 0.0)
+
+
 def test_derived_fallback_without_hud():
     # No server HUD, but count-based fold_to_cbet = 8/40 = 20% (sticky) + saw_flop sample -> escalates.
     s = OpponentStats(hands=60, vpip=33, pfr=5, aggression_bets_raises=6, aggression_calls=24,
@@ -122,7 +129,7 @@ def test_bluff_suppression_cuts_bets_with_air_vs_station():
     adj = bluff_suppression_logits(s, hand_strength=0.25)   # air vs a sticky non-folder
     assert adj[_BET_LO:_ALL_IN].max() < 0          # all bet/raise sizes de-prioritized
     assert adj[1] > 0                               # checking/giving up preferred
-    assert adj[0] == 0 and adj[_ALL_IN] == 0        # fold + all-in untouched
+    assert adj[0] == 0 and adj[_ALL_IN] < 0         # fold untouched; air jams suppressed too
 
 
 def test_bluff_suppression_value_hand_is_zero():
@@ -133,6 +140,25 @@ def test_bluff_suppression_value_hand_is_zero():
 
 def test_bluff_suppression_no_data_is_zero():
     assert np.allclose(bluff_suppression_logits(OpponentStats(hands=0), 0.2), 0.0)
+
+
+def test_bluff_suppression_uses_wtsd_when_arena_hud_omits_fold_stats():
+    # Arena exposes WTSD/WSD but often no fold-to-cbet/FTA.  A high-WTSD,
+    # high-WSD villain is not a value-payoff fish, but is still a bad bluff
+    # target: strong showdown results must not erase the call-down signal.
+    sticky = _neutral(wtsd=48, wsd=62)
+    score, conf = bluff_stickiness_score(sticky)
+    assert score > 0.0 and conf >= 0.8
+    assert station_payoff_score(sticky)[0] == 0.0
+    adj = bluff_suppression_logits(sticky, hand_strength=0.20)
+    assert adj[_BET_LO:].max() < 0.0
+    assert adj[1] > 0.0
+
+
+def test_bluff_suppression_does_not_infer_stickiness_from_normal_wtsd():
+    normal = _neutral(wtsd=31, wsd=62)
+    assert bluff_stickiness_score(normal)[0] == 0.0
+    assert np.allclose(bluff_suppression_logits(normal, hand_strength=0.20), 0.0)
 
 
 def test_bluff_suppression_damped_vs_lag():
