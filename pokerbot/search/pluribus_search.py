@@ -570,13 +570,22 @@ _NATIVE_FIT_PROBE_ITERS = 200
 # accepts wall_cap_ms — a cooperative in-native deadline checked per CFR iteration AND per 8
 # tree nodes; on expiry it returns the strategy_sum banked by the COMPLETED iterations with
 # wall_capped/iters_completed metadata (the under-search guard then judges the serve by its honest
-# iteration count). Under a live-scale budget (the fit regime) every native call gets
-# cap = remaining_budget * PAD + 100ms — a safety NET above the fit, not a scheduler; it never
-# fires on healthy solves (the fit keeps those under budget) and structurally bounds the
-# pathological ones. Eval/battery/cert budgets (>= _NATIVE_FIT_BUDGET_MS) pass cap 0 (off) =>
+# iteration count). Under a live-scale budget every native call gets
+# cap = remaining_budget * PAD + 100ms. A capable extension uses that cap as the scheduler:
+# Rust receives the full K target and returns the strategy accumulated at K or the wall deadline.
+# Legacy extensions retain the probe-fit scheduler. Eval/battery/cert budgets
+# (>= _NATIVE_FIT_BUDGET_MS) pass cap 0 (off) =>
 # byte-identical certified behavior. POKERBOT_NATIVE_WALL_CAP=0 disables the cap wiring entirely.
 _NATIVE_WALL_CAP_ENABLED = (os.environ.get("POKERBOT_NATIVE_WALL_CAP", "1").strip().lower()
                             not in ("0", "false", "no", "off"))
+# RUST-NATIVE ANYTIME SCHEDULER (2026-07-15): with a cooperative
+# solve_capped implementation, request the full target once and let Rust stop
+# at K or at the wall deadline.  The legacy cold-probe fit often undersized a
+# warmed main solve and returned with most of the live budget unused.  A stale
+# extension without solve_wall_cap retains the old probe-fit path.
+_NATIVE_RUST_ANYTIME_ENABLED = (
+    os.environ.get("POKERBOT_NATIVE_RUST_ANYTIME", "1").strip().lower()
+    not in ("0", "false", "no", "off"))
 # ANYTIME SERVE (2026-07-14): the pad multiplies the remaining budget to size the in-native wall cap.
 # The default 1.25 treats the cap as a loose "pathological-geometry" NET above the fit; but when the
 # probe under-measures the per-iter cost (cold-page faults during the main solve -> short-stack
@@ -2222,7 +2231,18 @@ class PluribusReBeLSolver:
                                  if self._river_overbet_armed else 0),
                 )
 
-            k_probe = min(_NATIVE_FIT_PROBE_ITERS, int(eff_max_iters)) if _fit else int(eff_max_iters)
+            rust_anytime = bool(
+                _fit and _NATIVE_WALL_CAP_ENABLED
+                and _NATIVE_RUST_ANYTIME_ENABLED
+                and _ns.native_wall_cap_capable())
+            # A capable Rust solver receives the full certified target and owns
+            # the time boundary.  The legacy probe-fit block below remains an
+            # exact compatibility path when that capability is unavailable.
+            k_probe = (int(eff_max_iters) if rust_anytime else
+                       (min(_NATIVE_FIT_PROBE_ITERS, int(eff_max_iters))
+                        if _fit else int(eff_max_iters)))
+            native_scheduler = ("rust_anytime" if rust_anytime else
+                                ("probe_fit" if _fit else "full_k"))
             probs_n = _native_call(k_probe)
             iters_used = int(k_probe)
             # TASK-75: honest per-call accounting — a wall-capped native call completed FEWER
@@ -2276,6 +2296,7 @@ class PluribusReBeLSolver:
                               # semantics judge/downgrade this serve with zero extra wiring).
                               "wall_capped": wall_capped,
                               "iters_completed": int(iters_used),
+                              "native_scheduler": native_scheduler,
                               # Stage-1 diagnostic: this native serve solved the widened river root.
                               "river_overbet_armed": bool(self._river_overbet_armed),
                               **self._preflop_risky_resolve_meta},
@@ -2378,7 +2399,15 @@ class PluribusReBeLSolver:
                         # the certified exploit serve is byte-identical regardless of those GTO-path knobs).
                     )
 
-                k_probe = min(_NATIVE_FIT_PROBE_ITERS, int(eff_max_iters)) if _fit else int(eff_max_iters)
+                rust_anytime = bool(
+                    _fit and _NATIVE_WALL_CAP_ENABLED
+                    and _NATIVE_RUST_ANYTIME_ENABLED
+                    and _ns.native_wall_cap_capable())
+                k_probe = (int(eff_max_iters) if rust_anytime else
+                           (min(_NATIVE_FIT_PROBE_ITERS, int(eff_max_iters))
+                            if _fit else int(eff_max_iters)))
+                native_scheduler = ("rust_anytime" if rust_anytime else
+                                    ("probe_fit" if _fit else "full_k"))
                 out = _native_exploit_call(k_probe)
                 iters_used = int(k_probe)
                 # TASK-75: honest per-call accounting (mirrors the GTO native path).
@@ -2433,7 +2462,8 @@ class PluribusReBeLSolver:
                                   # TASK-75 (see the GTO native path): honest completed count under
                                   # the in-native wall cap; the under-search guard judges it.
                                   "wall_capped": wall_capped,
-                                  "iters_completed": int(iters_used)},
+                                  "iters_completed": int(iters_used),
+                                  "native_scheduler": native_scheduler},
                     )
 
         root_key = self._infoset_key(base_state, hero)
