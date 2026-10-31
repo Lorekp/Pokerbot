@@ -166,7 +166,6 @@ def _spotpick_chain(instance_type: str, arch: str, n: int) -> list[str]:
         # capacity-fallback chain. The catalog carries no RAM column, so at 64 vCPU an unfiltered
         # chain includes 128 GB c-family boxes that OOM late in a ~132 GB-RSS training run — the
         # caller (babysitter env) owns the RAM floor for its workload.
-        import os
         excl = [f.strip() for f in os.environ.get("SPOTPICK_EXCLUDE_FAMILIES", "").split(",")
                 if f.strip()]
         if excl:
