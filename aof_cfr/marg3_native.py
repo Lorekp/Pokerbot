@@ -15,7 +15,7 @@ availability.
 
 Build (Windows, cargo only — no maturin/cmake):
 
-    PYO3_PYTHON="python" cargo build --release --features python --lib \
+    PYO3_PYTHON="$(python -c 'import sys; print(sys.executable)')" cargo build --release --features python --lib \
         --manifest-path tools/marg3_native/Cargo.toml
     cp tools/marg3_native/target/release/marg3_native.dll \
        tools/marg3_native/target/release/marg3_native.pyd   # CPython needs the .pyd name on Windows

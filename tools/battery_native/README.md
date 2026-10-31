@@ -108,7 +108,7 @@ require porting the CFR recursion + gadget RNG into Rust, which would forfeit th
 ```bash
 cd tools/battery_native
 cargo test --lib                                                      # pure-Rust sanity (no Python)
-PYO3_PYTHON="python" cargo build --release --features python --lib
+PYO3_PYTHON="$(python -c 'import sys; print(sys.executable)')" cargo build --release --features python --lib
 cp target/release/battery_native.dll target/release/battery_native.pyd   # Windows: alias cdylib -> .pyd
 
 # verify bit-identity + benchmark (from repo root, POKERBOT_BETTING_ABSTRACTION=1):

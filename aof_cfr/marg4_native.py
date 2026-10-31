@@ -17,7 +17,7 @@ pure-Python path — nothing special-cases availability.
 
 Build (Windows, cargo only — no maturin/cmake/cl):
 
-    PYO3_PYTHON="python" cargo build --release --features python --lib \
+    PYO3_PYTHON="$(python -c 'import sys; print(sys.executable)')" cargo build --release --features python --lib \
         --manifest-path tools/marg4_native/Cargo.toml
     cp tools/marg4_native/target/release/marg4_native.dll \
        tools/marg4_native/target/release/marg4_native.pyd   # CPython needs the .pyd name on Windows

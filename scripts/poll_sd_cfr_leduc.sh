@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Poll SD-CFR Leduc training status (run on homeserver; invoke via ssh monitor).
 set -euo pipefail
-ROOT="${ROOT:-.}"
+ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 PID_FILE="$ROOT/logs/sd_cfr_leduc_train.pid"
 LOG="$ROOT/logs/sd_cfr_leduc_train.log"
 CKPT_DIR="$ROOT/checkpoints/sd_cfr_leduc_run"

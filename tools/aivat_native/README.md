@@ -116,7 +116,7 @@ cd tools/aivat_native
 cargo test --lib
 
 # 2) Build the CPython extension (cdylib):
-PYO3_PYTHON="python" cargo build --release --features python --lib
+PYO3_PYTHON="$(python -c 'import sys; print(sys.executable)')" cargo build --release --features python --lib
 
 # 3) On Windows, alias the cdylib to a .pyd so CPython can import it:
 cp target/release/aivat_native.dll target/release/aivat_native.pyd

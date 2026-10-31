@@ -87,9 +87,9 @@ $lastConvIters = -1
 # the cheapest $Vcpus-vCPU box (currently c6a.32xlarge) and turns ON the capacity-diverse fallback chain
 # (-Spotpick) so a sold-out pool advances to the next type instead of hard-failing.
 if (-not $InstanceType) {
-  $SpotpickPy = "spotpick.py"
+  $SpotpickPy = $env:SPOTPICK_SCRIPT
   $picked = ""
-  if (Test-Path $SpotpickPy) {
+  if ($SpotpickPy -and (Test-Path -LiteralPath $SpotpickPy)) {
     try { $picked = (& python $SpotpickPy best --vcpus $Vcpus --arch $Arch 2>$null) } catch { $picked = "" }
     if ($picked) { $picked = ("$picked").Trim() }
   }

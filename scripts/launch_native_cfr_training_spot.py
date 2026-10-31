@@ -22,6 +22,7 @@ Reuses the same AWS identity + S3 prefix conventions as the SD-CFR launcher.
 from __future__ import annotations
 
 import argparse
+import os
 import base64
 import gzip
 import hashlib
@@ -142,12 +143,14 @@ _CAPACITY_ERROR_CODES = frozenset({
 
 def _spotpick_chain(instance_type: str, arch: str, n: int) -> list[str]:
     """Build a capacity-diverse fallback chain (one type per family) starting at the requested type's
-    vCPU count, via the shared spotpick lib (.). Returns [instance_type] alone if
+    vCPU count, via the separately installed spotpick library (or SPOTPICK_ROOT). Returns [instance_type] alone if
     spotpick or the catalog is unavailable, so --spotpick degrades gracefully to single-type behavior.
     The head of the chain is forced to be the explicitly-requested ``instance_type`` (so the default
     c6i.32xlarge is still tried FIRST), with the spotpick alternatives appended de-duplicated."""
     try:
-        sys.path.insert(0, r".")
+        spotpick_root = os.environ.get("SPOTPICK_ROOT")
+        if spotpick_root:
+            sys.path.insert(0, spotpick_root)
         import spotpick  # noqa: E402
     except Exception as e:  # noqa: BLE001
         print(f"[spotpick] unavailable ({e!r}) — falling back to single type {instance_type}", flush=True)

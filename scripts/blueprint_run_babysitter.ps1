@@ -85,9 +85,9 @@ $lastConvIters = -1
 
 # AUTO-PICK cheapest spot-available type via the shared spotpick lib when -InstanceType was not given.
 if (-not $InstanceType) {
-  $SpotpickPy = "spotpick.py"
+  $SpotpickPy = $env:SPOTPICK_SCRIPT
   $picked = ""
-  if (Test-Path $SpotpickPy) {
+  if ($SpotpickPy -and (Test-Path -LiteralPath $SpotpickPy)) {
     try { $picked = (& python $SpotpickPy best --vcpus $Vcpus --arch $Arch 2>$null) } catch { $picked = "" }
     if ($picked) { $picked = ("$picked").Trim() }
   }

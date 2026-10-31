@@ -76,7 +76,7 @@ function Get-SpotpickPrice([string]$it) {
   if ($priceCache.ContainsKey($it)) { return $priceCache[$it] }
   $p = $SpotPrice
   try {
-    $out = (& python -c "import sys;sys.path.insert(0,'.');import spotpick;print({i.name:i.spot for i in spotpick.load()}.get('$it',''))" 2>$null)
+    $out = (& python -c "import os,sys;root=os.environ.get('SPOTPICK_ROOT');sys.path.insert(0,root) if root else None;import spotpick;print({i.name:i.spot for i in spotpick.load()}.get('$it',''))" 2>$null)
     if ($out) { $out = ("$out").Trim(); if ($out -match '^[0-9.]+$') { $p = [double]$out } }
   } catch {}
   $priceCache[$it] = $p

@@ -58,6 +58,8 @@ python tools/battery_native/gen_phe_tables.py
 
 Run research scripts from the repository root. Former machine-specific defaults now point to repository-relative `checkpoints/`, `data/external/` and `artifacts/` locations; supply the required inputs or override the script's path options. These optional input files are not bundled.
 
+Some optional cloud launchers use an external Spotpick capacity helper, which is not included here. Set `SPOTPICK_ROOT` to its Python module directory or make it importable in the active environment; PowerShell babysitters use `SPOTPICK_SCRIPT` for its script path. Without that helper, use the existing explicit instance-type and price options/fallbacks. `POKERBOT_SEARCH_ROOTS` selects the optional captured research-root fixture for `native_exploit_equiv.py`; its default is `artifacts/search_roots.pkl`. Monitor scripts accept their existing root-directory environment overrides and otherwise use the script's repository root or the remote login directory.
+
 ## Scope and history
 
 This public edition contains the research. Client automation, captures, human-mimicking behavior, bundled third-party files, and player datasets were removed from its history. Original commit authorship and dates are preserved; some commits are now empty, and older messages or research comments can refer to omitted integrations. Historical revisions are not promised to be independently runnable. A few computational modules retain legacy names such as `live_exploit`; they operate on supplied data rather than controlling a client.

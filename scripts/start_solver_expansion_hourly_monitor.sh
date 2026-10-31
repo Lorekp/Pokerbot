@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT="."
+ROOT="${POKERBOT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 mkdir -p "$ROOT/logs"
 if pgrep -f 'monitor_solver_expansion_hourly_loop' >/dev/null 2>&1; then
   echo "hourly loop already running"

@@ -22,8 +22,6 @@ Set-Location $Root
 if (-not $Python) {
   if ($env:PYTHON -and (Get-Command $env:PYTHON -ErrorAction SilentlyContinue)) {
     $Python = $env:PYTHON
-  } elseif (Test-Path "python") {
-    $Python = "python"
   } else {
     $Python = "python"
   }

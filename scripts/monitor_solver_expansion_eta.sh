@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REMOTE="${REMOTE:-monitor}"
-ROOT="${REMOTE_ROOT:-.}"
+ROOT="${REMOTE_ROOT:-.}"  # Relative to the remote login directory; override REMOTE_ROOT as needed.
 LOG="$ROOT/logs/solver_expansion_chain.log"
 
 ssh "$REMOTE" "bash -s" <<EOF

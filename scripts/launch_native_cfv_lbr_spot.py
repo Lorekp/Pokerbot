@@ -20,6 +20,7 @@ Run from the user's terminal (their AWS creds = the labelgen-worker user):
 from __future__ import annotations
 
 import argparse
+import os
 import base64
 import io
 import tarfile
@@ -221,7 +222,9 @@ def main() -> None:
     else:
         try:
             import sys
-            sys.path.insert(0, r".")
+            spotpick_root = os.environ.get("SPOTPICK_ROOT")
+            if spotpick_root:
+                sys.path.insert(0, spotpick_root)
             import spotpick
             # prefer c6a family but allow the diverse x86 16-vCPU fallback chain.
             c6a = spotpick.chain(16, "x86_64", n=1, families=None, exclude_families=None)
@@ -230,7 +233,9 @@ def main() -> None:
         # Force c6a.4xlarge first per the directive, then the diverse fallback.
         chain = ["c6a.4xlarge"]
         try:
-            sys.path.insert(0, r".")
+            spotpick_root = os.environ.get("SPOTPICK_ROOT")
+            if spotpick_root:
+                sys.path.insert(0, spotpick_root)
             import spotpick
             for t in spotpick.chain(16, "x86_64", n=5):
                 if t not in chain:

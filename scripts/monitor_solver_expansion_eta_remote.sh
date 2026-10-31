@@ -2,7 +2,7 @@
 # Run ON homeserver (no ssh). Progress + ETA for prod600 -> prod6000 chain.
 set -euo pipefail
 
-ROOT="${ROOT:-.}"
+ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 LOG="$ROOT/logs/solver_expansion_chain.log"
 
 fmt_eta() {

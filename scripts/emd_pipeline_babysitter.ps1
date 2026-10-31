@@ -200,9 +200,9 @@ function Format-Probe($probe) {
 
 # AUTO-PICK the cheapest spot-available 128-vCPU box via the shared spotpick lib (same as native_cfr).
 if (-not $InstanceType) {
-  $SpotpickPy = "spotpick.py"
+  $SpotpickPy = $env:SPOTPICK_SCRIPT
   $picked = ""
-  if (Test-Path $SpotpickPy) {
+  if ($SpotpickPy -and (Test-Path -LiteralPath $SpotpickPy)) {
     try { $picked = (& python $SpotpickPy best --vcpus $Vcpus --arch $Arch 2>$null) } catch { $picked = "" }
     if ($picked) { $picked = ("$picked").Trim() }
   }
