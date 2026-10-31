@@ -49,6 +49,15 @@ The focused suite covers parsing, confidence labels, game economics, heads-up po
 
 For the wider Python project, install `python -m pip install -e ".[aof,dev]"`. Optional training dependencies are listed in [pyproject.toml](pyproject.toml). Advanced experiments may require generated data, model checkpoints, or separate native toolchains. The native wrappers do not bundle their upstream solver/evaluator dependencies. Full training, every historical experiment, and native builds are outside the small smoke suite’s coverage.
 
+The fingerprint and battery Rust crates generate their lookup tables locally from the separately installed `phevaluator==0.5.3.1` dependency. Cargo runs the included generators before compilation; select the Python environment with `PYO3_PYTHON` or `PYTHON` if needed. Generated tables are ignored by Git. For explicit generation from the repository root:
+
+```bash
+python tools/fingerprint_native/gen_tables.py
+python tools/battery_native/gen_phe_tables.py
+```
+
+Run research scripts from the repository root. Former machine-specific defaults now point to repository-relative `checkpoints/`, `data/external/` and `artifacts/` locations; supply the required inputs or override the script's path options. These optional input files are not bundled.
+
 ## Scope and history
 
 This public edition contains the research. Client automation, captures, human-mimicking behavior, bundled third-party files, and player datasets were removed from its history. Original commit authorship and dates are preserved; some commits are now empty, and older messages or research comments can refer to omitted integrations. Historical revisions are not promised to be independently runnable. A few computational modules retain legacy names such as `live_exploit`; they operate on supplied data rather than controlling a client.

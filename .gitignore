@@ -1,4 +1,6 @@
 .env
+tools/fingerprint_native/src/tables.rs
+tools/battery_native/src/phe_tables.rs
 __pycache__/
 *.py[cod]
 .pytest_cache/

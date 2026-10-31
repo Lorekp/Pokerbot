@@ -6,7 +6,7 @@ description = "Bit-identical native port of the blueprint infoset fingerprint (p
 
 [lib]
 name = "fingerprint_native"
-# rlib  -> `cargo test` runs the pure-Rust unit tests (blake2b / phevaluator goldens, no Python).
+# rlib -> unit tests need no Python bindings; the build first generates local tables with Python.
 # cdylib -> the importable CPython extension module (loaded by pokerbot/encoding/fingerprint_native.py).
 crate-type = ["rlib", "cdylib"]
 

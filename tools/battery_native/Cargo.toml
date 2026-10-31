@@ -6,7 +6,7 @@ description = "Bit-identical native core for the exploitation battery's hot path
 
 [lib]
 name = "battery_native"
-# rlib  -> `cargo test` runs the bit-identity unit tests against goldens (no Python needed).
+# rlib -> unit tests need no Python bindings; the build first generates local tables with Python.
 # cdylib -> the importable CPython extension module (loaded by pokerbot/search/native_solver.py).
 crate-type = ["rlib", "cdylib"]
 

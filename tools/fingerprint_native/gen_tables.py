@@ -1,12 +1,16 @@
 """Regenerate src/tables.rs from the installed phevaluator package (perfect-hash lookup tables).
 
-The tables are pure integer perfect-hash tables (~130KB), so vendoring them makes the Rust postflop
-made-hand bucket bit-exact by construction. Card id == rank*4+suit, identical to the encoder convention.
+The tables are generated locally and ignored by Git. They make the Rust postflop
+made-hand bucket bit-exact. Card id == rank*4+suit, identical to the encoder convention.
 Run from the repo root:  python tools/fingerprint_native/gen_tables.py
 """
 from __future__ import annotations
 
 from pathlib import Path
+from importlib.metadata import version
+
+if version("phevaluator") != "0.5.3.1":
+    raise SystemExit("Install phevaluator==0.5.3.1 before generating lookup tables")
 
 from phevaluator.tables import (
     BINARIES_BY_ID,

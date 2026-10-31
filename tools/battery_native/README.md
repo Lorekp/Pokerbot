@@ -1,5 +1,7 @@
 # `battery_native` — bit-identical native core for the Pluribus exploitation battery hot path
 
+Lookup tables are generated locally by Cargo from the separately installed `phevaluator==0.5.3.1` Python dependency. They are not distributed in Git. Activate the project Python environment before building, or set `PYO3_PYTHON` / `PYTHON` to its executable. Explicit generation from the repository root is also supported: `python tools/battery_native/gen_phe_tables.py`.
+
 A Rust (PyO3) reimplementation of the **np_engine state machine + showdown evaluation** — the dominant
 cost of `scripts/eval_exploitation_battery.py --hero pluribus`. Bit-for-bit identical to the Python oracle
 (`pokerbot/engine/np_engine.py`, which is itself bit-identical to the JAX engine). Bit-identity is the hard

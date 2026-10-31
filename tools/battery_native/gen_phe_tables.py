@@ -4,9 +4,16 @@
 The native postflop fingerprint bucket (`fast_made_hand_bucket`) needs phevaluator's exact 1..7462
 hand-rank, which is table-driven (perfect-hash). Rather than transcribe ~400 KB of tables by hand
 (transcription risk), we emit them directly from the live Python package, guaranteeing byte-identity
-by construction. Re-run whenever the installed phevaluator version changes; then `cargo build`.
+by construction. Cargo runs this generator using the pinned phevaluator==0.5.3.1 dependency.
+Generated tables are local build inputs and are ignored by Git.
 """
 from __future__ import annotations
+
+from pathlib import Path
+from importlib.metadata import version
+
+if version("phevaluator") != "0.5.3.1":
+    raise SystemExit("Install phevaluator==0.5.3.1 before generating lookup tables")
 
 from phevaluator.tables import (  # type: ignore
     BINARIES_BY_ID,
@@ -68,6 +75,7 @@ for a in DP:
 out.append("];")
 
 text = "\n".join(out) + "\n"
-with open("src/phe_tables.rs", "w", encoding="ascii") as f:
+dest = Path(__file__).resolve().parent / "src" / "phe_tables.rs"
+with dest.open("w", encoding="ascii") as f:
     f.write(text)
-print("wrote src/phe_tables.rs:", len(text), "bytes; DP dims", len(DP), len(DP[0]), len(DP[0][0]))
+print("wrote local phe_tables.rs:", len(text), "bytes; DP dims", len(DP), len(DP[0]), len(DP[0][0]))
