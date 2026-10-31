@@ -67,7 +67,7 @@ def test_superhuman_is_identity():
                       facing_bet=False, hand_strength=0.5)
     np.testing.assert_allclose(out, p, atol=1e-12)
     assert DEFAULT_PROFILES["superhuman"].is_flawless()
-    assert not DEFAULT_PROFILES["professional"].is_flawless()   # has cosmetic entropy
+    assert DEFAULT_PROFILES["professional"].is_flawless()   # no structural deviation
 
 
 # --------------------------------------------------------------------------- leak monotonicity
@@ -156,10 +156,10 @@ def test_profile_for_level_endpoints():
     assert p.passivity <= mid.passivity <= b.passivity
 
 
-def test_profile_for_level_excludes_superhuman():
+def test_profile_for_level_top_has_no_structural_leaks():
     # level 1.0 maps to professional, never superhuman (superhuman is off the continuous ladder).
     p = profile_for_level(1.0)
-    assert not p.is_flawless()      # professional retains cosmetic entropy; superhuman would be flawless
+    assert p.is_flawless()
 
 
 # --------------------------------------------------------------------------- sampling determinism

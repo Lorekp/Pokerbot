@@ -3,7 +3,7 @@ project(ompeval_cli LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 
-option(USE_OMPEVAL "Link vendored OMPEval" OFF)
+option(USE_OMPEVAL "Link separately installed OMPEval" OFF)
 option(BUILD_BENCH_NATIVE "Build Google Benchmark harness" ON)
 
 set(OMPEVAL_VENDOR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/OMPEval")
@@ -11,7 +11,7 @@ set(OMPEVAL_HEADER "${OMPEVAL_VENDOR}/omp/HandEvaluator.h")
 
 if(USE_OMPEVAL)
   if(NOT EXISTS "${OMPEVAL_HEADER}")
-    message(FATAL_ERROR "Run: git submodule update --init tools/ompeval_cli/vendor/OMPEval")
+    message(FATAL_ERROR "Install OMPEval separately into tools/ompeval_cli/vendor/OMPEval; see this directory's README")
   endif()
 endif()
 

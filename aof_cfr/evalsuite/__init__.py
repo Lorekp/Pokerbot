@@ -1,6 +1,6 @@
 """AoF evaluation-metrics suite.
 
-Certifies five things about the AoF engine, each as a gated cell in a versioned report:
+Measures four aspects about the AoF engine, each as a gated cell in a versioned report:
 
   1. GTO base quality        — exact/MC legal NashConv per seat count and depth (:mod:`nash_gates`).
   2. Exploitation uplift     — bb/100 vs leaky/mixed/GTO fields with honest multi-seed CIs,
@@ -10,8 +10,6 @@ Certifies five things about the AoF engine, each as a gated cell in a versioned 
                                (:mod:`coldstart`).
   4. Safety                  — adapting adversaries (gear switcher, counter-exploiter) and the
                                Ganzfried–Sandholm exploitability budget (:mod:`adversary`).
-  5. Ingestion integrity     — synthetic ground truth through the real collector -> DB path
-                               (:mod:`ingest_audit`).
 
 Run the whole suite with ``python scripts/run_aof_eval_suite.py``; the artifact lands in
 ``runs/aof_eval/<stamp>_<gitsha>/metrics.json`` (:mod:`result`). Every cell reports gross AND

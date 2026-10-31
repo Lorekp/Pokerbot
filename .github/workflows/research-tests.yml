@@ -1,0 +1,20 @@
+name: Offline research checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  aof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: python -m pip install -r requirements-aof.txt
+      - run: python -m pytest tests/test_aof.py tests/test_aof_confidence.py tests/test_route_hu.py tests/test_skill_tiers.py tests/test_aof_eval_gates.py::test_report_artifact_shape -q
+      - run: python aof.py "AJo BTN 8bb" --mc 20000 --seed 42 --json

@@ -9,11 +9,13 @@ Build-only helpers for combo-exact HU showdown tables. **Not used in the trainin
 - Python 3.11+ with development headers
 - `pip install pybind11`
 
+OMPEval is an optional upstream dependency, downloaded separately under its own license. It is not bundled in this research edition.
+
 ## Build (OMPEval + hu_table_native)
 
 ```powershell
 cd tools/ompeval_cli
-git submodule update --init vendor/OMPEval
+git clone https://github.com/zekyll/OMPEval vendor/OMPEval
 .\build.ps1
 ```
 

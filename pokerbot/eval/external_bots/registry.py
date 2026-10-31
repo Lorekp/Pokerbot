@@ -18,7 +18,6 @@ OPPONENTS: dict[str, tuple[str, str]] = {
     "fish":     ("pokerbot.eval.external_bots.pypoker_adapter", "make_fish_policy"),
     "honest":   ("pokerbot.eval.external_bots.pypoker_adapter", "make_honest_policy"),
     "deepbot":  ("pokerbot.eval.external_bots.deepbot_adapter",  "make_deepbot_policy"),
-    "deepcfr6": ("pokerbot.eval.external_bots.deepcfr6_adapter", "make_deepcfr6_policy"),
 }
 
 

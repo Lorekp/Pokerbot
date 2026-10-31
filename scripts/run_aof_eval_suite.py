@@ -103,12 +103,6 @@ def main() -> int:
 
     cells: list[AoFEvalCell] = []
 
-    print("== ingest audit ==")
-    from aof_cfr.evalsuite.ingest_audit import ingest_audit_cell
-    c = ingest_audit_cell()
-    cells.append(c)
-    print(f"   exact_match_rate={c.meta['ingest_exact_match_rate']:.3f} passed={c.passed}")
-
     if not args.no_nash:
         print("== nash gates ==")
         from aof_cfr.evalsuite.nash_gates import nash_gate_cells

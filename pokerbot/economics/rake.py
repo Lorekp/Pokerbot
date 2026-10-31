@@ -327,8 +327,8 @@ def kelly_fraction_banker(edge_bb: float, sigma_bb: float) -> float:
 # (is_practice, bot_action) -> (allowed_action) so it can be property-tested in isolation — the
 # actual live send path is a different module, but the GUARANTEE is the same.
 #
-# The live frida bridge returns None for "unknown" (the coin-type RPC failed) or False for "real
-# money"; only True (verified play-money) clears the guard. Anything else blocks the action.
+# Only an explicit True (verified play-money) clears the guard. Unknown or false inputs
+# fail closed. Research callers can use this check on supplied game metadata.
 #
 # We model bot decisions as opaque strings ("FOLD" / "CALL" / "RAISE_3" / etc.). The guard's job is
 # to either pass the decision through unchanged or replace it with the sentinel "REFUSE".

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pokerbot"
 version = "0.1.0"
-description = "6-max NLH hybrid GTO + exploitation poker ML system"
+description = "Offline poker simulation, strategy learning and evaluation"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+dev = ["pytest>=7.4", "pytest-timeout>=2.3"]
 aof = [
     "pokerkit>=0.5.0,<1",
     "phevaluator>=0.5.0,<1",
@@ -34,30 +34,6 @@ llm = [
     "accelerate>=0.30",
     "bitsandbytes>=0.43",
     "sentencepiece>=0.2",
-]
-live = [
-    "mss>=9.0",
-    "opencv-python>=4.8",
-    "pillow>=10.0",
-    "easyocr>=1.7",
-    "pytesseract>=0.3.10",
-    "UnityPy>=1.10",
-    "onnxruntime>=1.17",
-]
-# Trained-model recognition for the local vision path (digits/cards/badges CNNs).
-# Inference needs only onnxruntime; training scripts additionally use torch (core dep).
-vision-ml = [
-    "onnxruntime>=1.17",
-]
-vl = [
-    "instructor>=1.6",
-    "openai>=1.30",
-    "pydantic>=2.6",
-    "pillow>=10.0",
-    "mss>=9.0",
-    "opencv-python>=4.8",
-    "python-dotenv>=1.0",
-    "onnxruntime>=1.17",
 ]
 aof-native = [
     "pybind11>=2.11",
@@ -87,15 +63,19 @@ server = [
 py-modules = [
     "aof",
     "aof_confidence",
+    "aof_equity",
+    "aof_equity_cache",
+    "aof_equity_config",
+    "aof_equity_grids",
+    "aof_equity_score2",
+    "aof_equity_showdown",
     "aof_game_config",
+    "aof_multiway",
     "aof_parse",
     "aof_ranges",
     "aof_ranges_chart",
     "aof_ranges_gto",
-    "aof_equity",
-    "aof_equity_grids",
-    "aof_equity_score2",
-    "aof_equity_showdown",
+    "aof_ranges_tight",
     "aof_spot",
 ]
 

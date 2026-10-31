@@ -1,0 +1,7 @@
+numpy>=1.26,<3
+numba>=0.59,<1
+pokerkit>=0.5,<1
+phevaluator>=0.5,<1
+PyYAML>=6
+pytest>=7.4
+pytest-timeout>=2.3
