@@ -23,7 +23,7 @@ dependencies = [
 dev = ["pytest>=7.4", "pytest-timeout>=2.3"]
 aof = [
     "pokerkit>=0.5.0,<1",
-    "phevaluator>=0.5.0,<1",
+    "phevaluator==0.5.3.1",
     "numba>=0.59.0,<1",
     "numpy>=1.26.0,<3",
     "pyyaml>=6.0",
@@ -48,7 +48,7 @@ aof-cfr = [
     "open-spiel>=1.6",
     "numpy>=1.26.0,<3",
     "pokerkit>=0.5.0,<1",
-    "phevaluator>=0.5.0,<1",
+    "phevaluator==0.5.3.1",
     "numba>=0.59.0,<1",
 ]
 server = [
